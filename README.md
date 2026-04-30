@@ -19,92 +19,22 @@ argument for proxy-endpoint enforcement.
 
 ---
 
-## The easy button: `sessionscribe-mitigate.sh`
+## Tools
 
-If you operate cPanel at scale and want a single command that walks a host
-into the full SessionScribe mitigation posture, that's what
-[`sessionscribe-mitigate.sh`](./sessionscribe-mitigate.sh) is for. One
-phased pass, idempotent, fleet-friendly output, drop-in for any
-config-management or SSH-loop pipeline.
-
-What it actually does, in order:
-
-- **patch** - reads `cpanel -V`, compares to the published patched-build list
-  (incl. EL6 11.86.0.41 and WP Squared 136.1.7); if behind, kicks off
-  `/scripts/upcp --force --bg` in the background.
-- **preflight** - removes `/etc/yum.repos.d/threatdown.repo` if present,
-  installs `epel-release` if missing, probes every enabled repo and
-  disables the broken non-base ones so `upcp` doesn't die mid-flight.
-  CentOS / Alma / Rocky base/appstream/extras/updates/powertools are
-  *never* touched, even if they happen to be unreachable.
-- **proxysub** - turns on `proxysubdomains` and the new-account variant via
-  `whmapi1`, then rebuilds the Apache vhost config so customer ingress
-  flows through Apache (where ModSec can intercept) instead of straight
-  to cpsrvd.
-- **csf / apf / runfw** - scrubs the six cpsrvd ports
-  (2082/2083/2086/2087/2095/2096) out of `TCP_IN`, `TCP6_IN`,
-  `IG_TCP_CPORTS`; reloads csf/apf; walks the running iptables INPUT
-  chain (and every chain it references) to confirm no `ACCEPT` rule
-  still matches those ports from `0.0.0.0/0`.
-- **apache / modsec** - verifies `httpd` is up and `security2_module` is
-  loaded; checks `modsec2.user.conf` for rules `1500030` + `1500031` and,
-  if missing, fetches the source (local downloads, then `sh.rfxn.com`),
-  appends from the `# === RULES ===` anchor with a timestamped backup,
-  validates `httpd -t`, and graceful-reloads.
-- **probe (opt-in via `--probe`)** - runs `sessionscribe-remote-probe.sh`
-  against `127.0.0.1` to confirm the rules deny in practice, not just
-  on paper.
-
-Built for fleet roll-outs:
-
-- Defaults to `--check` (read-only); `--apply` is required to mutate state.
-- Idempotent - re-running on a healthy host is a no-op, no backup churn.
-- `--only PHASES` lets you pin scope, e.g. `--only modsec,csf` for a daily
-  drift check, or `--only patch,preflight` as the front of an upcp wave.
-- `--no-PHASE` opt-outs (`--no-upcp`, `--no-modsec`, `--no-fw`) for the
-  inverse.
-- Every JSONL/CSV/JSON record carries `host`, `os`, `cpanel_version`,
-  `ts`, `tool_version`, `mode`, `phase`, `severity`, `key`, `note` so
-  fleet aggregators can attribute every signal to its source without
-  joining tables.
-- Timestamped backups written to `/var/cpanel/sessionscribe-mitigation/`
-  before any mutation; `httpd -t` validation gates the modsec deploy.
-
-```bash
-# audit a single host
-bash sessionscribe-mitigate.sh
-
-# full remediation
-bash sessionscribe-mitigate.sh --apply
-
-# fleet collection
-bash sessionscribe-mitigate.sh --jsonl > host.jsonl
-bash sessionscribe-mitigate.sh --csv   > host.csv
-
-# narrow scope
-bash sessionscribe-mitigate.sh --apply --only modsec --probe
-bash sessionscribe-mitigate.sh --only patch,preflight     # pre-upcp gate
-```
-
-Exit codes are designed for fleet aggregation: `0` clean, `1` remediation
-applied, `2` manual intervention required, `3` tool error.
-
----
-
-## What's in the repo
+If you just want to fix it, run [`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh---defense-in-depth-shim) - one
+command brings a host into the documented mitigation posture (patch,
+proxy-endpoint enforcement, firewall, ModSec). Idempotent, fleet-friendly,
+defaults to read-only.
 
 | Artifact | Role | Where it runs |
 |---|---|---|
-| [`sessionscribe-mitigate.sh`](./sessionscribe-mitigate.sh) | Defense-in-depth active mitigation. One phased pass: patch / preflight / upcp / proxysub / csf / apf / runfw / apache / modsec / probe. Fleet-friendly JSONL+CSV with host/os/cpanel-version per record | On the cPanel host |
-| [`modsec-sessionscribe.conf`](./modsec-sessionscribe.conf) | ModSecurity rule pack - phase-1 deny on the CVE primitive, plus three rules for an adjacent WHM-token log-injection issue | Apache + mod_security2, in front of cpsrvd |
-| [`sessionscribe-remote-probe.sh`](./sessionscribe-remote-probe.sh) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions for safe cleanup | Anywhere with curl |
-| [`sessionscribe-ioc-scan.sh`](./sessionscribe-ioc-scan.sh) | Read-only on-host scanner. Vendor IOCs + four-way co-occurrence + forged-timestamp heuristics | On the cPanel host |
-| [`sessionscribe-revsnap.sh`](./sessionscribe-revsnap.sh) | Per-tier RE snapshot collector (binaries, strings, dynsym, disasm, Perl modules) | On the cPanel host, around `upcp` |
+| [`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh---defense-in-depth-shim) | Active mitigation shim. One phased pass with fleet-friendly JSONL/CSV per host | On the cPanel host |
+| [`modsec-sessionscribe.conf`](#modsec-sessionscribeconf---the-modsecurity-rule-pack) | ModSecurity rule pack. Phase-1 deny on the CVE primitive + adjacent WHM-token rules | Apache + mod_security2, in front of cpsrvd |
+| [`sessionscribe-remote-probe.sh`](#sessionscribe-remote-probesh---non-destructive-verdict-per-host) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions | Anywhere with curl |
+| [`sessionscribe-ioc-scan.sh`](#sessionscribe-ioc-scansh---on-host-ioc-ladder) | Read-only on-host IOC scanner. Vendor IOCs + co-occurrence detector | On the cPanel host |
+| [`sessionscribe-revsnap.sh`](#sessionscribe-revsnapsh---re-snapshot-collector) | Per-tier RE snapshot (binaries, strings, dynsym, disasm, Perl modules) | On the cPanel host, around `upcp` |
 
-All shell scripts are GPL v2.
-
-The canonical hosted versions are at `https://sh.rfxn.com/<filename>` if
-you'd rather `curl`-pipe than clone.
+All shell scripts are GPL v2. Canonical hosted versions at `https://sh.rfxn.com/<filename>` if you'd rather `curl`-pipe than clone.
 
 ---
 
@@ -164,6 +94,50 @@ adjacent identity-injection issue - is in the
 ---
 
 ## Each tool
+
+### `sessionscribe-mitigate.sh` - defense-in-depth shim
+
+One phased pass that walks a cPanel host into the documented mitigation
+posture. Idempotent (re-run on a healthy host is a no-op), defaults to
+`--check` (read-only), fleet-friendly output with `host`/`os`/
+`cpanel_version` on every JSONL/CSV/JSON record.
+
+| Phase | What it does |
+|---|---|
+| `patch` | `cpanel -V` vs the published patched-build list (incl. EL6 11.86.0.41 and WP Squared 136.1.7) |
+| `preflight` | Removes `/etc/yum.repos.d/threatdown.repo`; ensures `epel-release`; disables broken non-base repos so `upcp` doesn't die mid-flight |
+| `upcp` | If unpatched, kicks off `/scripts/upcp --force --bg` |
+| `proxysub` | Enables `proxysubdomains` + new-account variant; rebuilds httpd conf |
+| `csf` / `apf` / `runfw` | Strips cpsrvd ports (2082/2083/2086/2087/2095/2096) from `TCP_IN`/`TCP6_IN`/`IG_TCP_CPORTS`; verifies live iptables INPUT chain |
+| `apache` | `httpd` running + `security2_module` loaded |
+| `modsec` | `modsec2.user.conf` contains rules `1500030` + `1500031`; deploy if missing (timestamped backup, `httpd -t` validation, graceful reload) |
+| `probe` (opt-in) | Run `sessionscribe-remote-probe.sh` against `127.0.0.1` to confirm denials in practice |
+
+CentOS / Alma / Rocky base/appstream/extras/updates/powertools are *never*
+disabled by the preflight sweep, even if currently unreachable. Mutations
+write timestamped backups under `/var/cpanel/sessionscribe-mitigation/`
+before touching any file.
+
+```bash
+# audit (read-only)
+bash sessionscribe-mitigate.sh
+
+# full remediation
+bash sessionscribe-mitigate.sh --apply
+
+# fleet aggregation
+bash sessionscribe-mitigate.sh --jsonl > host.jsonl
+bash sessionscribe-mitigate.sh --csv   > host.csv
+
+# narrow scope
+bash sessionscribe-mitigate.sh --apply --only modsec --probe
+bash sessionscribe-mitigate.sh --only patch,preflight     # pre-upcp gate
+```
+
+`--only LIST` pins to a comma-separated phase list; `--no-PHASE` opt-outs
+(`--no-upcp`, `--no-modsec`, `--no-fw`) for the inverse; `--list-phases`
+enumerates everything. Exit codes: `0` clean, `1` remediation applied,
+`2` manual intervention required, `3` tool error.
 
 ### `modsec-sessionscribe.conf` - the ModSecurity rule pack
 
