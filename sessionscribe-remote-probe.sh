@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-remote-probe.sh v2.1.0
+# sessionscribe-remote-probe.sh v1.1.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
 #
-# sessionscribe-remote-probe.sh   v2.1.0
+# sessionscribe-remote-probe.sh   v1.1.0
 #
 # Detection probe for CVE-2026-41940 (SessionScribe - disclosed 2026-04-28,
 # cPanel KB 40073787579671). Unauthenticated session forgery in cPanel/WHM
@@ -183,7 +183,7 @@
 # No python, no perl, no openssl.
 
 set -u
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="1.1.0"
 
 # --- Defaults ---
 TIMEOUT=10

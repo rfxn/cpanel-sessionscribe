@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-revsnap.sh v0.4.0
+# sessionscribe-revsnap.sh v1.4.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
