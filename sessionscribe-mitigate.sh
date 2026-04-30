@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.2.0
+# sessionscribe-mitigate.sh v0.2.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -80,7 +80,7 @@
 
 set -u
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 ###############################################################################
 # Constants
@@ -647,7 +647,26 @@ phase_preflight() {
         fi
     fi
 
-    # 2c: broken-repo sweep.
+    # 2c: invalidate cached repo metadata. `clean metadata` is the surgical
+    # form - removes only the cached repodata XML so subsequent makecache
+    # calls test live upstream health rather than honoring a stale 304 hit.
+    # Leaves packages/, dbcache/, and downloaded RPMs intact (vs `clean all`).
+    sk repo_clean
+    if have_cmd dnf; then
+        if dnf clean metadata >/dev/null 2>&1; then
+            say_info "dnf clean metadata (cached repodata invalidated)"
+        else
+            say_warn "dnf clean metadata failed; sweep may use stale cache"
+        fi
+    elif have_cmd yum; then
+        if yum clean metadata >/dev/null 2>&1; then
+            say_info "yum clean metadata (cached repodata invalidated)"
+        else
+            say_warn "yum clean metadata failed; sweep may use stale cache"
+        fi
+    fi
+
+    # 2d: broken-repo sweep.
     sk repo_sweep
     if have_cmd dnf; then
         local enabled_repos r
