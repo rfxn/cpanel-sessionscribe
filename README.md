@@ -1,30 +1,44 @@
 # SessionScribe - CVE-2026-41940
 
-Detection, mitigation, and reverse-engineering tooling for **CVE-2026-41940**,
-the unauthenticated session-forgery vulnerability in cPanel & WHM disclosed
-on 2026-04-28 ([cPanel KB 40073787579671](https://support.cpanel.net/hc/en-us/articles/40073787579671)).
+**Critical unauthenticated RCE in cPanel & WHM.** Four HTTP requests forge
+a root session via CRLF injection into the password field of a preauth
+session - no auth, no preconditions, every supported tier affected.
+Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr.com/)
+([public PoC](https://github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py),
+[vendor advisory](https://support.cpanel.net/hc/en-us/articles/40073787579671)).
 
-> **The bug.** CRLF injection into the password field of a preauth session
-> promotes attacker input into canonical session attributes. Outcome is a
-> logged-in root session and a root-equivalent `cpsess` token. Severity is
-> the maximum the rubric allows: remote code execution as root, no
-> authentication, no preconditions, every supported tier affected.
+This repo is the operator-side toolkit: one-command active mitigation that
+holds across patched and unpatched tiers, ModSec rules that work today, a
+non-destructive remote probe for fleet sweeps, an on-host IOC scanner, and
+the patch-diff snapshot collector behind the
+[research article](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940).
 
-**Researcher credit:** Sina Kheirkhah ([@SinSinology](https://twitter.com/SinSinology)) of
-[watchTowr Labs](https://labs.watchtowr.com/).
+```bash
+# audit a single host (read-only)
+curl -fsSLO https://sh.rfxn.com/sessionscribe-mitigate.sh
+bash sessionscribe-mitigate.sh
 
-**Full writeup:** [rfxn.com/research/cpanel-sessionscribe-cve-2026-41940](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940).
-Covers the patch dissection, primitive walk-through, and the architectural
-argument for proxy-endpoint enforcement.
+# full remediation
+bash sessionscribe-mitigate.sh --apply
+
+# fleet roll-up - one CSV row per host (host, os, cpanel_version, ...)
+bash sessionscribe-mitigate.sh --csv
+```
+
+> **The primitive in one paragraph.** CRLF injected into the `pass=` line
+> of a preauth session splits the single line into multiple `key=value`
+> lines on disk. Set `user=root`, `hasroot=1`, and
+> `successful_internal_auth_with_timestamp`, and you've forged a
+> root-authenticated session plus a working `cpsess` token. The
+> [full writeup](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940)
+> covers the patch dissection, the two composing asymmetries
+> (`filter_sessiondata` not on every write path; encoder short-circuits
+> on missing `ob_part`), and the architectural argument for proxy-endpoint
+> enforcement.
 
 ---
 
 ## Tools
-
-If you just want to fix it, run [`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh---defense-in-depth-shim) - one
-command brings a host into the documented mitigation posture (patch,
-proxy-endpoint enforcement, firewall, ModSec). Idempotent, fleet-friendly,
-defaults to read-only.
 
 | Artifact | Role | Where it runs |
 |---|---|---|
