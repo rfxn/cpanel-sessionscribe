@@ -176,50 +176,81 @@ ASSUME_YES=0
 usage() {
     cat <<EOF
 sessionscribe-mitigate.sh v${VERSION}
-
 Defense-in-depth active mitigation for CVE-2026-41940 (SessionScribe).
 
-Modes:
-  --check                Read-only audit (default). No changes.
-  --apply                Execute remediations.
-  --dry-run              Alias for --check (more explicit).
+USAGE
+    sessionscribe-mitigate.sh [MODE] [PHASE-SELECTION] [OUTPUT] [MISC]
 
-Phase selection (compose any combination):
-  --only LIST            Run only the listed phases (CSV, or "all").
-                         Tokens: $(IFS=,; echo "${PHASE_IDS[*]}")
-  --no-PHASE             Skip a phase (e.g. --no-upcp, --no-modsec, --no-fw).
-                         --no-fw is shorthand for csf+apf+runfw.
-  --probe                Enable the optional self-probe phase (opt-in).
-  --list-phases          Print phase IDs and descriptions, then exit.
+    Read-only by default (--check). Use --apply to mutate state. All
+    enabled phases run in order unless restricted via --only or excluded
+    via --no-PHASE. Idempotent: re-running on a healthy host is a no-op.
 
-Output (mutually exclusive on stdout - last one wins):
-  (default)              ANSI sectioned report on stderr.
-  --json                 Single JSON envelope on stdout.
-  --jsonl                Stream one JSON signal per line on stdout (per-phase
-                         + final summary). Each line carries host, os,
-                         cpanel_version for fleet aggregation.
-  --csv                  Single CSV summary row on stdout (header + one row).
-  -o, --output FILE      Write final JSON envelope (or CSV row) to FILE.
-                         Format follows --csv if set, JSON otherwise.
+MODES
+    --check                Read-only audit (default). No state changes.
+    --apply                Execute remediations. Requires root.
+    --dry-run              Alias for --check.
 
-Misc:
-  --quiet                Suppress sectioned report on stderr.
-  --no-color             Disable ANSI color (also honored if NO_COLOR=1 env).
-  --backup-root DIR      Override backup directory
-                         (default: $BACKUP_ROOT_DEFAULT).
-  --yes                  Assume yes; do not prompt for confirmation.
-  -h, --help             Show this help.
+PHASE SELECTION
+    --only LIST            Run only the named phases (CSV, or "all").
+                           Phases: $(IFS=,; echo "${PHASE_IDS[*]}")
+    --no-PHASE             Skip a phase. Per-phase opt-outs:
+                             --no-patch     --no-preflight   --no-upcp
+                             --no-proxysub  --no-csf         --no-apf
+                             --no-runfw     --no-apache      --no-modsec
+    --no-fw                Shorthand for --no-csf --no-apf --no-runfw.
+    --probe                Enable the optional probe phase (opt-in).
+                           Runs sessionscribe-remote-probe.sh against
+                           127.0.0.1:2087; expects SAFE/blocked verdict.
+    --list-phases          Print phase IDs + descriptions, then exit.
 
-Exit codes: 0=clean, 1=remediation applied, 2=manual intervention, 3=tool error.
+OUTPUT (mutually exclusive on stdout - last flag wins)
+    (default)              ANSI sectioned report on stderr.
+    --json                 Single JSON envelope on stdout.
+    --jsonl                Stream one JSON signal per line on stdout. Every
+                           line carries host, os, cpanel_version, ts,
+                           tool_version, mode, phase, severity, key, note.
+    --csv                  Single CSV summary row on stdout (header + one
+                           data row). One row per host - designed for
+                           fleet roll-up via cat *.csv | awk ...
+    -o, --output FILE      Write final JSON envelope (or CSV row if --csv
+                           is set) to FILE.
 
-Examples:
-  bash sessionscribe-mitigate.sh                      # report only
-  bash sessionscribe-mitigate.sh --apply              # full remediation
-  bash sessionscribe-mitigate.sh --apply --no-upcp    # skip cpanel upgrade
-  bash sessionscribe-mitigate.sh --only modsec,csf    # check 2 phases
-  bash sessionscribe-mitigate.sh --apply --only modsec --probe
-  bash sessionscribe-mitigate.sh --jsonl --quiet > host.jsonl
-  bash sessionscribe-mitigate.sh --csv > host.csv
+MISC
+    --quiet                Suppress sectioned report. Auto-set by --jsonl/--csv.
+    --no-color             Disable ANSI color. NO_COLOR=1 env also honored.
+    --backup-root DIR      Backup directory for any mutation
+                           (default: $BACKUP_ROOT_DEFAULT).
+    --yes, -y              Non-interactive; assume yes (no prompts).
+    -h, --help             Show this help.
+
+EXIT CODES
+    0    clean - patched + posture ok, no action needed
+    1    remediation applied successfully (--apply made changes)
+    2    manual intervention required (warns in --check, or fail in --apply)
+    3    tool error (bad args, missing dependencies, not root for --apply)
+
+EXAMPLES
+    Audit a single host (read-only):
+        sessionscribe-mitigate.sh
+
+    Full remediation:
+        sessionscribe-mitigate.sh --apply
+
+    Skip the cPanel upgrade phase:
+        sessionscribe-mitigate.sh --apply --no-upcp
+
+    Check just the firewall + modsec posture (drift watch):
+        sessionscribe-mitigate.sh --only csf,apf,runfw,modsec
+
+    Apply only modsec, then verify end-to-end with the self-probe:
+        sessionscribe-mitigate.sh --apply --only modsec --probe
+
+    Fleet aggregation - one CSV row or JSONL stream per host:
+        sessionscribe-mitigate.sh --csv   > host.csv
+        sessionscribe-mitigate.sh --jsonl > host.jsonl
+
+    Pre-upcp wave gate (preflight only, exit nonzero if anything broken):
+        sessionscribe-mitigate.sh --apply --only patch,preflight
 EOF
     exit 0
 }

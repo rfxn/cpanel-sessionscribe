@@ -167,10 +167,66 @@ bash sessionscribe-mitigate.sh --apply --only modsec --probe
 bash sessionscribe-mitigate.sh --only patch,preflight     # pre-upcp gate
 ```
 
-`--only LIST` pins to a comma-separated phase list; `--no-PHASE` opt-outs
-(`--no-upcp`, `--no-modsec`, `--no-fw`) for the inverse; `--list-phases`
-enumerates everything. Exit codes: `0` clean, `1` remediation applied,
-`2` manual intervention required, `3` tool error.
+<details>
+<summary><b>Full <code>--help</code> reference</b> (click to expand)</summary>
+
+```
+sessionscribe-mitigate.sh v0.2.1
+Defense-in-depth active mitigation for CVE-2026-41940 (SessionScribe).
+
+USAGE
+    sessionscribe-mitigate.sh [MODE] [PHASE-SELECTION] [OUTPUT] [MISC]
+
+    Read-only by default (--check). Use --apply to mutate state. All
+    enabled phases run in order unless restricted via --only or excluded
+    via --no-PHASE. Idempotent: re-running on a healthy host is a no-op.
+
+MODES
+    --check                Read-only audit (default). No state changes.
+    --apply                Execute remediations. Requires root.
+    --dry-run              Alias for --check.
+
+PHASE SELECTION
+    --only LIST            Run only the named phases (CSV, or "all").
+                           Phases: patch,preflight,upcp,proxysub,csf,apf,runfw,apache,modsec,probe
+    --no-PHASE             Skip a phase. Per-phase opt-outs:
+                             --no-patch     --no-preflight   --no-upcp
+                             --no-proxysub  --no-csf         --no-apf
+                             --no-runfw     --no-apache      --no-modsec
+    --no-fw                Shorthand for --no-csf --no-apf --no-runfw.
+    --probe                Enable the optional probe phase (opt-in).
+                           Runs sessionscribe-remote-probe.sh against
+                           127.0.0.1:2087; expects SAFE/blocked verdict.
+    --list-phases          Print phase IDs + descriptions, then exit.
+
+OUTPUT (mutually exclusive on stdout - last flag wins)
+    (default)              ANSI sectioned report on stderr.
+    --json                 Single JSON envelope on stdout.
+    --jsonl                Stream one JSON signal per line on stdout. Every
+                           line carries host, os, cpanel_version, ts,
+                           tool_version, mode, phase, severity, key, note.
+    --csv                  Single CSV summary row on stdout (header + one
+                           data row). One row per host - designed for
+                           fleet roll-up via cat *.csv | awk ...
+    -o, --output FILE      Write final JSON envelope (or CSV row if --csv
+                           is set) to FILE.
+
+MISC
+    --quiet                Suppress sectioned report. Auto-set by --jsonl/--csv.
+    --no-color             Disable ANSI color. NO_COLOR=1 env also honored.
+    --backup-root DIR      Backup directory for any mutation
+                           (default: /var/cpanel/sessionscribe-mitigation).
+    --yes, -y              Non-interactive; assume yes (no prompts).
+    -h, --help             Show this help.
+
+EXIT CODES
+    0    clean - patched + posture ok, no action needed
+    1    remediation applied successfully (--apply made changes)
+    2    manual intervention required (warns in --check, or fail in --apply)
+    3    tool error (bad args, missing dependencies, not root for --apply)
+```
+
+</details>
 
 ### `modsec-sessionscribe.conf` - the ModSecurity rule pack
 
