@@ -1,4 +1,4 @@
-# SessionScribe — CVE-2026-41940
+# SessionScribe - CVE-2026-41940
 
 Detection, mitigation, and reverse-engineering tooling for **CVE-2026-41940**,
 the unauthenticated session-forgery vulnerability in cPanel & WHM disclosed
@@ -13,9 +13,9 @@ on 2026-04-28 ([cPanel KB 40073787579671](https://support.cpanel.net/hc/en-us/ar
 **Researcher credit:** Sina Kheirkhah ([@SinSinology](https://twitter.com/SinSinology)) of
 [watchTowr Labs](https://labs.watchtowr.com/).
 
-**Full writeup:** **[rfxn.com/research/cpanel-sessionscribe-cve-2026-41940](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940)**
-— patch dissection, primitive walk-through, and the architectural argument
-for proxy-endpoint enforcement.
+**Full writeup:** [rfxn.com/research/cpanel-sessionscribe-cve-2026-41940](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940).
+Covers the patch dissection, primitive walk-through, and the architectural
+argument for proxy-endpoint enforcement.
 
 ---
 
@@ -23,7 +23,7 @@ for proxy-endpoint enforcement.
 
 | Artifact | Role | Where it runs |
 |---|---|---|
-| [`modsec-sessionscribe.conf`](./modsec-sessionscribe.conf) | ModSecurity rule pack — phase-1 deny on the CVE primitive, plus three rules for an adjacent WHM-token log-injection issue | Apache + mod_security2, in front of cpsrvd |
+| [`modsec-sessionscribe.conf`](./modsec-sessionscribe.conf) | ModSecurity rule pack - phase-1 deny on the CVE primitive, plus three rules for an adjacent WHM-token log-injection issue | Apache + mod_security2, in front of cpsrvd |
 | [`sessionscribe-remote-probe.sh`](./sessionscribe-remote-probe.sh) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions for safe cleanup | Anywhere with curl |
 | [`sessionscribe-ioc-scan.sh`](./sessionscribe-ioc-scan.sh) | Read-only on-host scanner. Vendor IOCs + four-way co-occurrence + forged-timestamp heuristics | On the cPanel host |
 | [`sessionscribe-revsnap.sh`](./sessionscribe-revsnap.sh) | Per-tier RE snapshot collector (binaries, strings, dynsym, disasm, Perl modules) | On the cPanel host, around `upcp` |
@@ -65,7 +65,7 @@ The primitive is **two asymmetries that compose**:
    `s/,([0-9a-f]{1,64})$//`. Five cookie shapes fail this regex (no comma,
    trailing comma, non-hex tail, uppercase hex, hex tail >64 chars). When it
    fails, `$ob` stays undefined and `my $encoder = $ob && Encoder->new(...)`
-   short-circuits — `$encoder` is false, the next-line `$encoder->encode_data`
+   short-circuits - `$encoder` is false, the next-line `$encoder->encode_data`
    never runs, and `pass` is written through verbatim.
 
 Compose them: with the encoder skipped *and* `saveSession()` not filtering, a
@@ -83,20 +83,20 @@ side. CR and LF become ASCII hex, the value can no longer split into
 standalone `key=value` lines, and the invariant is encoded in the data
 rather than in a single function call.
 
-The full reverse-engineering walkthrough — including the auth-strings diff,
+The full reverse-engineering walkthrough - including the auth-strings diff,
 the 134-tier byte-identical-strings problem, and what we learned about the
-adjacent identity-injection issue — is in the
+adjacent identity-injection issue - is in the
 [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940).
 
 ---
 
 ## Each tool
 
-### `modsec-sessionscribe.conf` — the ModSecurity rule pack
+### `modsec-sessionscribe.conf` - the ModSecurity rule pack
 
 One file, two surfaces: the CVE primitive and an adjacent `Authorization: WHM`
 log-injection issue we surfaced during the analysis. ID range reserved is
-`1500000–1500099`. Every deny runs in phase 1 — the request never reaches
+`1500000–1500099`. Every deny runs in phase 1 - the request never reaches
 the body inspector or the application.
 
 | Rule | Surface | Action |
@@ -111,13 +111,13 @@ Rule 1500030 base64-decodes the `Authorization: Basic` payload in phase 1
 and rejects on CR/LF in the decoded bytes. No legitimate Basic-auth value
 decodes to bytes with newlines, so the rule has no trust-list bypass: it
 applies to every source on every path. The WHM-token rules use
-`@ipMatch` against an operator-defined trust list — edit the CIDRs at the
+`@ipMatch` against an operator-defined trust list - edit the CIDRs at the
 top of the file before deploying.
 
 Caveat: these rules run inside Apache. The `cpsrvd` daemon listens directly
 on its own ports (2082/2083/2086/2087/2095/2096) and is reachable
 independent of Apache. **The rule pack only fires on traffic that traverses
-Apache.** Pair it with cpsrvd-port firewalling to management CIDRs — the
+Apache.** Pair it with cpsrvd-port firewalling to management CIDRs - the
 "proxy-endpoint enforcement" section of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940#going-forward)
 is the canonical writeup of that posture.
 
@@ -136,7 +136,7 @@ apachectl -t
 /usr/local/cpanel/scripts/restartsrv_httpd
 ```
 
-### `sessionscribe-remote-probe.sh` — non-destructive verdict per host
+### `sessionscribe-remote-probe.sh` - non-destructive verdict per host
 
 We did not want live exploit code on customer hosts even for verification.
 The probe approximates the chain (mint preauth → inject CRLF → propagate
@@ -151,7 +151,7 @@ cleanup is wildcard-safe, and **no state-mutating API calls are made**.
 # single host
 bash sessionscribe-remote-probe.sh --target 1.2.3.4
 
-# fleet — quiet, exit 2 on any VULN
+# fleet - quiet, exit 2 on any VULN
 bash sessionscribe-remote-probe.sh --target 1.2.3.4 --quiet --no-color
 echo "exit=$?"
 
@@ -166,7 +166,7 @@ bash sessionscribe-remote-probe.sh --target 1.2.3.4 --all --json | jq .
 bash sessionscribe-remote-probe.sh --cleanup
 ```
 
-### `sessionscribe-ioc-scan.sh` — on-host IOC ladder
+### `sessionscribe-ioc-scan.sh` - on-host IOC ladder
 
 Patched build numbers are not enough. A patched host can still be carrying
 forensic artifacts of prior exploitation. This script is the read-only
@@ -174,9 +174,9 @@ counterpart to the probe: it walks `/var/cpanel/sessions/raw/`, the access
 logs, and the `cpsrvd` binary fingerprint, then returns two independent
 verdict axes:
 
-- **`code_verdict`** (`PATCHED` / `VULNERABLE` / `INCONCLUSIVE`) — from
+- **`code_verdict`** (`PATCHED` / `VULNERABLE` / `INCONCLUSIVE`) - from
   version, Perl source patterns, and binary fingerprint.
-- **`host_verdict`** (`CLEAN` / `SUSPICIOUS` / `COMPROMISED`) — from the
+- **`host_verdict`** (`CLEAN` / `SUSPICIOUS` / `COMPROMISED`) - from the
   session-file IOC ladder and access-log scan.
 
 The IOC set is the vendor pattern (token-injection, preauth-with-extauth,
@@ -201,7 +201,7 @@ ansible -i hosts all -m script -a 'sessionscribe-ioc-scan.sh --jsonl --quiet'
 pdsh -w cpanel-fleet 'bash -s' < sessionscribe-ioc-scan.sh
 ```
 
-### `sessionscribe-revsnap.sh` — RE snapshot collector
+### `sessionscribe-revsnap.sh` - RE snapshot collector
 
 The same collector used for the patch dissection in the writeup. Run it
 before each step of an upgrade, run `/scripts/upcp --force`, run it again.
@@ -333,9 +333,9 @@ was bumped from `.18` to `.19` in the same revision.
 - Standardize this proxy-endpoint posture as the default. The next cpsrvd
   advisory will land on the same six ports.
 
-The architectural case for proxy-endpoint enforcement — why we're treating
+The architectural case for proxy-endpoint enforcement - why we're treating
 SessionScribe as the moment to stop shipping cpsrvd to the open internet,
-and how to do it without breaking customer ingress — is the closing third
+and how to do it without breaking customer ingress - is the closing third
 of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940#going-forward).
 
 ---
@@ -350,6 +350,6 @@ of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-202
 
 ## License
 
-GPL v2 — see individual file headers. Additional IOCs or variant samples
+GPL v2 - see individual file headers. Additional IOCs or variant samples
 welcome via [Keybase](https://keybase.io/rfxn) or
 [email](mailto:ryan@rfxn.com).

@@ -132,7 +132,7 @@ done
 # Skip /usr/local/cpanel/3rdparty/ (upstream CPAN; rarely involved in cPanel-side bugs).
 #
 # For every captured subtree, also grab the sibling parent .pm one level up.
-# A recursive copy of Cpanel/Session/ alone misses Cpanel/Session.pm — the
+# A recursive copy of Cpanel/Session/ alone misses Cpanel/Session.pm - the
 # package file that holds the namespace's public API (saveSession, write_*,
 # filter_*, etc.). The parent .pm is almost always the entry point.
 for path in \
@@ -201,7 +201,7 @@ done
 # --- WHM ACL gate + exception/validation primitives ---
 # Whostmgr/ACLS{,.pm} resolves hasroot()/checkacl()/init_acls(). Cpanel/Exception
 # carries cpsrvd's Forbidden/AccessDenied response bodies. Username validation
-# is a common gate target — captured both as a subtree (above) and explicitly.
+# is a common gate target - captured both as a subtree (above) and explicitly.
 for srcfile in \
   /usr/local/cpanel/Whostmgr/ACLS.pm \
   /usr/local/cpanel/Whostmgr/ACLS \
@@ -258,7 +258,7 @@ find /usr/local/cpanel \
   > "$WORK/meta/full-tree-hashes.txt"
 
 # --- Function-level disassembly ---
-# Same-tier security patches frequently land with zero string deltas — only
+# Same-tier security patches frequently land with zero string deltas - only
 # function logic differs. Disasm dumps unblock BinDiff / Diaphora workflows
 # when string-level diff comes up empty. ~30-150 MB per binary; gzipped.
 mkdir -p "$WORK/symbols/disasm"
@@ -272,7 +272,7 @@ done
 
 # --- Runtime artifacts (anonymized) ---
 # One redacted preauth session file as a schema reference. Knowing the
-# baseline shape of a normal session — which fields exist, which don't —
+# baseline shape of a normal session - which fields exist, which don't -
 # is the cleanest way to spot anomalies in later forensic review.
 {
   echo "# Anonymized sample from /var/cpanel/sessions/raw/ at snapshot time."
@@ -292,7 +292,7 @@ done
   fi
 } > "$WORK/runtime/preauth-session-schema-sample.txt"
 
-# Session-dir listing only — no per-session bodies.
+# Session-dir listing only - no per-session bodies.
 {
   echo "# /var/cpanel/sessions/{raw,preauth,cache} layout. Filenames only."
   for sub in raw preauth cache; do
@@ -304,7 +304,7 @@ done
   done
 } > "$WORK/runtime/session-dir-layout.txt"
 
-# cpsrvd PID + start time — anchor for "was the daemon restarted post-upgrade?"
+# cpsrvd PID + start time - anchor for "was the daemon restarted post-upgrade?"
 {
   pgrep -fa '^/usr/local/cpanel/cpsrvd' 2>/dev/null | head -5
   echo ""
@@ -335,7 +335,7 @@ symbols/
 symbols/auth-strings/
   Pre-filtered strings: auth/login/session/token/cookie/csrf/2fa/otp/hmac
   plus regex-shaped strings (route dispatchers). Highest-signal subset for
-  cross-version diff — far less noise than the full strings dump.
+  cross-version diff - far less noise than the full strings dump.
 
 symbols/disasm/
   gzipped `objdump -d` for cpsrvd, cpsrvd.so, cpanel, whostmgr, whostmgr2.
@@ -365,12 +365,12 @@ meta/
   enumerate every changed file without unpacking the tarball.
 
 runtime/
-  preauth-session-schema-sample.txt — one anonymized session file from
+  preauth-session-schema-sample.txt - one anonymized session file from
     /var/cpanel/sessions/raw/. Establishes the baseline field set for a
     normal preauth session at this version.
-  session-dir-layout.txt — directory listings of the raw/preauth/cache
+  session-dir-layout.txt - directory listings of the raw/preauth/cache
     split (filenames only, no bodies).
-  cpsrvd-process-state.txt — running PID + etime. Anchors questions like
+  cpsrvd-process-state.txt - running PID + etime. Anchors questions like
     "was cpsrvd restarted after the upgrade?".
 
 INTENTIONAL OMISSIONS
