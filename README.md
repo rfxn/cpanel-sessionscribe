@@ -1,11 +1,26 @@
+<div align="center">
+
 # SessionScribe - CVE-2026-41940
 
-**Critical unauthenticated RCE in cPanel & WHM.** Four HTTP requests forge
-a root session via CRLF injection into the password field of a preauth
-session - no auth, no preconditions, every supported tier affected.
-Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr.com/)
-([public PoC](https://github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py),
-[vendor advisory](https://support.cpanel.net/hc/en-us/articles/40073787579671)).
+**Critical unauthenticated RCE in cPanel & WHM.**
+Four HTTP requests forge a root session via CRLF injection into the
+password field of a preauth session.
+No auth, no preconditions, every supported tier affected.
+Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr.com/).
+
+<a href="https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940"><img src="https://img.shields.io/badge/%F0%9F%93%96%20full%20research-rfxn.com-22d3ee?style=for-the-badge&labelColor=09090b" alt="rfxn.com research article"></a>
+
+[![CVE](https://img.shields.io/badge/CVE-2026--41940-d97757?labelColor=09090b)](https://support.cpanel.net/hc/en-us/articles/40073787579671)
+[![Severity](https://img.shields.io/badge/severity-CRITICAL%20RCE-d44d4d?labelColor=09090b)](#priority-order)
+[![Disclosed](https://img.shields.io/badge/disclosed-2026--04--28-22d3ee?labelColor=09090b)](https://support.cpanel.net/hc/en-us/articles/40073787579671)
+[![License](https://img.shields.io/badge/license-GPL--2.0-22d3ee?labelColor=09090b)](LICENSE)
+[![Hosted](https://img.shields.io/badge/hosted-sh.rfxn.com-4ade80?labelColor=09090b)](https://sh.rfxn.com/)
+
+[Tools](#tools) · [Each tool](#each-tool) · [Affected builds](#affected-builds) · [Priority order](#priority-order) · [References](#references)
+
+</div>
+
+---
 
 This repo is the operator-side toolkit: one-command active mitigation that
 holds across patched and unpatched tiers, ModSec rules that work today, a
@@ -30,7 +45,7 @@ bash sessionscribe-mitigate.sh --csv
 > lines on disk. Set `user=root`, `hasroot=1`, and
 > `successful_internal_auth_with_timestamp`, and you've forged a
 > root-authenticated session plus a working `cpsess` token. The
-> [full writeup](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940)
+> [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940)
 > covers the patch dissection, the two composing asymmetries
 > (`filter_sessiondata` not on every write path; encoder short-circuits
 > on missing `ob_part`), and the architectural argument for proxy-endpoint
@@ -40,15 +55,19 @@ bash sessionscribe-mitigate.sh --csv
 
 ## Tools
 
+Filename links go to the canonical hosted copy on
+[sh.rfxn.com](https://sh.rfxn.com/) (`curl`-ready); the per-tool docs
+sections below have full usage detail.
+
 | Artifact | Role | Where it runs |
 |---|---|---|
-| [`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh---defense-in-depth-shim) | Active mitigation shim. One phased pass with fleet-friendly JSONL/CSV per host | On the cPanel host |
-| [`modsec-sessionscribe.conf`](#modsec-sessionscribeconf---the-modsecurity-rule-pack) | ModSecurity rule pack. Phase-1 deny on the CVE primitive + adjacent WHM-token rules | Apache + mod_security2, in front of cpsrvd |
-| [`sessionscribe-remote-probe.sh`](#sessionscribe-remote-probesh---non-destructive-verdict-per-host) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions | Anywhere with curl |
-| [`sessionscribe-ioc-scan.sh`](#sessionscribe-ioc-scansh---on-host-ioc-ladder) | Read-only on-host IOC scanner. Vendor IOCs + co-occurrence detector | On the cPanel host |
-| [`sessionscribe-revsnap.sh`](#sessionscribe-revsnapsh---re-snapshot-collector) | Per-tier RE snapshot (binaries, strings, dynsym, disasm, Perl modules) | On the cPanel host, around `upcp` |
+| [`sessionscribe-mitigate.sh`](https://sh.rfxn.com/sessionscribe-mitigate.sh) | Active mitigation shim. One phased pass with fleet-friendly JSONL/CSV per host. [Docs](#sessionscribe-mitigatesh---defense-in-depth-shim) | On the cPanel host |
+| [`modsec-sessionscribe.conf`](https://sh.rfxn.com/modsec-sessionscribe.conf) | ModSecurity rule pack. Phase-1 deny on the CVE primitive + adjacent WHM-token rules. [Docs](#modsec-sessionscribeconf---the-modsecurity-rule-pack) | Apache + mod_security2, in front of cpsrvd |
+| [`sessionscribe-remote-probe.sh`](https://sh.rfxn.com/sessionscribe-remote-probe.sh) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions. [Docs](#sessionscribe-remote-probesh---non-destructive-verdict-per-host) | Anywhere with curl |
+| [`sessionscribe-ioc-scan.sh`](https://sh.rfxn.com/sessionscribe-ioc-scan.sh) | Read-only on-host IOC scanner. Vendor IOCs + co-occurrence detector. [Docs](#sessionscribe-ioc-scansh---on-host-ioc-ladder) | On the cPanel host |
+| [`sessionscribe-revsnap.sh`](https://sh.rfxn.com/sessionscribe-revsnap.sh) | Per-tier RE snapshot (binaries, strings, dynsym, disasm, Perl modules). [Docs](#sessionscribe-revsnapsh---re-snapshot-collector) | On the cPanel host, around `upcp` |
 
-All shell scripts are GPL v2. Canonical hosted versions at `https://sh.rfxn.com/<filename>` if you'd rather `curl`-pipe than clone.
+All shell scripts are GPL v2.
 
 ---
 
