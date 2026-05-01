@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.0
+# sessionscribe-forensic.sh v0.9.1
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.0"
+VERSION="0.9.1"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -144,99 +144,25 @@ MODSEC_USER_CONFS=(
 # "absent" message references the canonical EA4 location.
 MODSEC_USER_CONF="${MODSEC_USER_CONFS[0]}"
 
-# Pattern D fingerprints.
-PATTERN_D_DOMAIN="4ef72197.cpx.local"
-PATTERN_D_EMAIL="a@exploit.local"
-PATTERN_D_RESELLER="sptadm"
-
-# Pattern A fingerprints.
+# Pattern A encryptor binary - bundled in raw artifacts when present.
+# (All other Pattern A/B/C/D/F constants moved to ioc-scan; this script
+# consumes their detection results via the run envelope.)
 PATTERN_A_BINARY="/root/sshd"
-PATTERN_A_README="/root/README.md"
-PATTERN_A_SHA256="2fc0a056fd4eff5d31d06c103af3298d711f33dbcd5d122cae30b571ac511e5a"
-PATTERN_A_C2_IP="68.183.190.253"
-PATTERN_A_TOX_ID="3D7889AEC00F2325E1A3FBC0ACA4E521670497F11E47FDE13EADE8FED3144B5EB56D6B198724"
 
-# Pattern B fingerprints.
-PATTERN_B_BTC="bc1q9nh4revv6yqhj2gc5usncrpsfnh7ypwr9h0sp2"
-PATTERN_B_TWEET="ty15b6TOTuBuzUhfypJeagHl4e2sAs26"
-
-# Pattern C fingerprints.
-PATTERN_C_C2_IP="87.121.84.78"
-PATTERN_C_C2_HOST="raw.flameblox.com"
-PATTERN_C_SHA256="c04d526eb0f7c7660a19871d1675383c8eaf5336651b255c15f4da4708835eb7"
-
-# Pattern F fingerprints - automated harvester shell envelope.
-PATTERN_F_S_MARK="__S_MARK__"
-PATTERN_F_E_MARK="__E_MARK__"
-
-# Known-bad source IPs (consolidated IC-5790 attacker IOCs). Any of these in
-# any access log is high-signal even on hosts that show no other compromise
-# fingerprint - they're sweeping/staging.
-KNOWN_BAD_IPS=(
-    68.233.238.100   # badpass exploit (python-requests/2.33.1)
-    206.189.2.13     # badpass exploit (leakix scanner)
-    137.184.77.0     # badpass exploit
-    38.146.25.154    # badpass + sptadm createacct (Go-http-client/1.1)
-    157.245.204.205  # badpass exploit (leakix scanner)
-    192.81.219.190   # full enum + websocket Shell
-    149.102.229.144  # websocket Shell 24x120 (Mozilla/5.0)
-    94.231.206.39    # TLS handshake to 2095
-    45.82.78.104     # TLS handshake to 2082 (Chrome 135 / Opera 120)
-    68.183.190.253   # C2 for .sorry encryptor
-    87.121.84.78     # nuclear.x86 binary host
-    96.30.39.236     # claimed origin in createacct (graceworkz)
-)
-
-# Pattern G - SSH key persistence anchors observed on maple2 (PJHDUS). Keys
-# whose comments are these IPs were attacker-planted jumphost-mimic keys.
+# Pattern G - SSH key persistence anchors. Comments matching these literal
+# IP labels are attacker-planted jumphost-mimic keys.
 PATTERN_G_BAD_KEY_LABELS=(
     "209.59.141.49"
     "50.28.104.57"
 )
-# Pattern G - the forged mtime attackers stamped on the planted keys to make
-# them blend in with original host provisioning. ANY ssh key with mtime
-# matching this exactly should be treated as suspicious, especially if atime
-# is recent. The user issued `touch -d "2019-12-13 12:59:16"` on maple2 -
-# date(1) interprets that in the host's local timezone, so the actual stored
-# epoch differs by the host's UTC offset. We therefore compare against the
-# wall-clock string ("2019-12-13 12:59:16") under both UTC and localtime
-# interpretations rather than a single epoch (see pattern_g_forged_mtime).
+# Forged mtime stamp the attackers used (`touch -d "2019-12-13 12:59:16"`).
+# date(1) interprets in local TZ so the stored epoch depends on host offset;
+# pattern_g_deep_checks compares the wall-clock string under both UTC and
+# localtime to catch either interpretation.
 PATTERN_G_FORGED_MTIME_WALL="2019-12-13 12:59:16"
 
-# Known-bad attacker user-agents. Found in any access log line, escalates.
-# Two tiers:
-#   HIGH_RE - explicit IC-5790 wave fingerprints (python-requests pinned to
-#             2.28.1/2.33.1, Go-http-client/1.1, the leakix l9scan UA) +
-#             generic automated UAs that should never appear in /json-api/
-#             traffic from external sources (libwww-perl, aiohttp, okhttp,
-#             httpx). Aligned with sessionscribe-ioc-scan.sh's IOC_AUTOMATED_UA.
-KNOWN_BAD_UAS_RE='python-requests/(2\.28\.1|2\.33\.1)|Go-http-client/1\.1|l9scan/2\.0\.130313e2337313e2532323e27363|libwww-perl|aiohttp|okhttp|httpx'
-
-# Probe canary attribute - sessionscribe-remote-probe.sh tags every test
-# session with this so we can distinguish probe collateral from real
-# exploitation. Matches the same pattern ioc-scan.sh uses.
-PROBE_CANARY_RE='^nxesec_canary_[A-Za-z0-9]+='
-
-# Probe-traffic UA filter. The local-marker probe (sessionscribe-ioc-scan.sh
-# --probe) uses 'sessionscribe-validator/...'; the remote probe
-# (sessionscribe-remote-probe.sh) uses 'nxesec-cve-2026-41940-probe/...'.
-# The remote probe hits /cpsess<token>/json-api/version which would
-# otherwise match PATTERN_D_RECON_PATHS_RE; without this filter, every
-# probe run produces a Pattern D recon false-positive in forensic
-# reconciliation. Keep this in sync with ioc-scan.sh's PROBE_UA_RE.
-PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
-
-# Pattern D - the recon API path set the Go-http-client tool walks before
-# createacct. Seeing 4+ of these from the same IP within a short window is
-# the recon burst.
-PATTERN_D_RECON_PATHS_RE='/json-api/(version|gethostname|listaccts|getdiskusage|systemloadavg|getips)'
-
-# Pattern D - the Fileman viewfile harvest list (full path coverage from
-# graceworkz IOCs). Match any of these as file= or fullfilename= arg.
-PATTERN_D_FILEMAN_RE='(file|fullfilename|filename)=([^&"]*(/etc/(shadow|passwd|hosts|my\.cnf|os-release|redhat-release|debian_version)|/root/(\.my\.cnf|\.bash_history|\.aws/credentials|\.ssh/(authorized_keys2?|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|config|known_hosts))|/proc/(version|cpuinfo|net/arp)))'
-
-# Known-good SSH key comments seen in legitimate LW provisioning. Anything
-# else in authorized_keys is a Pattern G candidate for human review.
+# Known-good SSH key comments from legitimate LW/Nexcess provisioning -
+# anything else in authorized_keys becomes a Pattern G candidate for review.
 SSH_KNOWN_GOOD_RE='(lwadmin|lw-admin|liquidweb|nexcess|Parent Child key for [A-Z0-9]{6})'
 
 ###############################################################################
