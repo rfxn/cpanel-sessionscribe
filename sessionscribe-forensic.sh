@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.8.0
+# sessionscribe-forensic.sh v0.8.1
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.8.0"
+VERSION="0.8.1"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -486,8 +486,6 @@ say_fail()      { (( QUIET )) || printf '  %s[FAIL]%s %s\n'      "$C_RED" "$C_NC
 say_def()       { (( QUIET )) || printf '  %s[DEF-OK]%s %s\n'    "$C_GRN" "$C_NC" "$*" >&2; }
 say_def_miss()  { (( QUIET )) || printf '  %s[DEF-MISS]%s %s\n'  "$C_YEL" "$C_NC" "$*" >&2; }
 say_ioc()       { (( QUIET )) || printf '  %s[IOC]%s %s\n'       "$C_RED" "$C_NC" "$*" >&2; }
-# Backward-compat alias - old callsites still call say_off
-say_off()       { say_ioc "$@"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -929,7 +927,7 @@ phase_offense() {
         done < <(find /var/cpanel/sessions/raw -maxdepth 1 -type f -print0 2>/dev/null)
 
         if [[ -n "$first_session_epoch" ]]; then
-            say_off "PATTERN-X: $badpass_count forged sessions; earliest $(epoch_to_iso "$first_session_epoch") ($first_session_file)"
+            say_ioc "PATTERN-X: $badpass_count forged sessions; earliest $(epoch_to_iso "$first_session_epoch") ($first_session_file)"
             OFFENSE_EVENTS+=("$first_session_epoch|X|badpass_session|earliest CRLF exploit session|patch,modsec")
         else
             say_pass "no forged session-injection artifacts"
@@ -957,8 +955,8 @@ phase_offense() {
                 epoch "$epoch" raw "$line"
         done < <(grep -E "${PATTERN_D_RESELLER}|${PATTERN_D_DOMAIN}|${PATTERN_D_EMAIL}|WHM_FullRoot" /var/cpanel/accounting.log 2>/dev/null)
         if [[ -n "$earliest_d" ]]; then
-            say_off "PATTERN-D: persistence ops in accounting.log; earliest $(epoch_to_iso "$earliest_d")"
-            say_off "         first: $earliest_d_line"
+            say_ioc "PATTERN-D: persistence ops in accounting.log; earliest $(epoch_to_iso "$earliest_d")"
+            say_ioc "         first: $earliest_d_line"
             OFFENSE_EVENTS+=("$earliest_d|D|pattern_d_persistence|reseller/token persistence ops|patch,modsec")
         fi
     fi
@@ -968,7 +966,7 @@ phase_offense() {
        grep -q "^${PATTERN_D_RESELLER}" /var/cpanel/resellers 2>/dev/null; then
         local home_mtime=""
         [[ -d "/home/$PATTERN_D_RESELLER" ]] && home_mtime=$(mtime_of "/home/$PATTERN_D_RESELLER")
-        say_off "PATTERN-D: $PATTERN_D_RESELLER reseller/account still present (active persistence)"
+        say_ioc "PATTERN-D: $PATTERN_D_RESELLER reseller/account still present (active persistence)"
         emit_signal offense fail pattern_d_reseller_present "$PATTERN_D_RESELLER user/reseller exists" \
             home_mtime "$home_mtime"
         [[ -n "$home_mtime" ]] && OFFENSE_EVENTS+=("$home_mtime|D|pattern_d_reseller|sptadm reseller home created|patch,modsec")
@@ -991,7 +989,7 @@ phase_offense() {
             fi
         done
         if (( tok_count > 0 )); then
-            say_off "PATTERN-D: $tok_count WHM_FullRoot api token(s) present"
+            say_ioc "PATTERN-D: $tok_count WHM_FullRoot api token(s) present"
             [[ -n "$oldest_suspect" ]] && OFFENSE_EVENTS+=("$oldest_suspect|D|pattern_d_token|WHM_FullRoot api token|patch,modsec")
         fi
     fi
@@ -1124,20 +1122,34 @@ phase_offense() {
                     fi
                     ;;
             esac
-        done < <(cat_log "$lg" | awk \
-            -v ws_re='GET /cpsess[0-9]+/websocket/Shell' \
-            -v fm_re="Fileman.*(viewfile|showfile|getfilecontents).*${PATTERN_D_FILEMAN_RE}" \
-            -v rec_re="${PATTERN_D_RECON_PATHS_RE}" \
-            -v ua_re="${KNOWN_BAD_UAS_RE}" \
-            -v ip_re="${kb_re}" \
-            -v probe_re="${PROBE_UA_RE}" '
-        function get_ts(line,    rs, rl) {
+        # Regexes are passed via the environment (NOT awk -v) because
+        # `-v re='\.'` makes awk interpret \. as the escape sequence ".",
+        # destroying the dot-escape and producing a per-line warning. Env
+        # vars bypass awk's escape interpretation - the regex arrives at
+        # ENVIRON[] byte-for-byte as set by the shell.
+        done < <(cat_log "$lg" | \
+            WS_RE='GET /cpsess[0-9]+/websocket/Shell' \
+            FM_RE="Fileman.*(viewfile|showfile|getfilecontents).*${PATTERN_D_FILEMAN_RE}" \
+            REC_RE="${PATTERN_D_RECON_PATHS_RE}" \
+            UA_RE="${KNOWN_BAD_UAS_RE}" \
+            IP_RE="${kb_re}" \
+            PROBE_RE="${PROBE_UA_RE}" \
+            awk '
+        BEGIN {
+            ws_re    = ENVIRON["WS_RE"]
+            fm_re    = ENVIRON["FM_RE"]
+            rec_re   = ENVIRON["REC_RE"]
+            ua_re    = ENVIRON["UA_RE"]
+            ip_re    = ENVIRON["IP_RE"]
+            probe_re = ENVIRON["PROBE_RE"]
+        }
+        function get_ts(line) {
             if (match(line, /\[[0-9]+\/[0-9A-Za-z]+\/[0-9]+:[0-9:]+( [+-][0-9]{4})?\]/)) {
                 return substr(line, RSTART+1, RLENGTH-2)
             }
             return ""
         }
-        function bump(pat, ip, extra, line,    key, ts) {
+        function bump(pat, ip, extra, line,    key) {
             key = pat SUBSEP ip SUBSEP extra
             if (!(key in count)) {
                 count[key]    = 0
@@ -1277,7 +1289,7 @@ phase_offense() {
         fi
     done
     if [[ -n "$first_pattern_f" ]]; then
-        say_off "PATTERN-F: automated harvester shell traces; earliest history mtime $(epoch_to_iso "$first_pattern_f")"
+        say_ioc "PATTERN-F: automated harvester shell traces; earliest history mtime $(epoch_to_iso "$first_pattern_f")"
         OFFENSE_EVENTS+=("$first_pattern_f|F|pattern_f_harvester|automated harvester shell|patch,modsec")
     fi
 
@@ -1317,7 +1329,7 @@ phase_offense() {
             mt_local=$(date    -d "@$mtime_pre" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
             if [[ "$mt_utc" == "$PATTERN_G_FORGED_MTIME_WALL" \
                || "$mt_local" == "$PATTERN_G_FORGED_MTIME_WALL" ]]; then
-                say_off "PATTERN-G: $ak mtime matches known forged stamp \"$PATTERN_G_FORGED_MTIME_WALL\" (atime=$(epoch_to_iso "$atime_pre"))"
+                say_ioc "PATTERN-G: $ak mtime matches known forged stamp \"$PATTERN_G_FORGED_MTIME_WALL\" (atime=$(epoch_to_iso "$atime_pre"))"
                 emit_signal offense fail pattern_g_forged_mtime \
                     "$ak mtime matches IC-5790 backdate stamp ($PATTERN_G_FORGED_MTIME_WALL)" \
                     file "$ak" forged_mtime_wall "$PATTERN_G_FORGED_MTIME_WALL" \
@@ -1353,7 +1365,7 @@ phase_offense() {
             fi
         done < "$ak"
         if (( susp_count > 0 )); then
-            say_off "PATTERN-G: $susp_count non-standard ssh key(s) in $ak (atime=$(epoch_to_iso "$atime_pre") ctime=$(epoch_to_iso "$ctime_pre"))"
+            say_ioc "PATTERN-G: $susp_count non-standard ssh key(s) in $ak (atime=$(epoch_to_iso "$atime_pre") ctime=$(epoch_to_iso "$ctime_pre"))"
             # ctime can't be backdated by touch, so it's a stronger signal.
             if [[ -n "$ctime_pre" ]]; then
                 OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|non-standard ssh key (ctime)|patch,modsec")
@@ -1378,7 +1390,7 @@ phase_offense() {
             local m c
             m=$(stat -c %Y "$f" 2>/dev/null)
             c=$(stat -c %Z "$f" 2>/dev/null)
-            say_off "PATTERN-G: ssh key material in non-canonical location: $f"
+            say_ioc "PATTERN-G: ssh key material in non-canonical location: $f"
             emit_signal offense fail pattern_g_offpath_key \
                 "ssh-rsa/ed25519 in $f (out of band of ~/.ssh)" \
                 file "$f" mtime_epoch "$m" ctime_epoch "$c"
@@ -1396,12 +1408,12 @@ phase_offense() {
         # (still suspicious - cpanel never ships sshd here).
         sha=$(sha256sum "$PATTERN_A_BINARY" 2>/dev/null | awk '{print $1}')
         if [[ "$sha" == "$PATTERN_A_SHA256" ]]; then
-            say_off "PATTERN-A: encryptor CONFIRMED via sha256 at $PATTERN_A_BINARY mtime=$(epoch_to_iso "$m") ctime=$(epoch_to_iso "$c")"
+            say_ioc "PATTERN-A: encryptor CONFIRMED via sha256 at $PATTERN_A_BINARY mtime=$(epoch_to_iso "$m") ctime=$(epoch_to_iso "$c")"
             emit_signal offense fail pattern_a_binary_confirmed \
                 "$PATTERN_A_BINARY sha256 matches IC-5790 .sorry encryptor sample" \
                 file "$PATTERN_A_BINARY" sha256 "$sha" mtime_epoch "$m" ctime_epoch "$c"
         else
-            say_off "PATTERN-A: suspect binary at $PATTERN_A_BINARY (sha256=$sha NOT IC-5790 sample) mtime=$(epoch_to_iso "$m") ctime=$(epoch_to_iso "$c")"
+            say_ioc "PATTERN-A: suspect binary at $PATTERN_A_BINARY (sha256=$sha NOT IC-5790 sample) mtime=$(epoch_to_iso "$m") ctime=$(epoch_to_iso "$c")"
             emit_signal offense fail pattern_a_binary_variant \
                 "$PATTERN_A_BINARY present (sha256=$sha; not the IC-5790 sample - variant?)" \
                 file "$PATTERN_A_BINARY" sha256 "$sha" mtime_epoch "$m" ctime_epoch "$c"
@@ -1437,7 +1449,7 @@ phase_offense() {
             -o -name '*.sorry' -print0 2>/dev/null)
     fi
     if (( sorry_count > 0 )); then
-        say_off "PATTERN-A: $sorry_count .sorry files; earliest mtime $(epoch_to_iso "$first_sorry")"
+        say_ioc "PATTERN-A: $sorry_count .sorry files; earliest mtime $(epoch_to_iso "$first_sorry")"
         emit_signal offense fail pattern_a_sorry "count=$sorry_count earliest=$(epoch_to_iso "$first_sorry")" \
             count "$sorry_count" epoch "$first_sorry"
         OFFENSE_EVENTS+=("$first_sorry|A|pattern_a_sorry|.sorry encrypted files|patch,modsec")
@@ -1454,7 +1466,7 @@ phase_offense() {
             m=$(mtime_of "$rf")
             has_tox=0
             grep -q "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && has_tox=1
-            say_off "PATTERN-A: ransom README at $rf mtime $(epoch_to_iso "$m") tox_id_match=$has_tox"
+            say_ioc "PATTERN-A: ransom README at $rf mtime $(epoch_to_iso "$m") tox_id_match=$has_tox"
             emit_signal offense fail pattern_a_readme "ransom README at $rf (tox_id_match=$has_tox)" \
                 file "$rf" epoch "$m" tox_id_match "$has_tox"
             OFFENSE_EVENTS+=("$m|A|pattern_a_readme|qTox ransom README|patch,modsec")
@@ -1463,7 +1475,7 @@ phase_offense() {
     # Pattern A C2 IP in connections / iptables / log surface.
     if have_cmd ss; then
         if ss -tn 2>/dev/null | grep -q "$PATTERN_A_C2_IP"; then
-            say_off "PATTERN-A: live connection to encryptor C2 $PATTERN_A_C2_IP"
+            say_ioc "PATTERN-A: live connection to encryptor C2 $PATTERN_A_C2_IP"
             emit_signal offense fail pattern_a_c2_live "live socket to $PATTERN_A_C2_IP" c2 "$PATTERN_A_C2_IP"
             OFFENSE_EVENTS+=("$TS_EPOCH|A|pattern_a_c2_live|live connection to .sorry C2|patch,modsec")
         fi
@@ -1482,7 +1494,7 @@ phase_offense() {
         emit_signal offense fail pattern_b_btc_note "BTC ransom note in $f" file "$f" epoch "$m"
     done < <(grep -lE "${PATTERN_B_BTC}|${PATTERN_B_TWEET}|kindly send 0\.1 BTC" /home/*/public_html/index.html /var/www/html/index.html /usr/local/apache/htdocs/index.html 2>/dev/null)
     if (( btc_count > 0 )); then
-        say_off "PATTERN-B: $btc_count BTC ransom notes; earliest mtime $(epoch_to_iso "$first_btc")"
+        say_ioc "PATTERN-B: $btc_count BTC ransom notes; earliest mtime $(epoch_to_iso "$first_btc")"
         OFFENSE_EVENTS+=("$first_btc|B|pattern_b_btc|BTC index.html ransom drop|patch,modsec")
     fi
     # /var/lib/mysql/mysql is the system DB - cPanel hosts ALWAYS have it
@@ -1495,7 +1507,7 @@ phase_offense() {
        && [[ -d /var/lib/mysql ]]; then
         local mysql_parent_mtime
         mysql_parent_mtime=$(mtime_of /var/lib/mysql)
-        say_off "PATTERN-B: /var/lib/mysql/mysql missing on cPanel host - DB wiped (parent mtime $(epoch_to_iso "$mysql_parent_mtime"))"
+        say_ioc "PATTERN-B: /var/lib/mysql/mysql missing on cPanel host - DB wiped (parent mtime $(epoch_to_iso "$mysql_parent_mtime"))"
         emit_signal offense fail pattern_b_mysql_wiped \
             "/var/lib/mysql/mysql directory missing - DB wipe" \
             parent_mtime "$mysql_parent_mtime"
@@ -1529,7 +1541,7 @@ phase_offense() {
         if [[ -z "$first_nuclear" ]] || (( m < first_nuclear )); then
             first_nuclear="$m"
         fi
-        say_off "PATTERN-C: nuclear/flameblox reference in persistence path: $f"
+        say_ioc "PATTERN-C: nuclear/flameblox reference in persistence path: $f"
         emit_signal offense fail pattern_c_persistence \
             "nuclear.x86/flameblox in persistence path $f" file "$f" epoch "$m"
     done < <(grep -rIlE "nuclear\.x86|${PATTERN_C_C2_IP}|${PATTERN_C_C2_HOST}" "${persistence_paths[@]}" 2>/dev/null)
@@ -1540,7 +1552,7 @@ phase_offense() {
             local sha
             sha=$(sha256sum "$nx" 2>/dev/null | awk '{print $1}')
             if [[ "$sha" == "$PATTERN_C_SHA256" ]]; then
-                say_off "PATTERN-C: nuclear.x86 binary CONFIRMED via sha256 at $nx"
+                say_ioc "PATTERN-C: nuclear.x86 binary CONFIRMED via sha256 at $nx"
                 emit_signal offense fail pattern_c_binary_confirmed \
                     "$nx sha256 matches IC-5790 Mirai/nuclear.x86 sample" \
                     file "$nx" sha256 "$sha"
@@ -1552,7 +1564,7 @@ phase_offense() {
         done
     fi
     if [[ -n "$first_nuclear" ]]; then
-        say_off "PATTERN-C: ${#NUCLEAR_FILES[@]} files reference nuclear.x86; earliest mtime $(epoch_to_iso "$first_nuclear")"
+        say_ioc "PATTERN-C: ${#NUCLEAR_FILES[@]} files reference nuclear.x86; earliest mtime $(epoch_to_iso "$first_nuclear")"
         OFFENSE_EVENTS+=("$first_nuclear|C|pattern_c_nuclear|Mirai botnet reference|patch,modsec")
     fi
 
@@ -1569,7 +1581,7 @@ phase_offense() {
     if [[ -n "$suspect_ips" ]]; then
         local ip_list
         ip_list=$(echo "$suspect_ips" | tr '\n' ',' | sed 's/,$//')
-        say_off "suspect attacker IPs (websocket/createacct hits): $ip_list"
+        say_ioc "suspect attacker IPs (websocket/createacct hits): $ip_list"
         emit_signal offense info suspect_ips "$ip_list" ips "$ip_list"
     fi
 }
