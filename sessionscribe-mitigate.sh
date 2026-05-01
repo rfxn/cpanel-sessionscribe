@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.2.1
+# sessionscribe-mitigate.sh v0.3.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -51,6 +51,10 @@
 #   runfw       running iptables/ip6tables INPUT chain inspection
 #   apache      httpd active + security2_module loaded
 #   modsec      modsec2.user.conf contains 1500030 + 1500031
+#   sessions    /var/cpanel/sessions/raw IOC ladder; quarantine forged
+#               sessions to backup dir w/ .info metadata (preserves ctime
+#               that cp -a cannot carry); rm originals so leaked
+#               cp_security_token cannot be reused
 #   probe       (opt-in via --probe) self-test via remote-probe against
 #               127.0.0.1; expect SAFE/blocked verdict
 #
@@ -80,7 +84,7 @@
 
 set -u
 
-VERSION="0.2.1"
+VERSION="0.3.0"
 
 ###############################################################################
 # Constants
@@ -135,12 +139,22 @@ BACKUP_ROOT_DEFAULT="/var/cpanel/sessionscribe-mitigation"
 # Marker tag stamped into every backup path so undo logic can find them.
 BACKUP_MARKER='nxesec-sessionscribe-mitigate'
 
+# Session-store IOC ladder constants (mirrors sessionscribe-ioc-scan.sh).
+# Used by phase_sessions to detect/quarantine forged sessions left behind
+# by CRLF injection. Keep in sync with the IOC scanner so a session that
+# trips ioc-scan also trips mitigate's quarantine.
+SESSIONS_DIR="${SESSIONS_DIR:-/var/cpanel/sessions}"
+PASS_FORGERY_MAX_LEN=12
+# nxesec_canary_<nonce>= sessions are sessionscribe-remote-probe collateral
+# (probe artifacts) - never quarantine these.
+PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
+
 ###############################################################################
 # Phase registry - ordered list of (id, function, description, default-on)
 ###############################################################################
 
-PHASE_IDS=(patch preflight upcp proxysub csf apf runfw apache modsec probe)
-PHASE_DEFAULT_ON=(1     1         1    1        1   1   1     1      1      0)
+PHASE_IDS=(patch preflight upcp proxysub csf apf runfw apache modsec sessions probe)
+PHASE_DEFAULT_ON=(1     1         1    1        1   1   1     1      1      1        0)
 declare -A PHASE_DESC=(
     [patch]="cpanel -V vs published patched-build cutoffs"
     [preflight]="epel-release; threatdown.repo absent; broken-repo sweep"
@@ -151,6 +165,7 @@ declare -A PHASE_DESC=(
     [runfw]="running iptables INPUT chain inspection"
     [apache]="httpd active + security2_module loaded"
     [modsec]="modsec2.user.conf contains required CVE rule IDs"
+    [sessions]="quarantine forged session files (CRLF-injection IOC ladder)"
     [probe]="(opt-in) self-probe against 127.0.0.1 via remote-probe"
 )
 
@@ -195,6 +210,7 @@ PHASE SELECTION
                              --no-patch     --no-preflight   --no-upcp
                              --no-proxysub  --no-csf         --no-apf
                              --no-runfw     --no-apache      --no-modsec
+                             --no-sessions
     --no-fw                Shorthand for --no-csf --no-apf --no-runfw.
     --probe                Enable the optional probe phase (opt-in).
                            Runs sessionscribe-remote-probe.sh against
@@ -272,6 +288,7 @@ while [[ $# -gt 0 ]]; do
         --probe)            DO_PROBE=1; shift ;;
         --no-upcp)          PHASE_DISABLED[upcp]=1; shift ;;
         --no-modsec)        PHASE_DISABLED[modsec]=1; shift ;;
+        --no-sessions)      PHASE_DISABLED[sessions]=1; shift ;;
         --no-fw)            PHASE_DISABLED[csf]=1; PHASE_DISABLED[apf]=1; PHASE_DISABLED[runfw]=1; shift ;;
         --no-csf)           PHASE_DISABLED[csf]=1; shift ;;
         --no-apf)           PHASE_DISABLED[apf]=1; shift ;;
@@ -493,6 +510,16 @@ declare -a P_KV=()
 sk()  { P_KEY="$1"; shift; P_KV=("$@"); }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Epoch -> ISO-8601 UTC. Empty input or non-numeric -> empty output. Used
+# by phase_sessions for .info-file timestamp serialization. Bash 4.1
+# compatible: relies on GNU coreutils `date -d @<epoch>` (CentOS 6+).
+epoch_to_iso() {
+    local e="${1:-}"
+    [[ -z "$e" ]] && { echo ""; return; }
+    [[ "$e" =~ ^[0-9]+$ ]] || { echo ""; return; }
+    date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
 
 ###############################################################################
 # Backup root
@@ -780,7 +807,9 @@ phase_upcp() {
         return
     fi
 
-    if pgrep -fa '/scripts/upcp' >/dev/null 2>&1; then
+    # pgrep -f (no -a): output is discarded; -a is procps-ng 3.3.4+ only
+    # (not present in EL6 procps-3.2.x).
+    if pgrep -f '/scripts/upcp' >/dev/null 2>&1; then
         sk upcp_already_running
         say_warn "/scripts/upcp already running; not relaunching"
         phase_set upcp WARN "upcp in flight"
@@ -1260,7 +1289,328 @@ phase_modsec() {
 }
 
 ###############################################################################
-# 10. probe (opt-in self-test)
+# 10. sessions - forged-session IOC ladder + quarantine
+###############################################################################
+#
+# Symmetric with sessionscribe-ioc-scan.sh's session-store IOC ladder. Walks
+# /var/cpanel/sessions/raw/* and identifies forged sessions left behind by
+# CRLF injection (CVE-2026-41940). The patch closes the *vector* for new
+# forgeries, but a leaked cp_security_token survives until the session
+# expires - so a host that was exploited pre-patch may still be reachable
+# via the previously-forged token. This phase:
+#
+#   1. Detects forged sessions via the strong-IOC ladder
+#      (A/B/C/D/E/E2/F/H/I; matches ioc-scan.sh strong signals).
+#   2. In --apply mode: copies each forged session (and its preauth
+#      companion if present) into the run's backup dir under
+#      `quarantined-sessions/{raw,preauth}/`, writes a sibling .info file
+#      preserving every metadata field that `cp -a` cannot carry
+#      (most importantly ctime), then removes the original so the
+#      attacker cannot reuse the leaked token.
+#   3. In --check mode: reports what would be quarantined, no mutation.
+#
+# Probe-canary sessions (sessionscribe-remote-probe collateral, line
+# matching ^nxesec_canary_<nonce>=) are skipped and counted separately so
+# probe runs do not trigger mitigation.
+#
+# Bash floor: 4.1 (CentOS 6 ships bash-4.1.2). Avoids `[[ -v ]]` (4.2+),
+# `declare -g` (4.2+), `printf '%(...)T'` (4.2+), `mapfile -d` (4.4+).
+# Relies on GNU coreutils 8.4+ (`stat -c %Y/%X/%Z`, `date -d @<epoch>`)
+# and findutils 4.4+ - both shipped with EL6.
+
+phase_sessions() {
+    P_CUR=sessions
+    phase_begin sessions
+
+    local raw_dir="$SESSIONS_DIR/raw"
+    local preauth_dir="$SESSIONS_DIR/preauth"
+
+    if [[ ! -d "$raw_dir" ]]; then
+        sk no_session_dir
+        say_skip "no $raw_dir"
+        phase_set sessions SKIPPED "no session dir"
+        return
+    fi
+
+    local now_epoch
+    now_epoch=$(date -u +%s 2>/dev/null || echo 0)
+
+    local scanned=0 forged=0 quarantined=0 partial=0 failed=0 probe_artifacts=0
+    local f session_shape reasons sname preauth_file has_b q_rc
+
+    # Iterate. nullglob is not enabled globally, so guard with -f.
+    for f in "$raw_dir"/*; do
+        [[ -f "$f" ]] || continue
+        scanned=$((scanned+1))
+
+        # Single awk pass extracts the session shape and emits one of:
+        #   PROBE_ARTIFACT          - skip (probe collateral)
+        #   FORGED:<reason-list>    - forged; reasons is CSV of A/B-cand/C/D/E/E2/F/H/I
+        #   OK                      - clean
+        # B-cand is "candidate IOC-B" - confirmed in bash by checking for
+        # a paired preauth companion file (cpsrvd's write_session removes
+        # the preauth marker on auth promotion, so paired existence is
+        # structurally impossible in benign flow).
+        session_shape=$(awk -v now="$now_epoch" -v floor="$PASS_FORGERY_MAX_LEN" \
+                            -v canary_re="$PROBE_CANARY_PAT" '
+            BEGIN { line_idx=0; pass_count=0; pass_at=0 }
+            { line_idx++ }
+            /^token_denied=/        { has_td=1 }
+            /^cp_security_token=/   { has_cp=1 }
+            /^origin_as_string=/ {
+                origin=substr($0, index($0,"=")+1)
+                if (origin ~ /method=badpass/) has_bp=1
+            }
+            /^successful_external_auth_with_timestamp=/ {
+                has_ext=1; ts_val=substr($0, index($0,"=")+1)
+            }
+            /^successful_internal_auth_with_timestamp=/ {
+                has_int=1; ts_val=substr($0, index($0,"=")+1)
+            }
+            /^tfa_verified=1/       { has_tfa=1 }
+            /^hasroot=1/            { has_hasroot=1 }
+            $0 ~ canary_re          { has_canary=1 }
+            /^pass=/ {
+                if (pass_count == 0) {
+                    pass_val = substr($0, index($0,"=")+1)
+                    pass_at = line_idx
+                }
+                pass_count++; next
+            }
+            pass_at > 0 && line_idx == pass_at + 1 && /./ \
+                && !/^[A-Za-z_][A-Za-z0-9_]*=/ { stranded=1 }
+            $0 != "" && $0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/ { malformed=1 }
+            END {
+                if (has_canary) { print "PROBE_ARTIFACT"; exit }
+                pass_len = length(pass_val)
+                reasons = ""
+                # IOC-A: token_denied + cp_security_token + badpass origin.
+                if (has_td && has_cp && has_bp) reasons = reasons "A,"
+                # IOC-B candidate (preauth companion verified by bash).
+                if (has_ext || has_int) reasons = reasons "B-cand,"
+                # IOC-C: short pass + auth_ts.
+                if ((has_ext || has_int) && pass_len > 0 && pass_len <= floor+0)
+                    reasons = reasons "C,"
+                # IOC-D: multi-line / stranded pass.
+                if (pass_count > 1 || stranded) reasons = reasons "D,"
+                # IOC-E: badpass origin + any auth marker.
+                if (has_bp && (has_ext || has_int || has_hasroot || has_tfa))
+                    reasons = reasons "E,"
+                # IOC-E2: 4-way co-occurrence (canonical exploit shape).
+                if (has_hasroot && has_tfa && (has_ext || has_int) && has_bp)
+                    reasons = reasons "E2,"
+                # IOC-F: forged-future timestamp (>now+1y).
+                if (ts_val ~ /^[0-9]+$/ && now+0 > 0 \
+                    && ts_val+0 > now+0+31536000) reasons = reasons "F,"
+                # IOC-H: standalone hasroot (not in cpsrvd _SESSION_PARTS
+                # whitelist - conclusive injection footprint).
+                if (has_hasroot) reasons = reasons "H,"
+                # IOC-I: malformed (non-blank line not matching key=value).
+                if (malformed) reasons = reasons "I,"
+                sub(/,$/, "", reasons)
+                if (reasons == "") print "OK"
+                else print "FORGED:" reasons
+            }
+        ' "$f" 2>/dev/null)
+
+        if [[ "$session_shape" == "PROBE_ARTIFACT" ]]; then
+            probe_artifacts=$((probe_artifacts+1))
+            continue
+        fi
+        [[ "$session_shape" == FORGED:* ]] || continue
+
+        reasons="${session_shape#FORGED:}"
+        sname=$(basename -- "$f")
+        preauth_file="$preauth_dir/$sname"
+        has_b=0
+
+        # Resolve B-cand against preauth companion existence.
+        if [[ ",$reasons," == *",B-cand,"* ]]; then
+            if [[ -f "$preauth_file" ]]; then
+                has_b=1
+                # Promote B-cand -> B in the reasons string.
+                reasons="${reasons//B-cand/B}"
+            else
+                # Drop B-cand: not by itself proof of forgery.
+                reasons=$(echo "$reasons" \
+                    | sed -e 's/^B-cand$//' \
+                          -e 's/^B-cand,//' \
+                          -e 's/,B-cand,/,/g' \
+                          -e 's/,B-cand$//')
+            fi
+        fi
+
+        # If reasons collapsed to empty after B downgrade, it was a
+        # B-cand-only hit with no companion - not actionable.
+        [[ -z "$reasons" ]] && continue
+
+        forged=$((forged+1))
+        sk forged_session path "$f" reasons "$reasons" pre_companion "$has_b"
+
+        if [[ "$MODE" != "apply" ]]; then
+            say_warn "forged session: $f (ioc=$reasons; would quarantine)"
+            continue
+        fi
+
+        quarantine_session "$f" "$reasons" "$preauth_file" "$has_b"
+        q_rc=$?
+        case "$q_rc" in
+            0) quarantined=$((quarantined+1))
+               say_action "quarantined $f (ioc=$reasons)"
+               ;;
+            2) partial=$((partial+1))
+               say_warn "copy ok but rm failed: $f (manual cleanup needed)"
+               ;;
+            *) failed=$((failed+1))
+               say_fail "quarantine failed: $f"
+               ;;
+        esac
+    done
+
+    sk sessions_summary \
+       scanned "$scanned" forged "$forged" quarantined "$quarantined" \
+       partial "$partial" failed "$failed" probe_artifacts "$probe_artifacts"
+
+    if (( probe_artifacts > 0 )); then
+        say_info "skipped $probe_artifacts probe-canary session(s) (sessionscribe-remote-probe collateral)"
+    fi
+
+    # Verdict: ACTION on clean apply, WARN on partial / check-mode finds,
+    # FAIL on apply-mode failures, OK when nothing forged.
+    if (( forged == 0 )); then
+        say_pass "no forged sessions found ($scanned scanned)"
+        phase_set sessions OK "$scanned scanned, clean"
+    elif [[ "$MODE" != "apply" ]]; then
+        say_warn "$forged forged session(s); needs --apply to quarantine"
+        phase_set sessions WARN "$forged forged sessions"
+    elif (( failed > 0 )); then
+        phase_set sessions FAIL "$failed quarantine error(s); $quarantined ok, $partial partial"
+    elif (( partial > 0 )); then
+        say_warn "quarantined $quarantined; $partial partial (copy ok, rm failed)"
+        phase_set sessions WARN "$quarantined ok, $partial partial"
+    else
+        say_action "quarantined $quarantined of $forged forged session(s) -> $BACKUP_DIR/quarantined-sessions/"
+        phase_set sessions ACTION "$quarantined sessions quarantined"
+    fi
+}
+
+# Move a forged session (and its preauth companion if present) into the
+# run's backup dir. Strategy:
+#   - cp -a    -> preserves mode / owner / mtime / atime in the copy.
+#   - .info    -> sibling text file recording fields cp -a cannot carry,
+#                 most importantly ctime (which is the inode-change time
+#                 and is unset-only-bumpable in POSIX). Also captures
+#                 sha256, size, octal mode, uid/gid, and the IOC reasons.
+#   - rm       -> remove the original so the leaked cp_security_token
+#                 cannot be reused by the attacker.
+#
+# Return codes:
+#   0 - copy + .info + rm all succeeded
+#   2 - copy + .info ok, rm of original FAILED (operator must clean up)
+#   1 - copy itself failed (no .info written, original untouched)
+#
+# Bash 4.1 / coreutils 8.4 compatible.
+quarantine_session() {
+    local src="$1" reasons="$2" preauth_companion="$3" has_b="$4"
+    ensure_backup_dir || return 1
+
+    local qdir="$BACKUP_DIR/quarantined-sessions"
+    local qraw="$qdir/raw" qpre="$qdir/preauth"
+    if ! mkdir -p "$qraw" "$qpre" 2>/dev/null; then
+        return 1
+    fi
+    # Quarantine subtree contains forged-session bodies (which may carry
+    # cp_security_token values, hex-encoded passwords, etc). Lock down to
+    # 0700 so only root can read - same posture as sessionscribe-forensic
+    # bundle dirs. No-op if the dirs were already created on a prior run.
+    chmod 0700 "$qdir" "$qraw" "$qpre" 2>/dev/null || true
+
+    local sname dest info
+    sname=$(basename -- "$src")
+    dest="$qraw/$sname"
+    info="$qraw/${sname}.info"
+
+    # Copy first; preserves mode/owner/mtime/atime.
+    if ! cp -a -- "$src" "$dest" 2>/dev/null; then
+        return 1
+    fi
+
+    # Metadata sidecar - written from the ORIGINAL's stat (not the copy)
+    # so ctime reflects the attacker's write, not our cp.
+    write_session_info "$src" "$dest" "$reasons" > "$info" 2>/dev/null
+
+    # Companion preauth file. cpsrvd pairs them by session name; both
+    # carry forensic value, so both go to the quarantine subtree.
+    if [[ "$has_b" == "1" && -f "$preauth_companion" ]]; then
+        local pdest="$qpre/$sname"
+        local pinfo="$qpre/${sname}.info"
+        if cp -a -- "$preauth_companion" "$pdest" 2>/dev/null; then
+            write_session_info "$preauth_companion" "$pdest" \
+                "preauth-companion-of:$sname" > "$pinfo" 2>/dev/null
+            rm -f -- "$preauth_companion" 2>/dev/null
+        fi
+    fi
+
+    # Final step: remove the original raw session. If this fails (read-only
+    # mount, immutable bit, etc.) the attacker can still reuse the token,
+    # so we report partial-success (rc=2) rather than success.
+    if ! rm -f -- "$src" 2>/dev/null; then
+        return 2
+    fi
+    return 0
+}
+
+# Build the .info sidecar content. Captures every field that cp -a cannot
+# carry across a copy (ctime above all), plus integrity fingerprints
+# (sha256, size) and the IOC reasons that triggered the quarantine.
+#
+# Fields are key=value per line, no quoting, intended for cheap awk/sed
+# consumption by recovery scripts. Values come from stat / sha256sum /
+# script constants - none are unbounded user input - but printf '%s\n'
+# is used over heredoc to dodge any $() / backtick interpretation if a
+# session filename ever does contain shell metacharacters.
+write_session_info() {
+    local orig="$1" copy="$2" reasons="$3"
+
+    local mtime_e atime_e ctime_e size mode uid gid sha=""
+    mtime_e=$(stat -c %Y "$orig" 2>/dev/null)
+    atime_e=$(stat -c %X "$orig" 2>/dev/null)
+    ctime_e=$(stat -c %Z "$orig" 2>/dev/null)
+    size=$(stat -c %s "$orig" 2>/dev/null)
+    mode=$(stat -c %a "$orig" 2>/dev/null)
+    uid=$(stat -c %u "$orig" 2>/dev/null)
+    gid=$(stat -c %g "$orig" 2>/dev/null)
+
+    if have_cmd sha256sum; then
+        sha=$(sha256sum -- "$orig" 2>/dev/null | awk '{print $1}')
+    fi
+
+    printf '%s\n' \
+        "# sessionscribe-mitigate quarantine record" \
+        "# Preserves metadata that cp -a cannot carry (notably ctime)." \
+        "tool=sessionscribe-mitigate" \
+        "tool_version=$VERSION" \
+        "run_id=$RUN_ID" \
+        "quarantine_ts=$TS_ISO" \
+        "host=$HOSTNAME_FQDN" \
+        "original_path=$orig" \
+        "quarantined_path=$copy" \
+        "reasons_ioc=$reasons" \
+        "sha256=$sha" \
+        "size_bytes=${size:-}" \
+        "mode_octal=${mode:-}" \
+        "uid=${uid:-}" \
+        "gid=${gid:-}" \
+        "mtime_epoch=${mtime_e:-}" \
+        "mtime_iso=$(epoch_to_iso "${mtime_e:-}")" \
+        "atime_epoch=${atime_e:-}" \
+        "atime_iso=$(epoch_to_iso "${atime_e:-}")" \
+        "ctime_epoch=${ctime_e:-}" \
+        "ctime_iso=$(epoch_to_iso "${ctime_e:-}")"
+}
+
+###############################################################################
+# 11. probe (opt-in self-test)
 ###############################################################################
 
 phase_probe() {
@@ -1452,6 +1802,7 @@ run_phase() {
         runfw)      phase_runfw ;;
         apache)     phase_apache ;;
         modsec)     phase_modsec ;;
+        sessions)   phase_sessions ;;
         probe)      phase_probe ;;
     esac
 }

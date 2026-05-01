@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.3.0
+# sessionscribe-ioc-scan.sh v1.4.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -266,7 +266,10 @@ CHAIN_FORENSIC=0
 
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
-declare -ga EXCLUDE_IPS=()
+# Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
+# once at top-level scope so the global is already established when
+# functions append to it.
+declare -a EXCLUDE_IPS=()
 
 usage() {
     cat <<'EOF'
@@ -454,7 +457,14 @@ banner() {
 # jsonkv is a comma-separated list of "key":"value" pairs already JSON-escaped.
 ###############################################################################
 
-declare -ga SIGNALS=()
+# Bash 4.1 / EL6: -a (not -ga) at top-level scope.
+declare -a SIGNALS=()
+# Aggregation outputs from aggregate_verdict() consumed by print_verdict /
+# write_json / write_csv. Declared at top-level so they remain in global
+# scope without needing `declare -g` (bash 4.2+) inside the producer.
+declare -a REASONS=()
+declare -a IOC_KEYS=()
+declare -a ADVISORIES=()
 
 # JSON-escape an arbitrary string for embedding in JSON values.
 # Handles \, ", \n, \r, \t, and control chars.
@@ -1640,9 +1650,12 @@ aggregate_verdict() {
     # discriminate vuln from patched on 134+ tier.
     local version_says_vuln=0 version_says_patched=0
     local row area id sev key weight kv
-    declare -ga REASONS=()
-    declare -ga IOC_KEYS=()
-    declare -ga ADVISORIES=()
+    # Reset (don't redeclare) - the arrays are top-level globals; using
+    # `declare -ga` here would require bash 4.2. Reassigning to () clears
+    # the array contents while preserving the global binding.
+    REASONS=()
+    IOC_KEYS=()
+    ADVISORIES=()
     for row in "${SIGNALS[@]}"; do
         IFS=$'\t' read -r area id sev key weight kv <<< "$row"
         # Authoritative version-string check - record presence regardless of

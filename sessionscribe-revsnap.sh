@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-revsnap.sh v1.4.0
+# sessionscribe-revsnap.sh v1.4.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -305,8 +305,12 @@ done
 } > "$WORK/runtime/session-dir-layout.txt"
 
 # cpsrvd PID + start time - anchor for "was the daemon restarted post-upgrade?"
+# Use ps -eo pid,args (not pgrep -fa) so this works on EL6 procps-3.2.x
+# which does not implement the procps-ng -a flag (added in procps-ng 3.3.4).
 {
-  pgrep -fa '^/usr/local/cpanel/cpsrvd' 2>/dev/null | head -5
+  ps -eo pid,args 2>/dev/null \
+    | grep -E '^[[:space:]]*[0-9]+[[:space:]]+/usr/local/cpanel/cpsrvd($|[[:space:]])' \
+    | head -5
   echo ""
   ps -eo pid,etime,cmd 2>/dev/null | grep -E 'cpsrvd|whostmgrd' | grep -v grep | head -10
 } > "$WORK/runtime/cpsrvd-process-state.txt"
