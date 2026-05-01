@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.7"
+VERSION="0.9.8"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -1107,7 +1107,14 @@ pattern_g_deep_checks() {
         while IFS= read -r line; do
             [[ "$line" =~ ^# ]] && continue
             [[ -z "$line" ]] && continue
-            comment=$(echo "$line" | awk '{print $NF}')
+            # Extract the full multi-word comment field (fields 3..end of
+            # `<keytype> <base64> <comment...>`). The prior `awk '{print $NF}'`
+            # only returned the last token, breaking the SSH_KNOWN_GOOD_RE
+            # whitelist on multi-word comments like
+            # "Parent Child key for W9Z2DL" - LW provisioning keys were
+            # being flagged as Pattern G IOCs because $NF returned just
+            # "W9Z2DL", which doesn't match any known-good prefix.
+            comment=$(awk 'NF>=3 {sub(/^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print}' <<< "$line")
             is_known_bad=0; bad_label=""
             for bad in "${PATTERN_G_BAD_KEY_LABELS[@]}"; do
                 [[ "$comment" == *"$bad"* ]] && { is_known_bad=1; bad_label="$bad"; break; }
