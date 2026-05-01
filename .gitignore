@@ -1,6 +1,6 @@
 # Internal / non-upstream artifacts kept alongside the canonical toolkit
 # but intentionally not published. Add new local-only files here rather
-# than placing them outside the repo — single canonical location for
+# than placing them outside the repo - single canonical location for
 # all SessionScribe scripts.
 
 # Pre-codename internal probe variant (superseded by sessionscribe-remote-probe.sh)

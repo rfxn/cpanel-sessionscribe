@@ -557,7 +557,7 @@ phase_patch() {
     say_info "raw: $CPANEL_RAW"
     say_info "normalized: $CPANEL_NORM"
 
-    # Last upcp result — informational.
+    # Last upcp result - informational.
     local last_upcp_log last_upcp_exit
     if [[ -d /var/cpanel/updatelogs ]]; then
         last_upcp_log=$(ls -t /var/cpanel/updatelogs/ 2>/dev/null | head -1)
@@ -851,7 +851,7 @@ phase_proxysub() {
             if (( ok )); then
                 say_action "enabled proxysubdomains via whmapi1"
                 # Trigger Apache vhost rebuild so proxy subdomains land in vhost
-                # config. Idempotent — rebuildhttpdconf is safe to re-run.
+                # config. Idempotent - rebuildhttpdconf is safe to re-run.
                 if [[ -x /scripts/rebuildhttpdconf ]]; then
                     /scripts/rebuildhttpdconf >/dev/null 2>&1 \
                         && say_action "rebuilt httpd conf" \
