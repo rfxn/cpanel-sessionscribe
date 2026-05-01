@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.5"
+VERSION="0.9.7"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -316,6 +316,13 @@ fi
 ###############################################################################
 
 HOSTNAME_FQDN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)
+# Primary IPv4 - cheap independent tiebreaker for bundles where FQDN is
+# stale or generic (localhost.localdomain, post-restore hosts, default
+# provider templates). `hostname -I` first (BSD/RHEL/Debian portable);
+# fall back to iproute2 for hosts where -I is missing or empty.
+PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[[ -z "$PRIMARY_IP" ]] && PRIMARY_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+[[ -z "$PRIMARY_IP" ]] && PRIMARY_IP=unknown
 TS_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 TS_EPOCH=$(date -u +%s)
 # Honor SESSIONSCRIBE_RUN_ID from the environment so a parent ioc-scan
@@ -354,6 +361,25 @@ else
     C_RED=''; C_GRN=''; C_YEL=''; C_CYN=''; C_BLD=''; C_DIM=''; C_NC=''
 fi
 
+# Glyph table - unicode for UTF-8 TTYs, ASCII fallback otherwise. Detection
+# checks LANG/LC_ALL/LC_CTYPE for a UTF-8 indication AND requires stderr be
+# a TTY (so piped output `forensic | grep` and `LANG=C` consoles get plain
+# ASCII). The bundle's kill-chain.md inherits whichever set was active at
+# render time; both render legibly in modern editors and `less -R`.
+if [[ -t 2 ]] && [[ "${LC_ALL:-}${LANG:-}${LC_CTYPE:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
+    GLYPH_BOX_TL='┌'; GLYPH_BOX_TR='┐'; GLYPH_BOX_BL='└'; GLYPH_BOX_BR='┘'
+    GLYPH_BOX_H='─'; GLYPH_BOX_V='│'
+    GLYPH_OFFENSE='⚡'; GLYPH_DEFENSE='✓'; GLYPH_ARROW='↳'
+    GLYPH_OK='✓';     GLYPH_BAD='✗';     GLYPH_WARN='⚠'
+    GLYPH_ELLIPSIS='…'; GLYPH_TIMES='×'
+else
+    GLYPH_BOX_TL='+'; GLYPH_BOX_TR='+'; GLYPH_BOX_BL='+'; GLYPH_BOX_BR='+'
+    GLYPH_BOX_H='-'; GLYPH_BOX_V='|'
+    GLYPH_OFFENSE='!'; GLYPH_DEFENSE='+'; GLYPH_ARROW='->'
+    GLYPH_OK='+';     GLYPH_BAD='x';     GLYPH_WARN='!'
+    GLYPH_ELLIPSIS='...'; GLYPH_TIMES='x'
+fi
+
 json_esc() {
     local s="$1"
     s="${s//\\/\\\\}"
@@ -365,6 +391,7 @@ json_esc() {
 }
 
 HOSTNAME_J=$(json_esc "$HOSTNAME_FQDN")
+PRIMARY_IP_J=$(json_esc "$PRIMARY_IP")
 OS_J=$(json_esc "$OS_PRETTY")
 CPV_J=$(json_esc "$CPANEL_NORM")
 LP_UID_J=$(json_esc "$LP_UID")
@@ -417,8 +444,8 @@ emit_signal() {
         shift 2
     done
     local line
-    line=$(printf '{"host":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","mode":"forensic","incident_id":"%s","run_id":"%s","phase":"%s","severity":"%s","key":"%s","note":"%s"%s}' \
-        "$HOSTNAME_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" "$VERSION" "$INCIDENT_ID" "$RUN_ID" \
+    line=$(printf '{"host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","mode":"forensic","incident_id":"%s","run_id":"%s","phase":"%s","severity":"%s","key":"%s","note":"%s"%s}' \
+        "$HOSTNAME_J" "$PRIMARY_IP_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" "$VERSION" "$INCIDENT_ID" "$RUN_ID" \
         "$phase" "$sev" "$(json_esc "$key")" "$(json_esc "$note")" "$extra")
     SIGNALS+=("$line")
     (( JSONL_OUT )) && printf '%s\n' "$line"
@@ -1413,257 +1440,456 @@ ansi_strip() {
     sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g'
 }
 
-# Render one offense row in the canonical pretty form. Caller passes the
-# decomposed reconcile fields and the matching IOC_PRIMITIVES TSV row.
-# Outputs two indented lines: a header (verdict + ts + stage + key) and
-# a primitives sub-line (ip / path / log_file / count). Sub-line is
-# omitted when no primitive is present (e.g. forensic-only deep checks
-# that only have a path).
+# Format an IOC primitives row into a single detail string for the
+# compact renderer. Pulls the most-discriminating field in priority order:
+# ip+count+status > path > note. Truncates path/note to keep the renderer
+# one-line-per-IOC. Bundle's kill-chain.tsv carries the full primitives.
+fmt_offense_detail() {
+    local ip="$1" path="$2" count="$3" status="$4" note="$5"
+    local d=""
+    if [[ -n "$ip" ]]; then
+        d="$ip"
+        if [[ -n "$count" && "$count" =~ ^[0-9]+$ && "$count" -gt 1 ]]; then
+            d="$d ${GLYPH_TIMES}$count"
+        fi
+        [[ -n "$status" ]] && d="$d $status"
+    elif [[ -n "$path" ]]; then
+        if (( ${#path} > 50 )); then
+            d="${path:0:24}${GLYPH_ELLIPSIS}${path: -25}"
+        else
+            d="$path"
+        fi
+    elif [[ -n "$note" ]]; then
+        if (( ${#note} > 60 )); then
+            d="${note:0:60}${GLYPH_ELLIPSIS}"
+        else
+            d="$note"
+        fi
+    fi
+    printf '%s' "$d"
+}
+
+# Render one offense row in compact single-line form for the chronological
+# tree. Caller passes the decomposed reconcile fields and the matching
+# IOC_PRIMITIVES TSV row.
+# Layout: │ TS  ⚡ stage X    key                       detail
 render_offense_row() {
     local verdict="$1" delta="$2" ts_iso="$3" stage="$4" key="$5" note="$6" prims="$7"
-    local color label
+    local color
     case "$verdict" in
-        PRE-DEFENSE)  color="$C_RED"; label="PRE-DEFENSE " ;;
-        UNDEFENDED)   color="$C_RED"; label="UNDEFENDED  " ;;
-        POST-DEFENSE) color="$C_GRN"; label="POST-DEFENSE" ;;
-        POST-PARTIAL) color="$C_YEL"; label="POST-PARTIAL" ;;
-        *)            color="$C_DIM"; label="$verdict" ;;
+        PRE-DEFENSE|UNDEFENDED) color="$C_RED" ;;
+        POST-DEFENSE)           color="$C_GRN" ;;
+        POST-PARTIAL)           color="$C_YEL" ;;
+        *)                      color="$C_DIM" ;;
     esac
 
-    # Header row: [verdict] ISO  stage  key
-    printf '    %s[%s]%s %s  %s%s%s  %s%s%s\n' \
-        "$color" "$label" "$C_NC" \
-        "$ts_iso" \
-        "$C_BLD" "stage=$stage" "$C_NC" \
-        "$C_CYN" "$key" "$C_NC"
-
-    # Primitives sub-line(s) - one per non-empty field. PRIM_SEP-delimited
-    # (US 0x1f) so consecutive empty middles don't collapse on read.
-    #   1=area 2=ip 3=path 4=log_file 5=count 6=hits_2xx 7=status 8=line
     local area ip path log_file count h2xx status line
     IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
+    local detail
+    detail=$(fmt_offense_detail "$ip" "$path" "$count" "$status" "$note")
 
-    local detail=""
-    [[ -n "$ip"        ]] && detail+="ip=$ip "
-    [[ -n "$status"    ]] && detail+="status=$status "
-    [[ -n "$count"     ]] && detail+="count=$count "
-    [[ -n "$h2xx"      ]] && detail+="hits_2xx=$h2xx "
-    if [[ -n "$detail" ]]; then
-        printf '         %s%s%s\n' "$C_DIM" "${detail% }" "$C_NC"
-    fi
-    if [[ -n "$path" ]]; then
-        printf '         %spath:%s %s\n' "$C_DIM" "$C_NC" "$path"
-    fi
-    if [[ -n "$log_file" ]]; then
-        printf '         %slog: %s %s\n' "$C_DIM" "$C_NC" "$log_file"
-    fi
-    if [[ -n "$line" ]]; then
-        # Truncate raw log line to keep one-screen rendering predictable.
-        local trim="${line:0:120}"
-        printf '         %sevidence:%s %s\n' "$C_DIM" "$C_NC" "$trim"
-    fi
-    if [[ -n "$note" && -z "$ip" && -z "$path" && -z "$log_file" && -z "$line" ]]; then
-        printf '         %snote:%s %s\n' "$C_DIM" "$C_NC" "$note"
-    fi
+    # Stage column padded to 4 (covers "init"). Key column padded to 22.
+    printf '  %s%s%s  %s  %s%s%s stage %-4s  %s%-22s%s  %s\n' \
+        "$C_DIM" "$GLYPH_BOX_V" "$C_NC" \
+        "$ts_iso" \
+        "$color" "$GLYPH_OFFENSE" "$C_NC" \
+        "$stage" \
+        "$C_CYN" "$key" "$C_NC" \
+        "$detail"
+}
 
-    # Trailing delta line - human-readable timing relative to defense.
-    local delta_human="$delta"
-    if [[ "$delta" =~ ^-?[0-9]+$ ]]; then
-        local abs="$delta"
-        (( abs < 0 )) && abs=$(( -abs ))
-        if   (( abs >= 86400 )); then delta_human=$(printf '%dd %dh' "$(( abs / 86400 ))" "$(( (abs % 86400) / 3600 ))")
-        elif (( abs >= 3600  )); then delta_human=$(printf '%dh %dm' "$(( abs / 3600 ))"  "$(( (abs % 3600) / 60 ))")
-        elif (( abs >= 60    )); then delta_human=$(printf '%dm %ds' "$(( abs / 60 ))"    "$(( abs % 60 ))")
-        else                          delta_human="${abs}s"
-        fi
-        if (( delta < 0 )); then
-            delta_human="${delta_human} after defense"
-        else
-            delta_human="${delta_human} before defense"
-        fi
-    elif [[ "$delta" == partial:* ]]; then
-        delta_human="only ${delta#partial:} was up"
+# Render one defense-event row in the same compact form as offense rows.
+render_defense_row() {
+    local ts_iso="$1" key="$2" note="$3"
+    local note_trim="$note"
+    if (( ${#note_trim} > 60 )); then
+        note_trim="${note_trim:0:60}${GLYPH_ELLIPSIS}"
     fi
-    printf '         %sΔ defense:%s %s\n' "$C_DIM" "$C_NC" "$delta_human"
+    printf '  %s%s%s  %s  %s%s%s DEFENSE     %s%-22s%s  %s\n' \
+        "$C_DIM" "$GLYPH_BOX_V" "$C_NC" \
+        "$ts_iso" \
+        "$C_GRN" "$GLYPH_DEFENSE" "$C_NC" \
+        "$C_BLD" "$key" "$C_NC" \
+        "$note_trim"
+}
+
+# Aggregate attacker IPs from IOC_PRIMITIVES + RECONCILED. Sets globals
+# consumed by the HEADLINE renderer:
+#   ATTACKER_IP_PLAIN          space-separated top-N for copy-paste
+#   ATTACKER_IP_ANNOTATED[]    array of "ip ×count [stages]" annotated forms
+#   ATTACKER_IP_OVERFLOW       "+N more — see kill-chain.md", empty if <=top_n
+#   ATTACKER_IP_TOTAL          count of unique IPs across the chain
+# Sort order: hit-count desc, first-seen epoch asc tiebreak. Top 5 inline,
+# remainder rolled into the overflow line - the bundle's kill-chain.md
+# carries the full enumerated list (sorted same way).
+aggregate_attacker_ips() {
+    ATTACKER_IP_PLAIN=""
+    ATTACKER_IP_ANNOTATED=()
+    ATTACKER_IP_OVERFLOW=""
+    ATTACKER_IP_TOTAL=0
+
+    declare -A ip_count ip_stages ip_first
+
+    local idx
+    for (( idx=0; idx<${#IOC_PRIMITIVES[@]}; idx++ )); do
+        local prims="${IOC_PRIMITIVES[$idx]:-}"
+        local rec="${RECONCILED[$idx]:-}"
+        [[ -z "$prims" || -z "$rec" ]] && continue
+
+        local area ip path log_file count h2xx status line
+        IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
+        [[ -z "$ip" ]] && continue
+
+        local r_verdict r_delta r_epoch r_stage r_key r_note
+        IFS=$'\t' read -r r_verdict r_delta r_epoch r_stage r_key r_note \
+            < <(decode_pipe_tail "$rec" 6)
+
+        # Hit count = count primitive when numeric (multi-hit IOC), else 1.
+        local hits=1
+        [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] && hits="$count"
+        ip_count[$ip]=$(( ${ip_count[$ip]:-0} + hits ))
+
+        # Track stages per IP, deduped via comma-bracketed substring match.
+        local prev="${ip_stages[$ip]:-}"
+        if [[ ",$prev," != *",$r_stage,"* ]]; then
+            ip_stages[$ip]="${prev:+$prev,}$r_stage"
+        fi
+
+        if [[ -z "${ip_first[$ip]:-}" ]] || (( r_epoch < ${ip_first[$ip]} )); then
+            ip_first[$ip]="$r_epoch"
+        fi
+    done
+
+    ATTACKER_IP_TOTAL="${#ip_count[@]}"
+    (( ATTACKER_IP_TOTAL == 0 )) && return 0
+
+    local sorted
+    sorted=$(
+        local _ip
+        for _ip in "${!ip_count[@]}"; do
+            printf '%d\t%d\t%s\n' "${ip_count[$_ip]}" "${ip_first[$_ip]:-0}" "$_ip"
+        done | sort -k1,1nr -k2,2n
+    )
+
+    local top_n=5 i=0
+    local plain=()
+    local _cnt _first _ip
+    while IFS=$'\t' read -r _cnt _first _ip; do
+        [[ -z "$_ip" ]] && continue
+        if (( i < top_n )); then
+            plain+=("$_ip")
+            ATTACKER_IP_ANNOTATED+=("$(printf '%s %s%d [%s]' "$_ip" "$GLYPH_TIMES" "$_cnt" "${ip_stages[$_ip]}")")
+        fi
+        (( i++ ))
+    done <<< "$sorted"
+
+    ATTACKER_IP_PLAIN="${plain[*]}"
+    if (( ATTACKER_IP_TOTAL > top_n )); then
+        local sep="--"
+        [[ "$GLYPH_BOX_H" == "─" ]] && sep="—"
+        ATTACKER_IP_OVERFLOW=$(printf '+%d more %s see kill-chain.md for full list' \
+            "$(( ATTACKER_IP_TOTAL - top_n ))" "$sep")
+    fi
+}
+
+# Format a delta of seconds into "Xd Yh" / "Xh Ym" / "Xm Ys" / "Xs".
+fmt_delta_human() {
+    local abs="$1"
+    (( abs < 0 )) && abs=$(( -abs ))
+    if   (( abs >= 86400 )); then printf '%dd %dh' "$(( abs / 86400 ))" "$(( (abs % 86400) / 3600 ))"
+    elif (( abs >= 3600  )); then printf '%dh %dm' "$(( abs / 3600 ))"  "$(( (abs % 3600) / 60 ))"
+    elif (( abs >= 60    )); then printf '%dm %ds' "$(( abs / 60 ))"    "$(( abs % 60 ))"
+    else                          printf '%ds' "$abs"
+    fi
 }
 
 render_kill_chain() {
     (( QUIET )) && return 0
 
+    # Aggregate attacker IPs once for the HEADLINE section. Walks
+    # IOC_PRIMITIVES + RECONCILED; sets ATTACKER_IP_* globals.
+    aggregate_attacker_ips
+
+    # Build a single chronologically-merged event list (defense + offense)
+    # so the timeline reads as one story instead of two parallel sections.
+    # Each entry: epoch \t kind \t payload, where kind is DEF or OFF and
+    # payload is the index into DEFENSE_EVENTS or RECONCILED.
+    # Group both loops in `{ ... }` so the trailing `| sort` applies to the
+    # combined output, not just the second loop. Without the brace group,
+    # bash parses the pipe as binding to the immediately preceding compound
+    # statement, leaving DEFENSE rows unsorted in front of OFFENSE rows.
+    local merged
+    merged=$(
+        {
+            local _i _ts _rec _de
+            for (( _i=0; _i<${#DEFENSE_EVENTS[@]}; _i++ )); do
+                _de="${DEFENSE_EVENTS[$_i]}"
+                _ts=$(printf '%s' "$_de" | cut -d'|' -f1)
+                [[ -z "$_ts" ]] && continue
+                printf '%s\tDEF\t%d\n' "$_ts" "$_i"
+            done
+            for (( _i=0; _i<${#RECONCILED[@]}; _i++ )); do
+                _rec="${RECONCILED[$_i]}"
+                _ts=$(printf '%s' "$_rec" | cut -d'|' -f3)
+                [[ -z "$_ts" ]] && continue
+                printf '%s\tOFF\t%d\n' "$_ts" "$_i"
+            done
+        } | sort -n -k1,1
+    )
+
     # Buffer the entire render once so we can both print to stderr AND
-    # capture an ANSI-stripped copy for the bundle in a single pass. This
-    # avoids re-running the renderer twice or re-scanning arrays.
+    # capture an ANSI-stripped copy for the bundle in a single pass.
     local buf
     buf=$({
-        printf '\n%s== kill chain ==%s %s%s%s\n' \
-            "$C_BLD" "$C_NC" "$C_DIM" "CVE-2026-41940 / IC-5790" "$C_NC"
+        # ── Banner ──────────────────────────────────────────────────────
+        # Open box: top has title embedded in a horizontal bar, bottom is
+        # plain bar. Content lines have left bar only - skipping the right
+        # close-bar avoids width-counting around variable-length FQDNs and
+        # unicode combining chars.
+        local W=72
+        local title="CVE-2026-41940 / IC-5790"
+        # Title takes (3 left bar+space) + len(title) + 1 trailing space
+        # visual columns; remainder fills with horizontal bars.
+        local title_used=$(( 4 + ${#title} ))
+        local right_len=$(( W - title_used ))
+        (( right_len < 4 )) && right_len=4
+        local right_bar="" _bi
+        for (( _bi=0; _bi<right_len; _bi++ )); do right_bar+="$GLYPH_BOX_H"; done
+        local full_bar="" _bi2
+        for (( _bi2=0; _bi2<W; _bi2++ )); do full_bar+="$GLYPH_BOX_H"; done
 
-        # Header banner: envelope-derived verdict + score, defense state.
+        # Verdict color + display text.
         local hv="${ENV_HOST_VERDICT:-}"
-        local hv_color="$C_GRN"
+        local hv_color="$C_GRN" hv_text="$hv"
         case "$hv" in
             COMPROMISED) hv_color="$C_RED" ;;
             SUSPICIOUS)  hv_color="$C_YEL" ;;
             CLEAN)       hv_color="$C_GRN" ;;
-            "")          hv_color="$C_DIM"; hv="(no envelope)" ;;
+            "")          hv_color="$C_DIM"; hv_text="(no envelope - re-run from ioc-scan for verdict)" ;;
         esac
-        printf '\n  host: %s%s%s    cpanel: %s    os: %s\n' \
-            "$C_BLD" "$HOSTNAME_FQDN" "$C_NC" "${CPANEL_NORM:-unknown}" "$OS_PRETTY"
-        printf '  ioc-scan verdict: %s%s%s' "$hv_color" "$hv" "$C_NC"
-        [[ -n "$ENV_SCORE"        ]] && printf '    score: %s' "$ENV_SCORE"
-        [[ -n "$ENV_CODE_VERDICT" ]] && printf '    code: %s' "$ENV_CODE_VERDICT"
-        [[ -n "$ENV_IOC_TOOL_VERSION" ]] && printf '    ioc-scan v%s' "$ENV_IOC_TOOL_VERSION"
+
+        # Defense layer badges - inline glyphs (✓ up / ✗ absent / ⚠ dirty).
+        local def_patch="$GLYPH_BAD absent" def_modsec="$GLYPH_BAD absent"
+        local def_csf="$GLYPH_WARN dirty"   def_mitigate="$GLYPH_BAD never"
+        [[ -n "$DEF_PATCH_TIME"     ]] && def_patch="$GLYPH_OK up"
+        [[ -n "$DEF_MODSEC_TIME"    ]] && def_modsec="$GLYPH_OK up"
+        [[ -n "$DEF_CSF_TIME"       ]] && def_csf="$GLYPH_OK clean"
+        [[ -n "$DEF_MITIGATE_LAST"  ]] && def_mitigate="$GLYPH_OK ran"
+
+        # Compose verdict + score + ioc-scan version into one column line.
+        local verdict_line="$hv_text"
+        [[ -n "$ENV_SCORE" ]]            && verdict_line+="   score $ENV_SCORE"
+        [[ -n "$ENV_IOC_TOOL_VERSION" ]] && verdict_line+="   ioc-scan v$ENV_IOC_TOOL_VERSION"
+
+        printf '\n%s%s%s%s %s%s%s %s%s%s\n' \
+            "$C_BLD" "$GLYPH_BOX_TL" "$GLYPH_BOX_H" "$GLYPH_BOX_H" \
+            "$C_BLD" "$title" "$C_NC" \
+            "$C_BLD" "$right_bar" "$C_NC"
+        printf '%s%s%s host         %s%s%s (%s)\n'   "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$C_BLD" "$HOSTNAME_FQDN" "$C_NC" "$PRIMARY_IP"
+        printf '%s%s%s cpanel       %s   os %s\n'    "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "${CPANEL_NORM:-unknown}" "${OS_PRETTY:-unknown}"
+        printf '%s%s%s verdict      %s%s%s\n'        "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$hv_color" "$verdict_line" "$C_NC"
+        printf '%s%s%s defenses     patch %s   modsec %s   csf %s   mitigate %s\n' \
+            "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$def_patch" "$def_modsec" "$def_csf" "$def_mitigate"
+        printf '%s%s%s%s\n' "$C_BLD" "$GLYPH_BOX_BL" "$full_bar" "$C_NC"
+
+        # ── Chronological tree ──────────────────────────────────────────
+        # Single merged stream: defense + offense events, time-sorted, with
+        # zone separators when verdict-class transitions (PRE→DEF→POST).
+        if [[ -z "$merged" ]]; then
+            printf '\n  %s%s no events to render (no offenses, no defenses)%s\n' \
+                "$C_DIM" "$GLYPH_BOX_V" "$C_NC"
+        else
+            # First pass: bucket merged entries into zones by current verdict
+            # class. Zone IDs: pre / def / post / undef. Defense rows sit in
+            # their own def zone; consecutive offense rows of same class
+            # accumulate; class transitions emit a zone header before the
+            # first row of the new zone with the zone size in the label.
+            local _line _ts _kind _idx
+            local zones=() rows=()
+            local cur_zone="" cur_count=0 cur_first=-1
+
+            # Pre-walk to compute zone boundaries + counts. We collect rows
+            # into the rows[] array (one entry per event with all data baked
+            # in) and zones[] as parallel "zone_id|first_row|last_row|count"
+            # records, indexed by appearance order.
+            local row_idx=0
+            while IFS=$'\t' read -r _ts _kind _idx; do
+                [[ -z "$_ts" ]] && continue
+                local row_zone=""
+                if [[ "$_kind" == "DEF" ]]; then
+                    row_zone="def"
+                else
+                    local _rec="${RECONCILED[$_idx]}"
+                    local _v
+                    _v=$(printf '%s' "$_rec" | cut -d'|' -f1)
+                    case "$_v" in
+                        PRE-DEFENSE)             row_zone="pre"   ;;
+                        UNDEFENDED)              row_zone="undef" ;;
+                        POST-DEFENSE)            row_zone="post"  ;;
+                        POST-PARTIAL)            row_zone="partial" ;;
+                        *)                       row_zone="other" ;;
+                    esac
+                fi
+
+                rows+=("$_ts|$_kind|$_idx|$row_zone")
+
+                if [[ "$row_zone" != "$cur_zone" ]]; then
+                    # Close previous zone if any.
+                    if [[ -n "$cur_zone" ]]; then
+                        zones+=("$cur_zone|$cur_first|$(( row_idx - 1 ))|$cur_count")
+                    fi
+                    cur_zone="$row_zone"
+                    cur_first=$row_idx
+                    cur_count=1
+                else
+                    cur_count=$(( cur_count + 1 ))
+                fi
+                row_idx=$(( row_idx + 1 ))
+            done <<< "$merged"
+            # Close the trailing zone.
+            if [[ -n "$cur_zone" ]]; then
+                zones+=("$cur_zone|$cur_first|$(( row_idx - 1 ))|$cur_count")
+            fi
+
+            # Second pass: emit zone headers + rows. Each zone starts with a
+            # "── ZONE-LABEL (N events) ──" separator; rows render compactly.
+            local zone_rec z_id z_first z_last z_count
+            local r_str r_ts r_kind r_idx r_zone
+            local row_i=0
+
+            for zone_rec in "${zones[@]}"; do
+                IFS='|' read -r z_id z_first z_last z_count <<< "$zone_rec"
+                local z_color="$C_DIM" z_label="$z_id"
+                case "$z_id" in
+                    pre)     z_color="$C_RED";  z_label="PRE-DEFENSE"   ;;
+                    undef)   z_color="$C_RED";  z_label="UNDEFENDED"    ;;
+                    def)     z_color="$C_GRN";  z_label="DEFENSES"      ;;
+                    post)    z_color="$C_GRN";  z_label="POST-DEFENSE"  ;;
+                    partial) z_color="$C_YEL";  z_label="POST-PARTIAL"  ;;
+                    *)       z_color="$C_DIM";  z_label="$z_id"         ;;
+                esac
+                local zone_count_str=""
+                if [[ "$z_id" != "def" ]]; then
+                    zone_count_str=$(printf ' (%d event%s)' "$z_count" "$( (( z_count == 1 )) && echo '' || echo s)")
+                fi
+
+                # Zone header line.
+                printf '\n  %s%s%s  %s%s%s %s%s%s\n' \
+                    "$C_DIM" "$GLYPH_BOX_V" "$C_NC" \
+                    "$z_color$C_BLD" "${GLYPH_BOX_H}${GLYPH_BOX_H} $z_label$zone_count_str ${GLYPH_BOX_H}${GLYPH_BOX_H}" "$C_NC" \
+                    "" "" ""
+
+                # Emit rows in this zone.
+                local r
+                for (( r=z_first; r<=z_last; r++ )); do
+                    r_str="${rows[$r]}"
+                    IFS='|' read -r r_ts r_kind r_idx r_zone <<< "$r_str"
+                    if [[ "$r_kind" == "DEF" ]]; then
+                        local _de="${DEFENSE_EVENTS[$r_idx]}"
+                        local de_epoch de_key de_note
+                        IFS=$'\t' read -r de_epoch de_key de_note \
+                            < <(decode_pipe_tail "$_de" 3)
+                        render_defense_row "$(epoch_to_iso "$de_epoch")" "$de_key" "$de_note"
+                    else
+                        local _rec="${RECONCILED[$r_idx]}"
+                        local _prims="${IOC_PRIMITIVES[$r_idx]:-}"
+                        local r_verdict r_delta r_epoch r_stage r_key r_note
+                        IFS=$'\t' read -r r_verdict r_delta r_epoch r_stage r_key r_note \
+                            < <(decode_pipe_tail "$_rec" 6)
+                        render_offense_row "$r_verdict" "$r_delta" \
+                            "$(epoch_to_iso "$r_epoch")" "$r_stage" "$r_key" \
+                            "$r_note" "$_prims"
+                    fi
+                done
+            done
+        fi
+
+        # ── HEADLINE ────────────────────────────────────────────────────
+        # Verdict + defense lag + attacker IPs. The plain-IP line is the
+        # copy-paste artifact - space-separated, no decorations, ready for
+        # `csf -d`, ipset, or abuse-report pasting.
+        printf '\n  %s%s %sHEADLINE%s\n' "$C_DIM" "$GLYPH_BOX_V" "$C_BLD" "$C_NC"
+
+        # Verdict line.
+        printf '  %s%s   verdict       %s%s%s' \
+            "$C_DIM" "$GLYPH_BOX_V" "$hv_color" "${hv:-(no envelope)}" "$C_NC"
+        [[ -n "$ENV_SCORE" ]] && printf '  (score %s)' "$ENV_SCORE"
         printf '\n'
 
-        if [[ -n "$ENV_STRONG$ENV_FIXED$ENV_INCONCLUSIVE$ENV_IOC_CRITICAL$ENV_IOC_REVIEW" ]]; then
-            printf '  envelope counters: strong=%s fixed=%s inconclusive=%s ioc_critical=%s ioc_review=%s\n' \
-                "${ENV_STRONG:-0}" "${ENV_FIXED:-0}" "${ENV_INCONCLUSIVE:-0}" \
-                "${ENV_IOC_CRITICAL:-0}" "${ENV_IOC_REVIEW:-0}"
-        fi
-
-        # Defense badges - per-layer state.
-        local dline=""
-        if [[ -n "$DEF_PATCH_TIME" ]]; then
-            dline+="  patch=${C_GRN}up${C_NC} ($(epoch_to_iso "$DEF_PATCH_TIME"))"
-        else
-            dline+="  patch=${C_RED}absent${C_NC}"
-        fi
-        if [[ -n "$DEF_MODSEC_TIME" ]]; then
-            dline+="  modsec=${C_GRN}up${C_NC}"
-        else
-            dline+="  modsec=${C_RED}absent${C_NC}"
-        fi
-        if [[ -n "$DEF_CSF_TIME" ]]; then
-            dline+="  csf=${C_GRN}clean${C_NC}"
-        else
-            dline+="  csf=${C_YEL}dirty${C_NC}"
-        fi
-        if [[ -n "$DEF_MITIGATE_LAST" ]]; then
-            dline+="  mitigate=${C_GRN}ran${C_NC}"
-        else
-            dline+="  mitigate=${C_RED}never${C_NC}"
-        fi
-        printf '  defenses:%s\n' "$dline"
-
-        # Defense timeline - chronological.
-        printf '\n  %sDEFENSE TIMELINE%s\n' "$C_BLD" "$C_NC"
-        if (( ${#DEFENSE_EVENTS[@]} == 0 )); then
-            printf '    %s(none captured - host appears UNDEFENDED)%s\n' "$C_RED" "$C_NC"
-        else
-            local sorted_def
-            sorted_def=$(
-                local de
-                for de in "${DEFENSE_EVENTS[@]}"; do
-                    printf '%s\n' "$de"
-                done | sort -t'|' -k1,1n
-            )
-            # Pipe-tolerant per-line decode: notes may legitimately carry
-            # '|' chars (log lines, paths, attacker payloads). decode_pipe_tail
-            # rejoins parts[N-1..end] into the trailing field.
-            local de_epoch de_key de_note _de_line
-            while IFS= read -r _de_line; do
-                [[ -z "$_de_line" ]] && continue
-                IFS=$'\t' read -r de_epoch de_key de_note < <(decode_pipe_tail "$_de_line" 3)
-                [[ -z "$de_epoch" ]] && continue
-                printf '    %s[DEF-OK]%s %s  %s%-12s%s  %s\n' \
-                    "$C_GRN" "$C_NC" "$(epoch_to_iso "$de_epoch")" \
-                    "$C_BLD" "$de_key" "$C_NC" "$de_note"
-            done <<< "$sorted_def"
-        fi
-
-        # Offense timeline - reconciled rows, grouped by stage in canonical
-        # order, sorted by epoch within each stage. Indices into RECONCILED
-        # match IOC_PRIMITIVES; we pull both per row.
-        printf '\n  %sATTACK TIMELINE%s\n' "$C_BLD" "$C_NC"
-        if (( ${#RECONCILED[@]} == 0 )); then
-            printf '    %s(no IOCs reconciled - host is CLEAN)%s\n' "$C_GRN" "$C_NC"
-        else
-            local stage_iter idx
-            local -a stage_indices
-            for stage_iter in "${STAGE_ORDER[@]}"; do
-                stage_indices=()
-                for (( idx=0; idx<${#RECONCILED[@]}; idx++ )); do
-                    local rec="${RECONCILED[$idx]}"
-                    local r_pat
-                    r_pat=$(echo "$rec" | cut -d'|' -f4)
-                    [[ "$r_pat" == "$stage_iter" ]] || continue
-                    stage_indices+=("$idx")
-                done
-                (( ${#stage_indices[@]} == 0 )) && continue
-
-                printf '\n    %sstage %s%s  %s%s%s\n' \
-                    "$C_BLD" "$stage_iter" "$C_NC" \
-                    "$C_DIM" "${STAGE_LABEL[$stage_iter]:-}" "$C_NC"
-
-                # Sort this stage's indices by epoch (RECONCILED field 3).
-                local i_sorted
-                i_sorted=$(
-                    local i ts
-                    for i in "${stage_indices[@]}"; do
-                        ts=$(echo "${RECONCILED[$i]}" | cut -d'|' -f3)
-                        printf '%s\t%s\n' "${ts:-0}" "$i"
-                    done | sort -n -k1,1 | cut -f2
-                )
-                local i
-                while IFS= read -r i; do
-                    [[ -z "$i" ]] && continue
-                    local rec="${RECONCILED[$i]}"
-                    local prims="${IOC_PRIMITIVES[$i]:-}"
-                    local r_verdict r_delta r_epoch r_pat r_key r_note
-                    # Pipe-tolerant decode: r_note absorbs trailing parts
-                    # so notes containing '|' (log lines, paths, attacker
-                    # payloads) round-trip intact. The pre-fix
-                    # `cut -d'|' -f4` band-aid that re-pulled from
-                    # OFFENSE_EVENTS had the same truncation bug; with
-                    # this decoder both arrays carry full notes.
-                    IFS=$'\t' read -r r_verdict r_delta r_epoch r_pat r_key r_note \
-                        < <(decode_pipe_tail "$rec" 6)
-                    render_offense_row "$r_verdict" "$r_delta" \
-                        "$(epoch_to_iso "$r_epoch")" "$r_pat" "$r_key" \
-                        "$r_note" "$prims"
-                done <<< "$i_sorted"
-            done
-        fi
-
-        # Headline: defense lag (earliest IOC vs latest defense). Reuses
-        # phase_reconcile's logic without re-duplicating the calculation.
-        if (( ${#OFFENSE_EVENTS[@]} > 0 )); then
-            local min_off="" max_def="" oe ts
-            for oe in "${OFFENSE_EVENTS[@]}"; do
-                ts=$(echo "$oe" | cut -d'|' -f1)
-                [[ -z "$ts" ]] && continue
-                if [[ -z "$min_off" ]] || (( ts < min_off )); then min_off="$ts"; fi
-            done
-            local de
-            for de in "${DEFENSE_EVENTS[@]}"; do
-                ts=$(echo "$de" | cut -d'|' -f1)
-                [[ -z "$ts" ]] && continue
-                if [[ -z "$max_def" ]] || (( ts > max_def )); then max_def="$ts"; fi
-            done
-            printf '\n  %sHEADLINE%s\n' "$C_BLD" "$C_NC"
-            [[ -n "$min_off" ]] && printf '    earliest IOC:    %s\n' "$(epoch_to_iso "$min_off")"
-            [[ -n "$max_def" ]] && printf '    latest defense:  %s\n' "$(epoch_to_iso "$max_def")"
-            if [[ -n "$min_off" && -n "$max_def" ]]; then
-                local gap=$(( max_def - min_off ))
-                local lag_color="$C_GRN" lag_word="EARLY"
-                if (( gap > 0 )); then lag_color="$C_RED"; lag_word="LATE"; fi
-                local abs="$gap"
-                (( abs < 0 )) && abs=$(( -abs ))
-                local human
-                if   (( abs >= 86400 )); then human=$(printf '%dd %dh' "$(( abs / 86400 ))" "$(( (abs % 86400) / 3600 ))")
-                elif (( abs >= 3600  )); then human=$(printf '%dh %dm' "$(( abs / 3600 ))"  "$(( (abs % 3600) / 60 ))")
-                else                          human="${abs}s"
-                fi
-                printf '    defense lag:     %s%s%s (%s %s first compromise)\n' \
-                    "$lag_color" "$human" "$C_NC" "$lag_word" \
-                    "$( (( gap > 0 )) && echo after || echo before)"
+        # Defense lag line. Computed from min(offense epoch) vs max(defense
+        # epoch) - matches phase_reconcile's calculation.
+        local min_off="" max_def="" _oe _de _ts
+        for _oe in "${OFFENSE_EVENTS[@]}"; do
+            _ts=$(printf '%s' "$_oe" | cut -d'|' -f1)
+            [[ -z "$_ts" ]] && continue
+            [[ -z "$min_off" ]] || (( _ts < min_off )) && min_off="$_ts"
+        done
+        for _de in "${DEFENSE_EVENTS[@]}"; do
+            _ts=$(printf '%s' "$_de" | cut -d'|' -f1)
+            [[ -z "$_ts" ]] && continue
+            [[ -z "$max_def" ]] || (( _ts > max_def )) && max_def="$_ts"
+        done
+        if [[ -n "$min_off" && -n "$max_def" ]]; then
+            local gap=$(( max_def - min_off ))
+            local lag_color="$C_GRN" lag_word="EARLY"
+            local tail_clause
+            if (( gap > 0 )); then
+                lag_color="$C_RED"; lag_word="LATE"
+                tail_clause=$(printf 'first IOC %s, defense up %s later' \
+                    "$(epoch_to_iso "$min_off")" "$(fmt_delta_human "$gap")")
+            else
+                tail_clause=$(printf 'defenses up %s before first IOC at %s' \
+                    "$(fmt_delta_human "$gap")" "$(epoch_to_iso "$min_off")")
             fi
+            printf '  %s%s   defense lag   %s%s %s%s  (%s)\n' \
+                "$C_DIM" "$GLYPH_BOX_V" \
+                "$lag_color" "$(fmt_delta_human "$gap")" "$lag_word" "$C_NC" \
+                "$tail_clause"
+        elif [[ -n "$max_def" && -z "$min_off" ]]; then
+            printf '  %s%s   defense lag   %sEARLY%s  (defenses up, no IOCs reconciled)\n' \
+                "$C_DIM" "$GLYPH_BOX_V" "$C_GRN" "$C_NC"
+        elif [[ -n "$min_off" && -z "$max_def" ]]; then
+            printf '  %s%s   defense lag   %sno defense events captured%s\n' \
+                "$C_DIM" "$GLYPH_BOX_V" "$C_RED" "$C_NC"
+        else
+            printf '  %s%s   defense lag   %sno offense or defense events%s\n' \
+                "$C_DIM" "$GLYPH_BOX_V" "$C_DIM" "$C_NC"
         fi
 
-        printf '\n  %scounters:%s defenses=%d  iocs=%d  pre_defense=%d  post_defense=%d\n' \
+        # Attacker IP line(s). Plain copyable string first, annotated form
+        # below with ↳ glyph. Empty case prints "—" so grep always returns
+        # one line per host.
+        if (( ATTACKER_IP_TOTAL == 0 )); then
+            local empty_reason="no source IPs in evidence"
+            (( ${#OFFENSE_EVENTS[@]} == 0 )) && empty_reason="no offense events"
+            (( ${#OFFENSE_EVENTS[@]} > 0 ))  && empty_reason="filesystem-only IOCs"
+            printf '  %s%s   attackers     %s—  (%s)%s\n' \
+                "$C_DIM" "$GLYPH_BOX_V" "$C_DIM" "$empty_reason" "$C_NC"
+        else
+            printf '  %s%s   attackers     %s%s%s\n' \
+                "$C_DIM" "$GLYPH_BOX_V" "$C_BLD" "$ATTACKER_IP_PLAIN" "$C_NC"
+            [[ -n "$ATTACKER_IP_OVERFLOW" ]] && \
+                printf '  %s%s                 %s%s%s\n' \
+                    "$C_DIM" "$GLYPH_BOX_V" "$C_DIM" "$ATTACKER_IP_OVERFLOW" "$C_NC"
+            local ann
+            for ann in "${ATTACKER_IP_ANNOTATED[@]}"; do
+                printf '  %s%s                 %s%s%s %s\n' \
+                    "$C_DIM" "$GLYPH_BOX_V" "$C_DIM" "$GLYPH_ARROW" "$C_NC" "$ann"
+            done
+        fi
+
+        # ── Counters ────────────────────────────────────────────────────
+        # Surface UNDEFENDED separately - rolled into N_PRE during reconcile
+        # but the operator wants to see it broken out. Walk RECONCILED.
+        local n_undef=0 _r _v
+        for _r in "${RECONCILED[@]}"; do
+            _v=$(printf '%s' "$_r" | cut -d'|' -f1)
+            [[ "$_v" == "UNDEFENDED" ]] && n_undef=$(( n_undef + 1 ))
+        done
+        printf '\n  %scounters%s defenses=%d  iocs=%d  pre=%d  undef=%d  post=%d  attackers=%d\n' \
             "$C_BLD" "$C_NC" \
             "${#DEFENSE_EVENTS[@]}" "${#OFFENSE_EVENTS[@]}" \
-            "$N_PRE" "$N_POST"
+            "$(( N_PRE - n_undef ))" "$n_undef" "$N_POST" "$ATTACKER_IP_TOTAL"
     } 2>&1)
 
     printf '%s\n' "$buf" >&2
@@ -1792,8 +2018,8 @@ write_kill_chain_primitives() {
     # "meta" object on line 1; each subsequent line is a kind=DEF or kind=IOC
     # record with envelope-root metadata embedded for self-attribution.
     {
-        printf '{"kind":"meta","host":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
-            "$HOSTNAME_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" \
+        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
+            "$HOSTNAME_J" "$PRIMARY_IP_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" \
             "$VERSION" "$INCIDENT_ID" "$RUN_ID" \
             "$(json_esc "$ENV_IOC_RUN_ID")" "$(json_esc "$ENV_IOC_TOOL_VERSION")" "$(json_esc "$ENV_IOC_TS")" \
             "$(json_esc "$ENV_HOST_VERDICT")" "$(json_esc "$ENV_CODE_VERDICT")" "$(json_esc "$ENV_SCORE")" \
@@ -1978,6 +2204,7 @@ phase_bundle() {
     # Manifest first - records what we collected and when.
     {
         echo "host=$HOSTNAME_FQDN"
+        echo "primary_ip=$PRIMARY_IP"
         echo "uid=$LP_UID"
         echo "os=$OS_PRETTY"
         echo "cpanel_version=$CPANEL_NORM"
