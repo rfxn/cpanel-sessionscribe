@@ -14,7 +14,7 @@
 # later you can diff binaries, strings, and Perl source across tiers.
 #
 # Usage:
-#   ./sessionscribe-revsnap.sh              # writes to /var/tmp/cpanel-snapshots/
+#   ./sessionscribe-revsnap.sh              # writes to /var/cpanel/sessionscribe-revsnap/
 #   SNAPDIR=/path ./sessionscribe-revsnap.sh
 #
 # Workflow:
@@ -27,7 +27,7 @@
 # RPM packages are not included (use yumdownloader / dnf download separately).
 
 set -u
-SNAPDIR="${SNAPDIR:-/var/tmp/cpanel-snapshots}"
+SNAPDIR="${SNAPDIR:-/var/cpanel/sessionscribe-revsnap}"
 HOST=$(hostname -s)
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 
