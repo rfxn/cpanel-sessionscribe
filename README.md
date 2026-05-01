@@ -21,7 +21,7 @@ Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr
 
 <p align="center">
 <strong><em>Four requests forge a root session. Half the supported tiers got no patch.<br/>
-The architectural fix isn't in the binary — it's at the proxy endpoint.</em></strong>
+The architectural fix isn't in the binary - it's at the proxy endpoint.</em></strong>
 </p>
 
 ---
@@ -69,12 +69,12 @@ bash sessionscribe-mitigate.sh --csv
 
 Six artifacts in the kit. Click a name to jump to its quickstart + reference.
 
-- **[`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh--mitigation-orchestrator)** — mitigation orchestrator *(on the cPanel host)*
-- **[`modsec-sessionscribe.conf`](#modsec-sessionscribeconf--modsecurity-rule-pack)** — ModSecurity rule pack *(Apache + mod_security2, in front of cpsrvd)*
-- **[`sessionscribe-remote-probe.sh`](#sessionscribe-remote-probesh--non-destructive-verdict-per-host)** — non-destructive remote probe *(anywhere with `curl`)*
-- **[`sessionscribe-ioc-scan.sh`](#sessionscribe-ioc-scansh--on-host-ioc-ladder)** — on-host IOC ladder *(on the cPanel host)*
-- **[`sessionscribe-forensic.sh`](#sessionscribe-forensicsh--kill-chain-reconstruction--evidence-bundle)** — kill-chain reconstruction + evidence bundle *(on the cPanel host)*
-- **[`sessionscribe-revsnap.sh`](#sessionscribe-revsnapsh--re-snapshot-collector)** — per-tier RE snapshot collector *(on the cPanel host, around `upcp`)*
+- **[`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh---mitigation-orchestrator)** - mitigation orchestrator *(on the cPanel host)*
+- **[`modsec-sessionscribe.conf`](#modsec-sessionscribeconf---modsecurity-rule-pack)** - ModSecurity rule pack *(Apache + mod_security2, in front of cpsrvd)*
+- **[`sessionscribe-remote-probe.sh`](#sessionscribe-remote-probesh---non-destructive-verdict-per-host)** - non-destructive remote probe *(anywhere with `curl`)*
+- **[`sessionscribe-ioc-scan.sh`](#sessionscribe-ioc-scansh---on-host-ioc-ladder)** - on-host IOC ladder *(on the cPanel host)*
+- **[`sessionscribe-forensic.sh`](#sessionscribe-forensicsh---kill-chain-reconstruction--evidence-bundle)** - kill-chain reconstruction + evidence bundle *(on the cPanel host)*
+- **[`sessionscribe-revsnap.sh`](#sessionscribe-revsnapsh---re-snapshot-collector)** - per-tier RE snapshot collector *(on the cPanel host, around `upcp`)*
 
 All hosted at [`sh.rfxn.com`](https://sh.rfxn.com/) for `curl`-ready
 deployment. GPL v2.
@@ -89,8 +89,8 @@ in between.
 
 | Capability | Vendor advisory | watchTowr PoC | This toolkit |
 |---|---|---|---|
-| Patched-build list | yes | no | yes — incl. EL6 11.86.0.41 + WP² 136.1.7 + EOL handling |
-| Remote detection | no | partial — stage 1+2 only, false-positives on patched hosts | full 4-stage chain, deterministic verdict |
+| Patched-build list | yes | no | yes - incl. EL6 11.86.0.41 + WP² 136.1.7 + EOL handling |
+| Remote detection | no | partial - stage 1+2 only, false-positives on patched hosts | full 4-stage chain, deterministic verdict |
 | On-host IOC scan | partial | no | vendor patterns + co-occurrence + forged-timestamp heuristic |
 | Active mitigation | "patch + reboot" | n/a | mitigation orchestrator + ModSec rules + port lockdown |
 | Patch-dissection collateral | no | no | per-tier RE snapshot collector |
@@ -138,7 +138,7 @@ bash sessionscribe-mitigate.sh --check          # safe read-only audit
 echo "exit=$?"                                  # 0 on a non-cPanel host
 ```
 
-The orchestrator detects a non-cPanel host and exits clean — proving
+The orchestrator detects a non-cPanel host and exits clean - proving
 idempotency without needing a lab. Hosts with `/var/cpanel/` present run
 the full audit.
 
@@ -201,7 +201,7 @@ adjacent identity-injection issue - is in the
 
 ## Each tool
 
-### `sessionscribe-mitigate.sh` — mitigation orchestrator
+### `sessionscribe-mitigate.sh` - mitigation orchestrator
 
 ```bash
 curl -fsSL https://sh.rfxn.com/sessionscribe-mitigate.sh | bash
@@ -213,7 +213,7 @@ curl -fsSL https://sh.rfxn.com/sessionscribe-mitigate.sh | bash
 # read-only audit (default)
 bash sessionscribe-mitigate.sh
 
-# full remediation — idempotent, re-run on a healthy host is a no-op
+# full remediation - idempotent, re-run on a healthy host is a no-op
 bash sessionscribe-mitigate.sh --apply
 
 # narrow scope
@@ -302,7 +302,7 @@ EXIT CODES
 
 </details>
 
-### `modsec-sessionscribe.conf` — ModSecurity rule pack
+### `modsec-sessionscribe.conf` - ModSecurity rule pack
 
 ```bash
 curl -fsSL https://sh.rfxn.com/modsec-sessionscribe.conf | sudo tee /etc/apache2/conf.d/modsec/modsec2.user.conf >/dev/null
@@ -312,7 +312,7 @@ sudo apachectl -t && sudo /usr/local/cpanel/scripts/restartsrv_httpd
 **Common patterns:**
 
 ```bash
-# fresh install — modsec2.user.conf is empty by default, replace it
+# fresh install - modsec2.user.conf is empty by default, replace it
 curl -fsSL https://sh.rfxn.com/modsec-sessionscribe.conf \
     | sudo tee /etc/apache2/conf.d/modsec/modsec2.user.conf >/dev/null
 
@@ -338,12 +338,12 @@ sudo /usr/local/cpanel/scripts/restartsrv_httpd
 | `1500020` | `Authorization: WHM` on WebSocket dispatch family | deny when source not in trust list |
 | `1500021` | `Authorization: WHM` on SSE dispatch path | deny when source not in trust list |
 
-ID range reserved is `1500000–1500099`. Every deny runs in phase 1 — the
+ID range reserved is `1500000–1500099`. Every deny runs in phase 1 - the
 request never reaches the body inspector. Rule 1500030 base64-decodes the
 `Authorization: Basic` payload and rejects on CR/LF in the decoded bytes;
 no legitimate Basic-auth value decodes to bytes with newlines, so it has
 no trust-list bypass. The WHM-token rules use `@ipMatch` against an
-operator-defined trust list — edit the CIDRs at the top of the file
+operator-defined trust list - edit the CIDRs at the top of the file
 before deploying.
 
 > [!IMPORTANT]
@@ -355,7 +355,7 @@ before deploying.
 
 </details>
 
-### `sessionscribe-remote-probe.sh` — non-destructive verdict per host
+### `sessionscribe-remote-probe.sh` - non-destructive verdict per host
 
 ```bash
 curl -fsSL https://sh.rfxn.com/sessionscribe-remote-probe.sh | bash -s -- --target 1.2.3.4
@@ -367,17 +367,17 @@ curl -fsSL https://sh.rfxn.com/sessionscribe-remote-probe.sh | bash -s -- --targ
 # single host, default WHM-SSL ports
 bash sessionscribe-remote-probe.sh --target 1.2.3.4
 
-# Apache proxy test — whm./cpanel./webmail.example.com via 443 + 80
+# Apache proxy test - whm./cpanel./webmail.example.com via 443 + 80
 bash sessionscribe-remote-probe.sh --target 1.2.3.4 --proxy example.com
 
-# fleet — quiet, exit 2 on any VULN
+# fleet - quiet, exit 2 on any VULN
 bash sessionscribe-remote-probe.sh --target 1.2.3.4 --quiet --no-color
 
-# fleet — CSV across many targets
+# fleet - CSV across many targets
 bash sessionscribe-remote-probe.sh --csv \
     $(awk '{print "--target "$1}' fleet.txt) > fleet.csv
 
-# fast scoping — banner-only fingerprint, no session minted
+# fast scoping - banner-only fingerprint, no session minted
 bash sessionscribe-remote-probe.sh --target 1.2.3.4 --fingerprint-only
 
 # clean canary sessions on a target after a run
@@ -394,10 +394,10 @@ actively logs out. Verdict-determining signal is the HTTP code at stage 4:
 **SAFE**. Every test session is tagged with an `nxesec_canary_<nonce>`
 attribute for forensic cleanup, and **no state-changing API calls are
 made**. Forged sessions are root-equivalent for ~1–3s between stage 3 and
-stage 5 logout — see the script header for the full safety model.
+stage 5 logout - see the script header for the full safety model.
 
 ```
-sessionscribe-remote-probe.sh v1.2.2 — detection probe for CVE-2026-41940 (SessionScribe)
+sessionscribe-remote-probe.sh v1.2.2 - detection probe for CVE-2026-41940 (SessionScribe)
 
 Usage:
   sessionscribe-remote-probe.sh --target HOST [--port PORT] [--scheme https|http] [--host-header NAME]
@@ -412,12 +412,12 @@ Targeting:
   --scheme https|http      Default https
   --host-header NAME       Override Host: header
   --proxy DOMAIN           Test {whm,cpanel,webmail}.DOMAIN via 443 + 80
-  --all                    Exhaustive sweep — all 6 cpsrvd direct ports
+  --all                    Exhaustive sweep - all 6 cpsrvd direct ports
                            (cPanel/Webmail probes are informational only;
                             see "Known limitation" in the script header)
   --auto-host-discover     Pre-probe /openid_connect/cpanelid for canonical Host
 
-Output modes (mutually exclusive — last one wins):
+Output modes (mutually exclusive - last one wins):
   (default)                Pretty per-probe output + summary
   -q | --quiet             Only print [VULN] hits and the final verdict line
   --oneline                One verdict line per target ("HOST: VULN n=2")
@@ -425,9 +425,9 @@ Output modes (mutually exclusive — last one wins):
   --json                   Structured JSON with probe results + per-target rollup
   --no-color               Disable ANSI color (also honored if env NO_COLOR=1)
   --no-progress            Suppress progress lines on multi-target runs
-  --no-verify              Stage-2-only mode (v1 heuristic — NOTE: produces
+  --no-verify              Stage-2-only mode (v1 heuristic - NOTE: produces
                            FALSE POSITIVES on patched hosts).
-  --fingerprint-only       Stage 0 only — harvest cpsrvd build banner +
+  --fingerprint-only       Stage 0 only - harvest cpsrvd build banner +
                            cPanel_magic_revision and derive verdict from the
                            embedded patch-boundary table. Side-effect-free
                            (no session minted). Banner-only verdicts are
@@ -446,18 +446,18 @@ Exit codes:
   1  inconclusive results only (no VULN, but at least one INCONCLUSIVE)
   2  one or more VULN targets found
 
-Detection mechanism (full chain — default):
+Detection mechanism (full chain - default):
   Stage 0   GET /login/?login_only=1   passive fingerprint, no session
   Stage 1   POST /login/?login_only=1  mint preauth cookie
   Stage 2   GET / + Authorization Basic CRLF payload + ob-stripped cookie
   Stage 3   GET /scripts2/listaccts    cookie only, propagate raw→cache
   Stage 4   GET /cpsess.../json-api/version  → 200=VULN, 5xx+License=VULN, 401/403=SAFE
-  Stage 5   GET /cpsess.../logout + GET /logout — best-effort invalidate
+  Stage 5   GET /cpsess.../logout + GET /logout - best-effort invalidate
 ```
 
 </details>
 
-### `sessionscribe-ioc-scan.sh` — on-host IOC ladder
+### `sessionscribe-ioc-scan.sh` - on-host IOC ladder
 
 ```bash
 curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash
@@ -475,7 +475,7 @@ bash sessionscribe-ioc-scan.sh --jsonl --quiet > host.jsonl
 # CSV summary for fleet roll-up
 bash sessionscribe-ioc-scan.sh --csv --quiet > host.csv
 
-# host IOCs only — periodic post-patch sweep, last 7 days
+# host IOCs only - periodic post-patch sweep, last 7 days
 bash sessionscribe-ioc-scan.sh --ioc-only --since 7
 
 # auto-chain into forensic on dirty hosts (shared run_id)
@@ -493,13 +493,13 @@ bash sessionscribe-ioc-scan.sh \
 
 | Check | What it does |
 |---|---|
-| `version` | `cpanel -V` vs the published patched-build list — drives `code_verdict` |
+| `version` | `cpanel -V` vs the published patched-build list - drives `code_verdict` |
 | `static-pattern` | Greps `Cpanel/Session/*.pm` for post-patch sentinel patterns (`no-ob:` decode branch) |
 | `cpsrvd-fingerprint` | cpsrvd binary inspection against patched-build signatures |
 | `access-log` | Apache + cpsrvd logs for exploitation traffic shapes (`--no-logs` to skip) |
 | `session-store` | `/var/cpanel/sessions/raw/` walk: vendor IOCs + 4-way co-occurrence + forged-timestamp heuristic (`--no-sessions` to skip) |
 | `destruction` | Patterns A–G probes: `/root/sshd` encryptor, mysql-wipe, BTC index, `nuclear.x86`, `sptadm` reseller, `__S_MARK__` harvester, suspect SSH keys (`--no-destruction-iocs` to skip) |
-| `probe` (opt-in) | Single marker GET to `127.0.0.1:2087` — confirms cpsrvd is responsive. Does **not** attempt the bypass |
+| `probe` (opt-in) | Single marker GET to `127.0.0.1:2087` - confirms cpsrvd is responsive. Does **not** attempt the bypass |
 
 Two verdict axes report independently. **`code_verdict`** (`PATCHED` /
 `VULNERABLE` / `INCONCLUSIVE`) comes from version, Perl source patterns,
@@ -602,7 +602,7 @@ Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
 
 </details>
 
-### `sessionscribe-forensic.sh` — kill-chain reconstruction + evidence bundle
+### `sessionscribe-forensic.sh` - kill-chain reconstruction + evidence bundle
 
 ```bash
 curl -fsSL https://sh.rfxn.com/sessionscribe-forensic.sh | bash
@@ -611,7 +611,7 @@ curl -fsSL https://sh.rfxn.com/sessionscribe-forensic.sh | bash
 **Common patterns:**
 
 ```bash
-# default — sectioned report on stderr + JSONL on stdout + bundle capture
+# default - sectioned report on stderr + JSONL on stdout + bundle capture
 bash sessionscribe-forensic.sh
 
 # JSONL only (SIEM ingest)
@@ -623,7 +623,7 @@ SESSIONSCRIBE_RUN_ID=$(date +%s)-$$ \
 SESSIONSCRIBE_RUN_ID=$(date +%s)-$$ \
     bash sessionscribe-forensic.sh --jsonl > forensic.jsonl
 
-# Pattern A host — skip bundle (don't stat encryptor + don't bundle /root)
+# Pattern A host - skip bundle (don't stat encryptor + don't bundle /root)
 bash sessionscribe-forensic.sh --no-bundle --jsonl
 
 # narrow IR window (default 90 days)
@@ -635,7 +635,7 @@ mkdir -p /tmp/cp-archive && \
     tar -C /tmp/cp-archive -xzf /usr/local/cpanel/logs/archive/2026-02.tar.gz
 bash sessionscribe-forensic.sh --extra-logs /tmp/cp-archive
 
-# fleet — recommended: --no-bundle to avoid 20k tarballs; bundle on exit-2 hosts
+# fleet - recommended: --no-bundle to avoid 20k tarballs; bundle on exit-2 hosts
 ansible -i hosts all -m script -a 'sessionscribe-forensic.sh --jsonl --no-bundle'
 
 # submit bundle to R-fx forensic intake (opt-in)
@@ -648,7 +648,7 @@ RFXN_INTAKE_TOKEN=<hex-token> bash sessionscribe-forensic.sh --upload
 
 Where `sessionscribe-ioc-scan.sh` answers *"is this host compromised?"*,
 `sessionscribe-forensic.sh` answers *"when was each indicator first
-present, and was the relevant defense in place at that time?"* — the
+present, and was the relevant defense in place at that time?"* - the
 read-only kill-chain reconstruction tool for the IC-5790 cohort.
 
 | Phase | What it does |
@@ -667,7 +667,7 @@ Exit codes: `0` = no IOCs found, `1` = IOCs found and all post-defense,
 is recorded as an `upload fail` signal in the JSONL stream.
 
 **Bundle privacy.** Customer-domain web access logs (`domlogs`) are
-**not** bundled — only control-plane logs (cpsrvd, global Apache) and
+**not** bundled - only control-plane logs (cpsrvd, global Apache) and
 system auth logs. `/etc/shadow` is **not** bundled (no Pattern depends
 on hash material); `/etc/sudoers` + `/etc/sudoers.d/` are bundled
 instead, to catch attacker-planted `NOPASSWD:ALL` rules.
@@ -699,7 +699,7 @@ Typical bundle on a busy cPanel host with the 90-day window: ~250 MB –
 candidates individually so the rest of the bundle still lands.
 
 **Bundle upload (`--upload`, opt-in).** Submits the bundle as a single
-PUT to `https://intake.rfxn.com/`. Server is upload-only — no GET/HEAD,
+PUT to `https://intake.rfxn.com/`. Server is upload-only - no GET/HEAD,
 no retrieval, no directory listing. On 201 returns JSON with stored
 filename, sha256, and remaining uses.
 
@@ -778,7 +778,7 @@ EXIT CODES
 
 </details>
 
-### `sessionscribe-revsnap.sh` — RE snapshot collector
+### `sessionscribe-revsnap.sh` - RE snapshot collector
 
 ```bash
 curl -fsSL https://sh.rfxn.com/sessionscribe-revsnap.sh | bash
@@ -790,7 +790,7 @@ curl -fsSL https://sh.rfxn.com/sessionscribe-revsnap.sh | bash
 # capture current tier (writes to /var/cpanel/sessionscribe-revsnap/)
 bash sessionscribe-revsnap.sh
 
-# upgrade and capture next tier — RE diff workflow
+# upgrade and capture next tier - RE diff workflow
 /scripts/upcp --force
 bash sessionscribe-revsnap.sh
 
@@ -855,7 +855,7 @@ pdsh -w cpanel-fleet 'bash -s -- --jsonl --quiet' < sessionscribe-mitigate.sh \
     | jq -c 'select(.severity != "info")' \
     > fleet-mitigate.jsonl
 
-# remote probe sweep — exit 2 on any VULN
+# remote probe sweep - exit 2 on any VULN
 bash sessionscribe-remote-probe.sh --csv --quiet \
     $(awk '{print "--target "$1}' fleet.txt) > fleet-probe.csv
 echo "any_vuln=$?"
@@ -869,7 +869,7 @@ done | jq -c '.' > fleet-ioc.jsonl
 ansible -i hosts cpanel -m script -a 'sessionscribe-mitigate.sh --csv --quiet' \
     > fleet-mitigate.csv
 
-# kill-chain reconciliation across fleet — --no-bundle on the broad sweep,
+# kill-chain reconciliation across fleet - --no-bundle on the broad sweep,
 # then collect bundles only on the high-attention hosts that exit 2
 ansible -i hosts cpanel -m script \
     -a 'sessionscribe-forensic.sh --jsonl --no-bundle' > fleet-forensic.jsonl
@@ -1010,7 +1010,7 @@ of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-202
 
 > [!TIP]
 > **Found a bug, missed IOC, false positive, or have ops feedback?**
-> [Open a GitHub issue](https://github.com/rfxn/cpanel-sessionscribe/issues/new) —
+> [Open a GitHub issue](https://github.com/rfxn/cpanel-sessionscribe/issues/new) -
 > bug reports, IOC variants seen in the wild, detection misses on
 > patched/unpatched hosts, ModSec rule false positives, and general
 > operator feedback are all welcome.
@@ -1036,4 +1036,4 @@ GPL v2. See individual file headers.
 
 ---
 
-*Forged during the SessionScribe incident response — Ryan MacDonald, R-fx Networks.*
+*Forged during the SessionScribe incident response - Ryan MacDonald, R-fx Networks.*
