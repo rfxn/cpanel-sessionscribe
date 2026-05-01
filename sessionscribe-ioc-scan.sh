@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.2
+# sessionscribe-ioc-scan.sh v1.5.3
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.2"
+VERSION="1.5.3"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -991,10 +991,13 @@ check_attacker_ips() {
         excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
     fi
 
-    # Single-pass streaming scan. Newline after $( so bash 4.1 (CL6) does
-    # not choke parsing $({ at the start of command substitution - a known
-    # parser quirk in pre-4.4 bash that breaks the case-arm tokenization
-    # several lines later.
+    # Single-pass streaming scan. Two bash 4.1 (CL6) workarounds:
+    #   1) Newline after $( - bash <4.4 chokes parsing $({ at the start
+    #      of command substitution.
+    #   2) Leading-paren case patterns ((*.gz) not *.gz) - bash <4.4
+    #      miscounts the closing ) of a case arm inside $(...) and aborts
+    #      with "syntax error near unexpected token ;;". The leading (
+    #      makes the arm unambiguous to the parser.
     local result
     result=$(
         {
@@ -1002,9 +1005,9 @@ check_attacker_ips() {
             for f in "$logdir"/access_log-*; do
                 [[ -f "$f" ]] || continue
                 case "$f" in
-                    *.gz) zcat "$f" 2>/dev/null ;;
-                    *.xz) xzcat "$f" 2>/dev/null ;;
-                    *)    cat "$f" ;;
+                    (*.gz) zcat "$f" 2>/dev/null ;;
+                    (*.xz) xzcat "$f" 2>/dev/null ;;
+                    (*)    cat "$f" ;;
                 esac
             done
         } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" EXCLUDES="$excludes_env" awk '
