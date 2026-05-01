@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.4.1
+# sessionscribe-ioc-scan.sh v1.4.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -2045,27 +2045,53 @@ syslog_emit() {
 ###############################################################################
 
 # Mirror sessionscribe-mitigate.sh's source-candidate convention.
+# Order: raw GitHub first (canonical, always-current); sh.rfxn.com as
+# a CDN-mirror fallback (occasionally returns 200+empty during sync,
+# which we detect via the shebang sanity-check below). Adding both
+# means a transient empty body or TLS hiccup on either origin doesn't
+# kill the chain.
 FORENSIC_SRC_CANDIDATES=(
     "https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh"
+    "https://sh.rfxn.com/sessionscribe-forensic.sh"
 )
 
+# Last-attempt diagnostic state. Populated by fetch_forensic_remote on
+# failure so the warning emit can include the curl exit codes + URLs we
+# tried. Cleared on success.
+FORENSIC_FETCH_DIAG=""
+
 # Fetch the forensic script from one of the canonical URLs into a tempfile.
-# Echoes the path on success; returns non-zero on failure.
+# Echoes "<path>\t<url>" on success; returns non-zero on failure and sets
+# FORENSIC_FETCH_DIAG with a per-URL "<url>:<rc>:<reason>" trace.
 fetch_forensic_remote() {
-    command -v curl >/dev/null 2>&1 || return 1
-    local dest; dest=$(mktemp /tmp/sessionscribe-forensic.XXXXXX.sh) || return 1
+    FORENSIC_FETCH_DIAG=""
+    if ! command -v curl >/dev/null 2>&1; then
+        FORENSIC_FETCH_DIAG="curl_missing"
+        return 1
+    fi
+    local dest; dest=$(mktemp /tmp/sessionscribe-forensic.XXXXXX.sh) || {
+        FORENSIC_FETCH_DIAG="mktemp_failed"; return 1
+    }
     chmod 0700 "$dest" 2>/dev/null
-    local url
+    local url rc diag=""
     for url in "${FORENSIC_SRC_CANDIDATES[@]}"; do
-        if curl -fsSL --max-time 30 -o "$dest" "$url" 2>/dev/null; then
-            # Sanity-check: must be a bash script. Reject HTML/empty bodies.
+        rc=0
+        curl -fsSL --max-time 30 -o "$dest" "$url" 2>/dev/null || rc=$?
+        if (( rc == 0 )); then
+            # Sanity-check: must be a bash script. Reject HTML/empty bodies
+            # (sh.rfxn.com served HTTP 200 + 0 bytes during a CDN sync window).
             if head -1 "$dest" 2>/dev/null | grep -qE '^#!/(usr/bin/env[[:space:]]+)?bash'; then
                 printf '%s\t%s' "$dest" "$url"
                 return 0
+            else
+                diag+="$url:200:bad_shebang_or_empty;"
             fi
+        else
+            diag+="$url:curl_rc=$rc;"
         fi
     done
     rm -f "$dest"
+    FORENSIC_FETCH_DIAG="$diag"
     return 1
 }
 
@@ -2099,8 +2125,10 @@ chain_forensic_dispatch() {
         fi
     fi
     if [[ -z "$forensic_path" ]]; then
+        local diag="${FORENSIC_FETCH_DIAG:-no_attempt}"
         emit "chain" "forensic_locate" "warning" "chain_forensic_not_found" 0 \
-             "note" "sessionscribe-forensic.sh not found locally and remote fetch failed; skipping chain."
+             "note" "sessionscribe-forensic.sh not found locally and remote fetch failed; skipping chain. Diagnostic: $diag" \
+             "diag" "$diag"
         return 0
     fi
     local args=(--quiet --no-color)
