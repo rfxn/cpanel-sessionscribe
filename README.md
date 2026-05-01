@@ -34,7 +34,7 @@ scanner, and the patch-diff snapshot collector behind the
 
 ```bash
 # audit a single host (read-only)
-curl -fsSLO https://sh.rfxn.com/sessionscribe-mitigate.sh
+curl -fsSLO https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh
 bash sessionscribe-mitigate.sh
 
 # full remediation
@@ -76,8 +76,9 @@ Six artifacts in the kit. Click a name to jump to its quickstart + reference.
 - **[`sessionscribe-forensic.sh`](#sessionscribe-forensicsh---kill-chain-reconstruction--evidence-bundle)** - kill-chain reconstruction + evidence bundle *(on the cPanel host)*
 - **[`sessionscribe-revsnap.sh`](#sessionscribe-revsnapsh---re-snapshot-collector)** - per-tier RE snapshot collector *(on the cPanel host, around `upcp`)*
 
-All hosted at [`sh.rfxn.com`](https://sh.rfxn.com/) for `curl`-ready
-deployment. GPL v2.
+All artifacts live in this repo on
+[GitHub](https://github.com/rfxn/cpanel-sessionscribe) and are
+`curl`-ready via the raw URLs shown in each section's quickstart. GPL v2.
 
 ---
 
@@ -132,7 +133,7 @@ artifact. `sessionscribe-remote-probe.sh` runs this chain non-destructively
 Sixty-second smoke check on any Linux host (no cPanel required):
 
 ```bash
-curl -fsSLO https://sh.rfxn.com/sessionscribe-mitigate.sh
+curl -fsSLO https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh
 bash sessionscribe-mitigate.sh --list-phases    # surface the phase API
 bash sessionscribe-mitigate.sh --check          # safe read-only audit
 echo "exit=$?"                                  # 0 on a non-cPanel host
@@ -204,7 +205,7 @@ adjacent identity-injection issue - is in the
 ### `sessionscribe-mitigate.sh` - mitigation orchestrator
 
 ```bash
-curl -fsSL https://sh.rfxn.com/sessionscribe-mitigate.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash
 ```
 
 **Common patterns:**
@@ -305,7 +306,7 @@ EXIT CODES
 ### `modsec-sessionscribe.conf` - ModSecurity rule pack
 
 ```bash
-curl -fsSL https://sh.rfxn.com/modsec-sessionscribe.conf | sudo tee /etc/apache2/conf.d/modsec/modsec2.user.conf >/dev/null
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/modsec-sessionscribe.conf | sudo tee /etc/apache2/conf.d/modsec/modsec2.user.conf >/dev/null
 sudo apachectl -t && sudo /usr/local/cpanel/scripts/restartsrv_httpd
 ```
 
@@ -313,11 +314,11 @@ sudo apachectl -t && sudo /usr/local/cpanel/scripts/restartsrv_httpd
 
 ```bash
 # fresh install - modsec2.user.conf is empty by default, replace it
-curl -fsSL https://sh.rfxn.com/modsec-sessionscribe.conf \
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/modsec-sessionscribe.conf \
     | sudo tee /etc/apache2/conf.d/modsec/modsec2.user.conf >/dev/null
 
 # append to an existing user.conf instead of replacing
-curl -fsSL https://sh.rfxn.com/modsec-sessionscribe.conf -o /tmp/ss.conf
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/modsec-sessionscribe.conf -o /tmp/ss.conf
 sed -n '/^# === RULES ===/,$p' /tmp/ss.conf \
     | sudo tee -a /etc/apache2/conf.d/modsec/modsec2.user.conf
 
@@ -358,7 +359,7 @@ before deploying.
 ### `sessionscribe-remote-probe.sh` - non-destructive verdict per host
 
 ```bash
-curl -fsSL https://sh.rfxn.com/sessionscribe-remote-probe.sh | bash -s -- --target 1.2.3.4
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh | bash -s -- --target 1.2.3.4
 ```
 
 **Common patterns:**
@@ -460,7 +461,7 @@ Detection mechanism (full chain - default):
 ### `sessionscribe-ioc-scan.sh` - on-host IOC ladder
 
 ```bash
-curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash
 ```
 
 **Common patterns:**
@@ -586,10 +587,9 @@ Forensic chaining:
                              --since/--no-color/--quiet inherited and a
                              shared RUN_ID. Resolution order: (1) sibling
                              of this script, (2) PATH, (3) GitHub raw
-                             (rfxn/cpanel-sessionscribe@main), (4) CDN
-                             (sh.rfxn.com). Forensic exit code is
-                             reported as a chain.forensic_exit signal
-                             but does not override this script's
+                             (rfxn/cpanel-sessionscribe@main). Forensic
+                             exit code is reported as a chain.forensic_exit
+                             signal but does not override this script's
                              exit code.
 
 Misc:
@@ -605,7 +605,7 @@ Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
 ### `sessionscribe-forensic.sh` - kill-chain reconstruction + evidence bundle
 
 ```bash
-curl -fsSL https://sh.rfxn.com/sessionscribe-forensic.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh | bash
 ```
 
 **Common patterns:**
@@ -781,7 +781,7 @@ EXIT CODES
 ### `sessionscribe-revsnap.sh` - RE snapshot collector
 
 ```bash
-curl -fsSL https://sh.rfxn.com/sessionscribe-revsnap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-revsnap.sh | bash
 ```
 
 **Common patterns:**
@@ -1028,7 +1028,7 @@ of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-202
 - **Vendor advisory:** [cPanel KB 40073787579671](https://support.cpanel.net/hc/en-us/articles/40073787579671)
 - **Researcher writeup:** [watchTowr Labs](https://labs.watchtowr.com/)
 - **Public PoC:** [watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py](https://github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py)
-- **Hosted scripts:** [sh.rfxn.com](https://sh.rfxn.com/)
+- **Source:** [github.com/rfxn/cpanel-sessionscribe](https://github.com/rfxn/cpanel-sessionscribe)
 
 ## License
 

@@ -472,13 +472,13 @@ emit_signal() {
 # Sectioned report helpers.
 hdr()       { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
 # Output severity tags (color + label both telegraph meaning).
-#   [OK]        green   — clean / nothing wrong
-#   [INFO]      dim     — neutral information
-#   [WARN]      yellow  — anomaly worth attention but not a compromise
-#   [FAIL]      red     — tool error / inability to run a check
-#   [DEF-OK]    green   — defense layer is active (good)
-#   [DEF-MISS]  yellow  — defense layer is absent (this host is exposed)
-#   [IOC]       red     — indicator of compromise found (BAD - investigate)
+#   [OK]        green   - clean / nothing wrong
+#   [INFO]      dim     - neutral information
+#   [WARN]      yellow  - anomaly worth attention but not a compromise
+#   [FAIL]      red     - tool error / inability to run a check
+#   [DEF-OK]    green   - defense layer is active (good)
+#   [DEF-MISS]  yellow  - defense layer is absent (this host is exposed)
+#   [IOC]       red     - indicator of compromise found (BAD - investigate)
 say_pass()      { (( QUIET )) || printf '  %s[OK]%s %s\n'        "$C_GRN" "$C_NC" "$*" >&2; }
 say_info()      { (( QUIET )) || printf '  %s[INFO]%s %s\n'      "$C_DIM" "$C_NC" "$*" >&2; }
 say_warn()      { (( QUIET )) || printf '  %s[WARN]%s %s\n'      "$C_YEL" "$C_NC" "$*" >&2; }

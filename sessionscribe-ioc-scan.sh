@@ -337,10 +337,9 @@ Forensic chaining:
                              --since/--no-color/--quiet inherited and a
                              shared RUN_ID. Resolution order: (1) sibling
                              of this script, (2) PATH, (3) GitHub raw
-                             (rfxn/cpanel-sessionscribe@main), (4) CDN
-                             (sh.rfxn.com). Forensic exit code is
-                             reported as a chain.forensic_exit signal
-                             but does not override this script's
+                             (rfxn/cpanel-sessionscribe@main). Forensic
+                             exit code is reported as a chain.forensic_exit
+                             signal but does not override this script's
                              exit code.
 
 Misc:
@@ -2019,8 +2018,7 @@ syslog_emit() {
 # resolution pattern):
 #   1. Sibling of this script on disk
 #   2. sessionscribe-forensic.sh on PATH
-#   3. https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/...
-#   4. https://sh.rfxn.com/sessionscribe-forensic.sh (CDN fallback)
+#   3. https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh
 #
 # Remote fetches land in a mktemp file under /tmp with chmod 0700 so the
 # operator can re-use it without re-fetching. We do NOT verify a shasum
@@ -2036,7 +2034,6 @@ syslog_emit() {
 # Mirror sessionscribe-mitigate.sh's source-candidate convention.
 FORENSIC_SRC_CANDIDATES=(
     "https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh"
-    "https://sh.rfxn.com/sessionscribe-forensic.sh"
 )
 
 # Fetch the forensic script from one of the canonical URLs into a tempfile.

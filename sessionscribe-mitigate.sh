@@ -124,10 +124,9 @@ REQUIRED_MODSEC_IDS=(1500030 1500031)
 # Adjacent (WhmScribe-A) WHM-token rule IDs - informational, not required for CVE.
 INFORMATIONAL_MODSEC_IDS=(1500010 1500020 1500021)
 
-# Source candidates for the modsec config (in order).
+# Source candidate for the modsec config.
 MODSEC_SRC_CANDIDATES=(
   "https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/modsec-sessionscribe.conf"
-  "https://sh.rfxn.com/modsec-sessionscribe.conf"
 )
 
 # Backup root for any mutating action.
@@ -1288,7 +1287,7 @@ phase_probe() {
         probe_bin=$(mktemp /tmp/sessionscribe-probe.XXXXXX)
         curl -fsSL --max-time 15 \
              -o "$probe_bin" \
-             https://sh.rfxn.com/sessionscribe-remote-probe.sh \
+             https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh \
              2>/dev/null && [[ -s "$probe_bin" ]] || probe_bin=""
     fi
     if [[ -z "$probe_bin" ]]; then
