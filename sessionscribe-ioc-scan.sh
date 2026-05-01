@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.4.2
+# sessionscribe-ioc-scan.sh v1.5.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.4.2"
+VERSION="1.5.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -890,8 +890,28 @@ check_logs() {
 # after.
 check_attacker_ips() {
     local logdir="$1"
-    local atmp; atmp=$(mktemp /tmp/ssioc.aip.XXXXXX)
-    {
+
+    # Build IP alternation. Escape dots so 1.2.3.4 only matches that literal.
+    local ip ip_re=""
+    for ip in "${ATTACKER_IPS[@]}"; do
+        ip_re+="${ip_re:+|}${ip//./\\.}"
+    done
+    # Anchored to "^IP " so we don't match an IP buried inside a URL/UA.
+    ip_re="^(${ip_re}) "
+
+    # Single-pass streaming scan: filter+count+sample in one awk over the
+    # concatenated logs. Previous implementation wrote ALL logs to a /tmp
+    # file (often multi-GB on busy hosts) then ran TWO passes over it
+    # (grep -c + awk). New version streams once - halves IO and eliminates
+    # the /tmp footprint.
+    #
+    # Regexes pass via the environment: `awk -v ip_re='...'` would
+    # interpret `\.` as the escape sequence "." (any char) AND emit a
+    # per-line `warning: escape sequence \. treated as plain .` - a real
+    # correctness + noise bug. ENVIRON[] delivers the variable byte-for-
+    # byte without escape processing.
+    local result
+    result=$({
         [[ -f "$logdir/access_log" ]] && cat "$logdir/access_log"
         for f in "$logdir"/access_log-*; do
             [[ -f "$f" ]] || continue
@@ -901,50 +921,39 @@ check_attacker_ips() {
                 *)    cat "$f" ;;
             esac
         done
-    } > "$atmp" 2>/dev/null
-    # Build IP alternation. Escape dots so 1.2.3.4 only matches that literal.
-    local ip ip_re=""
-    for ip in "${ATTACKER_IPS[@]}"; do
-        ip_re+="${ip_re:+|}${ip//./\\.}"
-    done
-    # Anchored to "^IP " so we don't match an IP buried inside a URL/UA.
-    ip_re="^(${ip_re}) "
-    # Build exclude-IP filter (post-grep awk so we don't have to recompile
-    # the alternation when EXCLUDE_IPS is empty).
-    local total_hits unique_attackers
-    total_hits=$(grep -cE "$ip_re" "$atmp" 2>/dev/null)
-    total_hits="${total_hits:-0}"
-    if (( total_hits == 0 )); then
-        rm -f "$atmp"
-        return
-    fi
-    # Apply probe-UA exclusion + EXCLUDE_IPS filter via awk. The awk match
-    # against ip_re replaces the second grep -c so we walk the file once.
-    local filtered_count
-    filtered_count=$(awk -v probe_re="$PROBE_UA_RE" \
-                         -v ip_re="$ip_re" \
-                         -v excludes="$(printf '%s\n' "${EXCLUDE_IPS[@]:-}")" '
+    } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" \
+        EXCLUDES="$(printf '%s\n' "${EXCLUDE_IPS[@]:-}")" \
+        awk '
         BEGIN {
-            n = split(excludes, ex_arr, "\n")
+            ip_re    = ENVIRON["IP_RE"]
+            probe_re = ENVIRON["PROBE_RE"]
+            n = split(ENVIRON["EXCLUDES"], ex_arr, "\n")
             for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
             count = 0
+            sample = ""
         }
-        $0 ~ probe_re      { next }
-        $0 !~ ip_re        { next }
-        { if (!($1 in ex)) count++ }
-        END { print count + 0 }
-    ' "$atmp")
+        $0 !~ ip_re   { next }
+        $0 ~ probe_re { next }
+        $1 in ex      { next }
+        {
+            count++
+            if (sample == "") sample = $0
+        }
+        END {
+            print count
+            print sample
+        }')
+
+    local filtered_count="${result%%$'\n'*}"
+    local sample="${result#*$'\n'}"
     filtered_count="${filtered_count:-0}"
+
     if (( filtered_count > 0 )); then
-        local sample
-        sample=$(grep -E "$ip_re" "$atmp" 2>/dev/null \
-                    | grep -vE "$PROBE_UA_RE" | head -1)
         emit "logs" "ioc_attacker_ip" "strong" \
              "ioc_attacker_ip_in_access_log" 8 \
              "count" "$filtered_count" "sample" "${sample:0:200}" \
              "note" "$filtered_count access_log hit(s) from IC-5790 attacker IPs (CRITICAL)."
     fi
-    rm -f "$atmp"
 }
 
 # ---- session-store analyzer ----------------------------------------------
@@ -952,6 +961,31 @@ check_attacker_ips() {
 # CVE-2026-41940-relevant attribute shape. One subprocess per file replaces
 # 6+ greps; the awk reads the file once and emits structured key=value pairs
 # the bash side parses with a single read loop.
+# Wrapper around emit() that always includes the four identity / provenance
+# KPIs from the most recent analyze_session() call. Use this for EVERY
+# session-IOC emit so fleet aggregators see {user, src_ip, login_time,
+# file_mtime} on every record without having to re-grep the session file.
+#
+#   user         cPanel/WHM account (user= or whm_user=, first occurrence)
+#   src_ip       peer IP (address= or remote_addr=, first occurrence)
+#   login_time   login_time= as ISO-8601 UTC (CAN be forged via injection;
+#                compare against file_mtime to detect)
+#   file_mtime   session file mtime as ISO-8601 UTC (NOT forgeable in
+#                this exploit class - reflects actual cpsrvd write)
+#
+# Args identical to emit() minus the area (always "sessions"):
+#   emit_session <key> <severity> <signal> <weight> [k v ...]
+emit_session() {
+    local key="$1" sev="$2" sig="$3" weight="$4"
+    shift 4
+    emit "sessions" "$key" "$sev" "$sig" "$weight" \
+        "user"       "${SF_USER:-}" \
+        "src_ip"     "${SF_REMOTE_ADDR:-}" \
+        "login_time" "${SF_LOGIN_ISO:-}" \
+        "file_mtime" "${SF_FILE_MTIME_ISO:-}" \
+        "$@"
+}
+
 analyze_session() {
     SF_TOKEN_DENIED=0; SF_CP_TOKEN=0; SF_BADPASS=0; SF_LEGIT_LOGIN=0
     SF_EXT_AUTH=0;     SF_INT_AUTH=0; SF_TFA=0;     SF_HASROOT=0
@@ -959,6 +993,30 @@ analyze_session() {
     SF_MALFORMED=0;    SF_MALFORMED_SAMPLE=""
     SF_PASS_COUNT=0;   SF_PASS_LEN=0
     SF_TD_VAL="";      SF_CP_VAL="";   SF_ORIGIN="";  SF_AUTH_TS=""
+    # Identity + provenance KPIs - always populated when present in the
+    # session file. These travel with EVERY ioc_* emit so fleet aggregators
+    # can answer "which user / which source IP / when" without having to
+    # re-grep the session file.
+    #   SF_USER         user= (cPanel account) or whm_user= (WHM account)
+    #   SF_REMOTE_ADDR  address= (peer IP) or remote_addr= (legacy)
+    #   SF_LOGIN_TIME   login_time= epoch (when cpsrvd recorded the login)
+    #   SF_LOGIN_ISO    login_time formatted as ISO-8601 UTC (operator-friendly)
+    #   SF_FILE_MTIME   file mtime epoch (last write to disk)
+    #   SF_FILE_MTIME_ISO   file mtime as ISO-8601 UTC
+    SF_USER="";        SF_REMOTE_ADDR=""
+    SF_LOGIN_TIME="";  SF_LOGIN_ISO=""
+    SF_FILE_MTIME="";  SF_FILE_MTIME_ISO=""
+
+    # Capture file mtime BEFORE reading the file content (stat is read-only
+    # so atime is unaffected, but pull both file timestamps now so they're
+    # available for every emit downstream).
+    local _sf_path="$1"
+    if [[ -e "$_sf_path" ]]; then
+        SF_FILE_MTIME=$(stat -c %Y "$_sf_path" 2>/dev/null)
+        if [[ -n "$SF_FILE_MTIME" ]]; then
+            SF_FILE_MTIME_ISO=$(date -u -d "@$SF_FILE_MTIME" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+        fi
+    fi
 
     local _k _v
     while IFS='=' read -r _k _v; do
@@ -983,6 +1041,9 @@ analyze_session() {
             malformed_sample) SF_MALFORMED_SAMPLE=$_v ;;
             root_user)       SF_ROOT_USER=$_v ;;
             acllist)         SF_ACLLIST=$_v ;;
+            user_val)        SF_USER=$_v ;;
+            remote_addr_val) SF_REMOTE_ADDR=$_v ;;
+            login_time_val)  SF_LOGIN_TIME=$_v ;;
         esac
     done < <(awk -v canary_re="$PROBE_CANARY_PAT" '
         BEGIN { line_idx=0; pass_at=0; pass_count=0 }
@@ -1017,12 +1078,35 @@ analyze_session() {
         }
         /^(user|whm_user|user_id|cp_security_token_user)=root[[:space:]]*$/ { root_user=1 }
         /^(acllist|acl_list)=/  { has_acllist=1 }
+
+        # Identity / provenance fields. Capture the FIRST occurrence of each
+        # so injected duplicates do not overwrite the legitimate value (CRLF
+        # injection commonly stamps a second user= line; the first is the
+        # original / un-tampered one).
+        /^(user|whm_user)=/ {
+            if (user_val == "") {
+                user_val=substr($0,index($0,"=")+1)
+            }
+        }
+        /^(address|remote_addr)=/ {
+            if (remote_addr_val == "") {
+                remote_addr_val=substr($0,index($0,"=")+1)
+            }
+        }
+        /^login_time=/ {
+            if (login_time_val == "") {
+                login_time_val=substr($0,index($0,"=")+1)
+            }
+        }
+
         END {
             # neutralize stray CR/LF/TAB in values so they cannot break the
             # bash key=value parser downstream.
             gsub(/[\r\n\t]/, " ", td_val); gsub(/[\r\n\t]/, " ", cp_val)
             gsub(/[\r\n\t]/, " ", origin); gsub(/[\r\n\t]/, " ", auth_ts)
             gsub(/[\r\n\t]/, " ", malformed_sample)
+            gsub(/[\r\n\t]/, " ", user_val); gsub(/[\r\n\t]/, " ", remote_addr_val)
+            gsub(/[\r\n\t]/, " ", login_time_val)
             print "token_denied=" (has_td?1:0)
             print "td_val=" td_val
             print "cp_token=" (has_cp?1:0)
@@ -1043,8 +1127,19 @@ analyze_session() {
             print "malformed_sample=" malformed_sample
             print "root_user=" (root_user?1:0)
             print "acllist=" (has_acllist?1:0)
+            print "user_val=" user_val
+            print "remote_addr_val=" remote_addr_val
+            print "login_time_val=" login_time_val
         }
     ' "$1" 2>/dev/null)
+
+    # Convert login_time epoch to ISO-8601 if numeric. Implausible values
+    # (forged-future timestamps like 9999999999) still convert cleanly via
+    # date(1) and the consumer can compare against file mtime to detect
+    # the forgery shape.
+    if [[ "$SF_LOGIN_TIME" =~ ^[0-9]+$ ]]; then
+        SF_LOGIN_ISO=$(date -u -d "@$SF_LOGIN_TIME" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    fi
 }
 
 # ---- access_log token-use cross-ref --------------------------------------
@@ -1067,7 +1162,7 @@ check_token_used() {
     hit=$(grep -aF -- "$token_val" "$log" 2>/dev/null \
             | grep -E '" 2[0-9][0-9] ' | head -1)
     [[ -z "$hit" ]] && return 1
-    emit "sessions" "ioc_token_used_$session_name" "strong" \
+    emit_session "ioc_token_used_$session_name" "strong" \
          "ioc_injected_token_used_with_2xx" 10 \
          "path" "$session_path" "cp_security_token" "$token_val" \
          "access_log_line" "${hit:0:200}" \
@@ -1126,13 +1221,13 @@ check_sessions() {
             # bookmark - downgrade to warning.
             if (( SF_TOKEN_DENIED && SF_CP_TOKEN )); then
                 if (( SF_BADPASS )); then
-                    emit "sessions" "ioc_token_inject_$session_name" "strong" \
+                    emit_session "ioc_token_inject_$session_name" "strong" \
                          "ioc_token_denied_with_badpass_origin" 10 \
                          "path" "$f" "cp_security_token" "$SF_CP_VAL" \
                          "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
                          "note" "Pre-auth session with attacker-injected security token (CRITICAL)."
                 else
-                    emit "sessions" "ioc_token_review_$session_name" "warning" \
+                    emit_session "ioc_token_review_$session_name" "warning" \
                          "ioc_token_denied_with_cp_security_token" 0 \
                          "path" "$f" "cp_security_token" "$SF_CP_VAL" \
                          "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
@@ -1150,7 +1245,7 @@ check_sessions() {
                 local _which="external"
                 (( SF_INT_AUTH && ! SF_EXT_AUTH )) && _which="internal"
                 (( SF_EXT_AUTH && SF_INT_AUTH ))   && _which="external+internal"
-                emit "sessions" "ioc_preauth_extauth_$session_name" "strong" \
+                emit_session "ioc_preauth_extauth_$session_name" "strong" \
                      "ioc_preauth_with_auth_attribute" 10 \
                      "path" "$f" "preauth_path" "$preauth_file" "marker" "$_which" \
                      "note" "Pre-auth session carries successful_${_which}_auth_with_timestamp - injected (CRITICAL)."
@@ -1165,7 +1260,7 @@ check_sessions() {
             # password is consumed as the literal first line before the CRLF.
             # Short pass + injected timestamp is the canonical primitive shape.
             if (( (SF_INT_AUTH || SF_EXT_AUTH) && SF_PASS_LEN > 0 && SF_PASS_LEN <= PASS_FORGERY_MAX_LEN )); then
-                emit "sessions" "ioc_short_pass_$session_name" "strong" \
+                emit_session "ioc_short_pass_$session_name" "strong" \
                      "ioc_short_pass_with_auth_timestamp" 10 \
                      "path" "$f" "pass_len" "$SF_PASS_LEN" "auth_ts" "$SF_AUTH_TS" \
                      "note" "pass= length ${SF_PASS_LEN} (cleartext shape) co-occurs with successful_*_auth_with_timestamp - CVE-2026-41940 forgery primitive (CRITICAL)."
@@ -1176,7 +1271,7 @@ check_sessions() {
             # a stranded continuation line right after pass=. Catches sloppy
             # CRLF injection where the encoder write left detritus.
             if (( SF_PASS_COUNT > 1 || SF_STRANDED )); then
-                emit "sessions" "ioc_multiline_pass_$session_name" "strong" \
+                emit_session "ioc_multiline_pass_$session_name" "strong" \
                      "ioc_multiline_pass_value" 10 \
                      "path" "$f" "pass_count" "$SF_PASS_COUNT" "stranded" "$SF_STRANDED" \
                      "note" "Multi-line pass= structure (duplicate or stranded continuation) - CRLF injection artifact (CRITICAL)."
@@ -1195,7 +1290,7 @@ check_sessions() {
                 (( SF_INT_AUTH )) && _markers+="${_markers:+,}int_auth_ts"
                 (( SF_HASROOT )) && _markers+="${_markers:+,}hasroot=1"
                 (( SF_TFA ))     && _markers+="${_markers:+,}tfa_verified=1"
-                emit "sessions" "ioc_badpass_authmarkers_$session_name" "strong" \
+                emit_session "ioc_badpass_authmarkers_$session_name" "strong" \
                      "ioc_badpass_with_auth_markers" 10 \
                      "path" "$f" "origin" "$SF_ORIGIN" "markers" "$_markers" \
                      "note" "method=badpass origin co-occurs with auth markers ($_markers) - badpass call site cannot set these legitimately (CRITICAL)."
@@ -1208,7 +1303,7 @@ check_sessions() {
             # zero-FP; emitted as a separate signal so the dedicated
             # ioc_cve_2026_41940_combo key remains in fleet aggregations.
             if (( SF_HASROOT && SF_TFA && (SF_INT_AUTH || SF_EXT_AUTH) && SF_BADPASS )); then
-                emit "sessions" "ioc_cve41940_$session_name" "strong" \
+                emit_session "ioc_cve41940_$session_name" "strong" \
                      "ioc_cve_2026_41940_combo" 10 \
                      "path" "$f" "origin" "$SF_ORIGIN" \
                      "note" "hasroot=1 + tfa_verified=1 + successful_*_auth_with_timestamp + method=badpass origin co-occur - CVE-2026-41940 forged session (CRITICAL)."
@@ -1225,7 +1320,7 @@ check_sessions() {
             # subset) so a session with only hasroot smuggled in still
             # surfaces.
             if (( SF_HASROOT )); then
-                emit "sessions" "ioc_hasroot_$session_name" "strong" \
+                emit_session "ioc_hasroot_$session_name" "strong" \
                      "ioc_hasroot_in_session" 10 \
                      "path" "$f" "origin" "$SF_ORIGIN" \
                      "note" "hasroot=1 present in session - not in cpsrvd _SESSION_PARTS whitelist; conclusive injection footprint (CRITICAL)."
@@ -1240,7 +1335,7 @@ check_sessions() {
             # form valid key=value pairs. Distinct from IOC-D (multiline
             # pass=) which is the specific pass-continuation subset.
             if (( SF_MALFORMED )); then
-                emit "sessions" "ioc_malformed_line_$session_name" "strong" \
+                emit_session "ioc_malformed_line_$session_name" "strong" \
                      "ioc_malformed_session_line" 10 \
                      "path" "$f" "sample" "${SF_MALFORMED_SAMPLE:0:80}" \
                      "note" "Session contains a non-blank line not matching key=value - injection footprint (CRITICAL)."
@@ -1264,7 +1359,7 @@ check_sessions() {
             # forgery marker.
             if (( now_epoch > 0 )) && [[ "$SF_AUTH_TS" =~ ^[0-9]+$ ]] \
                && (( SF_AUTH_TS > now_epoch + 31536000 )); then
-                emit "sessions" "ioc_forged_timestamp_$session_name" "strong" \
+                emit_session "ioc_forged_timestamp_$session_name" "strong" \
                      "ioc_forged_auth_timestamp" 10 \
                      "path" "$f" "timestamp" "$SF_AUTH_TS" \
                      "note" "successful_*_auth_with_timestamp=$SF_AUTH_TS is more than a year in the future - clear CVE-2026-41940 forgery (CRITICAL)."
@@ -1274,7 +1369,7 @@ check_sessions() {
             # IOC-G: tfa_verified=1 without a recognized login origin
             # (warning - may be a stale/migrated session, may be injection).
             if (( SF_TFA && ! SF_LEGIT_LOGIN )); then
-                emit "sessions" "ioc_tfa_$session_name" "warning" \
+                emit_session "ioc_tfa_$session_name" "warning" \
                      "ioc_tfa_verified_without_login_origin" 3 \
                      "path" "$f" "origin" "$SF_ORIGIN" \
                      "note" "tfa_verified=1 but origin is not a valid login flow - review."
@@ -1371,14 +1466,21 @@ check_destruction_iocs() {
             ((hits++))
         fi
     fi
-    # .sorry files. Bounded find: -maxdepth 6 keeps it cheap on /home with
-    # many users; -print -quit early-exits on first hit (we just want a yes/no
-    # for triage; forensic does the full enumeration).
+    # .sorry files. Bounded find: depth 5 + prune of bulky-and-irrelevant
+    # subtrees (Maildir, .cagefs jail copies, node_modules, package caches,
+    # tmp, .trash) that dominate /home walk time on shared hosts with 500+
+    # accounts. Encryptor never targets these paths. -print -quit early-
+    # exits on first hit (we want yes/no for triage; forensic does the full
+    # enumeration).
     local first_sorry=""
     local sorry_root
     for sorry_root in /home /var/www; do
         [[ -d "$sorry_root" ]] || continue
-        first_sorry=$(find "$sorry_root" -maxdepth 6 -name '*.sorry' -print -quit 2>/dev/null)
+        first_sorry=$(find "$sorry_root" -maxdepth 5 \
+            \( -name 'mail' -o -name '.cagefs' -o -name 'node_modules' \
+               -o -name '.composer' -o -name '.npm' -o -name '.cache' \
+               -o -name '.trash' -o -name 'tmp' \) -prune \
+            -o -name '*.sorry' -print -quit 2>/dev/null)
         [[ -n "$first_sorry" ]] && break
     done
     if [[ -n "$first_sorry" ]]; then
@@ -1544,23 +1646,32 @@ check_destruction_iocs() {
             ((hits++))
         fi
     done
-    # Keys planted in non-standard locations (cron, /etc).
-    local oddkey_count=0
+    # Keys planted in non-standard locations (cron, /etc). One find call,
+    # not two: the previous version invoked find twice (once for `wc -l`,
+    # again for `head -1`) which doubled walk time. Both pieces of output
+    # come from a single walk into a bash array.
+    #
+    # -maxdepth 5 covers the realistic paths (/etc/<svc>/.ssh/authorized_keys
+    # depth 4; /var/spool/cron/<user>/.ssh/authorized_keys depth 4). Skips
+    # deep cpanel userdata trees (/etc/cpanel/userdata/<domain>/<svc>/...
+    # is depth 5+, gigabyte-class on shared hosts and never the right place
+    # for a planted SSH key). Also prune known-bulky cpanel/exim/dovecot
+    # trees that have no authorized_keys files anyway.
     if command -v find >/dev/null 2>&1; then
-        # -path prune to keep this bounded; we explicitly want files under
-        # /etc and /var/spool/cron only, never /var/cpanel/userdata or noisy
-        # configs.
-        oddkey_count=$(find /etc /var/spool/cron -type f \
-                          \( -name 'authorized_keys' -o -name 'authorized_keys2' \) \
-                          2>/dev/null | wc -l)
+        local oddkeys=()
+        while IFS= read -r _odd; do
+            [[ -n "$_odd" ]] && oddkeys+=("$_odd")
+        done < <(find /etc /var/spool/cron -maxdepth 5 \
+            \( -path '/etc/cpanel/userdata' -o -path '/etc/cpanel/users' \
+               -o -path '/etc/exim*' -o -path '/etc/dovecot' \
+               -o -path '/etc/mail' -o -path '/etc/skel' \) -prune \
+            -o -type f \( -name 'authorized_keys' -o -name 'authorized_keys2' \) \
+            -print 2>/dev/null)
+        local oddkey_count=${#oddkeys[@]}
         if (( oddkey_count > 0 )); then
-            local oddkey_sample
-            oddkey_sample=$(find /etc /var/spool/cron -type f \
-                              \( -name 'authorized_keys' -o -name 'authorized_keys2' \) \
-                              2>/dev/null | head -1)
             emit "destruction" "ioc_pattern_g_oddpath_keys" "warning" \
                  "ioc_pattern_g_keys_in_unexpected_paths" 3 \
-                 "count" "$oddkey_count" "sample" "${oddkey_sample:-}" \
+                 "count" "$oddkey_count" "sample" "${oddkeys[0]}" \
                  "note" "$oddkey_count authorized_keys file(s) in /etc or /var/spool/cron - non-standard, review."
             ((hits++))
         fi
