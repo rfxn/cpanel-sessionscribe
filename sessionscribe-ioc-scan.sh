@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.8
+# sessionscribe-ioc-scan.sh v1.6.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.8"
+VERSION="1.6.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -158,25 +158,26 @@ PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 ###############################################################################
 
 # Pattern A - .sorry encryptor + qTox ransom note. Encryptor masquerades as
-# /root/sshd; sha256 from VirusTotal sample. C2 IP (68.183.190.253) lives
-# in ATTACKER_IPS below for log cross-reference.
+# /root/sshd; sha256 from VirusTotal sample.
 PATTERN_A_BINARY="/root/sshd"
 PATTERN_A_SHA256="2fc0a056fd4eff5d31d06c103af3298d711f33dbcd5d122cae30b571ac511e5a"
+PATTERN_A_README="/root/README.md"
+PATTERN_A_C2_IP="68.183.190.253"
+PATTERN_A_TOX_ID="3D7889AEC00F2325E1A3FBC0ACA4E521670497F11E47FDE13EADE8FED3144B5EB56D6B198724"
 
-# Pattern B - DB wipe + index.html BTC note. BTC address is the one stable
-# fingerprint across all observed drops (the per-user note iterates with the
-# attacker's reseller harvest). mysql wipe = /var/lib/mysql/mysql directory
+# Pattern B - DB wipe + index.html BTC note. mysql wipe = /var/lib/mysql/mysql
 # removed but /var/lib/mysql kept (DB engine fails to start).
 PATTERN_B_BTC_ADDR="bc1q9nh4revv6yqhj2gc5usncrpsfnh7ypwr9h0sp2"
 PATTERN_B_MYSQL_DIR="/var/lib/mysql"
 PATTERN_B_MYSQL_DB="/var/lib/mysql/mysql"
 
-# Pattern C - Mirai/nuclear.x86 botnet drop. Dropper deletes binary after
-# launch; the literal string survives in shell history. C2 host signal is
-# independent (in case the binary was renamed). C2 IP (87.121.84.78) is in
-# ATTACKER_IPS below.
+# Pattern C - Mirai/nuclear.x86 botnet drop. Dropper deletes the binary after
+# launch but the string survives in shell history; C2 host/IP independent so
+# rename of the binary doesn't hide the drop.
 PATTERN_C_BIN="nuclear.x86"
 PATTERN_C_C2_HOST="raw.flameblox.com"
+PATTERN_C_C2_IP="87.121.84.78"
+PATTERN_C_SHA256="c04d526eb0f7c7660a19871d1675383c8eaf5336651b255c15f4da4708835eb7"
 
 # Pattern D - WHM JSON-API recon + reseller-as-persistence. The sptadm
 # reseller, exploit.local contact, and 4ef72197.cpx.local domain are the
@@ -425,6 +426,10 @@ fi
 # from SESSIONSCRIBE_RUN_ID env if set (chain entry from another wrapper).
 TS_EPOCH=$(date -u +%s)
 RUN_ID="${SESSIONSCRIBE_RUN_ID:-${TS_EPOCH}-$$}"
+
+# Resolved by write_ledger() to the per-run JSON envelope path. Forensic
+# v0.9+ reads this via SESSIONSCRIBE_IOC_JSON instead of re-detecting IOCs.
+ENVELOPE_PATH=""
 
 # Resolve ledger directory once - --ledger-dir wins, otherwise default.
 [[ -z "$LEDGER_DIR" ]] && LEDGER_DIR="$LEDGER_DIR_DEFAULT"
@@ -921,11 +926,10 @@ check_logs() {
              "note" "no $logdir - skipping"
         return
     fi
-    local total=0 hits_2xx=0 unique_ips=0
+    local total=0 hits_2xx=0 unique_ips=0 ts_first=""
     local tmp; tmp=$(mktemp /tmp/ssioc.logs.XXXXXX)
-    # ASCII US (\x1f) tags each line with its source file before merge.
-    # Operators need to know which rotated access_log holds the hit so they
-    # can grep/zgrep the exact file - concatenating loses that.
+    # Per-line src-file tag (ASCII US, \x1f) so the consumer awk knows which
+    # rotated log each match came from - operators need that for zgrep.
     local SEP=$'\x1f'
     {
         if [[ -f "$logdir/access_log" ]]; then
@@ -952,22 +956,19 @@ check_logs() {
         $2 ~ /\/json-api\// {
             src  = $1
             line = $2
-            # Apache combined log format. We need:
-            #   t[1]=ip ; t[3]=user ; t[4]=[date:time ; t[7]=path ;
-            #   t[9]=status; UA from quoted field; port at t[n].
             if (line !~ /"GET[[:space:]]+\/json-api\//) next
             if (line !~ ua_re) next
             n = split(line, t, " ")
             user = t[3]; status = t[9]; port = t[n]
             if (port !~ port_re) next
-            # Optional time filter: floor=0 means no filter.
-            # cpanel access_log timestamp is [MM/DD/YYYY:HH:MM:SS ...] (NOT
-            # Apache CLF DD/Mon/YYYY). m[1]=MM, m[2]=DD, m[3]=YYYY.
-            if (floor > 0 && match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
+            ts = 0
+            # cpanel timestamp [MM/DD/YYYY:HH:MM:SS ...] (NOT Apache CLF
+            # DD/Mon/YYYY). gawk mktime needs "YYYY MM DD HH MM SS".
+            if (match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
                 ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
-                if (ts > 0 && ts < floor) next
+                if (floor > 0 && ts > 0 && ts < floor) next
             }
-            print user "\t" status "\t" t[1] "\t" port "\t" src "\t" line
+            print user "\t" status "\t" t[1] "\t" port "\t" src "\t" ts "\t" line
         }
     ' > "$tmp" 2>/dev/null
 
@@ -981,26 +982,28 @@ check_logs() {
     if (( total > 0 )); then
         hits_2xx=$(awk -F'\t' '$2 ~ /^2/' "$tmp" | wc -l)
         unique_ips=$(awk -F'\t' '{print $3}' "$tmp" | sort -u | wc -l)
+        # Earliest non-zero ts across hits - drives the kill-chain reconcile
+        # in forensic v0.9+ via ts_epoch_first.
+        ts_first=$(awk -F'\t' '$6 != "" && $6 != "0" {print $6}' "$tmp" | sort -n | head -1)
         local sev="evidence"
         if (( hits_2xx > 0 )); then sev="strong"; fi
         emit "logs" "ioc_scan" "$sev" "ioc_hits" 4 \
              "count" "$total" "hits_2xx" "$hits_2xx" "unique_src_ips" "$unique_ips" \
+             "ts_epoch_first" "${ts_first:-0}" \
              "note" "$total IOC-pattern hits$window_note ($hits_2xx returned 2xx)"
-        # Process substitution (NOT a pipeline) so emit() updates the
-        # parent shell's SIGNALS array. With `head | while` the loop body
-        # runs in a subshell and array appends are silently dropped from
-        # the JSON file output.
-        local u st ip pt src_log line trim req
-        while IFS=$'\t' read -r u st ip pt src_log line; do
+        # Process substitution (not a pipeline) so emit() reaches the parent
+        # SIGNALS array. `head | while` would lose appends in a subshell.
+        local u st ip pt src_log ts line trim req
+        while IFS=$'\t' read -r u st ip pt src_log ts line; do
             trim="${line:0:200}"
-            # Extract method+path from the quoted request for the header note.
             req=""
             if [[ "$line" =~ \"([A-Z]+)[[:space:]]+([^\"\ ]+) ]]; then
                 req="${BASH_REMATCH[1]} ${BASH_REMATCH[2]:0:60}"
             fi
             emit "logs" "ioc_sample" "info" "ioc_sample" 0 \
                  "ip" "$ip" "user" "$u" "status" "$st" "port" "$pt" \
-                 "log_file" "$logdir/$src_log" "line" "$trim" \
+                 "log_file" "$logdir/$src_log" "ts_epoch" "${ts:-0}" \
+                 "line" "$trim" \
                  "note" "$ip → $st  ${req}"
         done < <(head -5 "$tmp")
     else
@@ -1051,14 +1054,13 @@ check_attacker_ips() {
         excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
     fi
 
-    # Stream all logs once with per-line src tagging (ASCII US, \x1f) so the
-    # downstream awk knows which rotated file each match came from. Operators
-    # need to know "grep this in access_log-2026-04-30.gz" not just "...somewhere".
-    # Two bash 4.1 (CL6) workarounds inside the case:
-    #   1) Newline after $( - bash <4.4 chokes on $({ at the start of cmdsub.
-    #   2) Leading-paren case patterns ((*.gz) not *.gz) - bash <4.4 miscounts
-    #      the closing ) inside $(...) and aborts with "syntax error near
-    #      unexpected token ;;".
+    # Per-line src tagging (ASCII US \x1f) preserves rotated-log attribution
+    # through the consumer awk so operators see the exact file each hit
+    # came from.
+    # Bash 4.1 quirks inside the case below:
+    #   - newline after $( required: $({ is a parser bug pre-4.4
+    #   - leading-paren case patterns required: bash <4.4 miscounts the
+    #     closing ) inside $(...) and aborts on ;;
     local SEP=$'\x1f'
     local tmp; tmp=$(mktemp /tmp/ssioc.atk.XXXXXX)
     {
@@ -1090,7 +1092,7 @@ check_attacker_ips() {
             n = split(ENVIRON["EXCLUDES"], ex_arr, "\n")
             for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
             total = 0; h2xx = 0; h3xx = 0; h4xx = 0; hother = 0
-            nsamp = 0
+            nsamp = 0; ts_first = 0
         }
         {
             src  = $1
@@ -1101,13 +1103,17 @@ check_attacker_ips() {
             ip = lf[1]
             if (ip in ex) next
 
-            # Apache combined: ... "REQUEST" STATUS BYTES "REFER" "UA" ...
-            # Locate end of quoted request, then next token is status.
             st = "?"
             if (match(line, /" [0-9]+ /)) {
                 s = substr(line, RSTART + 2)
                 split(s, ss, " ")
                 st = ss[1]
+            }
+
+            ts = 0
+            if (match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
+                ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
+                if (ts > 0 && (ts_first == 0 || ts < ts_first)) ts_first = ts
             }
 
             total++
@@ -1118,26 +1124,24 @@ check_attacker_ips() {
 
             if (nsamp < 5) {
                 nsamp++
-                # S\tsrc\tip\tstatus\tline - distinct prefix from TOTALS.
-                printf "S\t%s\t%s\t%s\t%s\n", src, ip, st, line
+                printf "S\t%s\t%s\t%s\t%d\t%s\n", src, ip, st, ts, line
             }
         }
         END {
-            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\n", total, h2xx, h3xx, h4xx, hother
+            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\t%d\n", total, h2xx, h3xx, h4xx, hother, ts_first
         }' > "$tmp" 2>/dev/null
 
-    local total=0 h2xx=0 h3xx=0 h4xx=0 hother=0
+    local total=0 h2xx=0 h3xx=0 h4xx=0 hother=0 ts_first=0
     local totals_line; totals_line=$(grep '^TOTALS' "$tmp" 2>/dev/null | head -1)
     if [[ -n "$totals_line" ]]; then
-        IFS=$'\t' read -r _ total h2xx h3xx h4xx hother <<< "$totals_line"
+        IFS=$'\t' read -r _ total h2xx h3xx h4xx hother ts_first <<< "$totals_line"
     fi
     total="${total:-0}"; h2xx="${h2xx:-0}"
-    h3xx="${h3xx:-0}"; h4xx="${h4xx:-0}"; hother="${hother:-0}"
+    h3xx="${h3xx:-0}"; h4xx="${h4xx:-0}"; hother="${hother:-0}"; ts_first="${ts_first:-0}"
 
     if (( total > 0 )); then
-        # Severity policy: only successful (2xx) responses indicate
-        # exploitation. Attacker IP probing (4xx/3xx/connection-noise) is
-        # SUSPICIOUS but not COMPROMISED - the host repelled the request.
+        # Only 2xx is exploitation. 4xx/3xx is probing - SUSPICIOUS, not
+        # COMPROMISED.
         local sev parent_note
         if (( h2xx > 0 )); then
             sev="strong"
@@ -1150,15 +1154,16 @@ check_attacker_ips() {
              "ioc_attacker_ip_in_access_log" 8 \
              "count" "$total" "hits_2xx" "$h2xx" "hits_3xx" "$h3xx" \
              "hits_4xx" "$h4xx" "hits_other" "$hother" \
+             "ts_epoch_first" "$ts_first" \
              "note" "$parent_note"
 
-        local tag src ip st line trim
-        while IFS=$'\t' read -r tag src ip st line; do
+        local tag src ip st ts line trim
+        while IFS=$'\t' read -r tag src ip st ts line; do
             [[ "$tag" == "S" ]] || continue
             trim="${line:0:200}"
             emit "logs" "ioc_attacker_ip_sample" "info" "ioc_attacker_ip_sample" 0 \
                  "ip" "$ip" "status" "$st" "log_file" "$logdir/$src" \
-                 "line" "$trim" \
+                 "ts_epoch" "${ts:-0}" "line" "$trim" \
                  "note" "$ip → $st  ($src)"
         done < "$tmp"
     fi
@@ -1663,9 +1668,10 @@ check_destruction_iocs() {
     section "Destruction IOC scan (Patterns A-G)"
     local hits=0
 
-    # ---- Pattern A: /root/sshd encryptor + .sorry files -------------------
+    # ---- Pattern A: /root/sshd encryptor + .sorry + ransom README + C2 ---
     if [[ -f "$PATTERN_A_BINARY" ]]; then
-        local actual_sha=""
+        local actual_sha="" bin_mtime
+        bin_mtime=$(stat -c %Y "$PATTERN_A_BINARY" 2>/dev/null)
         if command -v sha256sum >/dev/null 2>&1; then
             actual_sha=$(sha256sum "$PATTERN_A_BINARY" 2>/dev/null | awk '{print $1}')
         fi
@@ -1673,26 +1679,24 @@ check_destruction_iocs() {
             emit "destruction" "ioc_pattern_a_encryptor" "strong" \
                  "ioc_pattern_a_encryptor_match" 10 \
                  "path" "$PATTERN_A_BINARY" "sha256" "$actual_sha" \
+                 "mtime_epoch" "${bin_mtime:-0}" \
                  "note" "$PATTERN_A_BINARY sha256 matches IC-5790 .sorry encryptor (CRITICAL)."
             ((hits++))
         else
-            # Binary present at the encryptor's masquerade path but hash
-            # mismatched. Still suspicious - could be a variant - but
-            # downgrade to warning so we don't false-positive on a
-            # legitimate /root/sshd that some operator put there.
+            # Same path, different hash - variant or unrelated /root/sshd.
+            # Warning, not strong, to avoid FPs on legitimate operator drops.
             emit "destruction" "ioc_pattern_a_unknown" "warning" \
                  "ioc_pattern_a_binary_present_unknown_hash" 4 \
                  "path" "$PATTERN_A_BINARY" "sha256" "${actual_sha:-unknown}" \
+                 "mtime_epoch" "${bin_mtime:-0}" \
                  "note" "$PATTERN_A_BINARY exists but sha256 differs from known sample - review."
             ((hits++))
         fi
     fi
-    # .sorry files. Bounded find: depth 5 + prune of bulky-and-irrelevant
-    # subtrees (Maildir, .cagefs jail copies, node_modules, package caches,
-    # tmp, .trash) that dominate /home walk time on shared hosts with 500+
-    # accounts. Encryptor never targets these paths. -print -quit early-
-    # exits on first hit (we want yes/no for triage; forensic does the full
-    # enumeration).
+    # .sorry files. Depth 5 + prune of bulky-and-irrelevant subtrees that the
+    # encryptor never touches (Maildir, .cagefs, node_modules, caches, tmp,
+    # .trash) keeps the find bounded on shared hosts with 500+ accounts.
+    # -print -quit returns the first hit; forensic does the full enumeration.
     local first_sorry=""
     local sorry_root
     for sorry_root in /home /var/www; do
@@ -1705,19 +1709,52 @@ check_destruction_iocs() {
         [[ -n "$first_sorry" ]] && break
     done
     if [[ -n "$first_sorry" ]]; then
+        local sorry_mtime
+        sorry_mtime=$(stat -c %Y "$first_sorry" 2>/dev/null)
         emit "destruction" "ioc_pattern_a_sorry" "strong" \
              "ioc_pattern_a_sorry_files_present" 10 \
              "sample_path" "$first_sorry" \
+             "mtime_epoch" "${sorry_mtime:-0}" \
              "note" "found .sorry-encrypted files (Pattern A); use sessionscribe-forensic for full enumeration (CRITICAL)."
         ((hits++))
     fi
+    # qTox ransom README. Drop locations: /root/README.md (canonical) +
+    # /home/*/README.md (per-user). Either qtox/TOX ID/Sorry-ID strings or
+    # the dossier-known TOX ID hex.
+    local readme_hits=()
+    [[ -f "$PATTERN_A_README" ]] && readme_hits+=("$PATTERN_A_README")
+    while IFS= read -r rf; do
+        [[ -f "$rf" ]] && readme_hits+=("$rf")
+    done < <(find /home -maxdepth 2 -name 'README.md' 2>/dev/null)
+    local rf
+    for rf in "${readme_hits[@]}"; do
+        if grep -qE "qtox|TOX ID|Sorry-ID|${PATTERN_A_TOX_ID}" "$rf" 2>/dev/null; then
+            local rf_mtime tox_match=0
+            rf_mtime=$(stat -c %Y "$rf" 2>/dev/null)
+            grep -qF "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && tox_match=1
+            emit "destruction" "ioc_pattern_a_readme" "strong" \
+                 "ioc_pattern_a_ransom_readme" 10 \
+                 "path" "$rf" "tox_id_match" "$tox_match" \
+                 "mtime_epoch" "${rf_mtime:-0}" \
+                 "note" "qTox ransom README at $rf (tox_id_exact_match=$tox_match) - Pattern A drop (CRITICAL)."
+            ((hits++))
+        fi
+    done
+    # Live socket to .sorry C2. Cheap if `ss` exists; silently skip otherwise.
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tn 2>/dev/null | grep -qF "$PATTERN_A_C2_IP"; then
+            emit "destruction" "ioc_pattern_a_c2_live" "strong" \
+                 "ioc_pattern_a_live_c2_socket" 10 \
+                 "c2" "$PATTERN_A_C2_IP" \
+                 "note" "live TCP connection to encryptor C2 $PATTERN_A_C2_IP - active infection (CRITICAL)."
+            ((hits++))
+        fi
+    fi
 
     # ---- Pattern B: mysql wipe + BTC-note index drop ---------------------
-    # Wipe heuristic: /var/lib/mysql/ exists, mysql/ system-table subdir is
-    # gone, AND there's still innodb residue (ibdata1, ib_logfile*, etc).
-    # The innodb residue check rules out fresh-install hosts where mysql/
-    # legitimately doesn't exist yet. On a real wipe the attacker rm -rf's
-    # mysql/ but leaves the larger innodb files intact.
+    # Wipe heuristic: /var/lib/mysql/ exists, mysql/ subdir is gone, AND
+    # innodb residue (ibdata1, ib_logfile*) is still present. The innodb
+    # check rules out fresh-install hosts that legitimately have no mysql/.
     if [[ -d "$PATTERN_B_MYSQL_DIR" && ! -d "$PATTERN_B_MYSQL_DB" ]]; then
         local has_innodb=0
         if compgen -G "${PATTERN_B_MYSQL_DIR}/ibdata*" >/dev/null 2>&1 \
@@ -1726,28 +1763,34 @@ check_destruction_iocs() {
             has_innodb=1
         fi
         if (( has_innodb )); then
+            local mysql_parent_mtime
+            mysql_parent_mtime=$(stat -c %Y "$PATTERN_B_MYSQL_DIR" 2>/dev/null)
             emit "destruction" "ioc_pattern_b_mysql_wipe" "strong" \
                  "ioc_pattern_b_mysql_dir_missing" 10 \
                  "expected" "$PATTERN_B_MYSQL_DB" \
+                 "mtime_epoch" "${mysql_parent_mtime:-0}" \
                  "note" "${PATTERN_B_MYSQL_DIR}/ exists with innodb residue but mysql/ subdir is gone - matches Pattern B DB wipe (CRITICAL)."
             ((hits++))
         fi
     fi
-    # BTC-note index.html drops. Limit glob to public_html/index.html across
-    # /home users; one grep handles all per-user drops without walking deep.
+    # BTC index.html drops across /home users. One glob, one grep.
     local btc_hit=""
     btc_hit=$(grep -lF "$PATTERN_B_BTC_ADDR" /home/*/public_html/index.html 2>/dev/null | head -1)
     if [[ -n "$btc_hit" ]]; then
+        local btc_mtime
+        btc_mtime=$(stat -c %Y "$btc_hit" 2>/dev/null)
         emit "destruction" "ioc_pattern_b_btc_note" "strong" \
              "ioc_pattern_b_btc_index_present" 10 \
              "sample_path" "$btc_hit" \
+             "mtime_epoch" "${btc_mtime:-0}" \
              "note" "BTC ransom note in $btc_hit - Pattern B index drop (CRITICAL)."
         ((hits++))
     fi
 
-    # ---- Pattern C: nuclear.x86 dropper traces ---------------------------
-    # Binary is rm'd post-launch; the literal string survives in shell history
-    # and may briefly survive in /tmp / /var/tmp. Fast: compgen -G + grep -lF.
+    # ---- Pattern C: nuclear.x86 botnet drop ------------------------------
+    # Three independent signals: literal binary name in shell history,
+    # binary still on disk in known drop paths (sha256 anchored), or C2
+    # host/IP referenced in history or persistence files.
     local nuke_hit=""
     nuke_hit=$(grep -lF "$PATTERN_C_BIN" \
                   /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
@@ -1755,67 +1798,117 @@ check_destruction_iocs() {
         nuke_hit=$(grep -lF "$PATTERN_C_BIN" /tmp/*.log /var/tmp/*.log 2>/dev/null | head -1)
     fi
     if [[ -n "$nuke_hit" ]]; then
+        local nuke_mtime
+        nuke_mtime=$(stat -c %Y "$nuke_hit" 2>/dev/null)
         emit "destruction" "ioc_pattern_c_nuke_trace" "strong" \
              "ioc_pattern_c_nuclear_x86_referenced" 10 \
              "sample_path" "$nuke_hit" \
+             "mtime_epoch" "${nuke_mtime:-0}" \
              "note" "$PATTERN_C_BIN dropper string in $nuke_hit (Mirai botnet drop, Abuse 46488376)."
         ((hits++))
     fi
-    # raw.flameblox.com C2 reference (independent signal in case the literal
-    # binary name was renamed but C2 was reused).
+    # Live binary on disk - hash anchor distinguishes confirmed sample from
+    # a same-named variant.
+    local nx
+    for nx in /tmp/nuclear.x86 /var/tmp/nuclear.x86 /dev/shm/nuclear.x86; do
+        [[ -f "$nx" ]] || continue
+        local nx_sha="" nx_mtime
+        nx_mtime=$(stat -c %Y "$nx" 2>/dev/null)
+        if command -v sha256sum >/dev/null 2>&1; then
+            nx_sha=$(sha256sum "$nx" 2>/dev/null | awk '{print $1}')
+        fi
+        if [[ "$nx_sha" == "$PATTERN_C_SHA256" ]]; then
+            emit "destruction" "ioc_pattern_c_binary" "strong" \
+                 "ioc_pattern_c_nuclear_binary_match" 10 \
+                 "path" "$nx" "sha256" "$nx_sha" \
+                 "mtime_epoch" "${nx_mtime:-0}" \
+                 "note" "$nx sha256 matches IC-5790 nuclear.x86 sample (CRITICAL)."
+            ((hits++))
+        else
+            emit "destruction" "ioc_pattern_c_binary_variant" "warning" \
+                 "ioc_pattern_c_nuclear_binary_variant" 4 \
+                 "path" "$nx" "sha256" "${nx_sha:-unknown}" \
+                 "mtime_epoch" "${nx_mtime:-0}" \
+                 "note" "$nx present (sha256 differs from known sample - variant?)."
+            ((hits++))
+        fi
+    done
+    # C2 host/IP references in shell history or persistence paths. Anchor
+    # the search to where attackers stash the re-pull command (cron, rc.local,
+    # profile.d, systemd unit files).
     local flame_hit=""
-    flame_hit=$(grep -lF "$PATTERN_C_C2_HOST" \
+    flame_hit=$(grep -lE "${PATTERN_C_C2_HOST}|${PATTERN_C_C2_IP//./\\.}" \
                    /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
     if [[ -n "$flame_hit" ]]; then
+        local flame_mtime
+        flame_mtime=$(stat -c %Y "$flame_hit" 2>/dev/null)
         emit "destruction" "ioc_pattern_c_c2_ref" "strong" \
              "ioc_pattern_c_c2_referenced" 8 \
              "sample_path" "$flame_hit" \
-             "note" "Mirai C2 host $PATTERN_C_C2_HOST referenced in $flame_hit."
+             "mtime_epoch" "${flame_mtime:-0}" \
+             "note" "Mirai C2 ($PATTERN_C_C2_HOST / $PATTERN_C_C2_IP) referenced in $flame_hit."
+        ((hits++))
+    fi
+    local persist_hit=""
+    persist_hit=$(grep -rIlE "nuclear\.x86|${PATTERN_C_C2_HOST}|${PATTERN_C_C2_IP//./\\.}" \
+                     /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily \
+                     /var/spool/cron /etc/profile.d /etc/rc.local \
+                     /etc/systemd/system /etc/init.d 2>/dev/null | head -1)
+    if [[ -n "$persist_hit" ]]; then
+        local persist_mtime
+        persist_mtime=$(stat -c %Y "$persist_hit" 2>/dev/null)
+        emit "destruction" "ioc_pattern_c_persistence" "strong" \
+             "ioc_pattern_c_persistence_path" 10 \
+             "sample_path" "$persist_hit" \
+             "mtime_epoch" "${persist_mtime:-0}" \
+             "note" "nuclear.x86/flameblox reference in persistence path $persist_hit (CRITICAL)."
         ((hits++))
     fi
 
     # ---- Pattern D: sptadm reseller / WHM_FullRoot persistence ----------
-    # accounting.log scan: any of three universal fingerprints (sptadm,
-    # 4ef72197.cpx.local, WHM_FullRoot, exploit.local). One grep over the
-    # whole file - the file is line-oriented and bounded.
+    # accounting.log: any of sptadm/4ef72197.cpx.local/exploit.local/
+    # WHM_FullRoot fingerprints. Bounded line-oriented file; single grep.
     local acct_log=/var/cpanel/accounting.log
     if [[ -f "$acct_log" ]]; then
         local d_pat="${PATTERN_D_RESELLER}|${PATTERN_D_DOMAIN}|${PATTERN_D_EMAIL}|${PATTERN_D_TOKEN_NAME}"
         local d_count d_sample
-        # grep -c writes "0" with exit=1 on no-match - command substitution
-        # captures stdout cleanly; no `|| echo 0` (that would yield "0\n0"
-        # if grep wrote 0 then echo wrote 0).
         d_count=$(grep -cE "$d_pat" "$acct_log" 2>/dev/null)
         d_count="${d_count:-0}"
         if (( d_count > 0 )); then
+            local acct_mtime
+            acct_mtime=$(stat -c %Y "$acct_log" 2>/dev/null)
             d_sample=$(grep -E "$d_pat" "$acct_log" 2>/dev/null | head -1)
             emit "destruction" "ioc_pattern_d_acctlog" "strong" \
                  "ioc_pattern_d_reseller_persistence" 10 \
                  "count" "$d_count" "sample" "${d_sample:0:200}" \
+                 "mtime_epoch" "${acct_mtime:-0}" \
                  "note" "Pattern D persistence fingerprint in $acct_log ($d_count hits) - reseller/API token created post-exploit; revoke before clearing."
             ((hits++))
         fi
     fi
-    # Reseller account presence (independent signal: the row may have been
-    # rotated out of accounting.log on long-lived hosts).
+    # Reseller account presence - the accounting.log row may have rotated.
     if command -v getent >/dev/null 2>&1; then
         if getent passwd "$PATTERN_D_RESELLER" >/dev/null 2>&1; then
+            local home_mtime=""
+            [[ -d "/home/$PATTERN_D_RESELLER" ]] && home_mtime=$(stat -c %Y "/home/$PATTERN_D_RESELLER" 2>/dev/null)
             emit "destruction" "ioc_pattern_d_reseller" "strong" \
                  "ioc_pattern_d_reseller_user_present" 10 \
                  "user" "$PATTERN_D_RESELLER" \
+                 "mtime_epoch" "${home_mtime:-0}" \
                  "note" "user '$PATTERN_D_RESELLER' present in passwd - attacker reseller (CRITICAL)."
             ((hits++))
         fi
     fi
-    # WHM_FullRoot api token cache. Path varies across cpanel versions; the
-    # token-issuance machinery records the friendly name in api-tokens.cache.
-    # Single grep is cheap; if the file isn't where we expect, skip silently.
+    # WHM_FullRoot api token cache. Path stable across recent cpanel versions.
     local token_cache=/var/cpanel/whm/api-tokens.cache
     if [[ -f "$token_cache" ]]; then
         if grep -qF "\"$PATTERN_D_TOKEN_NAME\"" "$token_cache" 2>/dev/null; then
+            local token_mtime
+            token_mtime=$(stat -c %Y "$token_cache" 2>/dev/null)
             emit "destruction" "ioc_pattern_d_token" "strong" \
                  "ioc_pattern_d_whm_fullroot_token_present" 10 \
                  "path" "$token_cache" \
+                 "mtime_epoch" "${token_mtime:-0}" \
                  "note" "WHM_FullRoot api token present in $token_cache - revoke immediately (CRITICAL)."
             ((hits++))
         fi
@@ -1826,28 +1919,28 @@ check_destruction_iocs() {
     f_hit=$(grep -lF "$PATTERN_F_S_MARK" \
                 /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
     if [[ -n "$f_hit" ]]; then
+        local f_mtime
+        f_mtime=$(stat -c %Y "$f_hit" 2>/dev/null)
         emit "destruction" "ioc_pattern_f_harvester" "strong" \
              "ioc_pattern_f_smark_envelope" 10 \
              "sample_path" "$f_hit" \
+             "mtime_epoch" "${f_mtime:-0}" \
              "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $f_hit - automated post-exploit recon (CRITICAL)."
         ((hits++))
     fi
 
     # ---- Pattern G: suspect SSH keys ------------------------------------
-    # Heuristic fingerprint for the IC-5790 wave: forged mtime around
-    # 2019-12-13 with a recent atime AND an IP-shaped key comment.
-    # Both conditions required to keep FPs down (legitimate IP-labeled keys
-    # exist - LW provisioning uses them sometimes).
+    # IC-5790 fingerprint: mtime forged to 2019-12-13 + IP-shaped key
+    # comment. Both required (LW provisioning legitimately uses IP-labeled
+    # keys) so we don't FP on real ops.
     local key_file
     for key_file in "${SSH_KEY_FILES[@]}"; do
         [[ -f "$key_file" ]] || continue
-        # mtime check: stat the file once.
-        local key_mtime_iso
+        local key_mtime_epoch key_mtime_iso
+        key_mtime_epoch=$(stat -c %Y "$key_file" 2>/dev/null)
         key_mtime_iso=$(stat -c '%y' "$key_file" 2>/dev/null | cut -d' ' -f1)
         local has_forged_mtime=0
         [[ "$key_mtime_iso" == "$PATTERN_G_FORGED_MTIME" ]] && has_forged_mtime=1
-        # Comment scan: an IP-labeled "ssh-rsa ... IPv4" line is a strong
-        # tell when paired with the forged mtime.
         local ip_labeled_lines
         ip_labeled_lines=$(grep -cE '^(ssh-(rsa|ed25519|ecdsa|dsa))[[:space:]]+[A-Za-z0-9+/=]+[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}([[:space:]]|$)' \
                               "$key_file" 2>/dev/null)
@@ -1857,27 +1950,21 @@ check_destruction_iocs() {
                  "ioc_pattern_g_suspect_ssh_keys" 10 \
                  "path" "$key_file" "ip_labeled_lines" "$ip_labeled_lines" \
                  "mtime" "$key_mtime_iso" \
+                 "mtime_epoch" "${key_mtime_epoch:-0}" \
                  "note" "$key_file mtime forged to $key_mtime_iso + $ip_labeled_lines IP-labeled key(s) - Pattern G persistence (CRITICAL)."
             ((hits++))
         elif (( ip_labeled_lines > 0 )); then
             emit "destruction" "ioc_pattern_g_ip_keys_review" "warning" \
                  "ioc_pattern_g_ip_labeled_keys_present" 3 \
                  "path" "$key_file" "ip_labeled_lines" "$ip_labeled_lines" \
+                 "mtime_epoch" "${key_mtime_epoch:-0}" \
                  "note" "$ip_labeled_lines IP-labeled SSH key comment(s) in $key_file - review (may be legitimate provisioning)."
             ((hits++))
         fi
     done
-    # Keys planted in non-standard locations (cron, /etc). One find call,
-    # not two: the previous version invoked find twice (once for `wc -l`,
-    # again for `head -1`) which doubled walk time. Both pieces of output
-    # come from a single walk into a bash array.
-    #
-    # -maxdepth 5 covers the realistic paths (/etc/<svc>/.ssh/authorized_keys
-    # depth 4; /var/spool/cron/<user>/.ssh/authorized_keys depth 4). Skips
-    # deep cpanel userdata trees (/etc/cpanel/userdata/<domain>/<svc>/...
-    # is depth 5+, gigabyte-class on shared hosts and never the right place
-    # for a planted SSH key). Also prune known-bulky cpanel/exim/dovecot
-    # trees that have no authorized_keys files anyway.
+    # Keys planted in non-canonical locations (cron, /etc). Single find walk
+    # populates the bash array; -maxdepth 5 covers /etc/<svc>/.ssh and
+    # /var/spool/cron/<user>/.ssh. Bulky cpanel/exim/dovecot subtrees pruned.
     if command -v find >/dev/null 2>&1; then
         local oddkeys=()
         while IFS= read -r _odd; do
@@ -1890,9 +1977,12 @@ check_destruction_iocs() {
             -print 2>/dev/null)
         local oddkey_count=${#oddkeys[@]}
         if (( oddkey_count > 0 )); then
+            local odd_mtime=""
+            [[ -n "${oddkeys[0]:-}" ]] && odd_mtime=$(stat -c %Y "${oddkeys[0]}" 2>/dev/null)
             emit "destruction" "ioc_pattern_g_oddpath_keys" "warning" \
                  "ioc_pattern_g_keys_in_unexpected_paths" 3 \
                  "count" "$oddkey_count" "sample_path" "${oddkeys[0]}" \
+                 "mtime_epoch" "${odd_mtime:-0}" \
                  "note" "$oddkey_count authorized_keys file(s) in /etc or /var/spool/cron - non-standard, review."
             ((hits++))
         fi
@@ -1927,6 +2017,7 @@ check_destruction_iocs() {
                 for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
                 ext_total = 0; ext_2xx = 0; int_2xx = 0; int_other = 0
                 ext_sample = ""; int_sample = ""
+                ts_first_ext = 0
             }
             {
                 ip = $1
@@ -1936,6 +2027,10 @@ check_destruction_iocs() {
                     s = substr($0, RSTART + 2)
                     split(s, ss, " ")
                     st = ss[1]
+                }
+                ts = 0
+                if (match($0, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
+                    ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
                 }
                 is_internal = (ip ~ /^10\./ \
                                || ip ~ /^127\./ \
@@ -1950,28 +2045,31 @@ check_destruction_iocs() {
                     ext_total++
                     if (st ~ /^2/) ext_2xx++
                     if (ext_sample == "") ext_sample = $0
+                    if (ts > 0 && (ts_first_ext == 0 || ts < ts_first_ext)) ts_first_ext = ts
                 }
             }
             END {
-                printf "%d\t%d\t%d\t%d\n", ext_total, ext_2xx, int_2xx, int_other
+                printf "%d\t%d\t%d\t%d\t%d\n", ext_total, ext_2xx, int_2xx, int_other, ts_first_ext
                 print ext_sample
                 print int_sample
             }')
-        local ext_total=0 ext_2xx=0 int_2xx=0 int_other=0
+        local ext_total=0 ext_2xx=0 int_2xx=0 int_other=0 ts_first_ext=0
         local ext_sample="" int_sample=""
         {
-            IFS=$'\t' read -r ext_total ext_2xx int_2xx int_other
+            IFS=$'\t' read -r ext_total ext_2xx int_2xx int_other ts_first_ext
             IFS= read -r ext_sample
             IFS= read -r int_sample
         } <<< "$ws_result"
         ext_total="${ext_total:-0}"; ext_2xx="${ext_2xx:-0}"
         int_2xx="${int_2xx:-0}"; int_other="${int_other:-0}"
+        ts_first_ext="${ts_first_ext:-0}"
 
         if (( ext_2xx > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "strong" \
                  "ioc_pattern_e_websocket_shell_hits" 10 \
                  "count" "$ext_2xx" "external_total" "$ext_total" \
                  "internal_2xx" "$int_2xx" \
+                 "ts_epoch_first" "$ts_first_ext" \
                  "sample" "${ext_sample:0:200}" \
                  "note" "$ext_2xx external IP(s) reached /cpsess*/websocket/Shell with 2xx - Pattern E interactive RCE (CRITICAL)."
             ((hits++))
@@ -1979,6 +2077,7 @@ check_destruction_iocs() {
             emit "destruction" "ioc_pattern_e_websocket" "warning" \
                  "ioc_pattern_e_websocket_shell_probes" 3 \
                  "count" "$ext_total" "internal_2xx" "$int_2xx" \
+                 "ts_epoch_first" "$ts_first_ext" \
                  "sample" "${ext_sample:0:200}" \
                  "note" "$ext_total external IP probe(s) of /cpsess*/websocket/Shell - all rejected, no 2xx (REVIEW)."
             ((hits++))
@@ -2404,12 +2503,17 @@ ledger_write() {
     printf '%s\n' "$line" >> "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
     chmod 0600 "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
     # Per-run envelope. Skip if -o was given (operator captured their own).
+    # Path is exported on the global ENVELOPE_PATH so chain_forensic_dispatch
+    # can hand it to forensic via SESSIONSCRIBE_IOC_JSON.
     local envelope=""
     if [[ -z "$OUTPUT_FILE" ]]; then
         envelope="$LEDGER_DIR/${RUN_ID}.json"
         write_json "$envelope" 2>/dev/null || true
         chmod 0600 "$envelope" 2>/dev/null || true
+    elif [[ "$OUTPUT_FILE" != "-" ]]; then
+        envelope="$OUTPUT_FILE"
     fi
+    ENVELOPE_PATH="$envelope"
 
     # Tell the operator where the structured record landed. Without this,
     # only people who read the source know the ledger exists. Suppressed
@@ -2576,15 +2680,31 @@ chain_forensic_dispatch() {
         [[ -n "$CHAIN_UPLOAD_URL" ]]   && args+=(--upload-url   "$CHAIN_UPLOAD_URL")
         [[ -n "$CHAIN_UPLOAD_TOKEN" ]] && args+=(--upload-token "$CHAIN_UPLOAD_TOKEN")
     fi
+    # Write a preliminary envelope BEFORE forensic runs so it can read our
+    # IOCs via SESSIONSCRIBE_IOC_JSON (forensic v0.9+ uses this as its
+    # canonical IOC source). ledger_write rewrites the same path at the
+    # very end with the chain.forensic_* signals included.
+    local envelope_path=""
+    if [[ -z "$OUTPUT_FILE" && -n "${LEDGER_DIR:-}" ]]; then
+        envelope_path="$LEDGER_DIR/${RUN_ID}.json"
+        mkdir -p "$LEDGER_DIR" 2>/dev/null
+        write_json "$envelope_path" 2>/dev/null || envelope_path=""
+        [[ -n "$envelope_path" ]] && chmod 0600 "$envelope_path" 2>/dev/null
+    elif [[ -n "$OUTPUT_FILE" && "$OUTPUT_FILE" != "-" ]]; then
+        envelope_path="$OUTPUT_FILE"
+    fi
+    ENVELOPE_PATH="$envelope_path"
+
     section "Chaining sessionscribe-forensic.sh (run_id=$RUN_ID, origin=$forensic_origin)"
     local upload_note=""
     (( CHAIN_UPLOAD )) && upload_note=" upload=on(${CHAIN_UPLOAD_URL:-default})"
     emit "chain" "forensic_dispatch" "info" "chain_forensic_started" 0 \
          "path" "$forensic_path" "origin" "$forensic_origin" "run_id" "$RUN_ID" \
-         "upload" "$CHAIN_UPLOAD" \
+         "upload" "$CHAIN_UPLOAD" "envelope" "$ENVELOPE_PATH" \
          "note" "dispatching forensic chain${upload_note}"
     local fexit=0
     SESSIONSCRIBE_RUN_ID="$RUN_ID" \
+    SESSIONSCRIBE_IOC_JSON="$ENVELOPE_PATH" \
         bash "$forensic_path" "${args[@]}" >/dev/null 2>&1 || fexit=$?
     emit "chain" "forensic_exit" "info" "chain_forensic_complete" 0 \
          "exit_code" "$fexit" \
