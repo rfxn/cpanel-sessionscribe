@@ -126,8 +126,7 @@ INFORMATIONAL_MODSEC_IDS=(1500010 1500020 1500021)
 
 # Source candidates for the modsec config (in order).
 MODSEC_SRC_CANDIDATES=(
-  "/root/admin/work/downloads/modsec-sessionscribe.conf"
-  "/home/cpanel_ic5790/modsec-sessionscribe.conf"
+  "https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/modsec-sessionscribe.conf"
   "https://sh.rfxn.com/modsec-sessionscribe.conf"
 )
 
