@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.4
+# sessionscribe-ioc-scan.sh v1.5.5
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.4"
+VERSION="1.5.5"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -2391,12 +2391,23 @@ FORENSIC_SRC_CANDIDATES=(
 # failure so the warning emit can include the curl exit codes + URLs we
 # tried. Cleared on success.
 FORENSIC_FETCH_DIAG=""
+FORENSIC_FETCHED_PATH=""
+FORENSIC_FETCHED_URL=""
 
 # Fetch the forensic script from one of the canonical URLs into a tempfile.
-# Echoes "<path>\t<url>" on success; returns non-zero on failure and sets
-# FORENSIC_FETCH_DIAG with a per-URL "<url>:<rc>:<reason>" trace.
+# On success: sets FORENSIC_FETCHED_PATH + FORENSIC_FETCHED_URL, returns 0.
+# On failure: sets FORENSIC_FETCH_DIAG with a per-URL "<url>:<rc>:<reason>"
+# trace, returns non-zero.
+#
+# Globals (not stdout) are used because the caller would otherwise have to
+# capture the result via $(...), which runs the function in a subshell -
+# any FORENSIC_FETCH_DIAG set on failure would be lost when $(...) exits,
+# defaulting the operator-visible diagnostic to "no_attempt" and hiding
+# whether curl was missing, the URL 404'd, the body was empty, etc.
 fetch_forensic_remote() {
     FORENSIC_FETCH_DIAG=""
+    FORENSIC_FETCHED_PATH=""
+    FORENSIC_FETCHED_URL=""
     if ! command -v curl >/dev/null 2>&1; then
         FORENSIC_FETCH_DIAG="curl_missing"
         return 1
@@ -2413,7 +2424,8 @@ fetch_forensic_remote() {
             # Sanity-check: must be a bash script. Reject HTML/empty bodies
             # (sh.rfxn.com served HTTP 200 + 0 bytes during a CDN sync window).
             if head -1 "$dest" 2>/dev/null | grep -qE '^#!/(usr/bin/env[[:space:]]+)?bash'; then
-                printf '%s\t%s' "$dest" "$url"
+                FORENSIC_FETCHED_PATH="$dest"
+                FORENSIC_FETCHED_URL="$url"
                 return 0
             else
                 diag+="$url:200:bad_shebang_or_empty;"
@@ -2443,17 +2455,14 @@ chain_forensic_dispatch() {
         forensic_path=$(command -v sessionscribe-forensic.sh)
         forensic_origin="path"
     else
-        # Remote fetch fallback. Returns "<path>\t<url>" so we can record
-        # which mirror served us.
-        local fetch_result fetched_path fetched_url
-        if fetch_result=$(fetch_forensic_remote); then
-            fetched_path="${fetch_result%%$'\t'*}"
-            fetched_url="${fetch_result#*$'\t'}"
-            forensic_path="$fetched_path"
-            forensic_origin="remote:$fetched_url"
+        # Remote fetch fallback. Direct call (no $()) so the function's
+        # diagnostic globals reach this scope on failure.
+        if fetch_forensic_remote; then
+            forensic_path="$FORENSIC_FETCHED_PATH"
+            forensic_origin="remote:$FORENSIC_FETCHED_URL"
             emit "chain" "forensic_fetch" "info" "chain_forensic_fetched_remote" 0 \
-                 "url" "$fetched_url" "path" "$fetched_path" \
-                 "note" "forensic script not present locally; pulled from $fetched_url"
+                 "url" "$FORENSIC_FETCHED_URL" "path" "$FORENSIC_FETCHED_PATH" \
+                 "note" "forensic script not present locally; pulled from $FORENSIC_FETCHED_URL"
         fi
     fi
     if [[ -z "$forensic_path" ]]; then
