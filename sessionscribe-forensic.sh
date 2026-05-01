@@ -1,0 +1,2009 @@
+#!/bin/bash
+#
+##
+# sessionscribe-forensic.sh v0.5.0
+# (C) 2026, R-fx Networks <proj@rfxn.com>
+# This program may be freely redistributed under the terms of the GNU GPL v2
+##
+#
+###############################################################################
+# sessionscribe-forensic.sh
+#
+# Read-only kill-chain reconstruction for CVE-2026-41940 (SessionScribe) and
+# the IC-5790 cohort. Companion to sessionscribe-mitigate.sh - this script
+# never mutates state. Captures raw artifacts to a bundle, extracts
+# timestamps for both DEFENSE activations and OFFENSE events, and reconciles
+# the two so each compromise indicator is labeled PRE-DEFENSE, POST-DEFENSE,
+# POST-PARTIAL, or UNDEFENDED.
+#
+# The reconciliation answers the question: "for each indicator of compromise
+# we found on this host, was our mitigation present at the time?"
+#
+# Phases (all read-only):
+#   defense    extract timestamps for every defense layer that landed:
+#              cpanel patch, cpsrvd restart-after-patch, sessionscribe-
+#              mitigate.sh runs, modsec rule 1500030/1500031 install,
+#              CSF/APF cpsrvd port closures, proxysub enable, upcp logs
+#   offense    extract timestamps for every observed compromise indicator:
+#              session files (token_denied + badpass), pattern D reseller
+#              persistence (sptadm + WHM_FullRoot tokens + 4ef72197.cpx.local),
+#              pattern E websocket Shell + Fileman API harvest, pattern F
+#              automated harvester shell fingerprint, pattern G SSH-key
+#              persistence, pattern A .sorry encryptor + /root/sshd, pattern
+#              B BTC index.html drop + /var/lib/mysql/mysql wipe, pattern C
+#              nuclear.x86 references
+#   reconcile  per-indicator: was the relevant defense active when the
+#              indicator first appeared? Output: PRE-DEFENSE | POST-DEFENSE
+#              | POST-PARTIAL | UNDEFENDED, plus the time delta
+#   bundle     tarball of raw artifacts for offline analysis (sessions,
+#              access logs, accounting log, cron, ssh keys, apache config,
+#              modsec config, CSF config, bash history)
+#
+# Output:
+#   default   ANSI sectioned report on stderr + JSONL on stdout
+#   --jsonl   JSONL only on stdout (per-finding signals + timeline + verdict)
+#   --json    single JSON envelope on stdout
+#   --quiet   suppress sectioned report (auto-set by --jsonl/--json)
+#
+# Exit codes:
+#   0  no indicators of compromise found
+#   1  indicators found, all post-defense (defense was in place)
+#   2  indicators found, ANY pre-defense (defense was not in place at time
+#      of first compromise) - this is the high-attention case
+#   3  tool error
+#
+# Fleet usage:
+#   xargs -n1 -P64 -I'{}' ansible all -i '{},' -c local.liquid_web.lw_ssh \
+#     -m script -a 'sessionscribe-forensic.sh --jsonl --bundle-dir /root/.ic5790-forensic'
+#
+# Common flags: --no-bundle (Pattern A hosts), --since DAYS (narrow IR
+# window), --extra-logs DIR (point at expanded /usr/local/cpanel/logs/
+# archive/*.tar.gz to scan log generations older than the rotation window).
+#
+# Safe to run on hosts marked "encrypted" in column N of the IC-5790 tracker
+# only if you accept the risk of touching atime on artifacts. For Pattern A
+# (.sorry) hosts, prefer --no-bundle to avoid stat'ing the encryptor.
+###############################################################################
+set -u
+
+VERSION="0.5.0"
+INCIDENT_ID="IC-5790"
+
+# Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
+# any pre-disclosure 0-day exploitation back to early February 2026. Bounding
+# to 90d keeps the scan + bundle tractable on busy hosts (typical retained
+# log volume / session count fits well under 2 GB inside this window).
+# Override with --since DAYS or --since all for unbounded.
+DEFAULT_SINCE_DAYS=90
+
+# Default bundle size budget (MB), enforced PER-TARBALL (not bundle-wide).
+# Each tarball candidate set (sessions, access-logs, system-logs, cpanel-
+# state, cpanel-users, persistence, defense-state) is sized via pre-flight
+# `du` against this cap; oversize candidates are skipped individually with
+# a warning and a per-candidate size emitted as a signal. The bundle dir
+# total is the sum of accepted tarballs, typically 0.5-3 GB on a busy host
+# inside the 90-day window. To bound the host-wide total instead of per-
+# tarball, set --max-bundle-mb low (e.g. 256) so each tarball stays small.
+DEFAULT_MAX_BUNDLE_MB=2048
+
+###############################################################################
+# Constants - mirror sessionscribe-mitigate.sh definitions
+###############################################################################
+
+# Vendor-published patched builds.
+PATCHED_BUILDS_CPANEL=(
+    "11.86.0.41"  "11.110.0.97"  "11.118.0.63"  "11.126.0.54"
+    "11.130.0.19" "11.132.0.29"  "11.134.0.20"  "11.136.0.5"
+)
+PATCHED_BUILD_WPSQUARED="136.1.7"
+
+# Tiers explicitly excluded from the vendor patch list. Hosts on these tiers
+# have NO in-place fix and must be upgraded to a patched major series.
+# Operationally distinct from "patched build available but not applied" - the
+# response is upgrade/migrate, not upcp.
+UNPATCHED_TIERS=(112 114 116 120 122 124 128)
+
+# cpsrvd ports we expect to be closed on unpatched hosts.
+CPSRVD_PORTS=(2082 2083 2086 2087 2095 2096)
+
+# Patch artifact - this file changes when CVE-2026-41940 patch lands.
+PATCH_CANARY_FILE="/usr/local/cpanel/Cpanel/Session/Load.pm"
+
+# sessionscribe-mitigate.sh backup root.
+MITIGATE_BACKUP_ROOT="/var/cpanel/sessionscribe-mitigation"
+
+# modsec config drop paths. Order matters - first existing path wins.
+# EA4 is the cPanel default (/etc/apache2/...); the /etc/httpd/ paths cover
+# non-EA4 / vendor-relocated installs occasionally seen on hosts that pre-
+# date EA4 conversion or that run a side-by-side Apache.
+MODSEC_USER_CONFS=(
+    "/etc/apache2/conf.d/modsec/modsec2.user.conf"   # EA4 (cPanel default)
+    "/etc/httpd/conf.d/modsec/modsec2.user.conf"     # non-EA4 fallback
+    "/etc/httpd/conf.d/modsec2.user.conf"            # legacy non-EA4
+)
+# Resolved at runtime in phase_defense; defaults to first entry so the
+# "absent" message references the canonical EA4 location.
+MODSEC_USER_CONF="${MODSEC_USER_CONFS[0]}"
+
+# Pattern D fingerprints.
+PATTERN_D_DOMAIN="4ef72197.cpx.local"
+PATTERN_D_EMAIL="a@exploit.local"
+PATTERN_D_RESELLER="sptadm"
+
+# Pattern A fingerprints.
+PATTERN_A_BINARY="/root/sshd"
+PATTERN_A_README="/root/README.md"
+PATTERN_A_SHA256="2fc0a056fd4eff5d31d06c103af3298d711f33dbcd5d122cae30b571ac511e5a"
+PATTERN_A_C2_IP="68.183.190.253"
+PATTERN_A_TOX_ID="3D7889AEC00F2325E1A3FBC0ACA4E521670497F11E47FDE13EADE8FED3144B5EB56D6B198724"
+
+# Pattern B fingerprints.
+PATTERN_B_BTC="bc1q9nh4revv6yqhj2gc5usncrpsfnh7ypwr9h0sp2"
+PATTERN_B_TWEET="ty15b6TOTuBuzUhfypJeagHl4e2sAs26"
+
+# Pattern C fingerprints.
+PATTERN_C_C2_IP="87.121.84.78"
+PATTERN_C_C2_HOST="raw.flameblox.com"
+PATTERN_C_SHA256="c04d526eb0f7c7660a19871d1675383c8eaf5336651b255c15f4da4708835eb7"
+
+# Pattern F fingerprints - automated harvester shell envelope.
+PATTERN_F_S_MARK="__S_MARK__"
+PATTERN_F_E_MARK="__E_MARK__"
+
+# Known-bad source IPs (consolidated IC-5790 attacker IOCs). Any of these in
+# any access log is high-signal even on hosts that show no other compromise
+# fingerprint - they're sweeping/staging.
+KNOWN_BAD_IPS=(
+    68.233.238.100   # badpass exploit (python-requests/2.33.1)
+    206.189.2.13     # badpass exploit (leakix scanner)
+    137.184.77.0     # badpass exploit
+    38.146.25.154    # badpass + sptadm createacct (Go-http-client/1.1)
+    157.245.204.205  # badpass exploit (leakix scanner)
+    192.81.219.190   # full enum + websocket Shell
+    149.102.229.144  # websocket Shell 24x120 (Mozilla/5.0)
+    94.231.206.39    # TLS handshake to 2095
+    45.82.78.104     # TLS handshake to 2082 (Chrome 135 / Opera 120)
+    68.183.190.253   # C2 for .sorry encryptor
+    87.121.84.78     # nuclear.x86 binary host
+    96.30.39.236     # claimed origin in createacct (graceworkz)
+)
+
+# Pattern G - SSH key persistence anchors observed on maple2 (PJHDUS). Keys
+# whose comments are these IPs were attacker-planted jumphost-mimic keys.
+PATTERN_G_BAD_KEY_LABELS=(
+    "209.59.141.49"
+    "50.28.104.57"
+)
+# Pattern G - the forged mtime attackers stamped on the planted keys to make
+# them blend in with original host provisioning. ANY ssh key with mtime
+# matching this exactly should be treated as suspicious, especially if atime
+# is recent. The user issued `touch -d "2019-12-13 12:59:16"` on maple2 -
+# date(1) interprets that in the host's local timezone, so the actual stored
+# epoch differs by the host's UTC offset. We therefore compare against the
+# wall-clock string ("2019-12-13 12:59:16") under both UTC and localtime
+# interpretations rather than a single epoch (see pattern_g_forged_mtime).
+PATTERN_G_FORGED_MTIME_WALL="2019-12-13 12:59:16"
+
+# Known-bad attacker user-agents. Found in any access log line, escalates.
+# Two tiers:
+#   HIGH_RE - explicit IC-5790 wave fingerprints (python-requests pinned to
+#             2.28.1/2.33.1, Go-http-client/1.1, the leakix l9scan UA) +
+#             generic automated UAs that should never appear in /json-api/
+#             traffic from external sources (libwww-perl, aiohttp, okhttp,
+#             httpx). Aligned with sessionscribe-ioc-scan.sh's IOC_AUTOMATED_UA.
+KNOWN_BAD_UAS_RE='python-requests/(2\.28\.1|2\.33\.1)|Go-http-client/1\.1|l9scan/2\.0\.130313e2337313e2532323e27363|libwww-perl|aiohttp|okhttp|httpx'
+
+# Probe canary attribute - sessionscribe-remote-probe.sh tags every test
+# session with this so we can distinguish probe collateral from real
+# exploitation. Matches the same pattern ioc-scan.sh uses.
+PROBE_CANARY_RE='^nxesec_canary_[A-Za-z0-9]+='
+
+# Probe-traffic UA filter. The local-marker probe (sessionscribe-ioc-scan.sh
+# --probe) uses 'sessionscribe-validator/...'; the remote probe
+# (sessionscribe-remote-probe.sh) uses 'nxesec-cve-2026-41940-probe/...'.
+# The remote probe hits /cpsess<token>/json-api/version which would
+# otherwise match PATTERN_D_RECON_PATHS_RE; without this filter, every
+# probe run produces a Pattern D recon false-positive in forensic
+# reconciliation. Keep this in sync with ioc-scan.sh's PROBE_UA_RE.
+PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
+
+# Pattern D - the recon API path set the Go-http-client tool walks before
+# createacct. Seeing 4+ of these from the same IP within a short window is
+# the recon burst.
+PATTERN_D_RECON_PATHS_RE='/json-api/(version|gethostname|listaccts|getdiskusage|systemloadavg|getips)'
+
+# Pattern D - the Fileman viewfile harvest list (full path coverage from
+# graceworkz IOCs). Match any of these as file= or fullfilename= arg.
+PATTERN_D_FILEMAN_RE='(file|fullfilename|filename)=([^&"]*(/etc/(shadow|passwd|hosts|my\.cnf|os-release|redhat-release|debian_version)|/root/(\.my\.cnf|\.bash_history|\.aws/credentials|\.ssh/(authorized_keys2?|id_(rsa|ed25519|ecdsa|dsa)(\.pub)?|config|known_hosts))|/proc/(version|cpuinfo|net/arp)))'
+
+# Known-good SSH key comments seen in legitimate LW provisioning. Anything
+# else in authorized_keys is a Pattern G candidate for human review.
+SSH_KNOWN_GOOD_RE='(lwadmin|lw-admin|liquidweb|nexcess|Parent Child key for [A-Z0-9]{6})'
+
+###############################################################################
+# Argument parsing
+###############################################################################
+
+JSON_OUT=0
+JSONL_OUT=0
+QUIET=0
+NO_COLOR_FLAG=0
+DO_BUNDLE=1
+BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
+OUTPUT_FILE=""
+INCLUDE_HOMEDIR_HISTORY=1
+EXTRA_LOGS_DIR=""
+SINCE_DAYS="$DEFAULT_SINCE_DAYS"
+SINCE_EPOCH=""
+MAX_BUNDLE_MB="$DEFAULT_MAX_BUNDLE_MB"
+
+usage() {
+    cat <<EOF
+sessionscribe-forensic.sh v${VERSION}
+
+Read-only kill-chain reconstruction for CVE-2026-41940 (IC-5790).
+
+USAGE
+  sessionscribe-forensic.sh [OUTPUT] [BUNDLE] [MISC]
+
+OUTPUT
+  (default)         ANSI report on stderr + JSONL on stdout
+  --jsonl           JSONL only on stdout
+  --json            Single JSON envelope on stdout
+  --quiet           Suppress sectioned report
+  -o, --output FILE Write final JSON envelope to FILE
+
+BUNDLE
+  --bundle             Capture artifact tarball (default)
+  --no-bundle          Skip artifact tarball (recommended on Pattern A hosts)
+  --bundle-dir DIR     Root for bundle output
+                       (default: $BUNDLE_DIR_ROOT)
+  --max-bundle-mb N    Cap bundle size in MB. Pre-flight \`du\` runs per
+                       candidate set; oversize sets are skipped with a
+                       warning. (default: $DEFAULT_MAX_BUNDLE_MB MB / 2 GB).
+                       Use 0 for no cap.
+  --no-history         Skip /home/*/.bash_history capture (privacy)
+
+LOGS / TIME WINDOW
+  --extra-logs DIR     Additional access-log directory to scan (e.g. point
+                       at an expanded /usr/local/cpanel/logs/archive/*.tar.gz
+                       to include rotated logs from older incident windows).
+  --since DAYS         Limit log + session-file scans + bundle to last N
+                       days. Default: $DEFAULT_SINCE_DAYS days (covers any pre-disclosure
+                       exploitation since CVE-2026-41940 was released).
+  --since all          Disable the time window - scan every retained
+                       session and access-log, no upper bound on bundle.
+
+MISC
+  --no-color        Disable ANSI color (NO_COLOR=1 also honored)
+  -h, --help        Show this help
+
+EXIT CODES
+  0  no IOCs found
+  1  IOCs found, all post-defense
+  2  IOCs found, at least one pre-defense (defense was missing)
+  3  tool error
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --json)         JSON_OUT=1; JSONL_OUT=0; shift ;;
+        --jsonl)        JSONL_OUT=1; JSON_OUT=0; shift ;;
+        --quiet)        QUIET=1; shift ;;
+        --no-color)     NO_COLOR_FLAG=1; shift ;;
+        --bundle)       DO_BUNDLE=1; shift ;;
+        --no-bundle)    DO_BUNDLE=0; shift ;;
+        --bundle-dir)   BUNDLE_DIR_ROOT="$2"; shift 2 ;;
+        --no-history)   INCLUDE_HOMEDIR_HISTORY=0; shift ;;
+        --extra-logs)   EXTRA_LOGS_DIR="$2"; shift 2 ;;
+        --since)        SINCE_DAYS="$2"; shift 2 ;;
+        --max-bundle-mb) MAX_BUNDLE_MB="$2"; shift 2 ;;
+        -o|--output)    OUTPUT_FILE="$2"; shift 2 ;;
+        -h|--help)      usage ;;
+        *) echo "Unknown option: $1" >&2; exit 3 ;;
+    esac
+done
+
+(( JSONL_OUT )) && QUIET=1
+
+# Validate and resolve --since to an absolute epoch. Accepts:
+#   N        - positive integer days (the default is DEFAULT_SINCE_DAYS)
+#   0|all|none|"" - disable the window (scan everything retained on disk)
+case "${SINCE_DAYS,,}" in
+    ""|0|all|none|unlimited)
+        SINCE_DAYS=""; SINCE_EPOCH="" ;;
+    *)
+        if ! [[ "$SINCE_DAYS" =~ ^[0-9]+$ ]]; then
+            echo "Error: --since requires a positive integer (days) or 'all'" >&2
+            exit 3
+        fi
+        SINCE_EPOCH=$(( $(date -u +%s) - SINCE_DAYS * 86400 ))
+        ;;
+esac
+
+# Validate --max-bundle-mb. 0 = no cap. Must be a non-negative integer.
+if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
+    echo "Error: --max-bundle-mb requires a non-negative integer (MB)" >&2
+    exit 3
+fi
+
+###############################################################################
+# Host context
+###############################################################################
+
+HOSTNAME_FQDN=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)
+TS_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TS_EPOCH=$(date -u +%s)
+# Honor SESSIONSCRIBE_RUN_ID from the environment so a parent ioc-scan
+# chain dispatch produces a correlated run_id across both tools' outputs.
+# Falls back to local <epoch>-<pid> for standalone runs.
+RUN_ID="${SESSIONSCRIBE_RUN_ID:-${TS_EPOCH}-$$}"
+
+OS_PRETTY="unknown"
+if [[ -r /etc/os-release ]]; then
+    eval "$(awk -F= '$1=="PRETTY_NAME"{print "OS_PRETTY="$2}' /etc/os-release 2>/dev/null)"
+elif [[ -r /etc/redhat-release ]]; then
+    OS_PRETTY=$(head -1 /etc/redhat-release 2>/dev/null)
+fi
+OS_PRETTY="${OS_PRETTY//\"/}"
+
+CPANEL_RAW=""
+CPANEL_NORM="unknown"
+if [[ -x /usr/local/cpanel/cpanel ]]; then
+    CPANEL_RAW=$(/usr/local/cpanel/cpanel -V 2>/dev/null | head -1 | tr -d '\r')
+    CPANEL_NORM=$(echo "$CPANEL_RAW" | sed -E 's/^([0-9]+)\.([0-9]+)[[:space:]]+\(build[[:space:]]+([0-9]+)\).*/11.\1.\2.\3/')
+    [[ "$CPANEL_NORM" == "$CPANEL_RAW" ]] && CPANEL_NORM="unknown"
+fi
+
+LP_UID=""
+[[ -r /usr/local/lp/etc/lp-UID ]] && LP_UID=$(cat /usr/local/lp/etc/lp-UID 2>/dev/null | tr -d '\r\n[:space:]')
+
+###############################################################################
+# Output primitives
+###############################################################################
+
+if [[ -t 2 && "$NO_COLOR_FLAG" -eq 0 && "${NO_COLOR:-0}" = "0" ]]; then
+    C_RED=$'\033[0;31m'; C_GRN=$'\033[0;32m'; C_YEL=$'\033[1;33m'
+    C_CYN=$'\033[0;36m'; C_BLD=$'\033[1m'; C_DIM=$'\033[2m'
+    C_NC=$'\033[0m'
+else
+    C_RED=''; C_GRN=''; C_YEL=''; C_CYN=''; C_BLD=''; C_DIM=''; C_NC=''
+fi
+
+json_esc() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+HOSTNAME_J=$(json_esc "$HOSTNAME_FQDN")
+OS_J=$(json_esc "$OS_PRETTY")
+CPV_J=$(json_esc "$CPANEL_NORM")
+LP_UID_J=$(json_esc "$LP_UID")
+
+# Per-finding accumulators.
+declare -ga SIGNALS=()
+declare -ga DEFENSE_EVENTS=()   # "epoch|key|note"
+declare -ga OFFENSE_EVENTS=()   # "epoch|pattern|key|note|defenses_required"
+declare -ga RECONCILED=()       # "verdict|delta_seconds|epoch|pattern|key"
+
+N_DEF=0; N_OFF=0; N_PRE=0; N_POST=0
+
+emit_signal() {
+    # phase severity key note [k=v ...]
+    local phase="$1" sev="$2" key="$3" note="${4:-}"
+    shift 4 2>/dev/null || shift $#
+    local extra=""
+    while (( $# >= 2 )); do
+        extra+=",\"$(json_esc "$1")\":\"$(json_esc "$2")\""
+        shift 2
+    done
+    local line
+    line=$(printf '{"host":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","mode":"forensic","incident_id":"%s","run_id":"%s","phase":"%s","severity":"%s","key":"%s","note":"%s"%s}' \
+        "$HOSTNAME_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" "$VERSION" "$INCIDENT_ID" "$RUN_ID" \
+        "$phase" "$sev" "$(json_esc "$key")" "$(json_esc "$note")" "$extra")
+    SIGNALS+=("$line")
+    (( JSONL_OUT )) && printf '%s\n' "$line"
+}
+
+# Sectioned report helpers.
+hdr()       { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
+say_pass()  { (( QUIET )) || printf '  %s[OK]%s %s\n'    "$C_GRN" "$C_NC" "$*" >&2; }
+say_warn()  { (( QUIET )) || printf '  %s[WARN]%s %s\n'  "$C_YEL" "$C_NC" "$*" >&2; }
+say_fail()  { (( QUIET )) || printf '  %s[FAIL]%s %s\n'  "$C_RED" "$C_NC" "$*" >&2; }
+say_info()  { (( QUIET )) || printf '  %s[..]%s %s\n'    "$C_DIM" "$C_NC" "$*" >&2; }
+say_def()   { (( QUIET )) || printf '  %s[DEF]%s %s\n'   "$C_CYN" "$C_NC" "$*" >&2; }
+say_off()   { (( QUIET )) || printf '  %s[OFF]%s %s\n'   "$C_RED" "$C_NC" "$*" >&2; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Convert any of the four timestamp shapes we care about to epoch:
+#   1. accounting.log:   "Wed Apr 29 20:42:44 2026"
+#   2. apache CLF:       "[30/Apr/2026:09:30:50 +0000]"   DD/Mon/YYYY
+#   3. cpanel access_log:"[04/30/2026:09:30:50 -0500]"    MM/DD/YYYY
+#   4. ISO-8601:         "2026-04-30T09:30:50Z"
+# Returns empty string if unparseable.
+#
+# Note: cpanel's /usr/local/cpanel/logs/access_log uses MM/DD/YYYY (NOT the
+# apache CLF DD/Mon/YYYY). This is documented in the cPanel access-log spec
+# and is the format that ioc-scan.sh's awk parser handles. Earlier versions
+# of this script only handled the apache form, silently dropping every
+# cpanel-log timestamp.
+to_epoch() {
+    local s="$1"
+    [[ -z "$s" ]] && { echo ""; return; }
+    # Strip surrounding [] if present.
+    s="${s#[}"; s="${s%]}"
+    # Apache CLF: 30/Apr/2026:09:30:50 +0000 -> 30 Apr 2026 09:30:50 +0000
+    if [[ "$s" =~ ^[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}: ]]; then
+        s=$(echo "$s" | sed -E 's|^([0-9]{1,2})/([A-Za-z]{3})/([0-9]{4}):([0-9:]+)([[:space:]]+(.*))?$|\1 \2 \3 \4\5|')
+        date -u -d "$s" +%s 2>/dev/null
+        return
+    fi
+    # cpanel: 04/30/2026:09:30:50 -0500. date(1) won't parse MM/DD/YYYY-
+    # with the colon separator; rebuild as "YYYY-MM-DD HH:MM:SS TZ".
+    if [[ "$s" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4}):([0-9:]+)([[:space:]]+([+-][0-9]{4}))?$ ]]; then
+        local mm="${BASH_REMATCH[1]}" dd="${BASH_REMATCH[2]}" yyyy="${BASH_REMATCH[3]}"
+        local hms="${BASH_REMATCH[4]}" tz="${BASH_REMATCH[6]:-+0000}"
+        date -u -d "${yyyy}-${mm}-${dd} ${hms} ${tz}" +%s 2>/dev/null
+        return
+    fi
+    date -u -d "$s" +%s 2>/dev/null
+}
+
+# Extract a timestamp bracket from an access-log line. Tries cpanel
+# MM/DD/YYYY first then apache DD/Mon/YYYY. Returns the inner string
+# (without surrounding []) or empty.
+extract_log_ts() {
+    local line="$1" m
+    m=$(grep -oE '\[[0-9]{2}/[0-9]{2}/[0-9]{4}:[0-9:]+( [+-][0-9]{4})?\]' <<< "$line" | head -1)
+    [[ -z "$m" ]] && m=$(grep -oE '\[[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}:[0-9:]+( [+-][0-9]{4})?\]' <<< "$line" | head -1)
+    echo "$m"
+}
+
+# Stat -c %Y wrapper that returns "" for missing files.
+mtime_of() {
+    local f="$1"
+    [[ -e "$f" ]] || { echo ""; return; }
+    stat -c %Y "$f" 2>/dev/null
+}
+
+# Stream the contents of a (possibly compressed) log file. cPanel rotates
+# /usr/local/cpanel/logs/access_log to .gz typically; some sites recompress
+# to .xz. Plain text passes through. Failure modes (missing tool, corrupt
+# archive) are silent - the caller's grep just sees no input.
+cat_log() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    case "$f" in
+        *.gz)  have_cmd zcat  && zcat  "$f" 2>/dev/null ;;
+        *.xz)  have_cmd xzcat && xzcat "$f" 2>/dev/null ;;
+        *.bz2) have_cmd bzcat && bzcat "$f" 2>/dev/null ;;
+        *)     cat "$f" 2>/dev/null ;;
+    esac
+}
+
+epoch_to_iso() {
+    local e="$1"
+    [[ -z "$e" || "$e" == "0" ]] && { echo ""; return; }
+    date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
+###############################################################################
+# Defense extraction - when did each mitigation layer activate?
+###############################################################################
+
+DEF_PATCH_TIME=""        # cpanel patch landed (Load.pm mtime if patched)
+DEF_CPSRVD_RESTART=""    # cpsrvd PID start time (epoch)
+DEF_MITIGATE_FIRST=""    # earliest sessionscribe-mitigate.sh run dir
+DEF_MITIGATE_LAST=""     # most recent sessionscribe-mitigate.sh run dir
+DEF_MODSEC_TIME=""       # mtime of modsec2.user.conf if it contains 1500030
+DEF_CSF_TIME=""          # mtime of csf.conf if cpsrvd ports stripped
+DEF_APF_TIME=""          # mtime of conf.apf if cpsrvd ports stripped
+DEF_PROXYSUB_TIME=""     # mtime of cpanel.config if proxysubdomains=1
+DEF_UPCP_LATEST_TIME=""  # epoch of most recent successful upcp completion
+
+phase_defense() {
+    hdr "defense" "extracting timestamps for every mitigation layer"
+
+    # 1. cpanel patch landing time. PATCH_STATE distinguishes:
+    #    PATCHED      build matches vendor cutoff list - upgrade complete
+    #    UNPATCHED    sub-cutoff but tier has a patch available - run upcp
+    #    UNPATCHABLE  tier in vendor "no in-place patch" list (112/114/116/
+    #                 120/122/124/128) - response is upgrade major series
+    #    UNKNOWN      cpanel binary missing or build unparseable
+    # Mirrors mitigate.sh PATCH_STATE vocabulary so a fleet jq pipeline can
+    # join on the same state space.
+    PATCH_STATE="UNKNOWN"
+    if [[ "$CPANEL_NORM" == "unknown" || -z "$CPANEL_NORM" ]]; then
+        say_warn "cpanel binary missing or build unparseable - patch defense UNKNOWN"
+        emit_signal defense warn patch_unknown "cpanel build unparseable" \
+            build "$CPANEL_NORM" patch_state "$PATCH_STATE"
+    else
+        local patched=0
+        for b in "${PATCHED_BUILDS_CPANEL[@]}"; do
+            [[ "$CPANEL_NORM" == "$b" ]] && patched=1
+        done
+        [[ "$CPANEL_NORM" == "$PATCHED_BUILD_WPSQUARED" ]] && patched=1
+        if (( patched )) && [[ -f "$PATCH_CANARY_FILE" ]]; then
+            PATCH_STATE="PATCHED"
+            DEF_PATCH_TIME=$(mtime_of "$PATCH_CANARY_FILE")
+            say_def "cpanel patch present: $CPANEL_NORM (Load.pm mtime $(epoch_to_iso "$DEF_PATCH_TIME"))"
+            emit_signal defense info patch_active \
+                "build=$CPANEL_NORM mtime=$(epoch_to_iso "$DEF_PATCH_TIME")" \
+                epoch "$DEF_PATCH_TIME" build "$CPANEL_NORM" patch_state "$PATCH_STATE"
+            DEFENSE_EVENTS+=("$DEF_PATCH_TIME|patch|cpanel patched to $CPANEL_NORM")
+        else
+            # Tier-level classification: is this build in a tier that vendor
+            # released a patch for, or one of the no-in-place-patch tiers?
+            local tier
+            tier=$(echo "$CPANEL_NORM" | awk -F. '{print $2}')
+            local is_unpatchable=0 t
+            for t in "${UNPATCHED_TIERS[@]}"; do
+                [[ "$tier" == "$t" ]] && is_unpatchable=1
+            done
+            if (( is_unpatchable )); then
+                PATCH_STATE="UNPATCHABLE"
+                say_warn "cpanel tier $tier has NO in-place patch - upgrade major series or migrate"
+                emit_signal defense warn patch_unpatchable \
+                    "tier=$tier has no vendor patch; must upgrade or migrate" \
+                    build "$CPANEL_NORM" tier "$tier" patch_state "$PATCH_STATE"
+            else
+                PATCH_STATE="UNPATCHED"
+                say_warn "cpanel build $CPANEL_NORM is below vendor cutoff - upcp will help"
+                emit_signal defense warn patch_unpatched \
+                    "build=$CPANEL_NORM below vendor cutoff for tier $tier" \
+                    build "$CPANEL_NORM" tier "$tier" patch_state "$PATCH_STATE"
+            fi
+        fi
+    fi
+
+    # 2. cpsrvd restart time. The patch isn't fully effective until cpsrvd
+    # is restarted post-patch. Check process start.
+    local cpsrvd_pid cpsrvd_start
+    cpsrvd_pid=$(pgrep -f cpsrvd 2>/dev/null | head -1)
+    if [[ -n "$cpsrvd_pid" ]]; then
+        cpsrvd_start=$(ps -o lstart= -p "$cpsrvd_pid" 2>/dev/null | xargs -I{} date -d "{}" +%s 2>/dev/null)
+        if [[ -n "$cpsrvd_start" ]]; then
+            DEF_CPSRVD_RESTART="$cpsrvd_start"
+            say_def "cpsrvd pid=$cpsrvd_pid started at $(epoch_to_iso "$cpsrvd_start")"
+            emit_signal defense info cpsrvd_running "pid=$cpsrvd_pid started=$(epoch_to_iso "$cpsrvd_start")" \
+                epoch "$cpsrvd_start" pid "$cpsrvd_pid"
+            # Patch is only effective if cpsrvd restarted AFTER patch landed.
+            if [[ -n "$DEF_PATCH_TIME" && "$cpsrvd_start" -lt "$DEF_PATCH_TIME" ]]; then
+                say_warn "STALE: cpsrvd started BEFORE patch mtime - patch may not be live"
+                emit_signal defense warn cpsrvd_stale "cpsrvd started before patch landed" \
+                    cpsrvd_start "$cpsrvd_start" patch_mtime "$DEF_PATCH_TIME"
+            fi
+        fi
+    else
+        say_warn "cpsrvd not running"
+        emit_signal defense warn cpsrvd_absent "cpsrvd process not found"
+    fi
+
+    # 3. sessionscribe-mitigate.sh execution history. The backup root is the
+    # canonical fingerprint - existence of /var/cpanel/sessionscribe-mitigation/
+    # subdirectories proves the script ran; their names are ISO timestamps.
+    if [[ -d "$MITIGATE_BACKUP_ROOT" ]]; then
+        local count
+        # Iterate run directories sorted by mtime.
+        local dirs
+        dirs=$(find "$MITIGATE_BACKUP_ROOT" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -n)
+        if [[ -n "$dirs" ]]; then
+            DEF_MITIGATE_FIRST=$(echo "$dirs" | head -1 | awk '{print int($1)}')
+            DEF_MITIGATE_LAST=$(echo "$dirs" | tail -1 | awk '{print int($1)}')
+            count=$(echo "$dirs" | wc -l | tr -d ' ')
+            say_def "sessionscribe-mitigate.sh ran $count time(s); first=$(epoch_to_iso "$DEF_MITIGATE_FIRST") last=$(epoch_to_iso "$DEF_MITIGATE_LAST")"
+            emit_signal defense info mitigate_history "ran=$count first=$(epoch_to_iso "$DEF_MITIGATE_FIRST") last=$(epoch_to_iso "$DEF_MITIGATE_LAST")" \
+                first_epoch "$DEF_MITIGATE_FIRST" last_epoch "$DEF_MITIGATE_LAST" count "$count"
+            DEFENSE_EVENTS+=("$DEF_MITIGATE_FIRST|mitigate_first|sessionscribe-mitigate.sh first run")
+            DEFENSE_EVENTS+=("$DEF_MITIGATE_LAST|mitigate_last|sessionscribe-mitigate.sh last run")
+        fi
+    else
+        say_warn "no sessionscribe-mitigate.sh history found at $MITIGATE_BACKUP_ROOT"
+        emit_signal defense warn mitigate_absent "$MITIGATE_BACKUP_ROOT does not exist"
+    fi
+
+    # 4. modsec rule presence + install time. Rule 1500030 is the primary
+    # CRLF-in-Authorization-Basic block. Without it, the host had no
+    # exploit-vector defense regardless of cPanel patch state.
+    # Match both `id:1500030` and `id:"1500030"` shapes (mitigate.sh
+    # convention; either is valid SecRule syntax).
+    # Resolve modsec config from candidate paths (EA4 default, then non-EA4
+    # fallbacks). First existing path wins; if none exist we keep the
+    # canonical EA4 path for the "absent" diagnostic.
+    local mc
+    for mc in "${MODSEC_USER_CONFS[@]}"; do
+        if [[ -f "$mc" ]]; then
+            MODSEC_USER_CONF="$mc"
+            break
+        fi
+    done
+    if [[ -f "$MODSEC_USER_CONF" ]]; then
+        local has_30 has_31
+        has_30=$(grep -cE '^[[:space:]]*[^#].*\b(id:1500030\b|id:"1500030")' "$MODSEC_USER_CONF" 2>/dev/null)
+        has_31=$(grep -cE '^[[:space:]]*[^#].*\b(id:1500031\b|id:"1500031")' "$MODSEC_USER_CONF" 2>/dev/null)
+        if (( has_30 > 0 )); then
+            DEF_MODSEC_TIME=$(mtime_of "$MODSEC_USER_CONF")
+            say_def "modsec rule 1500030 present (mtime $(epoch_to_iso "$DEF_MODSEC_TIME")); 1500031=$has_31"
+            emit_signal defense info modsec_active "1500030=$has_30 1500031=$has_31 mtime=$(epoch_to_iso "$DEF_MODSEC_TIME")" \
+                epoch "$DEF_MODSEC_TIME" rule_30 "$has_30" rule_31 "$has_31"
+            DEFENSE_EVENTS+=("$DEF_MODSEC_TIME|modsec|modsec rule 1500030 installed")
+        else
+            say_warn "modsec rule 1500030 NOT present in $MODSEC_USER_CONF"
+            emit_signal defense warn modsec_absent "rule 1500030 missing"
+        fi
+    else
+        say_warn "modsec config $MODSEC_USER_CONF missing - modsec defense ABSENT"
+        emit_signal defense warn modsec_conf_absent "$MODSEC_USER_CONF not found"
+    fi
+
+    # 5. CSF cpsrvd port closure. The defensive state we want is
+    # TCP_IN/TCP6_IN with NO cpsrvd ports (2082/3, 2086/7, 2095/6).
+    # Two ways the closure can be defeated: explicit cpsrvd port in the
+    # CSV, OR a port range like 2080:2090 that overlaps a cpsrvd port.
+    # We treat either as `csf_dirty`.
+    if [[ -f /etc/csf/csf.conf ]]; then
+        local csf_clean=1 cur p k
+        local range_overlaps=()
+        for k in TCP_IN TCP6_IN; do
+            cur=$(grep -E "^${k}[[:space:]]*=" /etc/csf/csf.conf | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
+            for p in "${CPSRVD_PORTS[@]}"; do
+                if grep -qE "(^|,)${p}(,|$)" <<< "$cur"; then
+                    csf_clean=0
+                fi
+            done
+            # Range overlap detection (mitigate.sh phase_csf style). A range
+            # like 2080:2090 contains 2082/2083/2086/2087 implicitly.
+            local rngs
+            rngs=$(grep -oE '[0-9]+:[0-9]+' <<< "$cur")
+            if [[ -n "$rngs" ]]; then
+                while IFS= read -r r; do
+                    [[ -z "$r" ]] && continue
+                    local lo hi
+                    lo=${r%:*}; hi=${r#*:}
+                    for p in "${CPSRVD_PORTS[@]}"; do
+                        if (( lo <= p && p <= hi )); then
+                            csf_clean=0
+                            range_overlaps+=("$k:$r overlaps $p")
+                        fi
+                    done
+                done <<< "$rngs"
+            fi
+        done
+        if (( ${#range_overlaps[@]} > 0 )); then
+            emit_signal defense warn csf_range_overlap \
+                "csf range(s) overlap cpsrvd ports: ${range_overlaps[*]}" \
+                overlaps "${range_overlaps[*]}"
+        fi
+        if (( csf_clean )); then
+            DEF_CSF_TIME=$(mtime_of /etc/csf/csf.conf)
+            # Prefer the .ic5790.bak file mtime if it exists (Zane's pattern)
+            # since that records the original CSF mutation time.
+            if [[ -f /etc/csf/csf.conf.ic5790.bak ]]; then
+                local bak_time
+                bak_time=$(mtime_of /etc/csf/csf.conf.ic5790.bak)
+                # The .bak mtime is the pre-mutation original; the conf
+                # mtime is when we mutated. We want the mutation time.
+                say_def "CSF cpsrvd ports stripped; csf.conf mtime $(epoch_to_iso "$DEF_CSF_TIME") (bak from $(epoch_to_iso "$bak_time"))"
+            else
+                say_def "CSF cpsrvd ports clean; csf.conf mtime $(epoch_to_iso "$DEF_CSF_TIME")"
+            fi
+            emit_signal defense info csf_clean "cpsrvd ports stripped, mtime=$(epoch_to_iso "$DEF_CSF_TIME")" \
+                epoch "$DEF_CSF_TIME"
+            DEFENSE_EVENTS+=("$DEF_CSF_TIME|csf|csf.conf cpsrvd ports stripped")
+        else
+            say_warn "CSF still has cpsrvd ports in TCP_IN/TCP6_IN"
+            emit_signal defense warn csf_dirty "cpsrvd ports present in TCP_IN/TCP6_IN"
+        fi
+        # Verify actual iptables state (the host2.kyroslawgroup.net problem -
+        # csf.conf can be clean but iptables wasn't reloaded). cPanel/CSF
+        # posture is "explicit ACCEPT allowlist + default DROP via fall-
+        # through", so the defense state is checked as the ABSENCE of an
+        # ACCEPT 0.0.0.0/0 -> dpt:N rule for each cpsrvd port. We walk
+        # INPUT plus secondary chains CSF references (mirrors mitigate.sh
+        # phase_runfw logic).
+        if have_cmd iptables; then
+            local stale_ports=()
+            local secondary_chains
+            secondary_chains=$(iptables -L INPUT -n 2>/dev/null \
+                    | awk 'NR>2 && NF>=2 {print $1}' \
+                    | grep -vE '^(ACCEPT|DROP|REJECT|LOG|RETURN|target|Chain)$' \
+                    | sort -u)
+            for p in "${CPSRVD_PORTS[@]}"; do
+                local c open=0
+                for c in INPUT $secondary_chains; do
+                    if iptables -L "$c" -n 2>/dev/null \
+                         | awk -v p="$p" '$1=="ACCEPT" && $5=="0.0.0.0/0" \
+                                && index($0,"dpt:"p" ") {found=1} END{exit !found}'
+                    then
+                        open=1; break
+                    fi
+                done
+                (( open )) && stale_ports+=("$p")
+            done
+            if (( ${#stale_ports[@]} > 0 )); then
+                say_warn "iptables INPUT ACCEPTs cpsrvd ports from 0.0.0.0/0: ${stale_ports[*]}"
+                emit_signal defense warn csf_not_in_effect \
+                    "csf.conf clean but iptables INPUT still ACCEPTs cpsrvd ports from 0.0.0.0/0" \
+                    open_ports "${stale_ports[*]}"
+            fi
+        fi
+    fi
+
+    # 6. APF - same logic.
+    if [[ -f /etc/apf/conf.apf ]]; then
+        local apf_clean=1 cur p
+        cur=$(grep -E '^IG_TCP_CPORTS[[:space:]]*=' /etc/apf/conf.apf | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/')
+        for p in "${CPSRVD_PORTS[@]}"; do
+            grep -qE "(^|,)${p}(,|$)" <<< "$cur" && apf_clean=0
+        done
+        if (( apf_clean )) && [[ -n "$cur" ]]; then
+            DEF_APF_TIME=$(mtime_of /etc/apf/conf.apf)
+            say_def "APF cpsrvd ports clean; conf.apf mtime $(epoch_to_iso "$DEF_APF_TIME")"
+            DEFENSE_EVENTS+=("$DEF_APF_TIME|apf|apf cpsrvd ports stripped")
+        fi
+    fi
+
+    # 7. proxysubdomains enabled. cpanel.config mtime is the proxy.
+    if [[ -r /var/cpanel/cpanel.config ]]; then
+        local main new
+        main=$(awk -F= '$1=="proxysubdomains"{print $2}' /var/cpanel/cpanel.config)
+        new=$(awk -F= '$1=="proxysubdomainsfornewaccounts"{print $2}' /var/cpanel/cpanel.config)
+        if [[ "$main" == "1" && "$new" == "1" ]]; then
+            DEF_PROXYSUB_TIME=$(mtime_of /var/cpanel/cpanel.config)
+            say_def "proxysubdomains enabled; cpanel.config mtime $(epoch_to_iso "$DEF_PROXYSUB_TIME")"
+            emit_signal defense info proxysub_enabled "main=$main new=$new" epoch "$DEF_PROXYSUB_TIME"
+            DEFENSE_EVENTS+=("$DEF_PROXYSUB_TIME|proxysub|proxysubdomains enabled")
+        fi
+    fi
+
+    # 8. upcp completion history. summary.log records every successful update.
+    if [[ -f /var/cpanel/updatelogs/summary.log ]]; then
+        local last_complete
+        last_complete=$(grep -E '\[.*\][[:space:]]*Completed update' /var/cpanel/updatelogs/summary.log 2>/dev/null | tail -1 | sed -E 's/^\[([^]]*)\].*/\1/')
+        if [[ -n "$last_complete" ]]; then
+            DEF_UPCP_LATEST_TIME=$(date -d "$last_complete" +%s 2>/dev/null)
+            if [[ -n "$DEF_UPCP_LATEST_TIME" ]]; then
+                say_def "last successful upcp: $last_complete (epoch $DEF_UPCP_LATEST_TIME)"
+                emit_signal defense info upcp_history "last_complete=$last_complete" \
+                    epoch "$DEF_UPCP_LATEST_TIME"
+            fi
+        fi
+    fi
+}
+
+###############################################################################
+# Offense extraction - when did each compromise indicator first appear?
+###############################################################################
+
+phase_offense() {
+    hdr "offense" "extracting timestamps for every compromise indicator"
+
+    # Universal CRLF exploit fingerprint. The forged-session shape on disk
+    # has ALL of these markers (any one in isolation can be benign; the
+    # combination is diagnostic):
+    #   - token_denied=1
+    #   - cp_security_token=/cpsess[N]
+    #   - origin_as_string=...method=badpass
+    #   - tfa_verified=1                                          (forged)
+    #   - hasroot=1 / user=root                                   (forged)
+    #   - successful_internal_auth_with_timestamp=9999999999      (forged ts)
+    # We accept any session showing >=3 of the diagnostic markers as a hit
+    # to avoid over-tight ANDing - attackers may vary one or two fields.
+    local first_session_epoch="" first_session_file="" badpass_count=0 probe_artifact_count=0
+    if [[ -d /var/cpanel/sessions/raw ]]; then
+        while IFS= read -r -d '' sf; do
+            # Sessions tagged with sessionscribe-remote-probe canary are our
+            # own probe collateral. Skip the IOC ladder so probe runs don't
+            # escalate clean hosts to COMPROMISED. Aligns with ioc-scan.sh.
+            if grep -qE "$PROBE_CANARY_RE" "$sf" 2>/dev/null; then
+                probe_artifact_count=$((probe_artifact_count+1))
+                emit_signal offense info probe_canary_session \
+                    "session $sf is sessionscribe-remote-probe collateral, not exploitation" \
+                    file "$sf"
+                continue
+            fi
+            # --since DAYS: skip session files older than the cutoff. Vendor
+            # session IOCs always benefit from a full sweep, but for IR we
+            # let operators narrow to the incident window.
+            if [[ -n "$SINCE_EPOCH" ]]; then
+                local sm
+                sm=$(stat -c %Y "$sf" 2>/dev/null)
+                [[ -n "$sm" ]] && (( sm < SINCE_EPOCH )) && continue
+            fi
+            local markers=0 has_token_denied=0 has_cp_token=0 has_badpass=0
+            local has_tfa=0 has_root=0 has_forged_ts=0 has_multi_pass=0
+            grep -q '^token_denied=' "$sf" 2>/dev/null && { has_token_denied=1; markers=$((markers+1)); }
+            grep -q '^cp_security_token=' "$sf" 2>/dev/null && { has_cp_token=1; markers=$((markers+1)); }
+            grep -q '^origin_as_string=.*method=badpass' "$sf" 2>/dev/null && { has_badpass=1; markers=$((markers+1)); }
+            grep -q '^tfa_verified=1' "$sf" 2>/dev/null && { has_tfa=1; markers=$((markers+1)); }
+            if grep -qE '^(hasroot=1|user=root)' "$sf" 2>/dev/null; then
+                has_root=1; markers=$((markers+1))
+            fi
+            # Forged timestamp: anything beyond now+365d is implausible.
+            if grep -qE '^successful_internal_auth_with_timestamp=[0-9]+' "$sf" 2>/dev/null; then
+                local ts_val cutoff
+                ts_val=$(grep -oE '^successful_internal_auth_with_timestamp=[0-9]+' "$sf" | head -1 | cut -d= -f2)
+                cutoff=$(( TS_EPOCH + 31536000 ))
+                if [[ -n "$ts_val" ]] && (( ts_val > cutoff )); then
+                    has_forged_ts=1; markers=$((markers+1))
+                fi
+            fi
+            # Multi-line pass= (the CRLF carrier itself). Count occurrences;
+            # legitimate sessions either have no pass= or exactly one.
+            local pass_lines
+            pass_lines=$(grep -cE '^pass=' "$sf" 2>/dev/null)
+            if [[ -n "$pass_lines" ]] && (( pass_lines > 1 )); then
+                has_multi_pass=1; markers=$((markers+1))
+            fi
+
+            (( markers < 3 )) && continue
+
+            badpass_count=$((badpass_count+1))
+            local m src
+            m=$(stat -c %Y "$sf" 2>/dev/null)
+            src=$(grep -oE 'address=[0-9.:a-fA-F]+' "$sf" 2>/dev/null | head -1 | cut -d= -f2)
+            if [[ -z "$first_session_epoch" ]] || (( m < first_session_epoch )); then
+                first_session_epoch="$m"
+                first_session_file="$sf"
+            fi
+            local marker_summary="td=$has_token_denied cpt=$has_cp_token bp=$has_badpass tfa=$has_tfa root=$has_root fts=$has_forged_ts mpass=$has_multi_pass"
+            emit_signal offense fail badpass_session "session=$sf src=$src markers=$markers ($marker_summary) mtime=$(epoch_to_iso "$m")" \
+                epoch "$m" file "$sf" src_ip "$src" markers "$markers" \
+                token_denied "$has_token_denied" tfa_forged "$has_tfa" multi_pass "$has_multi_pass"
+        done < <(find /var/cpanel/sessions/raw -maxdepth 1 -type f -print0 2>/dev/null)
+
+        if [[ -n "$first_session_epoch" ]]; then
+            say_off "PATTERN-X: $badpass_count forged sessions; earliest $(epoch_to_iso "$first_session_epoch") ($first_session_file)"
+            OFFENSE_EVENTS+=("$first_session_epoch|X|badpass_session|earliest CRLF exploit session|patch,modsec")
+        else
+            say_pass "no forged session-injection artifacts"
+        fi
+        if (( probe_artifact_count > 0 )); then
+            say_info "skipped $probe_artifact_count probe-canary sessions (sessionscribe-remote-probe collateral)"
+        fi
+    fi
+
+    # Pattern D: sptadm reseller / 4ef72197.cpx.local / WHM_FullRoot tokens.
+    if [[ -f /var/cpanel/accounting.log ]]; then
+        # Earliest line matching any Pattern D fingerprint.
+        local earliest_d="" earliest_d_line=""
+        while IFS= read -r line; do
+            local ts
+            ts=$(echo "$line" | sed -E 's/^([A-Za-z]+ [A-Za-z]+ [0-9]+ [0-9:]+ [0-9]{4}):.*/\1/')
+            local epoch
+            epoch=$(date -d "$ts" +%s 2>/dev/null)
+            [[ -z "$epoch" ]] && continue
+            if [[ -z "$earliest_d" ]] || (( epoch < earliest_d )); then
+                earliest_d="$epoch"
+                earliest_d_line="$line"
+            fi
+            emit_signal offense fail pattern_d_accounting "line=$line" \
+                epoch "$epoch" raw "$line"
+        done < <(grep -E "${PATTERN_D_RESELLER}|${PATTERN_D_DOMAIN}|${PATTERN_D_EMAIL}|WHM_FullRoot" /var/cpanel/accounting.log 2>/dev/null)
+        if [[ -n "$earliest_d" ]]; then
+            say_off "PATTERN-D: persistence ops in accounting.log; earliest $(epoch_to_iso "$earliest_d")"
+            say_off "         first: $earliest_d_line"
+            OFFENSE_EVENTS+=("$earliest_d|D|pattern_d_persistence|reseller/token persistence ops|patch,modsec")
+        fi
+    fi
+
+    # Pattern D: sptadm user/reseller still present.
+    if id "$PATTERN_D_RESELLER" >/dev/null 2>&1 || \
+       grep -q "^${PATTERN_D_RESELLER}" /var/cpanel/resellers 2>/dev/null; then
+        local home_mtime=""
+        [[ -d "/home/$PATTERN_D_RESELLER" ]] && home_mtime=$(mtime_of "/home/$PATTERN_D_RESELLER")
+        say_off "PATTERN-D: $PATTERN_D_RESELLER reseller/account still present (active persistence)"
+        emit_signal offense fail pattern_d_reseller_present "$PATTERN_D_RESELLER user/reseller exists" \
+            home_mtime "$home_mtime"
+        [[ -n "$home_mtime" ]] && OFFENSE_EVENTS+=("$home_mtime|D|pattern_d_reseller|sptadm reseller home created|patch,modsec")
+    fi
+
+    # Pattern D: WHM API tokens with FullRoot scope created recently.
+    if [[ -d /var/cpanel/api_tokens_v2 ]]; then
+        local tok_count=0 oldest_suspect=""
+        for tf in /var/cpanel/api_tokens_v2/*; do
+            [[ -f "$tf" ]] || continue
+            if grep -q '"WHM_FullRoot"' "$tf" 2>/dev/null; then
+                tok_count=$((tok_count+1))
+                local m
+                m=$(mtime_of "$tf")
+                if [[ -z "$oldest_suspect" ]] || (( m < oldest_suspect )); then
+                    oldest_suspect="$m"
+                fi
+                emit_signal offense warn pattern_d_token "WHM_FullRoot token: $tf mtime=$(epoch_to_iso "$m")" \
+                    file "$tf" epoch "$m"
+            fi
+        done
+        if (( tok_count > 0 )); then
+            say_off "PATTERN-D: $tok_count WHM_FullRoot api token(s) present"
+            [[ -n "$oldest_suspect" ]] && OFFENSE_EVENTS+=("$oldest_suspect|D|pattern_d_token|WHM_FullRoot api token|patch,modsec")
+        fi
+    fi
+
+    # Build the access-log set: current + numbered rotations + .gz/.xz
+    # compressed rotations + cPanel access_log-YYYY-MM-DD style. cat_log()
+    # below is the read primitive that decompresses on the fly. With
+    # --since DAYS we filter rotations whose mtime is older than the cutoff
+    # to skip large historical files that can't contain recent evidence.
+    # Archived tarballs (/usr/local/cpanel/logs/archive/*.tar.gz) are
+    # surfaced as a warning - operators should expand them into a scratch
+    # dir and re-run with --extra-logs DIR if the incident window is older
+    # than the current rotation horizon.
+    local cp_logs=()
+    local lg
+    for lg in /usr/local/cpanel/logs/access_log \
+              /usr/local/cpanel/logs/access_log.[0-9]* \
+              /usr/local/cpanel/logs/access_log-* \
+              /usr/local/apache/logs/access_log \
+              /usr/local/apache/logs/access_log.[0-9]* \
+              /usr/local/apache/logs/access_log-*; do
+        [[ -f "$lg" ]] || continue
+        if [[ -n "$SINCE_EPOCH" ]]; then
+            local lm
+            lm=$(stat -c %Y "$lg" 2>/dev/null)
+            [[ -n "$lm" ]] && (( lm < SINCE_EPOCH )) && continue
+        fi
+        cp_logs+=("$lg")
+    done
+    # Honor extra-logs operator hint (set by --extra-logs).
+    if [[ -n "${EXTRA_LOGS_DIR:-}" && -d "$EXTRA_LOGS_DIR" ]]; then
+        while IFS= read -r -d '' lg; do
+            cp_logs+=("$lg")
+        done < <(find "$EXTRA_LOGS_DIR" -type f \( -name 'access_log*' -o -name '*.log*' \) -print0 2>/dev/null)
+    fi
+    if compgen -G "/usr/local/cpanel/logs/archive/*.tar.gz" >/dev/null 2>&1; then
+        local archive_count
+        archive_count=$(find /usr/local/cpanel/logs/archive -maxdepth 1 -name '*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')
+        say_warn "$archive_count archived log tarballs in /usr/local/cpanel/logs/archive/ are NOT scanned - expand and re-run with --extra-logs DIR if incident is older than rotation window"
+        emit_signal offense warn archive_logs_not_scanned \
+            "$archive_count tarballs in logs/archive not expanded" count "$archive_count"
+    fi
+
+    # Pattern E: websocket Shell hits. cPanel access_log format is
+    # IP - user [MM/DD/YYYY:HH:MM:SS +ZZZZ] "GET ..."  (extract_log_ts
+    # handles the cpanel MM/DD and apache DD/Mon variants).
+    # Capture session dimensions (rows/cols) - 24x80 vs 24x120 indicates
+    # different operators per the IC-5790 attribution.
+    local first_websocket="" first_ws_line="" ws_count=0
+    declare -A WS_DIMS=()
+    for lg in "${cp_logs[@]}"; do
+        [[ -f "$lg" ]] || continue
+        while IFS= read -r line; do
+            local apache_ts dims
+            apache_ts=$(extract_log_ts "$line")
+            [[ -z "$apache_ts" ]] && continue
+            local epoch
+            epoch=$(to_epoch "$apache_ts")
+            [[ -z "$epoch" ]] && continue
+            ws_count=$((ws_count+1))
+            dims=$(echo "$line" | grep -oE 'rows=[0-9]+&cols=[0-9]+' | head -1)
+            [[ -n "$dims" ]] && WS_DIMS["$dims"]=1
+            if [[ -z "$first_websocket" ]] || (( epoch < first_websocket )); then
+                first_websocket="$epoch"
+                first_ws_line="$line"
+            fi
+        done < <(cat_log "$lg" | grep -E 'GET /cpsess[0-9]+/websocket/Shell' 2>/dev/null \
+                                | grep -vE "$PROBE_UA_RE")
+    done
+    if [[ -n "$first_websocket" ]]; then
+        local src_ip dims_summary=""
+        src_ip=$(echo "$first_ws_line" | awk '{print $1}')
+        if (( ${#WS_DIMS[@]} > 0 )); then
+            dims_summary=$(printf '%s ' "${!WS_DIMS[@]}")
+            dims_summary="${dims_summary% }"
+        fi
+        say_off "PATTERN-E: $ws_count websocket/Shell hits; earliest $(epoch_to_iso "$first_websocket") src=$src_ip dims=[$dims_summary]"
+        emit_signal offense fail pattern_e_websocket "earliest websocket Shell from $src_ip ($ws_count total)" \
+            epoch "$first_websocket" src_ip "$src_ip" count "$ws_count" dims "$dims_summary" raw "$first_ws_line"
+        OFFENSE_EVENTS+=("$first_websocket|E|pattern_e_websocket|websocket Shell RCE|patch,modsec")
+    fi
+
+    # Pattern E: Fileman viewfile API harvesting sensitive files. Process
+    # ALL hits (not head -1) so per-IP / per-file detail is preserved.
+    local first_fileman=""
+    declare -A FM_IPS=()
+    for lg in "${cp_logs[@]}"; do
+        [[ -f "$lg" ]] || continue
+        while IFS= read -r hit; do
+            [[ -z "$hit" ]] && continue
+            local apache_ts epoch src_ip
+            apache_ts=$(extract_log_ts "$hit")
+            epoch=$(to_epoch "$apache_ts")
+            src_ip=$(echo "$hit" | awk '{print $1}')
+            [[ -z "$epoch" ]] && continue
+            if [[ -z "$first_fileman" ]] || (( epoch < first_fileman )); then
+                first_fileman="$epoch"
+            fi
+            FM_IPS["$src_ip"]=$(( ${FM_IPS["$src_ip"]:-0} + 1 ))
+            emit_signal offense fail pattern_e_fileman "Fileman API harvest from $src_ip" \
+                epoch "$epoch" src_ip "$src_ip" raw "$hit"
+        done < <(cat_log "$lg" | grep -E "Fileman.*(viewfile|showfile|getfilecontents).*${PATTERN_D_FILEMAN_RE}" 2>/dev/null \
+                                | grep -vE "$PROBE_UA_RE")
+    done
+    if [[ -n "$first_fileman" ]]; then
+        local ip_summary=""
+        for ip in "${!FM_IPS[@]}"; do
+            ip_summary+="$ip(${FM_IPS[$ip]}) "
+        done
+        say_off "PATTERN-E: Fileman API exfil; earliest $(epoch_to_iso "$first_fileman") ips=[${ip_summary% }]"
+        OFFENSE_EVENTS+=("$first_fileman|E|pattern_e_fileman|Fileman API credential harvest|patch,modsec")
+    fi
+
+    # Pattern D: WHM JSON-API recon burst. The Go-http-client tool walks the
+    # path set above before issuing createacct. Detect a burst of >=4
+    # distinct recon paths from the same source IP within a 60s window.
+    local first_recon=""
+    declare -A RECON_IPS=()
+    for lg in "${cp_logs[@]}"; do
+        [[ -f "$lg" ]] || continue
+        while IFS= read -r hit; do
+            [[ -z "$hit" ]] && continue
+            local src_ip path
+            src_ip=$(echo "$hit" | awk '{print $1}')
+            path=$(echo "$hit" | grep -oE '/json-api/(version|gethostname|listaccts|getdiskusage|systemloadavg|getips)' | head -1)
+            [[ -z "$src_ip" || -z "$path" ]] && continue
+            RECON_IPS["$src_ip"]+="$path,"
+            local apache_ts epoch
+            apache_ts=$(extract_log_ts "$hit")
+            epoch=$(to_epoch "$apache_ts")
+            if [[ -n "$epoch" ]]; then
+                if [[ -z "$first_recon" ]] || (( epoch < first_recon )); then
+                    first_recon="$epoch"
+                fi
+            fi
+        done < <(cat_log "$lg" | grep -E "${PATTERN_D_RECON_PATHS_RE}" 2>/dev/null \
+                                | grep -vE "$PROBE_UA_RE")
+    done
+    for ip in "${!RECON_IPS[@]}"; do
+        local distinct
+        distinct=$(echo "${RECON_IPS[$ip]}" | tr ',' '\n' | sort -u | grep -c .)
+        if (( distinct >= 4 )); then
+            say_off "PATTERN-D: recon burst from $ip ($distinct distinct json-api paths)"
+            emit_signal offense fail pattern_d_recon_burst \
+                "$ip walked $distinct distinct json-api recon paths" src_ip "$ip" distinct "$distinct"
+        fi
+    done
+    if [[ -n "$first_recon" ]]; then
+        OFFENSE_EVENTS+=("$first_recon|D|pattern_d_recon|json-api recon burst|patch,modsec")
+    fi
+
+    # Known-bad UAs across all access logs. Any hit is high-signal.
+    local bad_ua_count=0 first_bad_ua=""
+    declare -A UA_IPS=()
+    for lg in "${cp_logs[@]}"; do
+        [[ -f "$lg" ]] || continue
+        while IFS= read -r hit; do
+            [[ -z "$hit" ]] && continue
+            bad_ua_count=$((bad_ua_count+1))
+            local src_ip ua apache_ts epoch
+            src_ip=$(echo "$hit" | awk '{print $1}')
+            ua=$(echo "$hit" | grep -oE "(${KNOWN_BAD_UAS_RE})" | head -1)
+            apache_ts=$(extract_log_ts "$hit")
+            epoch=$(to_epoch "$apache_ts")
+            UA_IPS["$src_ip|$ua"]=$(( ${UA_IPS["$src_ip|$ua"]:-0} + 1 ))
+            if [[ -n "$epoch" ]]; then
+                if [[ -z "$first_bad_ua" ]] || (( epoch < first_bad_ua )); then
+                    first_bad_ua="$epoch"
+                fi
+            fi
+        done < <(cat_log "$lg" | grep -E "$KNOWN_BAD_UAS_RE" 2>/dev/null \
+                                | grep -vE "$PROBE_UA_RE")
+    done
+    if (( bad_ua_count > 0 )); then
+        for k in "${!UA_IPS[@]}"; do
+            local ip="${k%%|*}" ua="${k##*|}"
+            emit_signal offense warn pattern_d_bad_ua \
+                "known-bad UA: $ua from $ip (count=${UA_IPS[$k]})" \
+                src_ip "$ip" ua "$ua" count "${UA_IPS[$k]}"
+        done
+        say_off "$bad_ua_count attacker-UA hits across access logs (python-requests/Go-http-client/leakix)"
+        if [[ -n "$first_bad_ua" ]]; then
+            OFFENSE_EVENTS+=("$first_bad_ua|D|pattern_d_bad_ua|known-bad UA in access logs|patch,modsec")
+        fi
+    fi
+
+    # Known-bad source IPs across all access logs. Even one line from any
+    # blackholed IP is escalation-worthy.
+    local bad_ip_total=0 first_bad_ip=""
+    declare -A KB_HITS=()
+    local kb_re kb_re_pipe=""
+    for ip in "${KNOWN_BAD_IPS[@]}"; do
+        kb_re_pipe+="${ip//./\\.}|"
+    done
+    kb_re="^(${kb_re_pipe%|}) "
+    for lg in "${cp_logs[@]}"; do
+        [[ -f "$lg" ]] || continue
+        while IFS= read -r hit; do
+            [[ -z "$hit" ]] && continue
+            local src_ip apache_ts epoch
+            src_ip=$(echo "$hit" | awk '{print $1}')
+            KB_HITS["$src_ip"]=$(( ${KB_HITS["$src_ip"]:-0} + 1 ))
+            bad_ip_total=$((bad_ip_total+1))
+            apache_ts=$(extract_log_ts "$hit")
+            epoch=$(to_epoch "$apache_ts")
+            if [[ -n "$epoch" ]]; then
+                if [[ -z "$first_bad_ip" ]] || (( epoch < first_bad_ip )); then
+                    first_bad_ip="$epoch"
+                fi
+            fi
+        done < <(cat_log "$lg" | grep -E "$kb_re" 2>/dev/null)
+    done
+    if (( bad_ip_total > 0 )); then
+        for ip in "${!KB_HITS[@]}"; do
+            emit_signal offense fail known_bad_ip \
+                "known-bad attacker IP: $ip (count=${KB_HITS[$ip]})" \
+                src_ip "$ip" count "${KB_HITS[$ip]}"
+        done
+        say_off "$bad_ip_total log lines from ${#KB_HITS[@]} known-bad IC-5790 IPs"
+        if [[ -n "$first_bad_ip" ]]; then
+            OFFENSE_EVENTS+=("$first_bad_ip|init|known_bad_ip|known-bad attacker IP in logs|patch,modsec")
+        fi
+    fi
+
+    # Pattern F: automated harvester shell (__S_MARK__/__E_MARK__ envelope
+    # or TERM=dumb wrapper). bash_history doesn't carry timestamps unless
+    # HISTTIMEFORMAT was set, but file mtime brackets the latest write. We
+    # also read zsh/sh/fish history for shells the operator may have
+    # spawned within the websocket session.
+    local hist_files=(/root/.bash_history /root/.zsh_history /root/.sh_history /root/.local/share/fish/fish_history)
+    if (( INCLUDE_HOMEDIR_HISTORY )); then
+        while IFS= read -r -d '' h; do hist_files+=("$h"); done < <(find /home -maxdepth 4 \
+            \( -name '.bash_history' -o -name '.zsh_history' -o -name '.sh_history' -o -name 'fish_history' \) \
+            -type f -print0 2>/dev/null)
+    fi
+    local first_pattern_f=""
+    for h in "${hist_files[@]}"; do
+        [[ -f "$h" ]] || continue
+        if grep -qE "${PATTERN_F_S_MARK}|${PATTERN_F_E_MARK}|TERM=dumb; stty -echo" "$h" 2>/dev/null; then
+            local m
+            m=$(mtime_of "$h")
+            if [[ -z "$first_pattern_f" ]] || (( m < first_pattern_f )); then
+                first_pattern_f="$m"
+            fi
+            local count
+            count=$(grep -cE "${PATTERN_F_S_MARK}|${PATTERN_F_E_MARK}" "$h" 2>/dev/null)
+            emit_signal offense fail pattern_f_harvester "harvester fingerprint in $h (count=$count, file mtime=$(epoch_to_iso "$m"))" \
+                file "$h" count "$count" epoch "$m"
+        fi
+    done
+    if [[ -n "$first_pattern_f" ]]; then
+        say_off "PATTERN-F: automated harvester shell traces; earliest history mtime $(epoch_to_iso "$first_pattern_f")"
+        OFFENSE_EVENTS+=("$first_pattern_f|F|pattern_f_harvester|automated harvester shell|patch,modsec")
+    fi
+
+    # Pattern G: SSH key persistence. Find ssh-rsa / ssh-ed25519 entries
+    # anywhere on disk where attackers commonly stash keys (Muhammad's
+    # detection note - check beyond ~/.ssh: /root, /etc, /var/spool/cron).
+    # Comments not in the known-good set escalate. We capture atime + ctime
+    # BEFORE opening the file for read so our own scan doesn't pollute
+    # atime - that's the giveaway the attacker tries to hide via backdated
+    # mtime (the 2019-12-13 thing on maple2).
+
+    # First sweep: authorized_keys files specifically (per-line comment audit).
+    local ak_files=(/root/.ssh/authorized_keys /root/.ssh/authorized_keys2)
+    while IFS= read -r -d '' h; do
+        ak_files+=("$h/.ssh/authorized_keys" "$h/.ssh/authorized_keys2")
+    done < <(find /home -maxdepth 2 -mindepth 1 -type d -print0 2>/dev/null)
+
+    for ak in "${ak_files[@]}"; do
+        [[ -f "$ak" ]] || continue
+        # Capture timestamps BEFORE reading.
+        local mtime_pre atime_pre ctime_pre
+        mtime_pre=$(stat -c %Y "$ak" 2>/dev/null)
+        atime_pre=$(stat -c %X "$ak" 2>/dev/null)
+        ctime_pre=$(stat -c %Z "$ak" 2>/dev/null)
+
+        # Forged-mtime check: any ssh key authorized_keys file whose mtime
+        # matches the maple2 backdating wall-clock string under either UTC
+        # or localtime interpretation. The attackers ran `touch -d` which
+        # interprets in localtime; on a -0500 host the resulting epoch
+        # differs from the UTC interpretation by 5 hours. Comparing on the
+        # formatted wall-clock string (rather than a single epoch) catches
+        # both. We also try the immediate adjacent UTC offsets (-12..+14)
+        # so any timezone is covered without enumerating each.
+        if [[ -n "$mtime_pre" ]]; then
+            local mt_utc mt_local
+            mt_utc=$(date -u   -d "@$mtime_pre" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+            mt_local=$(date    -d "@$mtime_pre" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+            if [[ "$mt_utc" == "$PATTERN_G_FORGED_MTIME_WALL" \
+               || "$mt_local" == "$PATTERN_G_FORGED_MTIME_WALL" ]]; then
+                say_off "PATTERN-G: $ak mtime matches known forged stamp \"$PATTERN_G_FORGED_MTIME_WALL\" (atime=$(epoch_to_iso "$atime_pre"))"
+                emit_signal offense fail pattern_g_forged_mtime \
+                    "$ak mtime matches IC-5790 backdate stamp ($PATTERN_G_FORGED_MTIME_WALL)" \
+                    file "$ak" forged_mtime_wall "$PATTERN_G_FORGED_MTIME_WALL" \
+                    actual_mtime_utc "$mt_utc" actual_mtime_local "$mt_local" \
+                    actual_atime "$(epoch_to_iso "$atime_pre")"
+                [[ -n "$ctime_pre" ]] && OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_forged_mtime|backdated ssh key|patch,modsec")
+            fi
+        fi
+
+        local susp_count=0
+        while IFS= read -r line; do
+            [[ "$line" =~ ^# ]] && continue
+            [[ -z "$line" ]] && continue
+            # Pull comment (last whitespace-separated token).
+            local comment
+            comment=$(echo "$line" | awk '{print $NF}')
+            local is_known_bad=0 bad_label=""
+            for bad in "${PATTERN_G_BAD_KEY_LABELS[@]}"; do
+                if [[ "$comment" == *"$bad"* ]]; then
+                    is_known_bad=1; bad_label="$bad"; break
+                fi
+            done
+            if (( is_known_bad )); then
+                susp_count=$((susp_count+1))
+                emit_signal offense fail pattern_g_known_bad_key \
+                    "known-bad ssh key label in $ak: $comment matches $bad_label" \
+                    file "$ak" comment "$comment" matches "$bad_label"
+            elif [[ ! "$comment" =~ $SSH_KNOWN_GOOD_RE ]]; then
+                susp_count=$((susp_count+1))
+                emit_signal offense warn pattern_g_ssh_key \
+                    "non-standard ssh key in $ak: comment=$comment" \
+                    file "$ak" comment "$comment"
+            fi
+        done < "$ak"
+        if (( susp_count > 0 )); then
+            say_off "PATTERN-G: $susp_count non-standard ssh key(s) in $ak (atime=$(epoch_to_iso "$atime_pre") ctime=$(epoch_to_iso "$ctime_pre"))"
+            # ctime can't be backdated by touch, so it's a stronger signal.
+            if [[ -n "$ctime_pre" ]]; then
+                OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|non-standard ssh key (ctime)|patch,modsec")
+            fi
+        fi
+    done
+
+    # Second sweep: any ssh-rsa / ssh-ed25519 lines in non-canonical
+    # locations - cron, /etc, /var/spool/cron. This is where attackers
+    # hide keys outside ~/.ssh to avoid the obvious sweep.
+    local ssh_rsa_locations
+    # Exclude known-legitimate sshd host key paths and our own backups.
+    # head -100: prior cap was 20, which truncated on hosts with extensive
+    # per-user cron material. 100 is generous without unbounded output.
+    ssh_rsa_locations=$(grep -rIlE 'ssh-(rsa|ed25519|ecdsa|dss)[[:space:]]+[A-Za-z0-9+/=]{20,}' \
+        /etc /var/spool/cron /var/spool/at /usr/local/etc 2>/dev/null \
+        | grep -vE '^(/etc/ssh/ssh_host_|/etc/ssh/sshd_config|/etc/skel/\.ssh/|/etc/cpanel-known-hosts|'"$MITIGATE_BACKUP_ROOT"')' \
+        | head -100)
+    if [[ -n "$ssh_rsa_locations" ]]; then
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            local m c
+            m=$(stat -c %Y "$f" 2>/dev/null)
+            c=$(stat -c %Z "$f" 2>/dev/null)
+            say_off "PATTERN-G: ssh key material in non-canonical location: $f"
+            emit_signal offense fail pattern_g_offpath_key \
+                "ssh-rsa/ed25519 in $f (out of band of ~/.ssh)" \
+                file "$f" mtime_epoch "$m" ctime_epoch "$c"
+            [[ -n "$c" ]] && OFFENSE_EVENTS+=("$c|G|pattern_g_offpath|ssh key in non-canonical path|patch,modsec")
+        done <<< "$ssh_rsa_locations"
+    fi
+
+    # Pattern A: .sorry encryptor + /root/sshd binary.
+    if [[ -f "$PATTERN_A_BINARY" ]]; then
+        local m c sha
+        m=$(mtime_of "$PATTERN_A_BINARY")
+        c=$(stat -c %Z "$PATTERN_A_BINARY" 2>/dev/null)
+        # SHA-256 anchor: compare against the IC-5790 sample hash. Match =
+        # CONFIRMED encryptor; mismatch = unknown variant of /root/sshd
+        # (still suspicious - cpanel never ships sshd here).
+        sha=$(sha256sum "$PATTERN_A_BINARY" 2>/dev/null | awk '{print $1}')
+        if [[ "$sha" == "$PATTERN_A_SHA256" ]]; then
+            say_off "PATTERN-A: encryptor CONFIRMED via sha256 at $PATTERN_A_BINARY mtime=$(epoch_to_iso "$m") ctime=$(epoch_to_iso "$c")"
+            emit_signal offense fail pattern_a_binary_confirmed \
+                "$PATTERN_A_BINARY sha256 matches IC-5790 .sorry encryptor sample" \
+                file "$PATTERN_A_BINARY" sha256 "$sha" mtime_epoch "$m" ctime_epoch "$c"
+        else
+            say_off "PATTERN-A: suspect binary at $PATTERN_A_BINARY (sha256=$sha NOT IC-5790 sample) mtime=$(epoch_to_iso "$m") ctime=$(epoch_to_iso "$c")"
+            emit_signal offense fail pattern_a_binary_variant \
+                "$PATTERN_A_BINARY present (sha256=$sha; not the IC-5790 sample - variant?)" \
+                file "$PATTERN_A_BINARY" sha256 "$sha" mtime_epoch "$m" ctime_epoch "$c"
+        fi
+        [[ -n "$c" ]] && OFFENSE_EVENTS+=("$c|A|pattern_a_binary|/root/sshd encryptor binary|patch,modsec")
+    fi
+    # .sorry files - count and earliest. Default search root is /home + /var/www
+    # (where customer payloads live) plus / shallow for stray drops; depth
+    # scaled to common web-root layouts (e.g. wp-content/uploads is depth 6+).
+    local first_sorry="" sorry_count=0
+    local sorry_roots=()
+    [[ -d /home ]] && sorry_roots+=(/home)
+    [[ -d /var/www ]] && sorry_roots+=(/var/www)
+    [[ -d /usr/local/apache/htdocs ]] && sorry_roots+=(/usr/local/apache/htdocs)
+    [[ -d /root ]] && sorry_roots+=(/root)
+    if (( ${#sorry_roots[@]} > 0 )); then
+        while IFS= read -r -d '' sf; do
+            sorry_count=$((sorry_count+1))
+            local m
+            m=$(stat -c %Y "$sf" 2>/dev/null)
+            if [[ -z "$first_sorry" ]] || (( m < first_sorry )); then
+                first_sorry="$m"
+            fi
+        done < <(find "${sorry_roots[@]}" -maxdepth 8 -name '*.sorry' -print0 2>/dev/null)
+    fi
+    if (( sorry_count > 0 )); then
+        say_off "PATTERN-A: $sorry_count .sorry files; earliest mtime $(epoch_to_iso "$first_sorry")"
+        emit_signal offense fail pattern_a_sorry "count=$sorry_count earliest=$(epoch_to_iso "$first_sorry")" \
+            count "$sorry_count" epoch "$first_sorry"
+        OFFENSE_EVENTS+=("$first_sorry|A|pattern_a_sorry|.sorry encrypted files|patch,modsec")
+    fi
+    # README ransom note. Search common locations; encryptor often drops
+    # into /root, /home/*, and any encrypted directory.
+    local readme_hits=()
+    [[ -f "$PATTERN_A_README" ]] && readme_hits+=("$PATTERN_A_README")
+    while IFS= read -r -d '' f; do readme_hits+=("$f"); done < <(find /home -maxdepth 2 -name 'README.md' -print0 2>/dev/null)
+    for rf in "${readme_hits[@]}"; do
+        [[ -f "$rf" ]] || continue
+        if grep -qE "qtox|TOX ID|Sorry-ID|${PATTERN_A_TOX_ID}" "$rf" 2>/dev/null; then
+            local m has_tox
+            m=$(mtime_of "$rf")
+            has_tox=0
+            grep -q "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && has_tox=1
+            say_off "PATTERN-A: ransom README at $rf mtime $(epoch_to_iso "$m") tox_id_match=$has_tox"
+            emit_signal offense fail pattern_a_readme "ransom README at $rf (tox_id_match=$has_tox)" \
+                file "$rf" epoch "$m" tox_id_match "$has_tox"
+            OFFENSE_EVENTS+=("$m|A|pattern_a_readme|qTox ransom README|patch,modsec")
+        fi
+    done
+    # Pattern A C2 IP in connections / iptables / log surface.
+    if have_cmd ss; then
+        if ss -tn 2>/dev/null | grep -q "$PATTERN_A_C2_IP"; then
+            say_off "PATTERN-A: live connection to encryptor C2 $PATTERN_A_C2_IP"
+            emit_signal offense fail pattern_a_c2_live "live socket to $PATTERN_A_C2_IP" c2 "$PATTERN_A_C2_IP"
+            OFFENSE_EVENTS+=("$TS_EPOCH|A|pattern_a_c2_live|live connection to .sorry C2|patch,modsec")
+        fi
+    fi
+
+    # Pattern B: BTC index.html + /var/lib/mysql/mysql wipe.
+    local first_btc="" btc_count=0
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        btc_count=$((btc_count+1))
+        local m
+        m=$(stat -c %Y "$f" 2>/dev/null)
+        if [[ -z "$first_btc" ]] || (( m < first_btc )); then
+            first_btc="$m"
+        fi
+        emit_signal offense fail pattern_b_btc_note "BTC ransom note in $f" file "$f" epoch "$m"
+    done < <(grep -lE "${PATTERN_B_BTC}|${PATTERN_B_TWEET}|kindly send 0\.1 BTC" /home/*/public_html/index.html /var/www/html/index.html /usr/local/apache/htdocs/index.html 2>/dev/null)
+    if (( btc_count > 0 )); then
+        say_off "PATTERN-B: $btc_count BTC ransom notes; earliest mtime $(epoch_to_iso "$first_btc")"
+        OFFENSE_EVENTS+=("$first_btc|B|pattern_b_btc|BTC index.html ransom drop|patch,modsec")
+    fi
+    # /var/lib/mysql/mysql is the system DB - cPanel hosts ALWAYS have it
+    # when MySQL/MariaDB is healthy. Outside cPanel context this directory
+    # may be absent for benign reasons (different DB engine, fresh
+    # install), so gate the alert on cPanel presence to avoid noise on
+    # dev/lab boxes.
+    if [[ -x /usr/local/cpanel/cpanel ]] \
+       && [[ ! -d /var/lib/mysql/mysql ]] \
+       && [[ -d /var/lib/mysql ]]; then
+        local mysql_parent_mtime
+        mysql_parent_mtime=$(mtime_of /var/lib/mysql)
+        say_off "PATTERN-B: /var/lib/mysql/mysql missing on cPanel host - DB wiped (parent mtime $(epoch_to_iso "$mysql_parent_mtime"))"
+        emit_signal offense fail pattern_b_mysql_wiped \
+            "/var/lib/mysql/mysql directory missing - DB wipe" \
+            parent_mtime "$mysql_parent_mtime"
+        [[ -n "$mysql_parent_mtime" ]] && OFFENSE_EVENTS+=("$mysql_parent_mtime|B|pattern_b_mysql|DB wipe|patch,modsec")
+    fi
+
+    # Pattern C: nuclear.x86 references in history, cron, profile.d, rc.local.
+    local first_nuclear=""
+    declare -A NUCLEAR_FILES=()
+    for h in "${hist_files[@]}"; do
+        [[ -f "$h" ]] || continue
+        if grep -qE "nuclear\.x86|${PATTERN_C_C2_IP}|${PATTERN_C_C2_HOST}" "$h" 2>/dev/null; then
+            local m
+            m=$(mtime_of "$h")
+            NUCLEAR_FILES["$h"]="$m"
+            if [[ -z "$first_nuclear" ]] || (( m < first_nuclear )); then
+                first_nuclear="$m"
+            fi
+            emit_signal offense fail pattern_c_nuclear "nuclear.x86/flameblox reference in $h" \
+                file "$h" epoch "$m"
+        fi
+    done
+    # Persistence vectors: cron entries, profile.d, rc.local, systemd units
+    # commonly used to re-pull the binary after reboot.
+    local persistence_paths=(/etc/crontab /etc/cron.d /var/spool/cron /etc/cron.hourly /etc/cron.daily /etc/profile.d /etc/rc.local /etc/systemd/system /etc/init.d)
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        local m
+        m=$(mtime_of "$f")
+        NUCLEAR_FILES["$f"]="$m"
+        if [[ -z "$first_nuclear" ]] || (( m < first_nuclear )); then
+            first_nuclear="$m"
+        fi
+        say_off "PATTERN-C: nuclear/flameblox reference in persistence path: $f"
+        emit_signal offense fail pattern_c_persistence \
+            "nuclear.x86/flameblox in persistence path $f" file "$f" epoch "$m"
+    done < <(grep -rIlE "nuclear\.x86|${PATTERN_C_C2_IP}|${PATTERN_C_C2_HOST}" "${persistence_paths[@]}" 2>/dev/null)
+    # Live binary on disk - hash compare.
+    if [[ -f /tmp/nuclear.x86 || -f /var/tmp/nuclear.x86 || -f /dev/shm/nuclear.x86 ]]; then
+        for nx in /tmp/nuclear.x86 /var/tmp/nuclear.x86 /dev/shm/nuclear.x86; do
+            [[ -f "$nx" ]] || continue
+            local sha
+            sha=$(sha256sum "$nx" 2>/dev/null | awk '{print $1}')
+            if [[ "$sha" == "$PATTERN_C_SHA256" ]]; then
+                say_off "PATTERN-C: nuclear.x86 binary CONFIRMED via sha256 at $nx"
+                emit_signal offense fail pattern_c_binary_confirmed \
+                    "$nx sha256 matches IC-5790 Mirai/nuclear.x86 sample" \
+                    file "$nx" sha256 "$sha"
+            else
+                emit_signal offense warn pattern_c_binary_variant \
+                    "$nx present (sha256=$sha; not the IC-5790 sample - variant?)" \
+                    file "$nx" sha256 "$sha"
+            fi
+        done
+    fi
+    if [[ -n "$first_nuclear" ]]; then
+        say_off "PATTERN-C: ${#NUCLEAR_FILES[@]} files reference nuclear.x86; earliest mtime $(epoch_to_iso "$first_nuclear")"
+        OFFENSE_EVENTS+=("$first_nuclear|C|pattern_c_nuclear|Mirai botnet reference|patch,modsec")
+    fi
+
+    # Suspect inbound IPs from cpanel access_log: the ones that triggered
+    # badpass sessions or hit /cpsess.../websocket/Shell. Useful for
+    # cross-host correlation.
+    local suspect_ips
+    suspect_ips=$(
+        for lg in "${cp_logs[@]}"; do
+            cat_log "$lg"
+        done | grep -E '"GET /cpsess[0-9]+/(websocket/Shell|json-api/(createacct|setupreseller|setacls))' 2>/dev/null \
+             | awk '{print $1}' | sort -u | head -50
+    )
+    if [[ -n "$suspect_ips" ]]; then
+        local ip_list
+        ip_list=$(echo "$suspect_ips" | tr '\n' ',' | sed 's/,$//')
+        say_off "suspect attacker IPs (websocket/createacct hits): $ip_list"
+        emit_signal offense info suspect_ips "$ip_list" ips "$ip_list"
+    fi
+}
+
+###############################################################################
+# Reconciliation - was each defense in place when each indicator first hit?
+###############################################################################
+
+phase_reconcile() {
+    hdr "reconcile" "comparing defense activation vs compromise timestamps"
+
+    if (( ${#OFFENSE_EVENTS[@]} == 0 )); then
+        say_pass "no compromise indicators - nothing to reconcile"
+        emit_signal reconcile pass clean "no IOCs to reconcile"
+        return
+    fi
+
+    # The two defenses every offense event needs to be checked against:
+    #   - patch (Load.pm mtime + cpsrvd restart >= patch mtime)
+    #   - modsec rule 1500030 install time
+    # Both are proxies for "was the host actually defended at this moment?"
+
+    local effective_patch_time=""
+    if [[ -n "$DEF_PATCH_TIME" && -n "$DEF_CPSRVD_RESTART" ]]; then
+        # Effective patch time = max(patch_mtime, cpsrvd_restart_time).
+        # The patch isn't live until cpsrvd has restarted post-patch.
+        if (( DEF_CPSRVD_RESTART >= DEF_PATCH_TIME )); then
+            effective_patch_time="$DEF_CPSRVD_RESTART"
+        else
+            # cpsrvd predates the patch landing - patch not yet live.
+            effective_patch_time=""
+        fi
+    fi
+
+    local effective_modsec_time="$DEF_MODSEC_TIME"
+
+    say_info "effective patch time: $(epoch_to_iso "${effective_patch_time:-}")"
+    say_info "effective modsec time: $(epoch_to_iso "${effective_modsec_time:-}")"
+
+    local oe verdict delta
+    for oe in "${OFFENSE_EVENTS[@]}"; do
+        local ev_epoch ev_pat ev_key ev_note
+        # Field 5 (defenses_required) is reserved for future per-pattern
+        # reconciliation but currently every offense fires against the same
+        # patch+modsec pair, so we discard it.
+        IFS='|' read -r ev_epoch ev_pat ev_key ev_note _ <<< "$oe"
+
+        # Determine verdict:
+        #   pre-defense    if event happened before BOTH effective defenses
+        #   post-defense   if event happened after AT LEAST ONE effective defense
+        #   ambiguous      if defense times unknown
+        local pre_patch=0 pre_modsec=0
+        if [[ -n "$effective_patch_time" ]]; then
+            (( ev_epoch < effective_patch_time )) && pre_patch=1
+        else
+            pre_patch=1   # no effective patch -> event is "before" patch
+        fi
+        if [[ -n "$effective_modsec_time" ]]; then
+            (( ev_epoch < effective_modsec_time )) && pre_modsec=1
+        else
+            pre_modsec=1
+        fi
+
+        if [[ -z "$effective_patch_time" && -z "$effective_modsec_time" ]]; then
+            verdict="UNDEFENDED"
+            delta="n/a"
+            N_PRE=$((N_PRE+1))
+        elif (( pre_patch && pre_modsec )); then
+            verdict="PRE-DEFENSE"
+            # Delta to whichever defense landed first.
+            local first_def
+            if [[ -n "$effective_patch_time" && -n "$effective_modsec_time" ]]; then
+                first_def=$(( effective_patch_time < effective_modsec_time ? effective_patch_time : effective_modsec_time ))
+            elif [[ -n "$effective_patch_time" ]]; then
+                first_def="$effective_patch_time"
+            else
+                first_def="$effective_modsec_time"
+            fi
+            delta=$(( first_def - ev_epoch ))
+            N_PRE=$((N_PRE+1))
+        elif (( ! pre_patch && ! pre_modsec )); then
+            verdict="POST-DEFENSE"
+            delta=$(( ev_epoch - (effective_patch_time > effective_modsec_time ? effective_modsec_time : effective_patch_time) ))
+            N_POST=$((N_POST+1))
+        else
+            verdict="POST-PARTIAL"
+            # Only one defense was up. Highlight which.
+            local up_def="modsec"
+            (( pre_modsec )) && up_def="patch"
+            delta="partial:$up_def"
+            N_POST=$((N_POST+1))
+        fi
+
+        local color
+        case "$verdict" in
+            PRE-DEFENSE)  color="$C_RED" ;;
+            UNDEFENDED)   color="$C_RED" ;;
+            POST-DEFENSE) color="$C_GRN" ;;
+            POST-PARTIAL) color="$C_YEL" ;;
+            *)            color="$C_DIM" ;;
+        esac
+
+        if (( ! QUIET )); then
+            printf '  %s[%s]%s pattern=%s key=%s when=%s delta=%s\n' \
+                "$color" "$verdict" "$C_NC" "$ev_pat" "$ev_key" \
+                "$(epoch_to_iso "$ev_epoch")" "$delta" >&2
+        fi
+
+        local delta_human="$delta"
+        [[ "$delta" =~ ^-?[0-9]+$ ]] && delta_human="${delta}s"
+        emit_signal reconcile info kill_chain_event \
+            "pattern=$ev_pat verdict=$verdict event=$ev_key when=$(epoch_to_iso "$ev_epoch") delta=$delta_human" \
+            verdict "$verdict" pattern "$ev_pat" event_key "$ev_key" \
+            event_epoch "$ev_epoch" delta_seconds "$delta"
+
+        RECONCILED+=("$verdict|$delta|$ev_epoch|$ev_pat|$ev_key|$ev_note")
+    done
+
+    # Earliest offense vs latest defense - the headline number.
+    if (( ${#OFFENSE_EVENTS[@]} > 0 )); then
+        local min_off=""
+        for oe in "${OFFENSE_EVENTS[@]}"; do
+            local ts
+            ts=$(echo "$oe" | cut -d'|' -f1)
+            [[ -z "$ts" ]] && continue
+            if [[ -z "$min_off" ]] || (( ts < min_off )); then
+                min_off="$ts"
+            fi
+        done
+
+        local max_def=""
+        for de in "${DEFENSE_EVENTS[@]}"; do
+            local ts
+            ts=$(echo "$de" | cut -d'|' -f1)
+            [[ -z "$ts" ]] && continue
+            if [[ -z "$max_def" ]] || (( ts > max_def )); then
+                max_def="$ts"
+            fi
+        done
+
+        if [[ -n "$min_off" ]]; then
+            say_info "first compromise indicator: $(epoch_to_iso "$min_off")"
+        fi
+        if [[ -n "$max_def" ]]; then
+            say_info "latest defense activation: $(epoch_to_iso "$max_def")"
+        fi
+        if [[ -n "$min_off" && -n "$max_def" ]]; then
+            local gap=$(( max_def - min_off ))
+            if (( gap > 0 )); then
+                say_warn "DEFENSE LATE: latest defense ${gap}s ($(( gap / 3600 ))h) AFTER first compromise"
+                emit_signal reconcile warn defense_late \
+                    "latest defense ${gap}s after first compromise" \
+                    gap_seconds "$gap" first_offense "$min_off" last_defense "$max_def"
+            else
+                say_pass "DEFENSE EARLY: latest defense $(( -gap ))s before first compromise"
+            fi
+        fi
+    fi
+}
+
+###############################################################################
+# Bundle - tarball of raw artifacts for offline forensics
+###############################################################################
+
+# Estimate the on-disk footprint of a path list (MB). Used pre-tar to
+# enforce the bundle size budget before we spend wall time compressing.
+estimate_size_mb() {
+    [[ $# -eq 0 ]] && { echo 0; return; }
+    local mb
+    mb=$(du -smc "$@" 2>/dev/null | tail -1 | awk '{print $1+0}')
+    echo "${mb:-0}"
+}
+
+# Build a NUL-delimited path list under SRC restricted to mtime newer than
+# SINCE_EPOCH. If SINCE_EPOCH is empty, returns the full subtree as one entry.
+collect_recent() {
+    local src="$1"
+    [[ -e "$src" ]] || return 0
+    if [[ -z "$SINCE_EPOCH" ]]; then
+        printf '%s\0' "$src"
+        return
+    fi
+    if [[ -f "$src" ]]; then
+        local m; m=$(stat -c %Y "$src" 2>/dev/null)
+        [[ -n "$m" ]] && (( m >= SINCE_EPOCH )) && printf '%s\0' "$src"
+        return
+    fi
+    find "$src" -type f -newermt "@$SINCE_EPOCH" -print0 2>/dev/null
+}
+
+# Tar a candidate set with pre-flight size check.
+#   $1 = destination tarball name (relative to bundle dir)
+#   $2 = label for messages
+#   $3 = mode: "filtered" reads NUL-delimited paths from the file at $4;
+#               "raw" tars the literal paths in $4..N.
+# Skips with a warning if estimated size exceeds MAX_BUNDLE_MB (when > 0).
+bundle_tar() {
+    local dest="$1" label="$2" mode="$3"; shift 3
+    local bdir="$BUNDLE_BDIR" sz_mb=0 args=() rc=0
+
+    if [[ "$mode" == "filtered" ]]; then
+        local list="$1"
+        [[ ! -s "$list" ]] && { say_info "skipped: $label (no files in window)"; return; }
+        while IFS= read -r -d '' p; do args+=("$p"); done < "$list"
+        (( ${#args[@]} == 0 )) && { say_info "skipped: $label (no files in window)"; return; }
+        sz_mb=$(estimate_size_mb "${args[@]}")
+    else
+        args=("$@")
+        (( ${#args[@]} == 0 )) && return
+        sz_mb=$(estimate_size_mb "${args[@]}")
+    fi
+
+    if (( MAX_BUNDLE_MB > 0 && sz_mb > MAX_BUNDLE_MB )); then
+        say_warn "$label oversize (~${sz_mb}MB > ${MAX_BUNDLE_MB}MB cap) - SKIPPED"
+        emit_signal bundle warn bundle_oversize_skipped \
+            "$label estimated ${sz_mb}MB exceeds bundle budget ${MAX_BUNDLE_MB}MB" \
+            label "$label" estimate_mb "$sz_mb" cap_mb "$MAX_BUNDLE_MB"
+        return
+    fi
+
+    if [[ "$mode" == "filtered" ]]; then
+        printf '%s\0' "${args[@]}" \
+            | tar --null -czf "$bdir/$dest" -T - 2>/dev/null
+        rc=$?
+    else
+        tar -czf "$bdir/$dest" "${args[@]}" 2>/dev/null
+        rc=$?
+    fi
+    if (( rc == 0 )); then
+        say_info "captured: $dest (~${sz_mb}MB pre-compress)"
+        emit_signal bundle info bundle_captured \
+            "$dest captured (~${sz_mb}MB pre-compress)" \
+            file "$dest" estimate_mb "$sz_mb"
+    else
+        say_warn "$dest failed (tar rc=$rc)"
+    fi
+}
+
+phase_bundle() {
+    hdr "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
+
+    if (( ! DO_BUNDLE )); then
+        say_info "--no-bundle: skipping artifact capture"
+        return
+    fi
+
+    local bdir="${BUNDLE_DIR_ROOT}/${TS_ISO}-${RUN_ID}"
+    if ! mkdir -p "$bdir" 2>/dev/null; then
+        say_fail "could not create bundle dir: $bdir"
+        emit_signal bundle fail bundle_dir_failed "mkdir failed: $bdir"
+        return
+    fi
+    # Bundle contains ssh keys, sudoers, raw sessions, api tokens, root
+    # history; restrict access. (/etc/shadow intentionally not captured.)
+    chmod 0700 "$bdir" 2>/dev/null
+    chmod 0700 "$BUNDLE_DIR_ROOT" 2>/dev/null
+    BUNDLE_BDIR="$bdir"
+    say_info "bundle dir: $bdir (0700)"
+
+    # Manifest first - records what we collected and when.
+    {
+        echo "host=$HOSTNAME_FQDN"
+        echo "uid=$LP_UID"
+        echo "os=$OS_PRETTY"
+        echo "cpanel_version=$CPANEL_NORM"
+        echo "captured_at=$TS_ISO"
+        echo "run_id=$RUN_ID"
+        echo "tool_version=$VERSION"
+        echo "since_days=${SINCE_DAYS:-all}"
+        echo "since_epoch=${SINCE_EPOCH:-}"
+        echo "max_bundle_mb=$MAX_BUNDLE_MB"
+    } > "$bdir/manifest.txt"
+
+    # 1. cPanel sessions - forensically-relevant subtrees only. /var/cpanel/
+    # sessions/cache + tmpcache are the bulk of session-dir size on busy
+    # hosts and carry no forensic value (encoder cache, not forged-session
+    # artifacts). raw/ + preauth/ are where the IOCs live.
+    local sess_list; sess_list=$(mktemp /tmp/forensic-sess.XXXXXX)
+    {
+        collect_recent /var/cpanel/sessions/raw
+        collect_recent /var/cpanel/sessions/preauth
+    } > "$sess_list" 2>/dev/null
+    bundle_tar "sessions.tgz" "sessions (raw+preauth)" filtered "$sess_list"
+    rm -f "$sess_list"
+
+    # 2. Apache + cPanel access logs + cpsrvd incoming/error logs, filtered
+    # to within the window. incoming_http_requests.log carries the raw
+    # CRLF carrier on hosts that have it enabled - the highest-fidelity
+    # Pattern X primary source. error_log captures cpsrvd exception
+    # traces during exploitation attempts.
+    local logs_list; logs_list=$(mktemp /tmp/forensic-logs.XXXXXX)
+    {
+        local lg
+        for lg in /usr/local/cpanel/logs/access_log \
+                  /usr/local/cpanel/logs/access_log.[0-9]* \
+                  /usr/local/cpanel/logs/access_log-* \
+                  /usr/local/cpanel/logs/incoming_http_requests.log \
+                  /usr/local/cpanel/logs/incoming_http_requests.log.[0-9]* \
+                  /usr/local/cpanel/logs/incoming_http_requests.log-* \
+                  /usr/local/cpanel/logs/error_log \
+                  /usr/local/cpanel/logs/error_log.[0-9]* \
+                  /usr/local/cpanel/logs/error_log-* \
+                  /usr/local/apache/logs/access_log \
+                  /usr/local/apache/logs/access_log.[0-9]* \
+                  /usr/local/apache/logs/access_log-* \
+                  /usr/local/apache/logs/error_log \
+                  /usr/local/apache/logs/error_log.[0-9]* \
+                  /usr/local/apache/logs/error_log-*; do
+            [[ -f "$lg" ]] || continue
+            if [[ -n "$SINCE_EPOCH" ]]; then
+                local lm; lm=$(stat -c %Y "$lg" 2>/dev/null)
+                [[ -n "$lm" ]] && (( lm < SINCE_EPOCH )) && continue
+            fi
+            printf '%s\0' "$lg"
+        done
+    } > "$logs_list" 2>/dev/null
+    bundle_tar "access-logs.tgz" "access logs (cpanel+apache+cpsrvd)" filtered "$logs_list"
+    rm -f "$logs_list"
+
+    # 2b. System auth + audit logs. /var/log/secure carries sshd auth events
+    # (brute force, key acceptance), /var/log/messages catches sudo + kernel
+    # events, /var/log/audit/audit.log records syscall-level evidence of any
+    # post-RCE shell-out. Filtered by mtime so historical rotations outside
+    # the incident window don't blow the budget. cPanel runs RHEL family,
+    # so /var/log/secure is the canonical sshd log; /var/log/auth.log is
+    # included as a Debian-family fallback (no-op when absent).
+    local sys_logs_list; sys_logs_list=$(mktemp /tmp/forensic-syslogs.XXXXXX)
+    {
+        local lg
+        for lg in /var/log/secure /var/log/secure-* /var/log/secure.[0-9]* \
+                  /var/log/messages /var/log/messages-* /var/log/messages.[0-9]* \
+                  /var/log/audit/audit.log /var/log/audit/audit.log.[0-9]* \
+                  /var/log/auth.log /var/log/auth.log.[0-9]*; do
+            [[ -f "$lg" ]] || continue
+            if [[ -n "$SINCE_EPOCH" ]]; then
+                local lm; lm=$(stat -c %Y "$lg" 2>/dev/null)
+                [[ -n "$lm" ]] && (( lm < SINCE_EPOCH )) && continue
+            fi
+            printf '%s\0' "$lg"
+        done
+    } > "$sys_logs_list" 2>/dev/null
+    bundle_tar "system-logs.tgz" "system auth+audit logs" filtered "$sys_logs_list"
+    rm -f "$sys_logs_list"
+
+    # 3. cPanel control-plane state. accounting.log is line-grep'd later;
+    # api_tokens_v2 / resellers / cpanel.config are tiny. /var/cpanel/users
+    # is split into its own tarball (3b) so an oversize users/ on big
+    # shared hosts doesn't take accounting.log + api_tokens down with it.
+    local cp_state=()
+    [[ -f /var/cpanel/accounting.log ]] && cp_state+=(/var/cpanel/accounting.log)
+    [[ -f /var/cpanel/resellers ]]      && cp_state+=(/var/cpanel/resellers)
+    [[ -f /var/cpanel/cpanel.config ]]  && cp_state+=(/var/cpanel/cpanel.config)
+    [[ -d /var/cpanel/api_tokens_v2 ]]  && cp_state+=(/var/cpanel/api_tokens_v2)
+    bundle_tar "cpanel-state.tgz" "cpanel control-plane" raw "${cp_state[@]}"
+
+    # 3b. /var/cpanel/users is per-account JSON-like state (5-50 KB per
+    # account, hundreds of MB on shared hosts). Bundled separately so the
+    # oversize-skip path only drops users data, not accounting.log + tokens.
+    if [[ -d /var/cpanel/users ]]; then
+        bundle_tar "cpanel-users.tgz" "cpanel per-account state" raw /var/cpanel/users
+    fi
+
+    # 4. Persistence artifacts - SSH keys, cron (all variants), systemd
+    # units, init scripts, profile.d (login-time persistence vector),
+    # root shell histories (all flavors), passwd/shadow/group. Most paths
+    # are small; systemd unit + init.d trees can be a few MB on hosts
+    # with many services. Worth bundling whole - Pattern C only greps for
+    # nuclear.x86 so a hand-crafted backdoor unit would be invisible
+    # without the raw files.
+    local persist=()
+    [[ -d /root/.ssh ]] && persist+=(/root/.ssh)
+    [[ -d /var/spool/cron ]] && persist+=(/var/spool/cron)
+    [[ -d /etc/cron.d ]] && persist+=(/etc/cron.d)
+    [[ -d /etc/cron.hourly ]] && persist+=(/etc/cron.hourly)
+    [[ -d /etc/cron.daily ]] && persist+=(/etc/cron.daily)
+    [[ -d /etc/cron.weekly ]] && persist+=(/etc/cron.weekly)
+    [[ -d /etc/cron.monthly ]] && persist+=(/etc/cron.monthly)
+    [[ -f /etc/crontab ]] && persist+=(/etc/crontab)
+    [[ -d /etc/systemd/system ]] && persist+=(/etc/systemd/system)
+    [[ -d /etc/init.d ]] && persist+=(/etc/init.d)
+    [[ -d /etc/profile.d ]] && persist+=(/etc/profile.d)
+    [[ -f /etc/rc.local ]] && persist+=(/etc/rc.local)
+    [[ -f /root/.bash_history ]] && persist+=(/root/.bash_history)
+    [[ -f /root/.zsh_history ]] && persist+=(/root/.zsh_history)
+    [[ -f /root/.sh_history ]] && persist+=(/root/.sh_history)
+    [[ -f /root/.bash_profile ]] && persist+=(/root/.bash_profile)
+    [[ -f /root/.bashrc ]] && persist+=(/root/.bashrc)
+    [[ -f /root/.profile ]] && persist+=(/root/.profile)
+    [[ -f /root/.local/share/fish/fish_history ]] && persist+=(/root/.local/share/fish/fish_history)
+    [[ -f /etc/passwd ]] && persist+=(/etc/passwd)
+    [[ -f /etc/group ]] && persist+=(/etc/group)
+    # /etc/shadow intentionally NOT bundled - hash material is sensitive and
+    # not required for IC-5790 IR (no Pattern relies on shadow). /etc/sudoers
+    # + /etc/sudoers.d/ are bundled instead: attacker-planted sudo rules
+    # ("user ALL=(ALL) NOPASSWD:ALL") are a common post-RCE persistence
+    # vector and the file mtime/ctime brackets the plant time.
+    [[ -f /etc/sudoers ]] && persist+=(/etc/sudoers)
+    [[ -d /etc/sudoers.d ]] && persist+=(/etc/sudoers.d)
+    bundle_tar "persistence.tgz" "persistence artifacts" raw "${persist[@]}"
+
+    # 5. Defense state. updatelogs accumulate per upcp; filter by window so
+    # a 5-year-old host doesn't blow the budget on historical update logs
+    # irrelevant to the IC-5790 timeline.
+    local def_static=()
+    [[ -d "$MITIGATE_BACKUP_ROOT" ]] && def_static+=("$MITIGATE_BACKUP_ROOT")
+    [[ -f /etc/csf/csf.conf ]] && def_static+=(/etc/csf/csf.conf)
+    [[ -f /etc/csf/csf.conf.ic5790.bak ]] && def_static+=(/etc/csf/csf.conf.ic5790.bak)
+    [[ -f /etc/apf/conf.apf ]] && def_static+=(/etc/apf/conf.apf)
+    [[ -f "$MODSEC_USER_CONF" ]] && def_static+=("$MODSEC_USER_CONF")
+    local def_list; def_list=$(mktemp /tmp/forensic-def.XXXXXX)
+    {
+        local p
+        for p in "${def_static[@]}"; do printf '%s\0' "$p"; done
+        collect_recent /var/cpanel/updatelogs
+    } > "$def_list" 2>/dev/null
+    bundle_tar "defense-state.tgz" "defense state" filtered "$def_list"
+    rm -f "$def_list"
+
+    # 6. Process + network snapshot.
+    ps auxfww > "$bdir/ps.txt" 2>&1 || true
+    if have_cmd ss; then
+        ss -tnp > "$bdir/connections.txt" 2>&1 || true
+    elif have_cmd netstat; then
+        netstat -anp > "$bdir/connections.txt" 2>&1 || true
+    fi
+    if have_cmd iptables; then
+        iptables -L -nv > "$bdir/iptables.txt" 2>&1 || true
+    fi
+
+    # 7. Pattern A binary - capture metadata only, NOT the binary itself
+    # (avoid spreading the encryptor by accident).
+    if [[ -f "$PATTERN_A_BINARY" ]]; then
+        {
+            echo "Pattern A encryptor binary detected at $PATTERN_A_BINARY"
+            stat "$PATTERN_A_BINARY" 2>&1
+            md5sum "$PATTERN_A_BINARY" 2>&1
+            sha256sum "$PATTERN_A_BINARY" 2>&1
+            file "$PATTERN_A_BINARY" 2>&1
+        } > "$bdir/pattern-a-binary-metadata.txt"
+        say_warn "Pattern A binary metadata captured (binary itself NOT bundled)"
+    fi
+
+    # 8. Per-user bash histories (optional, gated on --no-history).
+    if (( INCLUDE_HOMEDIR_HISTORY )); then
+        mkdir -p "$bdir/user-histories"
+        local found=0
+        while IFS= read -r -d '' h; do
+            local user
+            user=$(echo "$h" | awk -F/ '{print $3}')
+            cp "$h" "$bdir/user-histories/$user.history" 2>/dev/null && found=$((found+1))
+        done < <(find /home -maxdepth 3 -name '.bash_history' -type f -print0 2>/dev/null)
+        say_info "captured $found user bash histories"
+    fi
+
+    # Final sweep: signal what we built.
+    local total_size
+    total_size=$(du -sh "$bdir" 2>/dev/null | awk '{print $1}')
+    say_info "bundle complete: $bdir ($total_size)"
+    emit_signal bundle info bundle_complete "dir=$bdir size=$total_size" dir "$bdir" size "$total_size"
+}
+
+###############################################################################
+# Run
+###############################################################################
+
+if (( ! QUIET )); then
+    printf '\n%ssessionscribe-forensic%s v%s - %s kill-chain reconstruction\n' \
+        "$C_BLD" "$C_NC" "$VERSION" "$INCIDENT_ID" >&2
+    printf '  host: %s    os: %s    cpanel: %s\n' \
+        "$HOSTNAME_FQDN" "$OS_PRETTY" "${CPANEL_NORM:-unknown}" >&2
+    printf '  ts: %s    run_id: %s\n' "$TS_ISO" "$RUN_ID" >&2
+    cap_human="${MAX_BUNDLE_MB}MB"
+    (( MAX_BUNDLE_MB == 0 )) && cap_human="unlimited"
+    if [[ -n "$SINCE_EPOCH" ]]; then
+        printf '  window: %s days (since %s)    bundle cap: %s\n' \
+            "$SINCE_DAYS" "$(date -u -d @"$SINCE_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+            "$cap_human" >&2
+    else
+        printf '  window: unlimited (all retained data)    bundle cap: %s\n' \
+            "$cap_human" >&2
+    fi
+fi
+
+phase_defense
+phase_offense
+phase_reconcile
+phase_bundle
+
+###############################################################################
+# Final summary
+###############################################################################
+
+N_DEF=${#DEFENSE_EVENTS[@]}
+N_OFF=${#OFFENSE_EVENTS[@]}
+
+hdr "summary" "kill-chain reconstruction"
+if (( ! QUIET )); then
+    printf '  defenses_extracted=%d  iocs_found=%d  pre_defense=%d  post_defense=%d\n' \
+        "$N_DEF" "$N_OFF" "$N_PRE" "$N_POST" >&2
+fi
+
+# Build a final summary signal.
+final_verdict="CLEAN"
+final_exit=0
+if (( N_OFF > 0 )); then
+    if (( N_PRE > 0 )); then
+        final_verdict="COMPROMISED_PRE_DEFENSE"
+        final_exit=2
+    else
+        final_verdict="COMPROMISED_POST_DEFENSE"
+        final_exit=1
+    fi
+fi
+
+emit_signal summary info verdict "$final_verdict" \
+    iocs_total "$N_OFF" \
+    pre_defense "$N_PRE" \
+    post_defense "$N_POST" \
+    defenses_extracted "$N_DEF"
+
+# JSON envelope mode - assemble all signals into one document.
+if (( JSON_OUT )); then
+    {
+        printf '{'
+        printf '"host":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s",' \
+            "$HOSTNAME_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO"
+        printf '"tool":"sessionscribe-forensic","tool_version":"%s","mode":"forensic","incident_id":"%s","run_id":"%s",' \
+            "$VERSION" "$INCIDENT_ID" "$RUN_ID"
+        printf '"verdict":"%s",' "$final_verdict"
+        printf '"defenses_extracted":%d,"iocs_found":%d,"pre_defense":%d,"post_defense":%d,' \
+            "$N_DEF" "$N_OFF" "$N_PRE" "$N_POST"
+        printf '"signals":['
+        first=1
+        for s in "${SIGNALS[@]}"; do
+            (( first )) || printf ','
+            printf '%s' "$s"
+            first=0
+        done
+        printf ']}'
+        printf '\n'
+    } > "${OUTPUT_FILE:-/dev/stdout}"
+fi
+
+if (( ! QUIET )); then
+    printf '\n  verdict: %s\n' "$final_verdict" >&2
+fi
+
+exit "$final_exit"
