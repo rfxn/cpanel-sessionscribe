@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.8.1
+# sessionscribe-forensic.sh v0.8.2
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.8.1"
+VERSION="0.8.2"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -1066,10 +1066,30 @@ phase_offense() {
 
     # Per-log: single awk pass emits TSV records aggregated by key.
     # Output columns: PAT \t IP \t EXTRA \t FIRST_TS \t COUNT \t FIRST_RAW
+    local malformed_records=0
     for lg in "${cp_logs[@]}"; do
         [[ -f "$lg" ]] || continue
         while IFS=$'\t' read -r pat ip extra ts cnt raw; do
             [[ -z "$pat" ]] && continue
+            # Defensive contract enforcement. Production crash on host2
+            # (CL6/bash 4.1, v0.8.1) showed cnt arriving as a full access-log
+            # line, breaking $(( bad_ua_count + cnt )) at line 1107 with
+            # "invalid arithmetic operator". Root cause was not reproducible
+            # off-host; reject any record whose cnt field is not a positive
+            # integer rather than crash the entire offense pass and lose
+            # every IOC after the first malformed line. The breadcrumb emit
+            # surfaces it once per run so future occurrences can be debugged
+            # with the actual offending row.
+            if [[ ! "$cnt" =~ ^[0-9]+$ ]]; then
+                if (( malformed_records == 0 )); then
+                    emit_signal offense warn malformed_offense_record \
+                        "awk emitted non-numeric count column - record skipped" \
+                        log "$lg" pat "$pat" ip "$ip" extra "${extra:0:80}" \
+                        ts "${ts:0:40}" cnt "${cnt:0:80}" raw "${raw:0:160}"
+                fi
+                ((malformed_records++))
+                continue
+            fi
             local epoch=""
             [[ -n "$ts" ]] && epoch=$(to_epoch "$ts")
             case "$pat" in
@@ -1194,6 +1214,12 @@ phase_offense() {
             }
         }')
     done
+
+    if (( malformed_records > 1 )); then
+        emit_signal offense warn malformed_offense_total \
+            "$malformed_records records skipped (contract violation)" \
+            count "$malformed_records"
+    fi
 
     # Post-aggregation: fold into the existing report shape.
     if [[ -n "$first_websocket" ]]; then
