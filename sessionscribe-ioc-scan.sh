@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.0
+# sessionscribe-ioc-scan.sh v1.6.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -2673,7 +2673,13 @@ chain_forensic_dispatch() {
              "diag" "$diag"
         return 0
     fi
-    local args=(--quiet --no-color)
+    # Mirror ioc-scan's quiet state into forensic so a quiet ioc-scan run
+    # gives a quiet chain. Otherwise let forensic's human report flow
+    # through to stderr - that's the value-add of chaining (defense
+    # timeline, kill-chain reconcile, bundle status). --no-color always
+    # set because ioc-scan's output is often piped to logs.
+    local args=(--no-color)
+    (( QUIET )) && args+=(--quiet)
     [[ -n "$SINCE_DAYS" ]] && args+=(--since "$SINCE_DAYS")
     if (( CHAIN_UPLOAD )); then
         args+=(--upload)
@@ -2702,10 +2708,13 @@ chain_forensic_dispatch() {
          "path" "$forensic_path" "origin" "$forensic_origin" "run_id" "$RUN_ID" \
          "upload" "$CHAIN_UPLOAD" "envelope" "$ENVELOPE_PATH" \
          "note" "dispatching forensic chain${upload_note}"
+    # Suppress forensic's stdout (its JSONL stream would interleave with
+    # ours and break a piping consumer); let stderr through so the
+    # operator sees the kill-chain reconstruction inline.
     local fexit=0
     SESSIONSCRIBE_RUN_ID="$RUN_ID" \
     SESSIONSCRIBE_IOC_JSON="$ENVELOPE_PATH" \
-        bash "$forensic_path" "${args[@]}" >/dev/null 2>&1 || fexit=$?
+        bash "$forensic_path" "${args[@]}" >/dev/null || fexit=$?
     emit "chain" "forensic_exit" "info" "chain_forensic_complete" 0 \
          "exit_code" "$fexit" \
          "note" "forensic chain exit=$fexit (does not override ioc exit_code)"

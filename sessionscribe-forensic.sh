@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.1
+# sessionscribe-forensic.sh v0.9.2
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.1"
+VERSION="0.9.2"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -1579,7 +1579,10 @@ phase_upload() {
 # Run
 ###############################################################################
 
-if (( ! QUIET )); then
+# When chained from ioc-scan, ioc-scan already printed the section header
+# and host metadata. Suppress our banner to avoid duplicate noise; the
+# chain context is unambiguous from SESSIONSCRIBE_IOC_JSON.
+if (( ! QUIET )) && [[ -z "${SESSIONSCRIBE_IOC_JSON:-}" ]]; then
     printf '\n%ssessionscribe-forensic%s v%s - %s kill-chain reconstruction\n' \
         "$C_BLD" "$C_NC" "$VERSION" "$INCIDENT_ID" >&2
     printf '  host: %s    os: %s    cpanel: %s\n' \
