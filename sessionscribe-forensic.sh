@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.7.0
+# sessionscribe-forensic.sh v0.7.1
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -66,7 +66,15 @@
 ###############################################################################
 set -u
 
-VERSION="0.7.0"
+# Require bash 4.0+ (associative arrays). CloudLinux 6 ships bash 4.1.2,
+# which is fine. Bash 3.x (RHEL5 / macOS-default) would fail later with
+# cryptic `declare -A` errors; emit a clean message and bail instead.
+if (( BASH_VERSINFO[0] < 4 )); then
+    echo "sessionscribe-forensic: requires bash >= 4.0 (have ${BASH_VERSION:-unknown})" >&2
+    exit 3
+fi
+
+VERSION="0.7.1"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -428,11 +436,12 @@ OS_J=$(json_esc "$OS_PRETTY")
 CPV_J=$(json_esc "$CPANEL_NORM")
 LP_UID_J=$(json_esc "$LP_UID")
 
-# Per-finding accumulators.
-declare -ga SIGNALS=()
-declare -ga DEFENSE_EVENTS=()   # "epoch|key|note"
-declare -ga OFFENSE_EVENTS=()   # "epoch|pattern|key|note|defenses_required"
-declare -ga RECONCILED=()       # "verdict|delta_seconds|epoch|pattern|key"
+# Per-finding accumulators. Module-scope arrays - `declare -a` is enough;
+# `-g` (bash 4.2+) is unnecessary here and breaks bash 4.1 (CloudLinux 6).
+declare -a SIGNALS=()
+declare -a DEFENSE_EVENTS=()   # "epoch|key|note"
+declare -a OFFENSE_EVENTS=()   # "epoch|pattern|key|note|defenses_required"
+declare -a RECONCILED=()       # "verdict|delta_seconds|epoch|pattern|key"
 
 N_DEF=0; N_OFF=0; N_PRE=0; N_POST=0
 
