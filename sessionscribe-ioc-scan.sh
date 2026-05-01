@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.3
+# sessionscribe-ioc-scan.sh v1.5.4
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.3"
+VERSION="1.5.4"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -538,16 +538,17 @@ print_signal_human() {
     #               itself, truncated for terminal readability)
     # All three are optional; rendered only when populated. Full content
     # always lands in JSONL (this function only formats the human view).
-    local note="" path="" sample_path="" file=""
+    local note="" path="" sample_path="" file="" log_file=""
     local user="" src_ip="" login_time="" file_mtime="" mtime=""
     local sample="" access_log_line="" line="" raw=""
-    local sha256="" count=""
+    local sha256="" count="" status="" port=""
     while (( $# >= 2 )); do
         case "$1" in
             note)             note="$2" ;;
             path)             path="$2" ;;
             sample_path)      sample_path="$2" ;;
             file)             file="$2" ;;
+            log_file)         log_file="$2" ;;
             user)             user="$2" ;;
             src_ip|ip)        src_ip="$2" ;;
             login_time)       login_time="$2" ;;
@@ -559,6 +560,8 @@ print_signal_human() {
             raw)              raw="$2" ;;
             sha256)           sha256="$2" ;;
             count)            count="$2" ;;
+            status)           status="$2" ;;
+            port)             port="$2" ;;
         esac
         shift 2
     done
@@ -570,17 +573,24 @@ print_signal_human() {
         printf '   %s%s%s %-44s %s%s%s\n' "$color" "$icon" "$NC" "$id" "$DIM" "$key" "$NC" >&2
     fi
 
-    # Suppress detail for known-clean info rows + the per-row sample
-    # emits whose entire payload IS the detail (no value-add to repeat).
+    # Suppress detail for known-clean info rows whose payload is meaningless.
+    # Per-row IOC samples are NOT suppressed - operators need ip/status/log_file/
+    # raw line to triage. anomalous_session_path samples are NOT suppressed
+    # because emit_session populates user/src_ip/login_time/file_mtime which
+    # are exactly the forensic fields that distinguish injection from a benign
+    # root-named session.
     case "$key" in
         no_ioc_hits|no_session_iocs|patched_per_build|patch_marker_present| \
-        ancillary_bug_fixed|acl_machinery_present_informational|ioc_sample| \
-        anomalous_session_path)
+        ancillary_bug_fixed|acl_machinery_present_informational)
             return ;;
     esac
 
-    # 1. WHERE - filesystem pointer the operator can stat/read directly
-    local location="${path:-${sample_path:-$file}}"
+    # 1. WHERE - filesystem pointer the operator can stat/read/grep directly.
+    # log_file (rotated access_log) takes precedence for IOC-sample rows: the
+    # operator's first action is "grep this in <file>", and we want to show
+    # the exact file rather than the live access_log they may have already
+    # checked.
+    local location="${log_file:-${path:-${sample_path:-$file}}}"
     if [[ -n "$location" ]]; then
         printf '       %s→ %s%s\n' "$DIM" "$location" "$NC" >&2
     fi
@@ -589,6 +599,8 @@ print_signal_human() {
     local kpi=""
     [[ -n "$user" ]]        && kpi+="user=$user  "
     [[ -n "$src_ip" ]]      && kpi+="src=$src_ip  "
+    [[ -n "$status" ]]      && kpi+="status=$status  "
+    [[ -n "$port" ]]        && kpi+="port=$port  "
     [[ -n "$login_time" ]]  && kpi+="login=$login_time  "
     if [[ -n "$file_mtime" ]]; then
         kpi+="mtime=$file_mtime  "
@@ -887,34 +899,51 @@ check_logs() {
     fi
     local total=0 hits_2xx=0 unique_ips=0
     local tmp; tmp=$(mktemp /tmp/ssioc.logs.XXXXXX)
+    # ASCII US (\x1f) tags each line with its source file before merge.
+    # Operators need to know which rotated access_log holds the hit so they
+    # can grep/zgrep the exact file - concatenating loses that.
+    local SEP=$'\x1f'
     {
-        [[ -f "$logdir/access_log" ]] && cat "$logdir/access_log"
+        if [[ -f "$logdir/access_log" ]]; then
+            awk -v src="access_log" -v sep="$SEP" \
+                '{ printf "%s%s%s\n", src, sep, $0 }' "$logdir/access_log"
+        fi
+        local f src
         for f in "$logdir"/access_log-*; do
             [[ -f "$f" ]] || continue
+            src=$(basename "$f")
             case "$f" in
-                *.gz) zcat "$f" 2>/dev/null ;;
-                *.xz) xzcat "$f" 2>/dev/null ;;
-                *)    cat "$f" ;;
+                (*.gz) zcat "$f" 2>/dev/null \
+                          | awk -v src="$src" -v sep="$SEP" \
+                              '{ printf "%s%s%s\n", src, sep, $0 }' ;;
+                (*.xz) xzcat "$f" 2>/dev/null \
+                          | awk -v src="$src" -v sep="$SEP" \
+                              '{ printf "%s%s%s\n", src, sep, $0 }' ;;
+                (*)    awk -v src="$src" -v sep="$SEP" \
+                              '{ printf "%s%s%s\n", src, sep, $0 }' "$f" ;;
             esac
         done
-    } | awk -v floor="${SINCE_EPOCH:-0}" -v ua_re="$IOC_AUTOMATED_UA" -v port_re="$CPSRVD_PORT_RE" '
-        /\/json-api\// {
+    } | awk -v floor="${SINCE_EPOCH:-0}" -v ua_re="$IOC_AUTOMATED_UA" -v port_re="$CPSRVD_PORT_RE" -v sep="$SEP" '
+        BEGIN { FS = sep }
+        $2 ~ /\/json-api\// {
+            src  = $1
+            line = $2
             # Apache combined log format. We need:
-            #   $1 = ip ; $3 = user ; $4 = [date:time ; $7 = path ;
-            #   $9 = status; UA from quoted field; port at $NF.
-            if ($0 !~ /"GET[[:space:]]+\/json-api\//) next
-            if ($0 !~ ua_re) next
-            n = split($0, t, " ")
+            #   t[1]=ip ; t[3]=user ; t[4]=[date:time ; t[7]=path ;
+            #   t[9]=status; UA from quoted field; port at t[n].
+            if (line !~ /"GET[[:space:]]+\/json-api\//) next
+            if (line !~ ua_re) next
+            n = split(line, t, " ")
             user = t[3]; status = t[9]; port = t[n]
             if (port !~ port_re) next
             # Optional time filter: floor=0 means no filter.
             # cpanel access_log timestamp is [MM/DD/YYYY:HH:MM:SS ...] (NOT
             # Apache CLF DD/Mon/YYYY). m[1]=MM, m[2]=DD, m[3]=YYYY.
-            if (floor > 0 && match($0, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
+            if (floor > 0 && match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
                 ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
                 if (ts > 0 && ts < floor) next
             }
-            print user "\t" status "\t" t[1] "\t" port "\t" $0
+            print user "\t" status "\t" t[1] "\t" port "\t" src "\t" line
         }
     ' > "$tmp" 2>/dev/null
 
@@ -937,11 +966,18 @@ check_logs() {
         # parent shell's SIGNALS array. With `head | while` the loop body
         # runs in a subshell and array appends are silently dropped from
         # the JSON file output.
-        local u st ip pt line trim
-        while IFS=$'\t' read -r u st ip pt line; do
+        local u st ip pt src_log line trim req
+        while IFS=$'\t' read -r u st ip pt src_log line; do
             trim="${line:0:200}"
+            # Extract method+path from the quoted request for the header note.
+            req=""
+            if [[ "$line" =~ \"([A-Z]+)[[:space:]]+([^\"\ ]+) ]]; then
+                req="${BASH_REMATCH[1]} ${BASH_REMATCH[2]:0:60}"
+            fi
             emit "logs" "ioc_sample" "info" "ioc_sample" 0 \
-                 "ip" "$ip" "user" "$u" "status" "$st" "port" "$pt" "line" "$trim"
+                 "ip" "$ip" "user" "$u" "status" "$st" "port" "$pt" \
+                 "log_file" "$logdir/$src_log" "line" "$trim" \
+                 "note" "$ip → $st  ${req}"
         done < <(head -5 "$tmp")
     else
         emit "logs" "ioc_scan" "info" "no_ioc_hits" 0 \
@@ -991,57 +1027,118 @@ check_attacker_ips() {
         excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
     fi
 
-    # Single-pass streaming scan. Two bash 4.1 (CL6) workarounds:
-    #   1) Newline after $( - bash <4.4 chokes parsing $({ at the start
-    #      of command substitution.
-    #   2) Leading-paren case patterns ((*.gz) not *.gz) - bash <4.4
-    #      miscounts the closing ) of a case arm inside $(...) and aborts
-    #      with "syntax error near unexpected token ;;". The leading (
-    #      makes the arm unambiguous to the parser.
-    local result
-    result=$(
-        {
-            [[ -f "$logdir/access_log" ]] && cat "$logdir/access_log"
-            for f in "$logdir"/access_log-*; do
-                [[ -f "$f" ]] || continue
-                case "$f" in
-                    (*.gz) zcat "$f" 2>/dev/null ;;
-                    (*.xz) xzcat "$f" 2>/dev/null ;;
-                    (*)    cat "$f" ;;
-                esac
-            done
-        } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" EXCLUDES="$excludes_env" awk '
+    # Stream all logs once with per-line src tagging (ASCII US, \x1f) so the
+    # downstream awk knows which rotated file each match came from. Operators
+    # need to know "grep this in access_log-2026-04-30.gz" not just "...somewhere".
+    # Two bash 4.1 (CL6) workarounds inside the case:
+    #   1) Newline after $( - bash <4.4 chokes on $({ at the start of cmdsub.
+    #   2) Leading-paren case patterns ((*.gz) not *.gz) - bash <4.4 miscounts
+    #      the closing ) inside $(...) and aborts with "syntax error near
+    #      unexpected token ;;".
+    local SEP=$'\x1f'
+    local tmp; tmp=$(mktemp /tmp/ssioc.atk.XXXXXX)
+    {
+        if [[ -f "$logdir/access_log" ]]; then
+            awk -v src="access_log" -v sep="$SEP" \
+                '{ printf "%s%s%s\n", src, sep, $0 }' "$logdir/access_log"
+        fi
+        local f src
+        for f in "$logdir"/access_log-*; do
+            [[ -f "$f" ]] || continue
+            src=$(basename "$f")
+            case "$f" in
+                (*.gz) zcat "$f" 2>/dev/null \
+                          | awk -v src="$src" -v sep="$SEP" \
+                              '{ printf "%s%s%s\n", src, sep, $0 }' ;;
+                (*.xz) xzcat "$f" 2>/dev/null \
+                          | awk -v src="$src" -v sep="$SEP" \
+                              '{ printf "%s%s%s\n", src, sep, $0 }' ;;
+                (*)    awk -v src="$src" -v sep="$SEP" \
+                              '{ printf "%s%s%s\n", src, sep, $0 }' "$f" ;;
+            esac
+        done
+    } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" EXCLUDES="$excludes_env" \
+        awk -v sep="$SEP" '
         BEGIN {
+            FS       = sep
             ip_re    = ENVIRON["IP_RE"]
             probe_re = ENVIRON["PROBE_RE"]
             n = split(ENVIRON["EXCLUDES"], ex_arr, "\n")
             for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
-            count = 0
-            sample = ""
+            total = 0; h2xx = 0; h3xx = 0; h4xx = 0; hother = 0
+            nsamp = 0
         }
-        $0 !~ ip_re   { next }
-        $0 ~ probe_re { next }
-        $1 in ex      { next }
         {
-            count++
-            if (sample == "") sample = $0
+            src  = $1
+            line = $2
+            if (line !~ ip_re) next
+            if (line ~ probe_re) next
+            split(line, lf, " ")
+            ip = lf[1]
+            if (ip in ex) next
+
+            # Apache combined: ... "REQUEST" STATUS BYTES "REFER" "UA" ...
+            # Locate end of quoted request, then next token is status.
+            st = "?"
+            if (match(line, /" [0-9]+ /)) {
+                s = substr(line, RSTART + 2)
+                split(s, ss, " ")
+                st = ss[1]
+            }
+
+            total++
+            if      (st ~ /^2/) h2xx++
+            else if (st ~ /^3/) h3xx++
+            else if (st ~ /^4/) h4xx++
+            else                hother++
+
+            if (nsamp < 5) {
+                nsamp++
+                # S\tsrc\tip\tstatus\tline - distinct prefix from TOTALS.
+                printf "S\t%s\t%s\t%s\t%s\n", src, ip, st, line
+            }
         }
         END {
-            print count
-            print sample
-        }'
-    )
+            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\n", total, h2xx, h3xx, h4xx, hother
+        }' > "$tmp" 2>/dev/null
 
-    local filtered_count="${result%%$'\n'*}"
-    local sample="${result#*$'\n'}"
-    filtered_count="${filtered_count:-0}"
-
-    if (( filtered_count > 0 )); then
-        emit "logs" "ioc_attacker_ip" "strong" \
-             "ioc_attacker_ip_in_access_log" 8 \
-             "count" "$filtered_count" "sample" "${sample:0:200}" \
-             "note" "$filtered_count access_log hit(s) from IC-5790 attacker IPs (CRITICAL)."
+    local total=0 h2xx=0 h3xx=0 h4xx=0 hother=0
+    local totals_line; totals_line=$(grep '^TOTALS' "$tmp" 2>/dev/null | head -1)
+    if [[ -n "$totals_line" ]]; then
+        IFS=$'\t' read -r _ total h2xx h3xx h4xx hother <<< "$totals_line"
     fi
+    total="${total:-0}"; h2xx="${h2xx:-0}"
+    h3xx="${h3xx:-0}"; h4xx="${h4xx:-0}"; hother="${hother:-0}"
+
+    if (( total > 0 )); then
+        # Severity policy: only successful (2xx) responses indicate
+        # exploitation. Attacker IP probing (4xx/3xx/connection-noise) is
+        # SUSPICIOUS but not COMPROMISED - the host repelled the request.
+        local sev parent_note
+        if (( h2xx > 0 )); then
+            sev="strong"
+            parent_note="$total hit(s) from IC-5790 IPs - $h2xx returned 2xx (EXPLOITATION EVIDENCE - CRITICAL)"
+        else
+            sev="warning"
+            parent_note="$total hit(s) from IC-5790 IPs - all rejected ($h4xx 4xx, $h3xx 3xx, $hother other) - probing only, no successful response (REVIEW)"
+        fi
+        emit "logs" "ioc_attacker_ip" "$sev" \
+             "ioc_attacker_ip_in_access_log" 8 \
+             "count" "$total" "hits_2xx" "$h2xx" "hits_3xx" "$h3xx" \
+             "hits_4xx" "$h4xx" "hits_other" "$hother" \
+             "note" "$parent_note"
+
+        local tag src ip st line trim
+        while IFS=$'\t' read -r tag src ip st line; do
+            [[ "$tag" == "S" ]] || continue
+            trim="${line:0:200}"
+            emit "logs" "ioc_attacker_ip_sample" "info" "ioc_attacker_ip_sample" 0 \
+                 "ip" "$ip" "status" "$st" "log_file" "$logdir/$src" \
+                 "line" "$trim" \
+                 "note" "$ip → $st  ($src)"
+        done < "$tmp"
+    fi
+    rm -f "$tmp"
 }
 
 # ---- session-store analyzer ----------------------------------------------
@@ -1493,9 +1590,21 @@ check_sessions() {
         emit "sessions" "session_shape_scan" "evidence" "anomalous_root_sessions" 4 \
              "count" "$anomalous" "scanned" "$scanned" \
              "note" "$anomalous root-named sessions${window_note} lacking expected authz fields"
-        local path
+        # Re-analyze each sample so emit_session can stamp user/src_ip/login_time/
+        # file_mtime - those four KPIs are the operator's primary forensic
+        # surface ("when was this written, from where, claiming what user").
+        # analyze_session is one awk pass per file; bounded at 10 samples.
+        local path reason
         while read -r path; do
-            emit "sessions" "session_shape_sample" "info" "anomalous_session_path" 0 "path" "$path"
+            analyze_session "$path"
+            reason=""
+            (( ! SF_ACLLIST )) && reason="missing acllist"
+            if (( SF_PASS_LEN > 0 && SF_PASS_LEN < 8 )); then
+                reason="${reason:+$reason; }short pass=${SF_PASS_LEN}"
+            fi
+            emit_session "session_shape_sample" "info" "anomalous_session_path" 0 \
+                 "path" "$path" \
+                 "note" "${reason:-anomalous root-named session}"
         done < <(head -10 "$atmp")
     fi
     rm -f "$atmp"
@@ -1889,6 +1998,10 @@ aggregate_verdict() {
                 if [[ "$key" == ioc_* ]]; then
                     ((ioc_review++))
                     IOC_KEYS+=("$key")
+                    # Surface review-tier IOCs in the verdict reasons line
+                    # so operators see "ioc_attacker_ip_in_access_log" even
+                    # when host_verdict is SUSPICIOUS not COMPROMISED.
+                    REASONS+=("$key")
                 fi
                 ;;
             info)
