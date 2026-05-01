@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -142,6 +142,86 @@ PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
 # combined with successful_*_auth_with_timestamp is treated as forgery evidence.
 PASS_FORGERY_MAX_LEN=12
 
+# Probe-traffic exclusion. Both the local-marker probe (this script) and the
+# remote probe (sessionscribe-remote-probe.sh) emit distinctive UAs so their
+# own access-log entries don't get mistaken for attacker traffic by --chain-
+# forensic or the attacker-IP cross-check. Updated when probe UAs change.
+PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
+
+###############################################################################
+# Destruction-stage IOCs (Patterns A-G). Cheap host-state probes - bounded
+# stat / hash / grep checks suitable for fleet triage. Heavyweight kill-chain
+# reconstruction lives in sessionscribe-forensic.sh; this set just answers
+# "does this host carry visible compromise residue?"
+#
+# Last updated from incident dossier: 2026-05-01.
+###############################################################################
+
+# Pattern A - .sorry encryptor + qTox ransom note. Encryptor masquerades as
+# /root/sshd; sha256 from VirusTotal sample. C2 IP (68.183.190.253) lives
+# in ATTACKER_IPS below for log cross-reference.
+PATTERN_A_BINARY="/root/sshd"
+PATTERN_A_SHA256="2fc0a056fd4eff5d31d06c103af3298d711f33dbcd5d122cae30b571ac511e5a"
+
+# Pattern B - DB wipe + index.html BTC note. BTC address is the one stable
+# fingerprint across all observed drops (the per-user note iterates with the
+# attacker's reseller harvest). mysql wipe = /var/lib/mysql/mysql directory
+# removed but /var/lib/mysql kept (DB engine fails to start).
+PATTERN_B_BTC_ADDR="bc1q9nh4revv6yqhj2gc5usncrpsfnh7ypwr9h0sp2"
+PATTERN_B_MYSQL_DIR="/var/lib/mysql"
+PATTERN_B_MYSQL_DB="/var/lib/mysql/mysql"
+
+# Pattern C - Mirai/nuclear.x86 botnet drop. Dropper deletes binary after
+# launch; the literal string survives in shell history. C2 host signal is
+# independent (in case the binary was renamed). C2 IP (87.121.84.78) is in
+# ATTACKER_IPS below.
+PATTERN_C_BIN="nuclear.x86"
+PATTERN_C_C2_HOST="raw.flameblox.com"
+
+# Pattern D - WHM JSON-API recon + reseller-as-persistence. The sptadm
+# reseller, exploit.local contact, and 4ef72197.cpx.local domain are the
+# universal fingerprints across host.graceworkz.com and the cohort. The
+# WHM_FullRoot API token they create persists post-patch unless revoked,
+# so a clean host_verdict isn't enough - this string in accounting.log
+# means the attacker had root via API token at some point.
+PATTERN_D_RESELLER="sptadm"
+PATTERN_D_DOMAIN="4ef72197.cpx.local"
+PATTERN_D_EMAIL="a@exploit.local"
+PATTERN_D_TOKEN_NAME="WHM_FullRoot"
+
+# Pattern E - websocket/Shell access-log signature. The 24x80 dimension is
+# the script-kiddie automated default; 24x120 has been seen too. The path
+# pattern (cpsess token + /websocket/Shell) is what matters.
+PATTERN_E_WS_RE='GET /cpsess[0-9]+/websocket/Shell'
+
+# Pattern F - automated harvester wrap. The __S_MARK__/__E_MARK__ envelope
+# is a strong actor fingerprint; only a single grep needed across bash
+# histories to confirm the same toolchain ran.
+PATTERN_F_S_MARK="__S_MARK__"
+PATTERN_F_E_MARK="__E_MARK__"
+
+# Pattern G - SSH key persistence. Suspect keys appear with mtime forged
+# to 2019-12-13 12:59:16 but a recent atime (Apr-May 2026). They masquerade
+# as LW-internal keys with IP-labeled comments. Real LW provisioning keys
+# carry "Parent Child key for <PJID>" comments - anything else in roots
+# /etc/, /var/spool/cron/ is a candidate.
+PATTERN_G_FORGED_MTIME="2019-12-13"
+SSH_KEY_FILES=(
+    "/root/.ssh/authorized_keys"
+    "/root/.ssh/authorized_keys2"
+)
+
+# Attacker source IPs consolidated from the IC-5790 dossier (2026-05-01).
+# Roles: badpass exploit, JSON-API enum, websocket Shell, TLS/HTTP probes,
+# C2/dropper. Some are blackholed; we still want to count log hits as a
+# late-stage signal in case rotation didn't take. Operators with internal
+# scan boxes can suppress hits via --exclude-ip CIDR.
+ATTACKER_IPS=(
+    68.233.238.100   206.189.2.13     137.184.77.0     38.146.25.154
+    157.245.204.205  192.81.219.190   149.102.229.144  94.231.206.39
+    45.82.78.104     68.183.190.253   87.121.84.78     96.30.39.236
+)
+
 ###############################################################################
 # Argument parsing
 ###############################################################################
@@ -162,6 +242,32 @@ CPSRVD_OVERRIDE=""
 SINCE_DAYS=""            # default: no time filter - scan all retained logs/sessions
 SINCE_EPOCH=""           # computed from SINCE_DAYS at parse time
 
+# Destruction-IOC scan (Patterns A-G). Cheap host-state probes; default ON
+# because the late-stage payload may be all that survives if initial-access
+# sessions have rotated out of /var/cpanel/sessions/raw/.
+NO_DESTRUCTION_IOCS=0
+
+# Run ledger. /var/cpanel/sessionscribe-ioc/ holds an append-only JSONL
+# of every run plus a per-run JSON envelope. Default ON so operators get
+# local history without an aggregator; --no-ledger opts out for paranoid
+# runs that must leave no host residue. Sibling to sessionscribe-mitigate's
+# /var/cpanel/sessionscribe-mitigation/ - both stay under /var/cpanel/
+# so cpanel-tool state is co-located.
+NO_LEDGER=0
+LEDGER_DIR_DEFAULT="/var/cpanel/sessionscribe-ioc"
+LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
+
+# Optional syslog one-liner for SIEM ingestion. Off by default.
+SYSLOG=0
+
+# --chain-forensic: when host_verdict != CLEAN, exec sessionscribe-forensic.sh
+# with the same RUN_ID for correlation. Default off; opt-in only.
+CHAIN_FORENSIC=0
+
+# --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
+# operator scan boxes / known-good IR sources.
+declare -ga EXCLUDE_IPS=()
+
 usage() {
     cat <<'EOF'
 Usage: bash sessionscribe-ioc-scan.sh [OPTIONS]
@@ -172,12 +278,23 @@ Scan options:
                              is responsive and access logs are flowing).
       --no-logs              Skip access-log IOC scan.
       --no-sessions          Skip session-store IOC + anomaly scan.
+      --no-destruction-iocs  Skip destruction-stage probes (Patterns A-G:
+                             /root/sshd encryptor, mysql-wipe, BTC index,
+                             nuclear.x86, sptadm reseller, __S_MARK__
+                             harvester, suspect SSH keys). Use for the
+                             original-shape ioc-scan triage when only
+                             session/log signals are wanted.
       --ioc-only             Run only the host-state IOC scans (logs +
-                             sessions + optional probe). Skip version,
-                             static-pattern, and cpsrvd-binary code-state
-                             checks. code_verdict is reported as SKIPPED;
-                             the exit code reflects host_verdict only.
-                             Useful for periodic post-patch sweeps.
+                             sessions + destruction probes + optional
+                             marker probe). Skip version, static-pattern,
+                             and cpsrvd-binary code-state checks. The
+                             code_verdict is reported as SKIPPED; the exit
+                             code reflects host_verdict only. Useful for
+                             periodic post-patch sweeps.
+      --exclude-ip CIDR      Suppress attacker-IP cross-ref hits for this
+                             address (single IP only - no CIDR mask
+                             matching). Repeatable. Use for operator scan
+                             boxes / known-good IR sources.
       --since DAYS           Limit log + session-anomaly scans to last N days.
                              Default: no filter (scan all retained data).
                              Vendor session IOCs (token-injection / preauth-
@@ -205,6 +322,27 @@ Output:
       --quiet                Suppress sectioned report.
       --no-color             Disable ANSI color codes.
 
+Run ledger (default ON):
+      --no-ledger            Skip the /var/cpanel/sessionscribe-ioc/ run
+                             ledger. Use on hosts where you must not
+                             leave residue.
+      --ledger-dir DIR       Override default ledger directory
+                             (/var/cpanel/sessionscribe-ioc/).
+      --syslog               Emit a one-line summary via logger -t
+                             sessionscribe-ioc -p auth.notice on completion.
+
+Forensic chaining:
+      --chain-forensic       After scan, if host_verdict != CLEAN, exec
+                             sessionscribe-forensic.sh with
+                             --since/--no-color/--quiet inherited and a
+                             shared RUN_ID. Resolution order: (1) sibling
+                             of this script, (2) PATH, (3) GitHub raw
+                             (rfxn/cpanel-sessionscribe@main), (4) CDN
+                             (sh.rfxn.com). Forensic exit code is
+                             reported as a chain.forensic_exit signal
+                             but does not override this script's
+                             exit code.
+
 Misc:
       --timeout N            Probe timeout in seconds (default 8).
   -h, --help                 Show this help.
@@ -225,8 +363,14 @@ while [[ $# -gt 0 ]]; do
         --no-color)           NO_COLOR=1; shift ;;
         --no-logs)            NO_LOGS=1; shift ;;
         --no-sessions)        NO_SESSIONS=1; shift ;;
+        --no-destruction-iocs) NO_DESTRUCTION_IOCS=1; shift ;;
         --ioc-only|--iocs-only) IOC_ONLY=1; shift ;;
         --since)              SINCE_DAYS="$2"; shift 2 ;;
+        --exclude-ip)         EXCLUDE_IPS+=("$2"); shift 2 ;;
+        --no-ledger)          NO_LEDGER=1; shift ;;
+        --ledger-dir)         LEDGER_DIR="$2"; shift 2 ;;
+        --syslog)             SYSLOG=1; shift ;;
+        --chain-forensic)     CHAIN_FORENSIC=1; shift ;;
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
@@ -249,6 +393,15 @@ if [[ -n "$SINCE_DAYS" ]]; then
     fi
     SINCE_EPOCH=$(( $(date -u +%s) - SINCE_DAYS * 86400 ))
 fi
+
+# RUN_ID: <epoch>-<pid>. Mirrors sessionscribe-mitigate.sh convention so
+# chained ioc->forensic outputs and operator log greps line up. Inherits
+# from SESSIONSCRIBE_RUN_ID env if set (chain entry from another wrapper).
+TS_EPOCH=$(date -u +%s)
+RUN_ID="${SESSIONSCRIBE_RUN_ID:-${TS_EPOCH}-$$}"
+
+# Resolve ledger directory once - --ledger-dir wins, otherwise default.
+[[ -z "$LEDGER_DIR" ]] && LEDGER_DIR="$LEDGER_DIR_DEFAULT"
 
 # Streaming output formats own stdout; suppress the sectioned report (which
 # the say/sayf/section helpers would otherwise emit on stderr) so the run
@@ -339,8 +492,8 @@ emit() {
     SIGNALS+=("${area}"$'\t'"${id}"$'\t'"${severity}"$'\t'"${key}"$'\t'"${weight}"$'\t'"${jsonkv}")
     print_signal_human "$area" "$id" "$severity" "$key" "$@"
     if (( JSONL )); then
-        printf '{"host":"%s","area":"%s","id":"%s","severity":"%s","key":"%s","weight":%s%s}\n' \
-            "$HOSTNAME_JSON" "$area" "$id" "$severity" "$key" "${weight:-0}" \
+        printf '{"host":"%s","run_id":"%s","area":"%s","id":"%s","severity":"%s","key":"%s","weight":%s%s}\n' \
+            "$HOSTNAME_JSON" "$RUN_ID" "$area" "$id" "$severity" "$key" "${weight:-0}" \
             "${jsonkv:+,${jsonkv}}"
     fi
 }
@@ -713,6 +866,76 @@ check_logs() {
              "note" "no IOC-pattern hits in access logs${window_note}."
     fi
     rm -f "$tmp"
+
+    # ---- attacker-IP cross-ref -------------------------------------------
+    # Independent signal: count access_log hits from the consolidated
+    # IC-5790 attacker IP list. Excludes probe-UA traffic and any
+    # operator-supplied --exclude-ip values. A hit here doesn't imply
+    # successful exploitation (the IP may have been blackholed before
+    # request landed) but does mean the attacker reached this host.
+    check_attacker_ips "$logdir"
+}
+
+# Cross-reference access_log against the dossier attacker-IP list. Pulled
+# out of check_logs() to keep that function readable; called immediately
+# after.
+check_attacker_ips() {
+    local logdir="$1"
+    local atmp; atmp=$(mktemp /tmp/ssioc.aip.XXXXXX)
+    {
+        [[ -f "$logdir/access_log" ]] && cat "$logdir/access_log"
+        for f in "$logdir"/access_log-*; do
+            [[ -f "$f" ]] || continue
+            case "$f" in
+                *.gz) zcat "$f" 2>/dev/null ;;
+                *.xz) xzcat "$f" 2>/dev/null ;;
+                *)    cat "$f" ;;
+            esac
+        done
+    } > "$atmp" 2>/dev/null
+    # Build IP alternation. Escape dots so 1.2.3.4 only matches that literal.
+    local ip ip_re=""
+    for ip in "${ATTACKER_IPS[@]}"; do
+        ip_re+="${ip_re:+|}${ip//./\\.}"
+    done
+    # Anchored to "^IP " so we don't match an IP buried inside a URL/UA.
+    ip_re="^(${ip_re}) "
+    # Build exclude-IP filter (post-grep awk so we don't have to recompile
+    # the alternation when EXCLUDE_IPS is empty).
+    local total_hits unique_attackers
+    total_hits=$(grep -cE "$ip_re" "$atmp" 2>/dev/null)
+    total_hits="${total_hits:-0}"
+    if (( total_hits == 0 )); then
+        rm -f "$atmp"
+        return
+    fi
+    # Apply probe-UA exclusion + EXCLUDE_IPS filter via awk. The awk match
+    # against ip_re replaces the second grep -c so we walk the file once.
+    local filtered_count
+    filtered_count=$(awk -v probe_re="$PROBE_UA_RE" \
+                         -v ip_re="$ip_re" \
+                         -v excludes="$(printf '%s\n' "${EXCLUDE_IPS[@]:-}")" '
+        BEGIN {
+            n = split(excludes, ex_arr, "\n")
+            for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
+            count = 0
+        }
+        $0 ~ probe_re      { next }
+        $0 !~ ip_re        { next }
+        { if (!($1 in ex)) count++ }
+        END { print count + 0 }
+    ' "$atmp")
+    filtered_count="${filtered_count:-0}"
+    if (( filtered_count > 0 )); then
+        local sample
+        sample=$(grep -E "$ip_re" "$atmp" 2>/dev/null \
+                    | grep -vE "$PROBE_UA_RE" | head -1)
+        emit "logs" "ioc_attacker_ip" "strong" \
+             "ioc_attacker_ip_in_access_log" 8 \
+             "count" "$filtered_count" "sample" "${sample:0:200}" \
+             "note" "$filtered_count access_log hit(s) from IC-5790 attacker IPs (CRITICAL)."
+    fi
+    rm -f "$atmp"
 }
 
 # ---- session-store analyzer ----------------------------------------------
@@ -724,6 +947,7 @@ analyze_session() {
     SF_TOKEN_DENIED=0; SF_CP_TOKEN=0; SF_BADPASS=0; SF_LEGIT_LOGIN=0
     SF_EXT_AUTH=0;     SF_INT_AUTH=0; SF_TFA=0;     SF_HASROOT=0
     SF_CANARY=0;       SF_ROOT_USER=0; SF_ACLLIST=0; SF_STRANDED=0
+    SF_MALFORMED=0;    SF_MALFORMED_SAMPLE=""
     SF_PASS_COUNT=0;   SF_PASS_LEN=0
     SF_TD_VAL="";      SF_CP_VAL="";   SF_ORIGIN="";  SF_AUTH_TS=""
 
@@ -746,6 +970,8 @@ analyze_session() {
             pass_count)      SF_PASS_COUNT=$_v ;;
             pass_len)        SF_PASS_LEN=$_v ;;
             stranded)        SF_STRANDED=$_v ;;
+            malformed)       SF_MALFORMED=$_v ;;
+            malformed_sample) SF_MALFORMED_SAMPLE=$_v ;;
             root_user)       SF_ROOT_USER=$_v ;;
             acllist)         SF_ACLLIST=$_v ;;
         esac
@@ -769,6 +995,17 @@ analyze_session() {
             pass_count++; next
         }
         pass_at > 0 && line_idx == pass_at + 1 && /./ && !/^[a-zA-Z_][a-zA-Z0-9_]*=/ { stranded=1 }
+        # Broader malformed-line detector (per WebPros IOC-3): any non-blank
+        # line that does not match key=value. cpsrvd serializes via
+        # FlushConfig with `=` separator and a fixed _SESSION_PARTS key
+        # whitelist (Cpanel/Server.pm:2216-2247), and Cpanel::Session::
+        # filter_sessiondata strips \r\n from values - so legitimate
+        # sessions cannot produce non-conforming lines. Any hit here is
+        # injection footprint that bypassed those invariants.
+        $0 != "" && $0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/ {
+            malformed=1
+            if (malformed_sample == "") malformed_sample=substr($0,1,80)
+        }
         /^(user|whm_user|user_id|cp_security_token_user)=root[[:space:]]*$/ { root_user=1 }
         /^(acllist|acl_list)=/  { has_acllist=1 }
         END {
@@ -776,6 +1013,7 @@ analyze_session() {
             # bash key=value parser downstream.
             gsub(/[\r\n\t]/, " ", td_val); gsub(/[\r\n\t]/, " ", cp_val)
             gsub(/[\r\n\t]/, " ", origin); gsub(/[\r\n\t]/, " ", auth_ts)
+            gsub(/[\r\n\t]/, " ", malformed_sample)
             print "token_denied=" (has_td?1:0)
             print "td_val=" td_val
             print "cp_token=" (has_cp?1:0)
@@ -792,10 +1030,40 @@ analyze_session() {
             print "pass_count=" (pass_count+0)
             print "pass_len=" length(pass_val)
             print "stranded=" (stranded?1:0)
+            print "malformed=" (malformed?1:0)
+            print "malformed_sample=" malformed_sample
             print "root_user=" (root_user?1:0)
             print "acllist=" (has_acllist?1:0)
         }
     ' "$1" 2>/dev/null)
+}
+
+# ---- access_log token-use cross-ref --------------------------------------
+# When session-store IOCs detect a forged cp_security_token, this helper
+# checks whether the same token was actually used in access_log with a
+# 2xx response. A hit escalates the actionable shape from "session was
+# forged" to "session was forged AND used" - meaningful for IR scoping
+# (token revocation urgency, blast-radius assessment).
+#
+# Uses the same access_log root the rest of the script reads from. The
+# closing-quote-then-status pattern ('" 2[0-9][0-9] ') is the apache
+# combined-log marker for the request-line/status boundary - more
+# robust than a bare " 200 " grep which would false-positive on IPs
+# beginning with 200, response-byte-counts of 200, etc.
+check_token_used() {
+    local session_path="$1" token_val="$2" session_name="$3"
+    local log=/usr/local/cpanel/logs/access_log
+    [[ -f "$log" && -n "$token_val" ]] || return 1
+    local hit
+    hit=$(grep -aF -- "$token_val" "$log" 2>/dev/null \
+            | grep -E '" 2[0-9][0-9] ' | head -1)
+    [[ -z "$hit" ]] && return 1
+    emit "sessions" "ioc_token_used_$session_name" "strong" \
+         "ioc_injected_token_used_with_2xx" 10 \
+         "path" "$session_path" "cp_security_token" "$token_val" \
+         "access_log_line" "${hit:0:200}" \
+         "note" "Injected security token observed in access_log with 2xx response - attacker successfully used the forged session (CRITICAL)."
+    return 0
 }
 
 # ---- session-store IOC scan ----------------------------------------------
@@ -864,13 +1132,19 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-B: pre-auth-paired session with successful_external_auth_with_timestamp
-            # (vendor IOC for OAuth/external-auth-pathway injection).
-            if [[ -f "$preauth_file" ]] && (( SF_EXT_AUTH )); then
+            # IOC-B: pre-auth-paired session with successful_*_auth_with_timestamp.
+            # Both external (original PoC) and internal (watchtowr poc/poc_
+            # watchtowr.py:35) variants are caught - cpsrvd's write_session
+            # removes the preauth marker on auth promotion, so any session
+            # carrying both is structurally impossible in a benign flow.
+            if [[ -f "$preauth_file" ]] && (( SF_EXT_AUTH || SF_INT_AUTH )); then
+                local _which="external"
+                (( SF_INT_AUTH && ! SF_EXT_AUTH )) && _which="internal"
+                (( SF_EXT_AUTH && SF_INT_AUTH ))   && _which="external+internal"
                 emit "sessions" "ioc_preauth_extauth_$session_name" "strong" \
-                     "ioc_preauth_with_external_auth_attribute" 10 \
-                     "path" "$f" "preauth_path" "$preauth_file" \
-                     "note" "Pre-auth session contains successful_external_auth_with_timestamp - injected (CRITICAL)."
+                     "ioc_preauth_with_auth_attribute" 10 \
+                     "path" "$f" "preauth_path" "$preauth_file" "marker" "$_which" \
+                     "note" "Pre-auth session carries successful_${_which}_auth_with_timestamp - injected (CRITICAL)."
                 ((ioc_hits++))
             fi
 
@@ -900,16 +1174,80 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-E: deterministic 4-way co-occurrence. The canonical exploit
-            # shape sets hasroot=1 + tfa_verified=1 + auth_timestamp +
-            # badpass-origin in one CRLF-injection write. All four together
-            # is effectively zero-FP.
+            # IOC-E: badpass origin combined with ANY auth marker (per
+            # WebPros code-path analysis: the badpass call site at
+            # Cpanel/Server.pm:1244-1252 cannot legitimately set
+            # successful_*_auth_with_timestamp, hasroot=1, or tfa_verified=1).
+            # Catches any single-field injection that promotes the badpass
+            # session, including watchtowr's internal_auth variant.
+            if (( SF_BADPASS && (SF_EXT_AUTH || SF_INT_AUTH || SF_HASROOT || SF_TFA) )); then
+                local _markers=""
+                (( SF_EXT_AUTH )) && _markers+="${_markers:+,}ext_auth_ts"
+                (( SF_INT_AUTH )) && _markers+="${_markers:+,}int_auth_ts"
+                (( SF_HASROOT )) && _markers+="${_markers:+,}hasroot=1"
+                (( SF_TFA ))     && _markers+="${_markers:+,}tfa_verified=1"
+                emit "sessions" "ioc_badpass_authmarkers_$session_name" "strong" \
+                     "ioc_badpass_with_auth_markers" 10 \
+                     "path" "$f" "origin" "$SF_ORIGIN" "markers" "$_markers" \
+                     "note" "method=badpass origin co-occurs with auth markers ($_markers) - badpass call site cannot set these legitimately (CRITICAL)."
+                ((ioc_hits++))
+            fi
+
+            # IOC-E2: high-confidence 4-way co-occurrence. The canonical
+            # exploit shape sets hasroot=1 + tfa_verified=1 + auth_timestamp
+            # + badpass-origin in one CRLF-injection write. Effectively
+            # zero-FP; emitted as a separate signal so the dedicated
+            # ioc_cve_2026_41940_combo key remains in fleet aggregations.
             if (( SF_HASROOT && SF_TFA && (SF_INT_AUTH || SF_EXT_AUTH) && SF_BADPASS )); then
                 emit "sessions" "ioc_cve41940_$session_name" "strong" \
                      "ioc_cve_2026_41940_combo" 10 \
                      "path" "$f" "origin" "$SF_ORIGIN" \
                      "note" "hasroot=1 + tfa_verified=1 + successful_*_auth_with_timestamp + method=badpass origin co-occur - CVE-2026-41940 forged session (CRITICAL)."
                 ((ioc_hits++))
+            fi
+
+            # IOC-H: standalone hasroot=1. Per WebPros code-path analysis,
+            # `hasroot` is NOT in cpsrvd's _SESSION_PARTS whitelist
+            # (Cpanel/Server.pm:2216-2247) and a repo-wide grep finds no
+            # caller of Cpanel::Session::Modify->set('hasroot', ...). Its
+            # presence in any session is conclusive newline-injection
+            # evidence, regardless of other markers. Emitted in addition
+            # to IOC-E / IOC-E2 (which already cover the badpass+hasroot
+            # subset) so a session with only hasroot smuggled in still
+            # surfaces.
+            if (( SF_HASROOT )); then
+                emit "sessions" "ioc_hasroot_$session_name" "strong" \
+                     "ioc_hasroot_in_session" 10 \
+                     "path" "$f" "origin" "$SF_ORIGIN" \
+                     "note" "hasroot=1 present in session - not in cpsrvd _SESSION_PARTS whitelist; conclusive injection footprint (CRITICAL)."
+                ((ioc_hits++))
+            fi
+
+            # IOC-I: malformed session line. Any non-blank line not matching
+            # ^[A-Za-z_][A-Za-z0-9_]*= is structurally impossible in a
+            # legitimate session (FlushConfig serialization + filter_sessiondata
+            # CR/LF strip + _SESSION_PARTS whitelist exclude this shape).
+            # Catches injection footprints where smuggled bytes did not
+            # form valid key=value pairs. Distinct from IOC-D (multiline
+            # pass=) which is the specific pass-continuation subset.
+            if (( SF_MALFORMED )); then
+                emit "sessions" "ioc_malformed_line_$session_name" "strong" \
+                     "ioc_malformed_session_line" 10 \
+                     "path" "$f" "sample" "${SF_MALFORMED_SAMPLE:0:80}" \
+                     "note" "Session contains a non-blank line not matching key=value - injection footprint (CRITICAL)."
+                ((ioc_hits++))
+            fi
+
+            # Token-use cross-ref. If any token-injection IOC fired AND
+            # we have the cp_security_token value, grep access_log for
+            # that token paired with a 2xx response. A hit means the
+            # forged session was actually USED by the attacker - escalates
+            # the actionable shape from "forged" to "forged AND used".
+            if [[ -n "$SF_CP_VAL" ]] \
+               && (( (SF_TOKEN_DENIED && SF_CP_TOKEN && SF_BADPASS) \
+                     || (SF_BADPASS && (SF_EXT_AUTH || SF_INT_AUTH || SF_HASROOT || SF_TFA)) \
+                     || SF_HASROOT )); then
+                check_token_used "$f" "$SF_CP_VAL" "$session_name" && ((ioc_hits++))
             fi
 
             # IOC-F: forged-future timestamp (e.g. 9999999999 = year 2286).
@@ -980,6 +1318,273 @@ check_sessions() {
         emit "sessions" "session_scan" "info" "no_session_iocs" 0 \
              "scanned" "$scanned" "probe_artifacts" "$probe_artifacts" \
              "note" "no IOCs or anomalous-shape sessions found"
+    fi
+}
+
+# ---- destruction-stage IOC scan (Patterns A-G) ---------------------------
+# Cheap, bounded host-state probes for late-stage compromise residue.
+# Scoped to /home, /var/www, /root, /etc, /var/spool/cron, /tmp, /var/tmp -
+# operator-overrideable via $CPANEL_ROOT? No: these paths are filesystem
+# constants, not cpanel-prefixed. Snapshot mode (--root) skips this whole
+# block (we don't have meaningful destruction traces in a snapshot).
+check_destruction_iocs() {
+    (( NO_DESTRUCTION_IOCS )) && return
+    if [[ -n "$ROOT_OVERRIDE" ]]; then
+        section "Destruction IOC scan (Patterns A-G)"
+        emit "destruction" "destruction_scan" "info" "skipped_snapshot_mode" 0 \
+             "note" "destruction probes skip snapshot/--root mode (no host filesystem)"
+        return
+    fi
+    section "Destruction IOC scan (Patterns A-G)"
+    local hits=0
+
+    # ---- Pattern A: /root/sshd encryptor + .sorry files -------------------
+    if [[ -f "$PATTERN_A_BINARY" ]]; then
+        local actual_sha=""
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual_sha=$(sha256sum "$PATTERN_A_BINARY" 2>/dev/null | awk '{print $1}')
+        fi
+        if [[ "$actual_sha" == "$PATTERN_A_SHA256" ]]; then
+            emit "destruction" "ioc_pattern_a_encryptor" "strong" \
+                 "ioc_pattern_a_encryptor_match" 10 \
+                 "path" "$PATTERN_A_BINARY" "sha256" "$actual_sha" \
+                 "note" "$PATTERN_A_BINARY sha256 matches IC-5790 .sorry encryptor (CRITICAL)."
+            ((hits++))
+        else
+            # Binary present at the encryptor's masquerade path but hash
+            # mismatched. Still suspicious - could be a variant - but
+            # downgrade to warning so we don't false-positive on a
+            # legitimate /root/sshd that some operator put there.
+            emit "destruction" "ioc_pattern_a_unknown" "warning" \
+                 "ioc_pattern_a_binary_present_unknown_hash" 4 \
+                 "path" "$PATTERN_A_BINARY" "sha256" "${actual_sha:-unknown}" \
+                 "note" "$PATTERN_A_BINARY exists but sha256 differs from known sample - review."
+            ((hits++))
+        fi
+    fi
+    # .sorry files. Bounded find: -maxdepth 6 keeps it cheap on /home with
+    # many users; -print -quit early-exits on first hit (we just want a yes/no
+    # for triage; forensic does the full enumeration).
+    local first_sorry=""
+    local sorry_root
+    for sorry_root in /home /var/www; do
+        [[ -d "$sorry_root" ]] || continue
+        first_sorry=$(find "$sorry_root" -maxdepth 6 -name '*.sorry' -print -quit 2>/dev/null)
+        [[ -n "$first_sorry" ]] && break
+    done
+    if [[ -n "$first_sorry" ]]; then
+        emit "destruction" "ioc_pattern_a_sorry" "strong" \
+             "ioc_pattern_a_sorry_files_present" 10 \
+             "sample_path" "$first_sorry" \
+             "note" "found .sorry-encrypted files (Pattern A); use sessionscribe-forensic for full enumeration (CRITICAL)."
+        ((hits++))
+    fi
+
+    # ---- Pattern B: mysql wipe + BTC-note index drop ---------------------
+    # Wipe heuristic: /var/lib/mysql/ exists, mysql/ system-table subdir is
+    # gone, AND there's still innodb residue (ibdata1, ib_logfile*, etc).
+    # The innodb residue check rules out fresh-install hosts where mysql/
+    # legitimately doesn't exist yet. On a real wipe the attacker rm -rf's
+    # mysql/ but leaves the larger innodb files intact.
+    if [[ -d "$PATTERN_B_MYSQL_DIR" && ! -d "$PATTERN_B_MYSQL_DB" ]]; then
+        local has_innodb=0
+        if compgen -G "${PATTERN_B_MYSQL_DIR}/ibdata*" >/dev/null 2>&1 \
+           || compgen -G "${PATTERN_B_MYSQL_DIR}/ib_logfile*" >/dev/null 2>&1 \
+           || compgen -G "${PATTERN_B_MYSQL_DIR}/ib_buffer_pool" >/dev/null 2>&1; then
+            has_innodb=1
+        fi
+        if (( has_innodb )); then
+            emit "destruction" "ioc_pattern_b_mysql_wipe" "strong" \
+                 "ioc_pattern_b_mysql_dir_missing" 10 \
+                 "expected" "$PATTERN_B_MYSQL_DB" \
+                 "note" "${PATTERN_B_MYSQL_DIR}/ exists with innodb residue but mysql/ subdir is gone - matches Pattern B DB wipe (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+    # BTC-note index.html drops. Limit glob to public_html/index.html across
+    # /home users; one grep handles all per-user drops without walking deep.
+    local btc_hit=""
+    btc_hit=$(grep -lF "$PATTERN_B_BTC_ADDR" /home/*/public_html/index.html 2>/dev/null | head -1)
+    if [[ -n "$btc_hit" ]]; then
+        emit "destruction" "ioc_pattern_b_btc_note" "strong" \
+             "ioc_pattern_b_btc_index_present" 10 \
+             "sample_path" "$btc_hit" \
+             "note" "BTC ransom note in $btc_hit - Pattern B index drop (CRITICAL)."
+        ((hits++))
+    fi
+
+    # ---- Pattern C: nuclear.x86 dropper traces ---------------------------
+    # Binary is rm'd post-launch; the literal string survives in shell history
+    # and may briefly survive in /tmp / /var/tmp. Fast: compgen -G + grep -lF.
+    local nuke_hit=""
+    nuke_hit=$(grep -lF "$PATTERN_C_BIN" \
+                  /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
+    if [[ -z "$nuke_hit" ]]; then
+        nuke_hit=$(grep -lF "$PATTERN_C_BIN" /tmp/*.log /var/tmp/*.log 2>/dev/null | head -1)
+    fi
+    if [[ -n "$nuke_hit" ]]; then
+        emit "destruction" "ioc_pattern_c_nuke_trace" "strong" \
+             "ioc_pattern_c_nuclear_x86_referenced" 10 \
+             "sample_path" "$nuke_hit" \
+             "note" "$PATTERN_C_BIN dropper string in $nuke_hit (Mirai botnet drop, Abuse 46488376)."
+        ((hits++))
+    fi
+    # raw.flameblox.com C2 reference (independent signal in case the literal
+    # binary name was renamed but C2 was reused).
+    local flame_hit=""
+    flame_hit=$(grep -lF "$PATTERN_C_C2_HOST" \
+                   /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
+    if [[ -n "$flame_hit" ]]; then
+        emit "destruction" "ioc_pattern_c_c2_ref" "strong" \
+             "ioc_pattern_c_c2_referenced" 8 \
+             "sample_path" "$flame_hit" \
+             "note" "Mirai C2 host $PATTERN_C_C2_HOST referenced in $flame_hit."
+        ((hits++))
+    fi
+
+    # ---- Pattern D: sptadm reseller / WHM_FullRoot persistence ----------
+    # accounting.log scan: any of three universal fingerprints (sptadm,
+    # 4ef72197.cpx.local, WHM_FullRoot, exploit.local). One grep over the
+    # whole file - the file is line-oriented and bounded.
+    local acct_log=/var/cpanel/accounting.log
+    if [[ -f "$acct_log" ]]; then
+        local d_pat="${PATTERN_D_RESELLER}|${PATTERN_D_DOMAIN}|${PATTERN_D_EMAIL}|${PATTERN_D_TOKEN_NAME}"
+        local d_count d_sample
+        # grep -c writes "0" with exit=1 on no-match - command substitution
+        # captures stdout cleanly; no `|| echo 0` (that would yield "0\n0"
+        # if grep wrote 0 then echo wrote 0).
+        d_count=$(grep -cE "$d_pat" "$acct_log" 2>/dev/null)
+        d_count="${d_count:-0}"
+        if (( d_count > 0 )); then
+            d_sample=$(grep -E "$d_pat" "$acct_log" 2>/dev/null | head -1)
+            emit "destruction" "ioc_pattern_d_acctlog" "strong" \
+                 "ioc_pattern_d_reseller_persistence" 10 \
+                 "count" "$d_count" "sample" "${d_sample:0:200}" \
+                 "note" "Pattern D persistence fingerprint in $acct_log ($d_count hits) - reseller/API token created post-exploit; revoke before clearing."
+            ((hits++))
+        fi
+    fi
+    # Reseller account presence (independent signal: the row may have been
+    # rotated out of accounting.log on long-lived hosts).
+    if command -v getent >/dev/null 2>&1; then
+        if getent passwd "$PATTERN_D_RESELLER" >/dev/null 2>&1; then
+            emit "destruction" "ioc_pattern_d_reseller" "strong" \
+                 "ioc_pattern_d_reseller_user_present" 10 \
+                 "user" "$PATTERN_D_RESELLER" \
+                 "note" "user '$PATTERN_D_RESELLER' present in passwd - attacker reseller (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+    # WHM_FullRoot api token cache. Path varies across cpanel versions; the
+    # token-issuance machinery records the friendly name in api-tokens.cache.
+    # Single grep is cheap; if the file isn't where we expect, skip silently.
+    local token_cache=/var/cpanel/whm/api-tokens.cache
+    if [[ -f "$token_cache" ]]; then
+        if grep -qF "\"$PATTERN_D_TOKEN_NAME\"" "$token_cache" 2>/dev/null; then
+            emit "destruction" "ioc_pattern_d_token" "strong" \
+                 "ioc_pattern_d_whm_fullroot_token_present" 10 \
+                 "path" "$token_cache" \
+                 "note" "WHM_FullRoot api token present in $token_cache - revoke immediately (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+
+    # ---- Pattern F: __S_MARK__ harvester envelope -----------------------
+    local f_hit=""
+    f_hit=$(grep -lF "$PATTERN_F_S_MARK" \
+                /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
+    if [[ -n "$f_hit" ]]; then
+        emit "destruction" "ioc_pattern_f_harvester" "strong" \
+             "ioc_pattern_f_smark_envelope" 10 \
+             "sample_path" "$f_hit" \
+             "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $f_hit - automated post-exploit recon (CRITICAL)."
+        ((hits++))
+    fi
+
+    # ---- Pattern G: suspect SSH keys ------------------------------------
+    # Heuristic fingerprint for the IC-5790 wave: forged mtime around
+    # 2019-12-13 with a recent atime AND an IP-shaped key comment.
+    # Both conditions required to keep FPs down (legitimate IP-labeled keys
+    # exist - LW provisioning uses them sometimes).
+    local key_file
+    for key_file in "${SSH_KEY_FILES[@]}"; do
+        [[ -f "$key_file" ]] || continue
+        # mtime check: stat the file once.
+        local key_mtime_iso
+        key_mtime_iso=$(stat -c '%y' "$key_file" 2>/dev/null | cut -d' ' -f1)
+        local has_forged_mtime=0
+        [[ "$key_mtime_iso" == "$PATTERN_G_FORGED_MTIME" ]] && has_forged_mtime=1
+        # Comment scan: an IP-labeled "ssh-rsa ... IPv4" line is a strong
+        # tell when paired with the forged mtime.
+        local ip_labeled_lines
+        ip_labeled_lines=$(grep -cE '^(ssh-(rsa|ed25519|ecdsa|dsa))[[:space:]]+[A-Za-z0-9+/=]+[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}([[:space:]]|$)' \
+                              "$key_file" 2>/dev/null)
+        ip_labeled_lines="${ip_labeled_lines:-0}"
+        if (( has_forged_mtime && ip_labeled_lines > 0 )); then
+            emit "destruction" "ioc_pattern_g_ssh_key" "strong" \
+                 "ioc_pattern_g_suspect_ssh_keys" 10 \
+                 "path" "$key_file" "ip_labeled_lines" "$ip_labeled_lines" \
+                 "mtime" "$key_mtime_iso" \
+                 "note" "$key_file mtime forged to $key_mtime_iso + $ip_labeled_lines IP-labeled key(s) - Pattern G persistence (CRITICAL)."
+            ((hits++))
+        elif (( ip_labeled_lines > 0 )); then
+            emit "destruction" "ioc_pattern_g_ip_keys_review" "warning" \
+                 "ioc_pattern_g_ip_labeled_keys_present" 3 \
+                 "path" "$key_file" "ip_labeled_lines" "$ip_labeled_lines" \
+                 "note" "$ip_labeled_lines IP-labeled SSH key comment(s) in $key_file - review (may be legitimate provisioning)."
+            ((hits++))
+        fi
+    done
+    # Keys planted in non-standard locations (cron, /etc).
+    local oddkey_count=0
+    if command -v find >/dev/null 2>&1; then
+        # -path prune to keep this bounded; we explicitly want files under
+        # /etc and /var/spool/cron only, never /var/cpanel/userdata or noisy
+        # configs.
+        oddkey_count=$(find /etc /var/spool/cron -type f \
+                          \( -name 'authorized_keys' -o -name 'authorized_keys2' \) \
+                          2>/dev/null | wc -l)
+        if (( oddkey_count > 0 )); then
+            local oddkey_sample
+            oddkey_sample=$(find /etc /var/spool/cron -type f \
+                              \( -name 'authorized_keys' -o -name 'authorized_keys2' \) \
+                              2>/dev/null | head -1)
+            emit "destruction" "ioc_pattern_g_oddpath_keys" "warning" \
+                 "ioc_pattern_g_keys_in_unexpected_paths" 3 \
+                 "count" "$oddkey_count" "sample" "${oddkey_sample:-}" \
+                 "note" "$oddkey_count authorized_keys file(s) in /etc or /var/spool/cron - non-standard, review."
+            ((hits++))
+        fi
+    fi
+
+    # ---- Pattern E: websocket/Shell access-log signature ---------------
+    # Cheap one-liner over the same access_log set check_logs walks. We
+    # specifically want this in the triage path (forensic also has it but
+    # forensic is opt-in via --chain-forensic; the triage scanner shouldn't
+    # miss this just because the operator skipped chaining).
+    local ws_log=/usr/local/cpanel/logs/access_log
+    if [[ -f "$ws_log" ]]; then
+        # Exclude PROBE_UA_RE so our own scan traffic can never trip this
+        # (probes don't currently hit /websocket/Shell, but the filter is
+        # defensive across future probe iterations).
+        local ws_count ws_sample
+        ws_count=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
+                      | grep -vcE "$PROBE_UA_RE" 2>/dev/null || true)
+        ws_count="${ws_count:-0}"
+        if (( ws_count > 0 )); then
+            ws_sample=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
+                           | grep -vE "$PROBE_UA_RE" | head -1)
+            emit "destruction" "ioc_pattern_e_websocket" "strong" \
+                 "ioc_pattern_e_websocket_shell_hits" 10 \
+                 "count" "$ws_count" "sample" "${ws_sample:0:200}" \
+                 "note" "$ws_count GET /cpsess*/websocket/Shell hit(s) in access_log - Pattern E interactive RCE (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+
+    if (( hits == 0 )); then
+        emit "destruction" "destruction_scan" "info" "no_destruction_iocs" 0 \
+             "note" "no destruction-stage residue (Patterns A-G) found"
     fi
 }
 
@@ -1256,6 +1861,7 @@ write_json() {
         printf '{\n'
         printf '  "tool": "sessionscribe-ioc-scan",\n'
         printf '  "tool_version": "%s",\n' "$VERSION"
+        printf '  "run_id": "%s",\n' "$RUN_ID"
         printf '  "host": "%s",\n' "$(json_esc "$HOSTNAME_FQDN")"
         printf '  "ts": "%s",\n' "$TS_ISO"
         if [[ -n "$SINCE_EPOCH" ]]; then
@@ -1326,9 +1932,10 @@ write_csv() {
         adv_ids="${adv_ids:+${adv_ids};}${adv_id}"
     done
     {
-        printf 'host,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids\n'
-        printf '%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s\n' \
+        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids\n'
+        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s\n' \
             "$(csv_field "$HOSTNAME_FQDN")" \
+            "$(csv_field "$RUN_ID")" \
             "$(csv_field "$TS_ISO")" \
             "$(csv_field "$VERSION")" \
             "$(csv_field "$VERDICT")" \
@@ -1345,6 +1952,158 @@ write_csv() {
             "$(csv_field "$reasons")" \
             "$(csv_field "$adv_ids")"
     } > "$out"
+}
+
+###############################################################################
+# Run ledger
+#
+# Append-only JSONL at $LEDGER_DIR/runs.jsonl - one line per run, plus a
+# per-run JSON envelope at $LEDGER_DIR/<RUN_ID>.json (skipped when -o was
+# supplied; the operator gets their own copy at the requested path).
+# Defaults ON; --no-ledger opts out for paranoid runs that must leave no
+# host residue. Soft-fail if the directory isn't writable - do not let
+# logging-permission issues interfere with the scan exit code.
+###############################################################################
+
+ledger_write() {
+    (( NO_LEDGER )) && return 0
+    if ! mkdir -p "$LEDGER_DIR" 2>/dev/null; then
+        emit "ledger" "ledger_write" "warning" "ledger_dir_unwritable" 0 \
+             "path" "$LEDGER_DIR" \
+             "note" "could not create ledger directory; skipping run history"
+        return 0
+    fi
+    chmod 0700 "$LEDGER_DIR" 2>/dev/null || true
+    local end_epoch duration
+    end_epoch=$(date -u +%s)
+    duration=$(( end_epoch - TS_EPOCH ))
+    local line
+    line=$(printf '{"ts":"%s","run_id":"%s","host":"%s","tool_version":"%s","code_verdict":"%s","host_verdict":"%s","score":%d,"exit_code":%d,"duration_s":%d,"ioc_critical":%d,"ioc_review":%d}' \
+        "$TS_ISO" "$RUN_ID" "$HOSTNAME_JSON" "$VERSION" \
+        "$VERDICT" "$HOST_VERDICT" "$SCORE" "$EXIT_CODE" "$duration" \
+        "$IOC_CRITICAL" "$IOC_REVIEW")
+    # Append - flock would be ideal but introduces a util-linux dependency
+    # we don't want for fleet portability. The single-line atomic write
+    # is good enough for this access pattern (one writer per host per run).
+    printf '%s\n' "$line" >> "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
+    chmod 0600 "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
+    # Per-run envelope. Skip if -o was given (operator captured their own).
+    if [[ -z "$OUTPUT_FILE" ]]; then
+        local envelope="$LEDGER_DIR/${RUN_ID}.json"
+        write_json "$envelope" 2>/dev/null || true
+        chmod 0600 "$envelope" 2>/dev/null || true
+    fi
+}
+
+# Optional syslog one-liner. Logger tag matches the script name minus .sh.
+# auth.notice is the right facility for a security-tool summary; operators
+# can rsyslog-route on tag.
+syslog_emit() {
+    (( SYSLOG )) || return 0
+    command -v logger >/dev/null 2>&1 || return 0
+    local msg
+    msg=$(printf 'run_id=%s host=%s code=%s host_verdict=%s exit=%d ioc_critical=%d ioc_review=%d' \
+        "$RUN_ID" "$HOSTNAME_FQDN" "$VERDICT" "$HOST_VERDICT" \
+        "$EXIT_CODE" "$IOC_CRITICAL" "$IOC_REVIEW")
+    logger -t sessionscribe-ioc -p auth.notice -- "$msg" 2>/dev/null || true
+}
+
+###############################################################################
+# --chain-forensic dispatch
+#
+# When host_verdict != CLEAN and --chain-forensic is set, locate
+# sessionscribe-forensic.sh and exec it with --since/--no-color/--quiet
+# inherited and the same RUN_ID exported via SESSIONSCRIBE_RUN_ID.
+#
+# Resolution order (matches sessionscribe-mitigate.sh's modsec-config
+# resolution pattern):
+#   1. Sibling of this script on disk
+#   2. sessionscribe-forensic.sh on PATH
+#   3. https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/...
+#   4. https://sh.rfxn.com/sessionscribe-forensic.sh (CDN fallback)
+#
+# Remote fetches land in a mktemp file under /tmp with chmod 0700 so the
+# operator can re-use it without re-fetching. We do NOT verify a shasum
+# (no upstream-published hash to pin to yet); the caller is implicitly
+# trusting the same TLS pinning as `curl -fsSLO`.
+#
+# Forensic exit code is captured into a chain.forensic_exit signal (so
+# the JSON envelope and ledger record it) but does NOT override this
+# script's exit code - ioc-scan's exit code contract (0/1/2/3/4) is
+# what fleet wrappers consume.
+###############################################################################
+
+# Mirror sessionscribe-mitigate.sh's source-candidate convention.
+FORENSIC_SRC_CANDIDATES=(
+    "https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh"
+    "https://sh.rfxn.com/sessionscribe-forensic.sh"
+)
+
+# Fetch the forensic script from one of the canonical URLs into a tempfile.
+# Echoes the path on success; returns non-zero on failure.
+fetch_forensic_remote() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local dest; dest=$(mktemp /tmp/sessionscribe-forensic.XXXXXX.sh) || return 1
+    chmod 0700 "$dest" 2>/dev/null
+    local url
+    for url in "${FORENSIC_SRC_CANDIDATES[@]}"; do
+        if curl -fsSL --max-time 30 -o "$dest" "$url" 2>/dev/null; then
+            # Sanity-check: must be a bash script. Reject HTML/empty bodies.
+            if head -1 "$dest" 2>/dev/null | grep -qE '^#!/(usr/bin/env[[:space:]]+)?bash'; then
+                printf '%s\t%s' "$dest" "$url"
+                return 0
+            fi
+        fi
+    done
+    rm -f "$dest"
+    return 1
+}
+
+chain_forensic_dispatch() {
+    (( CHAIN_FORENSIC )) || return 0
+    if [[ "$HOST_VERDICT" == "CLEAN" ]]; then
+        emit "chain" "forensic_skip" "info" "chain_forensic_skipped_clean" 0 \
+             "note" "host_verdict=CLEAN; not chaining forensic."
+        return 0
+    fi
+    local self_dir; self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+    local forensic_path="" forensic_origin="local"
+    if [[ -n "$self_dir" && -f "$self_dir/sessionscribe-forensic.sh" ]]; then
+        forensic_path="$self_dir/sessionscribe-forensic.sh"
+        forensic_origin="sibling"
+    elif command -v sessionscribe-forensic.sh >/dev/null 2>&1; then
+        forensic_path=$(command -v sessionscribe-forensic.sh)
+        forensic_origin="path"
+    else
+        # Remote fetch fallback. Returns "<path>\t<url>" so we can record
+        # which mirror served us.
+        local fetch_result fetched_path fetched_url
+        if fetch_result=$(fetch_forensic_remote); then
+            fetched_path="${fetch_result%%$'\t'*}"
+            fetched_url="${fetch_result#*$'\t'}"
+            forensic_path="$fetched_path"
+            forensic_origin="remote:$fetched_url"
+            emit "chain" "forensic_fetch" "info" "chain_forensic_fetched_remote" 0 \
+                 "url" "$fetched_url" "path" "$fetched_path" \
+                 "note" "forensic script not present locally; pulled from $fetched_url"
+        fi
+    fi
+    if [[ -z "$forensic_path" ]]; then
+        emit "chain" "forensic_locate" "warning" "chain_forensic_not_found" 0 \
+             "note" "sessionscribe-forensic.sh not found locally and remote fetch failed; skipping chain."
+        return 0
+    fi
+    local args=(--quiet --no-color)
+    [[ -n "$SINCE_DAYS" ]] && args+=(--since "$SINCE_DAYS")
+    section "Chaining sessionscribe-forensic.sh (run_id=$RUN_ID, origin=$forensic_origin)"
+    emit "chain" "forensic_dispatch" "info" "chain_forensic_started" 0 \
+         "path" "$forensic_path" "origin" "$forensic_origin" "run_id" "$RUN_ID"
+    local fexit=0
+    SESSIONSCRIBE_RUN_ID="$RUN_ID" \
+        bash "$forensic_path" "${args[@]}" >/dev/null 2>&1 || fexit=$?
+    emit "chain" "forensic_exit" "info" "chain_forensic_complete" 0 \
+         "exit_code" "$fexit" \
+         "note" "forensic chain exit=$fexit (does not override ioc exit_code)"
 }
 
 ###############################################################################
@@ -1367,9 +2126,16 @@ else
 fi
 check_logs
 check_sessions
+check_destruction_iocs
 check_localhost_probe
 
 aggregate_verdict
+
+# Chain to forensic BEFORE printing the verdict / writing outputs so the
+# chain.forensic_* signals make it into the JSON envelope, CSV row, and
+# ledger entry. Forensic exit captured into signals; never overrides ours.
+chain_forensic_dispatch
+
 print_verdict
 
 # Streaming: --csv to stdout (--jsonl is already streamed line-by-line during
@@ -1386,5 +2152,10 @@ if [[ -n "$OUTPUT_FILE" ]]; then
         write_json "$OUTPUT_FILE"
     fi
 fi
+
+# Run ledger - write before exit so a failed exit code still records the
+# run. Soft-fails on permission issues; never alters the exit code.
+ledger_write
+syslog_emit
 
 exit "$EXIT_CODE"
