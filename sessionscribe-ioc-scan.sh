@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.6
+# sessionscribe-ioc-scan.sh v1.5.7
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.6"
+VERSION="1.5.7"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -2491,7 +2491,12 @@ fetch_forensic_remote() {
         if (( rc == 0 )); then
             # Sanity-check: must be a bash script. Reject HTML/empty bodies
             # (sh.rfxn.com served HTTP 200 + 0 bytes during a CDN sync window).
-            if head -1 "$dest" 2>/dev/null | grep -qE '^#!/(usr/bin/env[[:space:]]+)?bash'; then
+            # Accept any reasonable bash shebang: #!/bin/bash, #!/usr/bin/bash,
+            # #!/usr/local/bin/bash, #!/usr/bin/env bash. The earlier regex
+            # `^#!/(usr/bin/env[[:space:]]+)?bash` only matched #!/bash and
+            # #!/usr/bin/env bash, so #!/bin/bash (canonical) failed the
+            # check and every fetched script was rejected.
+            if head -1 "$dest" 2>/dev/null | grep -qE '^#![[:space:]]*/[^[:space:]]*bash([[:space:]]|$)|^#![[:space:]]*/[^[:space:]]*env[[:space:]]+bash([[:space:]]|$)'; then
                 FORENSIC_FETCHED_PATH="$dest"
                 FORENSIC_FETCHED_URL="$url"
                 return 0
