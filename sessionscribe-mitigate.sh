@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.3.0
+# sessionscribe-mitigate.sh v0.3.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -84,7 +84,7 @@
 
 set -u
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 ###############################################################################
 # Constants
@@ -1301,12 +1301,20 @@ phase_modsec() {
 #
 #   1. Detects forged sessions via the strong-IOC ladder
 #      (A/B/C/D/E/E2/F/H/I; matches ioc-scan.sh strong signals).
-#   2. In --apply mode: copies each forged session (and its preauth
-#      companion if present) into the run's backup dir under
-#      `quarantined-sessions/{raw,preauth}/`, writes a sibling .info file
-#      preserving every metadata field that `cp -a` cannot carry
-#      (most importantly ctime), then removes the original so the
-#      attacker cannot reuse the leaked token.
+#   2. In --apply mode: copies each forged session AND its sibling
+#      companions (preauth/<sname>, cache/<sname>) into the run's backup
+#      dir under `quarantined-sessions/{raw,preauth,cache}/`, writes a
+#      sibling .info file preserving every metadata field that `cp -a`
+#      cannot carry (most importantly ctime), then removes the originals
+#      so the attacker cannot reuse the leaked token.
+#
+#      Why all three subdirs: cpsrvd's stage-3 listaccts handler in the
+#      exploit chain propagates raw -> cache; subsequent token-bearing
+#      requests read from cache. Removing raw alone leaves the cache copy
+#      live and the cp_security_token still useful. preauth holds the
+#      pre-promotion marker (IOC-B). The remote-probe --cleanup helper
+#      already cleans all three for canary collateral; mitigation does
+#      the same for actual forgeries.
 #   3. In --check mode: reports what would be quarantined, no mutation.
 #
 # Probe-canary sessions (sessionscribe-remote-probe collateral, line
@@ -1324,6 +1332,7 @@ phase_sessions() {
 
     local raw_dir="$SESSIONS_DIR/raw"
     local preauth_dir="$SESSIONS_DIR/preauth"
+    local cache_dir="$SESSIONS_DIR/cache"
 
     if [[ ! -d "$raw_dir" ]]; then
         sk no_session_dir
@@ -1336,7 +1345,7 @@ phase_sessions() {
     now_epoch=$(date -u +%s 2>/dev/null || echo 0)
 
     local scanned=0 forged=0 quarantined=0 partial=0 failed=0 probe_artifacts=0
-    local f session_shape reasons sname preauth_file has_b q_rc
+    local f session_shape reasons sname preauth_file cache_file has_b q_rc
 
     # Iterate. nullglob is not enabled globally, so guard with -f.
     for f in "$raw_dir"/*; do
@@ -1422,6 +1431,7 @@ phase_sessions() {
         reasons="${session_shape#FORGED:}"
         sname=$(basename -- "$f")
         preauth_file="$preauth_dir/$sname"
+        cache_file="$cache_dir/$sname"
         has_b=0
 
         # Resolve B-cand against preauth companion existence.
@@ -1445,14 +1455,23 @@ phase_sessions() {
         [[ -z "$reasons" ]] && continue
 
         forged=$((forged+1))
-        sk forged_session path "$f" reasons "$reasons" pre_companion "$has_b"
+        # Cache companion presence is informational - quarantined uncondi-
+        # tionally (cpsrvd raw->cache propagation makes it the live token
+        # store; leaving it lets the forged session keep working).
+        local has_cache=0
+        [[ -f "$cache_file" ]] && has_cache=1
+        sk forged_session path "$f" reasons "$reasons" \
+           pre_companion "$has_b" cache_companion "$has_cache"
 
         if [[ "$MODE" != "apply" ]]; then
-            say_warn "forged session: $f (ioc=$reasons; would quarantine)"
+            local would_msg="ioc=$reasons; would quarantine"
+            (( has_b ))     && would_msg+=" + preauth"
+            (( has_cache )) && would_msg+=" + cache"
+            say_warn "forged session: $f ($would_msg)"
             continue
         fi
 
-        quarantine_session "$f" "$reasons" "$preauth_file" "$has_b"
+        quarantine_session "$f" "$reasons" "$preauth_file" "$has_b" "$cache_file"
         q_rc=$?
         case "$q_rc" in
             0) quarantined=$((quarantined+1))
@@ -1494,8 +1513,8 @@ phase_sessions() {
     fi
 }
 
-# Move a forged session (and its preauth companion if present) into the
-# run's backup dir. Strategy:
+# Move a forged session (and any sibling companion files) into the run's
+# backup dir. Strategy:
 #   - cp -a    -> preserves mode / owner / mtime / atime in the copy.
 #   - .info    -> sibling text file recording fields cp -a cannot carry,
 #                 most importantly ctime (which is the inode-change time
@@ -1504,26 +1523,33 @@ phase_sessions() {
 #   - rm       -> remove the original so the leaked cp_security_token
 #                 cannot be reused by the attacker.
 #
-# Return codes:
-#   0 - copy + .info + rm all succeeded
-#   2 - copy + .info ok, rm of original FAILED (operator must clean up)
-#   1 - copy itself failed (no .info written, original untouched)
+# Companions handled:
+#   - preauth/<sname>: pre-promotion marker (IOC-B). Quarantined when the
+#     IOC ladder fired IOC-B (i.e. has_b=1).
+#   - cache/<sname>:   cpsrvd's propagated copy. Quarantined whenever the
+#     file exists - removing only raw/ leaves the live token store intact.
+#
+# Return codes (highest priority wins across raw + companions):
+#   0 - all copies + .info + rm succeeded
+#   2 - copies + .info ok but at least one rm of an original FAILED
+#   1 - the raw copy itself failed (no .info written, original untouched)
 #
 # Bash 4.1 / coreutils 8.4 compatible.
 quarantine_session() {
     local src="$1" reasons="$2" preauth_companion="$3" has_b="$4"
+    local cache_companion="${5:-}"
     ensure_backup_dir || return 1
 
     local qdir="$BACKUP_DIR/quarantined-sessions"
-    local qraw="$qdir/raw" qpre="$qdir/preauth"
-    if ! mkdir -p "$qraw" "$qpre" 2>/dev/null; then
+    local qraw="$qdir/raw" qpre="$qdir/preauth" qcache="$qdir/cache"
+    if ! mkdir -p "$qraw" "$qpre" "$qcache" 2>/dev/null; then
         return 1
     fi
     # Quarantine subtree contains forged-session bodies (which may carry
     # cp_security_token values, hex-encoded passwords, etc). Lock down to
     # 0700 so only root can read - same posture as sessionscribe-forensic
     # bundle dirs. No-op if the dirs were already created on a prior run.
-    chmod 0700 "$qdir" "$qraw" "$qpre" 2>/dev/null || true
+    chmod 0700 "$qdir" "$qraw" "$qpre" "$qcache" 2>/dev/null || true
 
     local sname dest info
     sname=$(basename -- "$src")
@@ -1539,24 +1565,47 @@ quarantine_session() {
     # so ctime reflects the attacker's write, not our cp.
     write_session_info "$src" "$dest" "$reasons" > "$info" 2>/dev/null
 
-    # Companion preauth file. cpsrvd pairs them by session name; both
-    # carry forensic value, so both go to the quarantine subtree.
+    # Track whether any rm step failed across raw + companions. The raw
+    # rm at the bottom may also flip this; partial-success (rc=2) wins
+    # over full success but is dominated by an earlier rc=1 (which
+    # already returned).
+    local partial=0
+
+    # Companion preauth file. Only quarantined if IOC-B fired (i.e. the
+    # raw session was paired with a preauth marker that should not exist
+    # post-promotion in a benign flow).
     if [[ "$has_b" == "1" && -f "$preauth_companion" ]]; then
         local pdest="$qpre/$sname"
         local pinfo="$qpre/${sname}.info"
         if cp -a -- "$preauth_companion" "$pdest" 2>/dev/null; then
             write_session_info "$preauth_companion" "$pdest" \
                 "preauth-companion-of:$sname" > "$pinfo" 2>/dev/null
-            rm -f -- "$preauth_companion" 2>/dev/null
+            rm -f -- "$preauth_companion" 2>/dev/null || partial=1
+        fi
+    fi
+
+    # Companion cache file. Always quarantined when present - this is the
+    # live token store cpsrvd reads on subsequent requests. Leaving it
+    # would let the leaked cp_security_token continue to authenticate
+    # even after raw/ removal.
+    if [[ -n "$cache_companion" && -f "$cache_companion" ]]; then
+        local cdest="$qcache/$sname"
+        local cinfo="$qcache/${sname}.info"
+        if cp -a -- "$cache_companion" "$cdest" 2>/dev/null; then
+            write_session_info "$cache_companion" "$cdest" \
+                "cache-companion-of:$sname" > "$cinfo" 2>/dev/null
+            rm -f -- "$cache_companion" 2>/dev/null || partial=1
         fi
     fi
 
     # Final step: remove the original raw session. If this fails (read-only
     # mount, immutable bit, etc.) the attacker can still reuse the token,
-    # so we report partial-success (rc=2) rather than success.
+    # so we report partial-success (rc=2) rather than success. Same logic
+    # if a companion (preauth/cache) rm failed earlier in the function.
     if ! rm -f -- "$src" 2>/dev/null; then
         return 2
     fi
+    (( partial )) && return 2
     return 0
 }
 
