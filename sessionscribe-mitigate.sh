@@ -1275,12 +1275,14 @@ phase_probe() {
         return
     fi
 
-    # Locate a probe binary.
+    # Locate a probe binary. Prefer a sibling next to this script, then /tmp,
+    # then fall back to fetching from the CDN below.
     local probe_bin=""
-    for cand in /home/cpanel_ic5790/sessionscribe-remote-probe.sh \
-                /root/admin/work/downloads/sessionscribe-remote-probe.sh \
+    local self_dir
+    self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || self_dir=""
+    for cand in "${self_dir:+$self_dir/sessionscribe-remote-probe.sh}" \
                 /tmp/sessionscribe-remote-probe.sh; do
-        [[ -r "$cand" ]] && { probe_bin="$cand"; break; }
+        [[ -n "$cand" && -r "$cand" ]] && { probe_bin="$cand"; break; }
     done
     if [[ -z "$probe_bin" ]] && have_cmd curl; then
         probe_bin=$(mktemp /tmp/sessionscribe-probe.XXXXXX)
