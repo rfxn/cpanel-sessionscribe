@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.5
+# sessionscribe-ioc-scan.sh v1.5.6
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.5"
+VERSION="1.5.6"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -1875,27 +1875,95 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern E: websocket/Shell access-log signature ---------------
-    # Cheap one-liner over the same access_log set check_logs walks. We
-    # specifically want this in the triage path (forensic also has it but
-    # forensic is opt-in via --chain-forensic; the triage scanner shouldn't
-    # miss this just because the operator skipped chaining).
+    # cPanel exposes an interactive shell via /cpsess<id>/websocket/Shell -
+    # the WHM "Terminal" feature. ANY hit was previously flagged CRITICAL,
+    # but the canonical legitimate caller is RFC1918/loopback admin traffic
+    # (operators, internal jump hosts, mgmt VLAN). True Pattern-E
+    # exploitation requires an EXTERNAL IP getting a 2xx response.
+    #
+    # Categorize per (origin, status):
+    #   external + 2xx     → strong (RCE landed)
+    #   external + non-2xx → warning (probing, host repelled)
+    #   internal + 2xx     → info    (admin Terminal session, benign)
+    #   internal + non-2xx → ignore  (noise)
+    # EXCLUDE_IPS applies here too so operators can suppress known-good
+    # external admin IPs (home VPN exit, monitoring egress, etc).
     local ws_log=/usr/local/cpanel/logs/access_log
     if [[ -f "$ws_log" ]]; then
-        # Exclude PROBE_UA_RE so our own scan traffic can never trip this
-        # (probes don't currently hit /websocket/Shell, but the filter is
-        # defensive across future probe iterations).
-        local ws_count ws_sample
-        ws_count=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
-                      | grep -vcE "$PROBE_UA_RE" 2>/dev/null || true)
-        ws_count="${ws_count:-0}"
-        if (( ws_count > 0 )); then
-            ws_sample=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
-                           | grep -vE "$PROBE_UA_RE" | head -1)
+        local excludes_env=""
+        if (( ${#EXCLUDE_IPS[@]} > 0 )); then
+            excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
+        fi
+        local ws_result
+        ws_result=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
+                       | grep -vE "$PROBE_UA_RE" \
+                       | EXCLUDES="$excludes_env" awk '
+            BEGIN {
+                n = split(ENVIRON["EXCLUDES"], ex_arr, "\n")
+                for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
+                ext_total = 0; ext_2xx = 0; int_2xx = 0; int_other = 0
+                ext_sample = ""; int_sample = ""
+            }
+            {
+                ip = $1
+                if (ip in ex) next
+                st = "?"
+                if (match($0, /" [0-9]+ /)) {
+                    s = substr($0, RSTART + 2)
+                    split(s, ss, " ")
+                    st = ss[1]
+                }
+                is_internal = (ip ~ /^10\./ \
+                               || ip ~ /^127\./ \
+                               || ip ~ /^192\.168\./ \
+                               || ip ~ /^172\.(1[6-9]|2[0-9]|3[01])\./)
+                if (is_internal) {
+                    if (st ~ /^2/) {
+                        int_2xx++
+                        if (int_sample == "") int_sample = $0
+                    } else int_other++
+                } else {
+                    ext_total++
+                    if (st ~ /^2/) ext_2xx++
+                    if (ext_sample == "") ext_sample = $0
+                }
+            }
+            END {
+                printf "%d\t%d\t%d\t%d\n", ext_total, ext_2xx, int_2xx, int_other
+                print ext_sample
+                print int_sample
+            }')
+        local ext_total=0 ext_2xx=0 int_2xx=0 int_other=0
+        local ext_sample="" int_sample=""
+        {
+            IFS=$'\t' read -r ext_total ext_2xx int_2xx int_other
+            IFS= read -r ext_sample
+            IFS= read -r int_sample
+        } <<< "$ws_result"
+        ext_total="${ext_total:-0}"; ext_2xx="${ext_2xx:-0}"
+        int_2xx="${int_2xx:-0}"; int_other="${int_other:-0}"
+
+        if (( ext_2xx > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "strong" \
                  "ioc_pattern_e_websocket_shell_hits" 10 \
-                 "count" "$ws_count" "sample" "${ws_sample:0:200}" \
-                 "note" "$ws_count GET /cpsess*/websocket/Shell hit(s) in access_log - Pattern E interactive RCE (CRITICAL)."
+                 "count" "$ext_2xx" "external_total" "$ext_total" \
+                 "internal_2xx" "$int_2xx" \
+                 "sample" "${ext_sample:0:200}" \
+                 "note" "$ext_2xx external IP(s) reached /cpsess*/websocket/Shell with 2xx - Pattern E interactive RCE (CRITICAL)."
             ((hits++))
+        elif (( ext_total > 0 )); then
+            emit "destruction" "ioc_pattern_e_websocket" "warning" \
+                 "ioc_pattern_e_websocket_shell_probes" 3 \
+                 "count" "$ext_total" "internal_2xx" "$int_2xx" \
+                 "sample" "${ext_sample:0:200}" \
+                 "note" "$ext_total external IP probe(s) of /cpsess*/websocket/Shell - all rejected, no 2xx (REVIEW)."
+            ((hits++))
+        elif (( int_2xx > 0 )); then
+            emit "destruction" "websocket_shell_internal_admin" "info" \
+                 "websocket_shell_internal_admin" 0 \
+                 "count" "$int_2xx" "internal_other" "$int_other" \
+                 "sample" "${int_sample:0:200}" \
+                 "note" "$int_2xx /cpsess*/websocket/Shell hit(s) from RFC1918/loopback - WHM Terminal admin sessions, benign."
         fi
     fi
 
