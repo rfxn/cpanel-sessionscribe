@@ -4,8 +4,8 @@
 
 | Script | Version | Notes |
 |---|---|---|
-| sessionscribe-ioc-scan.sh | **1.6.2** | added `--chain-on-critical` (gate forensic chain on COMPROMISED only) |
-| sessionscribe-forensic.sh | **0.9.4** | pipe-tolerant pipe-record decoder across phase_reconcile + 6 kill-chain rendering sites; cut-based oe_note band-aids removed |
+| sessionscribe-ioc-scan.sh | **1.6.3** | `--chain-on-critical` (forensic chain only on COMPROMISED); Pattern G non-canonical-paths walk now skips files where every key is a known-good LW provisioning key (`Parent Child key for <PJID>`, `lwadmin`, `liquidweb`, `nexcess`) |
+| sessionscribe-forensic.sh | **0.9.5** | pipe-tolerant decoder across phase_reconcile + 6 kill-chain rendering sites (`decode_pipe_tail` helper); cut-based oe_note band-aids removed; non-canonical SSH-key sweep also filters by `SSH_KNOWN_GOOD_RE` |
 | sessionscribe-mitigate.sh | **0.3.1** | forged-session quarantine phase covers raw + preauth + cache; .info sidecar preserves ctime/mtime/atime |
 
 CDN sha256 / LOC columns will be re-stamped on next CDN sync. Repo:

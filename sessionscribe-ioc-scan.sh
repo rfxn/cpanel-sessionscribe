@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.2
+# sessionscribe-ioc-scan.sh v1.6.3
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.2"
+VERSION="1.6.3"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -207,6 +207,14 @@ PATTERN_F_E_MARK="__E_MARK__"
 # carry "Parent Child key for <PJID>" comments - anything else in roots
 # /etc/, /var/spool/cron/ is a candidate.
 PATTERN_G_FORGED_MTIME="2019-12-13"
+
+# Known-good SSH key labels - must mirror sessionscribe-forensic.sh's
+# SSH_KNOWN_GOOD_RE. Real LW provisioning keys carry "Parent Child key
+# for <PJID>" comments (the PJID is a 6-char alnum project tag). The
+# lwadmin / lw-admin / liquidweb / nexcess prefixes cover the operator-
+# tooling key cohort. A line whose key-comment matches this pattern is
+# legitimate and should NOT trigger Pattern G.
+SSH_KNOWN_GOOD_RE='(lwadmin|lw-admin|liquidweb|nexcess|Parent Child key for [A-Z0-9]{6})'
 SSH_KEY_FILES=(
     "/root/.ssh/authorized_keys"
     "/root/.ssh/authorized_keys2"
@@ -1987,8 +1995,25 @@ check_destruction_iocs() {
     # /var/spool/cron/<user>/.ssh. Bulky cpanel/exim/dovecot subtrees pruned.
     if command -v find >/dev/null 2>&1; then
         local oddkeys=()
+        local _odd _odd_total _odd_known _odd_unknown
         while IFS= read -r _odd; do
-            [[ -n "$_odd" ]] && oddkeys+=("$_odd")
+            [[ -z "$_odd" ]] && continue
+            # Filter out files where every key entry is a known-good LW
+            # provisioning key (Parent Child key for <PJID>, lwadmin,
+            # liquidweb, nexcess). These are legitimate placements in
+            # /etc and /var/spool/cron and should not surface as IOCs.
+            _odd_total=$(grep -cE '^[[:space:]]*(ssh-(rsa|ed25519|ecdsa|dsa)|ecdsa-sha2-)[[:space:]]+[A-Za-z0-9+/=]+' "$_odd" 2>/dev/null)
+            _odd_total="${_odd_total:-0}"
+            if (( _odd_total > 0 )); then
+                _odd_known=$(grep -cE "^[[:space:]]*(ssh-(rsa|ed25519|ecdsa|dsa)|ecdsa-sha2-)[[:space:]]+[A-Za-z0-9+/=]+.*${SSH_KNOWN_GOOD_RE}" "$_odd" 2>/dev/null)
+                _odd_known="${_odd_known:-0}"
+                _odd_unknown=$(( _odd_total - _odd_known ))
+                if (( _odd_unknown <= 0 )); then
+                    # All keys in this file are known-good; skip.
+                    continue
+                fi
+            fi
+            oddkeys+=("$_odd")
         done < <(find /etc /var/spool/cron -maxdepth 5 \
             \( -path '/etc/cpanel/userdata' -o -path '/etc/cpanel/users' \
                -o -path '/etc/exim*' -o -path '/etc/dovecot' \
