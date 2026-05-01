@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.2
+# sessionscribe-forensic.sh v0.9.3
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.2"
+VERSION="0.9.3"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -1062,10 +1062,39 @@ phase_reconcile() {
     local oe verdict delta
     for oe in "${OFFENSE_EVENTS[@]}"; do
         local ev_epoch ev_pat ev_key ev_note
+        # Record shape: epoch|pattern|key|note|defenses_required (5 fields).
         # Field 5 (defenses_required) is reserved for future per-pattern
         # reconciliation but currently every offense fires against the same
         # patch+modsec pair, so we discard it.
-        IFS='|' read -r ev_epoch ev_pat ev_key ev_note _ <<< "$oe"
+        #
+        # Pipe-tolerant decode: read into an array, then rejoin parts[3..n-2]
+        # with '|' so a note that legitimately contains '|' (e.g. a quoted
+        # access_log line, a path with embedded '|', a session-attribute
+        # value carrying CRLF-injected content) round-trips intact instead
+        # of being silently truncated at the first '|' inside the note.
+        # Pre-fix `read -r ... ev_note _` set ev_note=<note-prefix> and
+        # discarded the rest, dropping the trailing portion of the note.
+        local _oe_parts _oe_n _note_start _note_end
+        IFS='|' read -r -a _oe_parts <<< "$oe"
+        _oe_n=${#_oe_parts[@]}
+        ev_epoch="${_oe_parts[0]:-}"
+        ev_pat="${_oe_parts[1]:-}"
+        ev_key="${_oe_parts[2]:-}"
+        if (( _oe_n >= 5 )); then
+            # Re-join parts[3..n-2] with '|'. The last element (n-1) is
+            # defenses_required and is discarded.
+            _note_start=3
+            _note_end=$(( _oe_n - 2 ))
+            local _note_slice IFS='|'
+            _note_slice="${_oe_parts[*]:_note_start:_note_end-_note_start+1}"
+            ev_note="$_note_slice"
+            unset IFS
+        elif (( _oe_n == 4 )); then
+            # 4-field record (legacy / no defenses field). Field 4 is the note.
+            ev_note="${_oe_parts[3]:-}"
+        else
+            ev_note=""
+        fi
 
         # Determine verdict:
         #   pre-defense    if event happened before BOTH effective defenses
