@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.7.1
+# sessionscribe-forensic.sh v0.8.0
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.7.1"
+VERSION="0.8.0"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -255,6 +255,7 @@ EXTRA_LOGS_DIR=""
 SINCE_DAYS="$DEFAULT_SINCE_DAYS"
 SINCE_EPOCH=""
 MAX_BUNDLE_MB="$DEFAULT_MAX_BUNDLE_MB"
+NO_LOGS=0
 DO_UPLOAD=0
 INTAKE_URL="$INTAKE_DEFAULT_URL"
 INTAKE_TOKEN=""
@@ -287,6 +288,11 @@ BUNDLE
   --no-history         Skip /home/*/.bash_history capture (privacy)
 
 LOGS / TIME WINDOW
+  --no-logs            Skip ALL access-log scans (Pattern E websocket/Fileman,
+                       Pattern D recon/bad-UA/bad-IP). Sessions, persistence,
+                       Pattern A/B/C/F/G checks still run. Useful on hosts
+                       where access-log volume is huge and the operator
+                       only needs session+persistence verdicts.
   --extra-logs DIR     Additional access-log directory to scan (e.g. point
                        at an expanded /usr/local/cpanel/logs/archive/*.tar.gz
                        to include rotated logs from older incident windows).
@@ -338,6 +344,7 @@ while [[ $# -gt 0 ]]; do
         --upload-url)   INTAKE_URL="$2"; shift 2 ;;
         --upload-token) INTAKE_TOKEN="$2"; shift 2 ;;
         --no-history)   INCLUDE_HOMEDIR_HISTORY=0; shift ;;
+        --no-logs)      NO_LOGS=1; shift ;;
         --extra-logs)   EXTRA_LOGS_DIR="$2"; shift 2 ;;
         --since)        SINCE_DAYS="$2"; shift 2 ;;
         --max-bundle-mb) MAX_BUNDLE_MB="$2"; shift 2 ;;
@@ -464,12 +471,23 @@ emit_signal() {
 
 # Sectioned report helpers.
 hdr()       { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
-say_pass()  { (( QUIET )) || printf '  %s[OK]%s %s\n'    "$C_GRN" "$C_NC" "$*" >&2; }
-say_warn()  { (( QUIET )) || printf '  %s[WARN]%s %s\n'  "$C_YEL" "$C_NC" "$*" >&2; }
-say_fail()  { (( QUIET )) || printf '  %s[FAIL]%s %s\n'  "$C_RED" "$C_NC" "$*" >&2; }
-say_info()  { (( QUIET )) || printf '  %s[..]%s %s\n'    "$C_DIM" "$C_NC" "$*" >&2; }
-say_def()   { (( QUIET )) || printf '  %s[DEF]%s %s\n'   "$C_CYN" "$C_NC" "$*" >&2; }
-say_off()   { (( QUIET )) || printf '  %s[OFF]%s %s\n'   "$C_RED" "$C_NC" "$*" >&2; }
+# Output severity tags (color + label both telegraph meaning).
+#   [OK]        green   — clean / nothing wrong
+#   [INFO]      dim     — neutral information
+#   [WARN]      yellow  — anomaly worth attention but not a compromise
+#   [FAIL]      red     — tool error / inability to run a check
+#   [DEF-OK]    green   — defense layer is active (good)
+#   [DEF-MISS]  yellow  — defense layer is absent (this host is exposed)
+#   [IOC]       red     — indicator of compromise found (BAD - investigate)
+say_pass()      { (( QUIET )) || printf '  %s[OK]%s %s\n'        "$C_GRN" "$C_NC" "$*" >&2; }
+say_info()      { (( QUIET )) || printf '  %s[INFO]%s %s\n'      "$C_DIM" "$C_NC" "$*" >&2; }
+say_warn()      { (( QUIET )) || printf '  %s[WARN]%s %s\n'      "$C_YEL" "$C_NC" "$*" >&2; }
+say_fail()      { (( QUIET )) || printf '  %s[FAIL]%s %s\n'      "$C_RED" "$C_NC" "$*" >&2; }
+say_def()       { (( QUIET )) || printf '  %s[DEF-OK]%s %s\n'    "$C_GRN" "$C_NC" "$*" >&2; }
+say_def_miss()  { (( QUIET )) || printf '  %s[DEF-MISS]%s %s\n'  "$C_YEL" "$C_NC" "$*" >&2; }
+say_ioc()       { (( QUIET )) || printf '  %s[IOC]%s %s\n'       "$C_RED" "$C_NC" "$*" >&2; }
+# Backward-compat alias - old callsites still call say_off
+say_off()       { say_ioc "$@"; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -572,7 +590,7 @@ phase_defense() {
     # join on the same state space.
     PATCH_STATE="UNKNOWN"
     if [[ "$CPANEL_NORM" == "unknown" || -z "$CPANEL_NORM" ]]; then
-        say_warn "cpanel binary missing or build unparseable - patch defense UNKNOWN"
+        say_def_miss "cpanel binary missing or build unparseable - patch defense UNKNOWN"
         emit_signal defense warn patch_unknown "cpanel build unparseable" \
             build "$CPANEL_NORM" patch_state "$PATCH_STATE"
     else
@@ -600,13 +618,13 @@ phase_defense() {
             done
             if (( is_unpatchable )); then
                 PATCH_STATE="UNPATCHABLE"
-                say_warn "cpanel tier $tier has NO in-place patch - upgrade major series or migrate"
+                say_def_miss "cpanel tier $tier has NO in-place patch - upgrade major series or migrate"
                 emit_signal defense warn patch_unpatchable \
                     "tier=$tier has no vendor patch; must upgrade or migrate" \
                     build "$CPANEL_NORM" tier "$tier" patch_state "$PATCH_STATE"
             else
                 PATCH_STATE="UNPATCHED"
-                say_warn "cpanel build $CPANEL_NORM is below vendor cutoff - upcp will help"
+                say_def_miss "cpanel build $CPANEL_NORM is below vendor cutoff - upcp will help"
                 emit_signal defense warn patch_unpatched \
                     "build=$CPANEL_NORM below vendor cutoff for tier $tier" \
                     build "$CPANEL_NORM" tier "$tier" patch_state "$PATCH_STATE"
@@ -627,13 +645,13 @@ phase_defense() {
                 epoch "$cpsrvd_start" pid "$cpsrvd_pid"
             # Patch is only effective if cpsrvd restarted AFTER patch landed.
             if [[ -n "$DEF_PATCH_TIME" && "$cpsrvd_start" -lt "$DEF_PATCH_TIME" ]]; then
-                say_warn "STALE: cpsrvd started BEFORE patch mtime - patch may not be live"
+                say_def_miss "STALE: cpsrvd started BEFORE patch mtime - patch may not be live"
                 emit_signal defense warn cpsrvd_stale "cpsrvd started before patch landed" \
                     cpsrvd_start "$cpsrvd_start" patch_mtime "$DEF_PATCH_TIME"
             fi
         fi
     else
-        say_warn "cpsrvd not running"
+        say_def_miss "cpsrvd not running"
         emit_signal defense warn cpsrvd_absent "cpsrvd process not found"
     fi
 
@@ -656,7 +674,7 @@ phase_defense() {
             DEFENSE_EVENTS+=("$DEF_MITIGATE_LAST|mitigate_last|sessionscribe-mitigate.sh last run")
         fi
     else
-        say_warn "no sessionscribe-mitigate.sh history found at $MITIGATE_BACKUP_ROOT"
+        say_def_miss "no sessionscribe-mitigate.sh history found at $MITIGATE_BACKUP_ROOT"
         emit_signal defense warn mitigate_absent "$MITIGATE_BACKUP_ROOT does not exist"
     fi
 
@@ -686,11 +704,11 @@ phase_defense() {
                 epoch "$DEF_MODSEC_TIME" rule_30 "$has_30" rule_31 "$has_31"
             DEFENSE_EVENTS+=("$DEF_MODSEC_TIME|modsec|modsec rule 1500030 installed")
         else
-            say_warn "modsec rule 1500030 NOT present in $MODSEC_USER_CONF"
+            say_def_miss "modsec rule 1500030 NOT present in $MODSEC_USER_CONF"
             emit_signal defense warn modsec_absent "rule 1500030 missing"
         fi
     else
-        say_warn "modsec config $MODSEC_USER_CONF missing - modsec defense ABSENT"
+        say_def_miss "modsec config $MODSEC_USER_CONF missing - modsec defense ABSENT"
         emit_signal defense warn modsec_conf_absent "$MODSEC_USER_CONF not found"
     fi
 
@@ -749,7 +767,7 @@ phase_defense() {
                 epoch "$DEF_CSF_TIME"
             DEFENSE_EVENTS+=("$DEF_CSF_TIME|csf|csf.conf cpsrvd ports stripped")
         else
-            say_warn "CSF still has cpsrvd ports in TCP_IN/TCP6_IN"
+            say_def_miss "CSF still has cpsrvd ports in TCP_IN/TCP6_IN"
             emit_signal defense warn csf_dirty "cpsrvd ports present in TCP_IN/TCP6_IN"
         fi
         # Verify actual iptables state (the host2.kyroslawgroup.net problem -
@@ -779,7 +797,7 @@ phase_defense() {
                 (( open )) && stale_ports+=("$p")
             done
             if (( ${#stale_ports[@]} > 0 )); then
-                say_warn "iptables INPUT ACCEPTs cpsrvd ports from 0.0.0.0/0: ${stale_ports[*]}"
+                say_def_miss "iptables INPUT ACCEPTs cpsrvd ports from 0.0.0.0/0: ${stale_ports[*]}"
                 emit_signal defense warn csf_not_in_effect \
                     "csf.conf clean but iptables INPUT still ACCEPTs cpsrvd ports from 0.0.0.0/0" \
                     open_ports "${stale_ports[*]}"
@@ -1017,186 +1035,220 @@ phase_offense() {
             "$archive_count tarballs in logs/archive not expanded" count "$archive_count"
     fi
 
-    # Pattern E: websocket Shell hits. cPanel access_log format is
-    # IP - user [MM/DD/YYYY:HH:MM:SS +ZZZZ] "GET ..."  (extract_log_ts
-    # handles the cpanel MM/DD and apache DD/Mon variants).
-    # Capture session dimensions (rows/cols) - 24x80 vs 24x120 indicates
-    # different operators per the IC-5790 attribution.
-    local first_websocket="" first_ws_line="" ws_count=0
-    declare -A WS_DIMS=()
+    # All 5 access-log IOC patterns (Pattern E websocket/Fileman, Pattern D
+    # recon/bad-UA/bad-IP) consolidated into a SINGLE awk pass per log file.
+    #
+    # Why: the previous version walked each log 5 times, with bash while-read
+    # over each match plus 4-5 subshell forks per match (echo|awk for IP,
+    # grep -oE for path/UA/dims, sed for ts bracket, date for epoch). On
+    # busy hosts where KNOWN_BAD_UAS_RE matches every legitimate python-
+    # requests / okhttp / aiohttp client, total cost was N-matches × 5-loops
+    # × 4-subshells = O(20N) forks, easily 100k+ on a 90-day window.
+    #
+    # The awk pass below filters and aggregates per (pattern, src_ip, extra)
+    # in one process per log file. Bash receives one record per aggregated
+    # key (typically dozens, not millions) and does only the per-key work.
+    # On the host2 case (45 websocket hits, 3 recon-burst IPs, ~100k bad-UA
+    # log lines) this is the difference between minutes and seconds.
+    #
+    # Operators can skip this entire section with --no-logs.
+    if (( ! NO_LOGS )); then
+    local first_websocket="" first_ws_line="" first_ws_src="" ws_count=0
+    local first_fileman="" first_recon=""
+    local bad_ua_count=0 first_bad_ua=""
+    local bad_ip_total=0 first_bad_ip=""
+    declare -A WS_DIMS=() FM_IPS=() RECON_IPS=() UA_IPS=() KB_HITS=()
+
+    # Build the bad-IP anchored regex once.
+    local kb_re_pipe=""
+    for ip in "${KNOWN_BAD_IPS[@]}"; do
+        kb_re_pipe+="${ip//./\\.}|"
+    done
+    local kb_re="^(${kb_re_pipe%|}) "
+
+    # Per-log: single awk pass emits TSV records aggregated by key.
+    # Output columns: PAT \t IP \t EXTRA \t FIRST_TS \t COUNT \t FIRST_RAW
     for lg in "${cp_logs[@]}"; do
         [[ -f "$lg" ]] || continue
-        while IFS= read -r line; do
-            local apache_ts dims
-            apache_ts=$(extract_log_ts "$line")
-            [[ -z "$apache_ts" ]] && continue
-            local epoch
-            epoch=$(to_epoch "$apache_ts")
-            [[ -z "$epoch" ]] && continue
-            ws_count=$((ws_count+1))
-            dims=$(echo "$line" | grep -oE 'rows=[0-9]+&cols=[0-9]+' | head -1)
-            [[ -n "$dims" ]] && WS_DIMS["$dims"]=1
-            if [[ -z "$first_websocket" ]] || (( epoch < first_websocket )); then
-                first_websocket="$epoch"
-                first_ws_line="$line"
-            fi
-        done < <(cat_log "$lg" | grep -E 'GET /cpsess[0-9]+/websocket/Shell' 2>/dev/null \
-                                | grep -vE "$PROBE_UA_RE")
+        while IFS=$'\t' read -r pat ip extra ts cnt raw; do
+            [[ -z "$pat" ]] && continue
+            local epoch=""
+            [[ -n "$ts" ]] && epoch=$(to_epoch "$ts")
+            case "$pat" in
+                E_WS)
+                    ws_count=$(( ws_count + cnt ))
+                    [[ -n "$extra" ]] && WS_DIMS["$extra"]=1
+                    if [[ -n "$epoch" ]]; then
+                        if [[ -z "$first_websocket" ]] || (( epoch < first_websocket )); then
+                            first_websocket="$epoch"
+                            first_ws_line="$raw"
+                            first_ws_src="$ip"
+                        fi
+                    fi
+                    ;;
+                E_FM)
+                    FM_IPS["$ip"]=$(( ${FM_IPS["$ip"]:-0} + cnt ))
+                    if [[ -n "$epoch" ]]; then
+                        if [[ -z "$first_fileman" ]] || (( epoch < first_fileman )); then
+                            first_fileman="$epoch"
+                        fi
+                    fi
+                    emit_signal offense fail pattern_e_fileman \
+                        "Fileman API harvest from $ip (count=$cnt)" \
+                        epoch "${epoch:-}" src_ip "$ip" count "$cnt" raw "$raw"
+                    ;;
+                D_REC)
+                    RECON_IPS["$ip"]+="$extra,"
+                    if [[ -n "$epoch" ]]; then
+                        if [[ -z "$first_recon" ]] || (( epoch < first_recon )); then
+                            first_recon="$epoch"
+                        fi
+                    fi
+                    ;;
+                D_UA)
+                    bad_ua_count=$(( bad_ua_count + cnt ))
+                    UA_IPS["$ip|$extra"]=$(( ${UA_IPS["$ip|$extra"]:-0} + cnt ))
+                    if [[ -n "$epoch" ]]; then
+                        if [[ -z "$first_bad_ua" ]] || (( epoch < first_bad_ua )); then
+                            first_bad_ua="$epoch"
+                        fi
+                    fi
+                    ;;
+                D_IP)
+                    KB_HITS["$ip"]=$(( ${KB_HITS["$ip"]:-0} + cnt ))
+                    bad_ip_total=$(( bad_ip_total + cnt ))
+                    if [[ -n "$epoch" ]]; then
+                        if [[ -z "$first_bad_ip" ]] || (( epoch < first_bad_ip )); then
+                            first_bad_ip="$epoch"
+                        fi
+                    fi
+                    ;;
+            esac
+        done < <(cat_log "$lg" | awk \
+            -v ws_re='GET /cpsess[0-9]+/websocket/Shell' \
+            -v fm_re="Fileman.*(viewfile|showfile|getfilecontents).*${PATTERN_D_FILEMAN_RE}" \
+            -v rec_re="${PATTERN_D_RECON_PATHS_RE}" \
+            -v ua_re="${KNOWN_BAD_UAS_RE}" \
+            -v ip_re="${kb_re}" \
+            -v probe_re="${PROBE_UA_RE}" '
+        function get_ts(line,    rs, rl) {
+            if (match(line, /\[[0-9]+\/[0-9A-Za-z]+\/[0-9]+:[0-9:]+( [+-][0-9]{4})?\]/)) {
+                return substr(line, RSTART+1, RLENGTH-2)
+            }
+            return ""
+        }
+        function bump(pat, ip, extra, line,    key, ts) {
+            key = pat SUBSEP ip SUBSEP extra
+            if (!(key in count)) {
+                count[key]    = 0
+                first_ts[key] = get_ts(line)
+                first_raw[key]= line
+            }
+            count[key]++
+        }
+        {
+            ip = $1
+            is_probe = ($0 ~ probe_re)
+
+            # D_IP: anchored bad-IP match - cheap, do first; skip probe-UA
+            # filter (probes never originate from these blackholed IPs).
+            if (ip_re != "" && match($0, ip_re)) bump("D_IP", ip, "", $0)
+
+            # The remaining patterns skip probe-UA traffic.
+            if (is_probe) next
+
+            if ($0 ~ ws_re) {
+                dims = ""
+                if (match($0, /rows=[0-9]+&cols=[0-9]+/)) dims = substr($0, RSTART, RLENGTH)
+                bump("E_WS", ip, dims, $0)
+            }
+            if ($0 ~ fm_re) bump("E_FM", ip, "", $0)
+            if ($0 ~ rec_re) {
+                path = ""
+                if (match($0, rec_re)) path = substr($0, RSTART, RLENGTH)
+                bump("D_REC", ip, path, $0)
+            }
+            if ($0 ~ ua_re) {
+                ua = ""
+                if (match($0, ua_re)) ua = substr($0, RSTART, RLENGTH)
+                bump("D_UA", ip, ua, $0)
+            }
+        }
+        END {
+            for (k in count) {
+                n = split(k, parts, SUBSEP)
+                printf "%s\t%s\t%s\t%s\t%d\t%s\n", \
+                    parts[1], parts[2], parts[3], first_ts[k], count[k], first_raw[k]
+            }
+        }')
     done
+
+    # Post-aggregation: fold into the existing report shape.
     if [[ -n "$first_websocket" ]]; then
-        local src_ip dims_summary=""
-        src_ip=$(echo "$first_ws_line" | awk '{print $1}')
+        local dims_summary=""
         if (( ${#WS_DIMS[@]} > 0 )); then
             dims_summary=$(printf '%s ' "${!WS_DIMS[@]}")
             dims_summary="${dims_summary% }"
         fi
-        say_off "PATTERN-E: $ws_count websocket/Shell hits; earliest $(epoch_to_iso "$first_websocket") src=$src_ip dims=[$dims_summary]"
-        emit_signal offense fail pattern_e_websocket "earliest websocket Shell from $src_ip ($ws_count total)" \
-            epoch "$first_websocket" src_ip "$src_ip" count "$ws_count" dims "$dims_summary" raw "$first_ws_line"
+        say_ioc "PATTERN-E: $ws_count websocket/Shell hits; earliest $(epoch_to_iso "$first_websocket") src=$first_ws_src dims=[$dims_summary]"
+        emit_signal offense fail pattern_e_websocket \
+            "earliest websocket Shell from $first_ws_src ($ws_count total)" \
+            epoch "$first_websocket" src_ip "$first_ws_src" count "$ws_count" \
+            dims "$dims_summary" raw "$first_ws_line"
         OFFENSE_EVENTS+=("$first_websocket|E|pattern_e_websocket|websocket Shell RCE|patch,modsec")
     fi
 
-    # Pattern E: Fileman viewfile API harvesting sensitive files. Process
-    # ALL hits (not head -1) so per-IP / per-file detail is preserved.
-    local first_fileman=""
-    declare -A FM_IPS=()
-    for lg in "${cp_logs[@]}"; do
-        [[ -f "$lg" ]] || continue
-        while IFS= read -r hit; do
-            [[ -z "$hit" ]] && continue
-            local apache_ts epoch src_ip
-            apache_ts=$(extract_log_ts "$hit")
-            epoch=$(to_epoch "$apache_ts")
-            src_ip=$(echo "$hit" | awk '{print $1}')
-            [[ -z "$epoch" ]] && continue
-            if [[ -z "$first_fileman" ]] || (( epoch < first_fileman )); then
-                first_fileman="$epoch"
-            fi
-            FM_IPS["$src_ip"]=$(( ${FM_IPS["$src_ip"]:-0} + 1 ))
-            emit_signal offense fail pattern_e_fileman "Fileman API harvest from $src_ip" \
-                epoch "$epoch" src_ip "$src_ip" raw "$hit"
-        done < <(cat_log "$lg" | grep -E "Fileman.*(viewfile|showfile|getfilecontents).*${PATTERN_D_FILEMAN_RE}" 2>/dev/null \
-                                | grep -vE "$PROBE_UA_RE")
-    done
     if [[ -n "$first_fileman" ]]; then
         local ip_summary=""
         for ip in "${!FM_IPS[@]}"; do
             ip_summary+="$ip(${FM_IPS[$ip]}) "
         done
-        say_off "PATTERN-E: Fileman API exfil; earliest $(epoch_to_iso "$first_fileman") ips=[${ip_summary% }]"
+        say_ioc "PATTERN-E: Fileman API exfil; earliest $(epoch_to_iso "$first_fileman") ips=[${ip_summary% }]"
         OFFENSE_EVENTS+=("$first_fileman|E|pattern_e_fileman|Fileman API credential harvest|patch,modsec")
     fi
 
-    # Pattern D: WHM JSON-API recon burst. The Go-http-client tool walks the
-    # path set above before issuing createacct. Detect a burst of >=4
-    # distinct recon paths from the same source IP within a 60s window.
-    local first_recon=""
-    declare -A RECON_IPS=()
-    for lg in "${cp_logs[@]}"; do
-        [[ -f "$lg" ]] || continue
-        while IFS= read -r hit; do
-            [[ -z "$hit" ]] && continue
-            local src_ip path
-            src_ip=$(echo "$hit" | awk '{print $1}')
-            path=$(echo "$hit" | grep -oE '/json-api/(version|gethostname|listaccts|getdiskusage|systemloadavg|getips)' | head -1)
-            [[ -z "$src_ip" || -z "$path" ]] && continue
-            RECON_IPS["$src_ip"]+="$path,"
-            local apache_ts epoch
-            apache_ts=$(extract_log_ts "$hit")
-            epoch=$(to_epoch "$apache_ts")
-            if [[ -n "$epoch" ]]; then
-                if [[ -z "$first_recon" ]] || (( epoch < first_recon )); then
-                    first_recon="$epoch"
-                fi
-            fi
-        done < <(cat_log "$lg" | grep -E "${PATTERN_D_RECON_PATHS_RE}" 2>/dev/null \
-                                | grep -vE "$PROBE_UA_RE")
-    done
     for ip in "${!RECON_IPS[@]}"; do
         local distinct
         distinct=$(echo "${RECON_IPS[$ip]}" | tr ',' '\n' | sort -u | grep -c .)
         if (( distinct >= 4 )); then
-            say_off "PATTERN-D: recon burst from $ip ($distinct distinct json-api paths)"
+            say_ioc "PATTERN-D: recon burst from $ip ($distinct distinct json-api paths)"
             emit_signal offense fail pattern_d_recon_burst \
-                "$ip walked $distinct distinct json-api recon paths" src_ip "$ip" distinct "$distinct"
+                "$ip walked $distinct distinct json-api recon paths" \
+                src_ip "$ip" distinct "$distinct"
         fi
     done
     if [[ -n "$first_recon" ]]; then
         OFFENSE_EVENTS+=("$first_recon|D|pattern_d_recon|json-api recon burst|patch,modsec")
     fi
 
-    # Known-bad UAs across all access logs. Any hit is high-signal.
-    local bad_ua_count=0 first_bad_ua=""
-    declare -A UA_IPS=()
-    for lg in "${cp_logs[@]}"; do
-        [[ -f "$lg" ]] || continue
-        while IFS= read -r hit; do
-            [[ -z "$hit" ]] && continue
-            bad_ua_count=$((bad_ua_count+1))
-            local src_ip ua apache_ts epoch
-            src_ip=$(echo "$hit" | awk '{print $1}')
-            ua=$(echo "$hit" | grep -oE "(${KNOWN_BAD_UAS_RE})" | head -1)
-            apache_ts=$(extract_log_ts "$hit")
-            epoch=$(to_epoch "$apache_ts")
-            UA_IPS["$src_ip|$ua"]=$(( ${UA_IPS["$src_ip|$ua"]:-0} + 1 ))
-            if [[ -n "$epoch" ]]; then
-                if [[ -z "$first_bad_ua" ]] || (( epoch < first_bad_ua )); then
-                    first_bad_ua="$epoch"
-                fi
-            fi
-        done < <(cat_log "$lg" | grep -E "$KNOWN_BAD_UAS_RE" 2>/dev/null \
-                                | grep -vE "$PROBE_UA_RE")
-    done
     if (( bad_ua_count > 0 )); then
         for k in "${!UA_IPS[@]}"; do
-            local ip="${k%%|*}" ua="${k##*|}"
+            local kip="${k%%|*}" kua="${k##*|}"
             emit_signal offense warn pattern_d_bad_ua \
-                "known-bad UA: $ua from $ip (count=${UA_IPS[$k]})" \
-                src_ip "$ip" ua "$ua" count "${UA_IPS[$k]}"
+                "known-bad UA: $kua from $kip (count=${UA_IPS[$k]})" \
+                src_ip "$kip" ua "$kua" count "${UA_IPS[$k]}"
         done
-        say_off "$bad_ua_count attacker-UA hits across access logs (python-requests/Go-http-client/leakix)"
+        say_ioc "$bad_ua_count attacker-UA hits across access logs (python-requests/Go-http-client/leakix)"
         if [[ -n "$first_bad_ua" ]]; then
             OFFENSE_EVENTS+=("$first_bad_ua|D|pattern_d_bad_ua|known-bad UA in access logs|patch,modsec")
         fi
     fi
 
-    # Known-bad source IPs across all access logs. Even one line from any
-    # blackholed IP is escalation-worthy.
-    local bad_ip_total=0 first_bad_ip=""
-    declare -A KB_HITS=()
-    local kb_re kb_re_pipe=""
-    for ip in "${KNOWN_BAD_IPS[@]}"; do
-        kb_re_pipe+="${ip//./\\.}|"
-    done
-    kb_re="^(${kb_re_pipe%|}) "
-    for lg in "${cp_logs[@]}"; do
-        [[ -f "$lg" ]] || continue
-        while IFS= read -r hit; do
-            [[ -z "$hit" ]] && continue
-            local src_ip apache_ts epoch
-            src_ip=$(echo "$hit" | awk '{print $1}')
-            KB_HITS["$src_ip"]=$(( ${KB_HITS["$src_ip"]:-0} + 1 ))
-            bad_ip_total=$((bad_ip_total+1))
-            apache_ts=$(extract_log_ts "$hit")
-            epoch=$(to_epoch "$apache_ts")
-            if [[ -n "$epoch" ]]; then
-                if [[ -z "$first_bad_ip" ]] || (( epoch < first_bad_ip )); then
-                    first_bad_ip="$epoch"
-                fi
-            fi
-        done < <(cat_log "$lg" | grep -E "$kb_re" 2>/dev/null)
-    done
     if (( bad_ip_total > 0 )); then
         for ip in "${!KB_HITS[@]}"; do
             emit_signal offense fail known_bad_ip \
                 "known-bad attacker IP: $ip (count=${KB_HITS[$ip]})" \
                 src_ip "$ip" count "${KB_HITS[$ip]}"
         done
-        say_off "$bad_ip_total log lines from ${#KB_HITS[@]} known-bad IC-5790 IPs"
+        say_ioc "$bad_ip_total log lines from ${#KB_HITS[@]} known-bad IC-5790 IPs"
         if [[ -n "$first_bad_ip" ]]; then
             OFFENSE_EVENTS+=("$first_bad_ip|init|known_bad_ip|known-bad attacker IP in logs|patch,modsec")
         fi
     fi
+    else
+        say_info "--no-logs: skipping access-log scans (Pattern D + Pattern E)"
+        emit_signal offense info logs_skipped "--no-logs flag set; access-log scans bypassed"
+    fi  # end if (( ! NO_LOGS ))
 
     # Pattern F: automated harvester shell (__S_MARK__/__E_MARK__ envelope
     # or TERM=dumb wrapper). bash_history doesn't carry timestamps unless
@@ -1373,7 +1425,16 @@ phase_offense() {
             if [[ -z "$first_sorry" ]] || (( m < first_sorry )); then
                 first_sorry="$m"
             fi
-        done < <(find "${sorry_roots[@]}" -maxdepth 8 -name '*.sorry' -print0 2>/dev/null)
+        # Depth 5 covers /home/<user>/public_html/wp-content/uploads which is
+        # the deepest realistic ransom drop location. Pruned subtrees below
+        # are bulky-and-irrelevant (Maildir, .cagefs jail copies, node_modules,
+        # composer caches, .trash) that can dominate find time on shared
+        # hosts with 500+ accounts. Encryptor never targets these paths.
+        done < <(find "${sorry_roots[@]}" -maxdepth 5 \
+            \( -name 'mail' -o -name '.cagefs' -o -name 'node_modules' \
+               -o -name '.composer' -o -name '.npm' -o -name '.cache' \
+               -o -name '.trash' -o -name 'tmp' \) -prune \
+            -o -name '*.sorry' -print0 2>/dev/null)
     fi
     if (( sorry_count > 0 )); then
         say_off "PATTERN-A: $sorry_count .sorry files; earliest mtime $(epoch_to_iso "$first_sorry")"
@@ -2084,6 +2145,8 @@ if (( ! QUIET )); then
         printf '  window: unlimited (all retained data)    bundle cap: %s\n' \
             "$cap_human" >&2
     fi
+    printf '  legend: %s[OK]%s clean  %s[DEF-OK]%s defense present (good)  %s[DEF-MISS]%s defense absent (bad)  %s[IOC]%s compromise indicator (BAD)\n' \
+        "$C_GRN" "$C_NC" "$C_GRN" "$C_NC" "$C_YEL" "$C_NC" "$C_RED" "$C_NC" >&2
 fi
 
 phase_defense
