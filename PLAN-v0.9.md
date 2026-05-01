@@ -1,5 +1,9 @@
 # Plan — v1.6.0 ioc-scan + v0.9.0 forensic — single-source IOC, kill-chain over canonical envelope
 
+> **Status: SHIPPED** (2026-05-01). Final versions: ioc-scan **v1.6.1**,
+> forensic **v0.9.2**. Net delta: forensic 2255 → 1667 LOC (-588);
+> ioc-scan +400 LOC (port + envelope plumbing). All 4 phases complete.
+
 ## Why
 
 Today both scripts independently detect IOCs. They have diverged: on
@@ -104,33 +108,46 @@ ioc-scan emit that needs the field added — caught in dev, not prod.
 
 ## Phasing
 
-**Phase 1 — already shipped (v0.8.2)**
-- Defensive contract enforcement in forensic's offense loop. Prevents
-  the line-1107 crash from losing IOCs silently. Still the duplicated
-  detector; just no longer crashes. Buys time for the refactor.
+**Phase 1 — DONE** (forensic v0.8.2, commit `51603c9`)
+- Defensive contract enforcement in forensic's offense loop. Validate
+  `cnt` is `^[0-9]+$` before `$(( ... ))`, breadcrumb emit on first
+  malformed record, count summary on more. Stops the line-1107 crash
+  from silently losing every IOC after the first bad row.
 
-**Phase 2 — v1.6.0 ioc-scan**
-- Confirm every signal we want in the kill-chain has a usable
-  timestamp in its kv pairs. Where missing, add (e.g. parse the
-  `[MM/DD/YYYY:HH:MM:SS ±ZZZZ]` bracket from `line` into a `ts_epoch`
-  kv on every log-area signal).
-- Export `SESSIONSCRIBE_IOC_JSON` from `chain_forensic_dispatch`.
-- Bump tool_version. CDN+repo deploy.
+**Phase 2 — DONE** (ioc-scan v1.6.0, commit `48bd7ff`)
+- `ts_epoch_first` on log-area parents (`ioc_scan`, `ioc_attacker_ip`,
+  `ioc_pattern_e_websocket`); `mtime_epoch` on destruction-pattern
+  parents (A/B/C/D/F/G).
+- Ported forensic-only checks: Pattern A ransom README, Pattern A live
+  C2 socket, Pattern C nuclear.x86 binary sha256 + persistence paths.
+- `SESSIONSCRIBE_IOC_JSON` exported from `chain_forensic_dispatch`;
+  envelope written pre-chain by `write_json` so forensic can read it.
+- CDN+repo deployed.
 
-**Phase 3 — v0.9.0 forensic**
-- Add `read_iocs_from_envelope()`.
-- Delete the offense-extraction block.
-- Wire `OFFENSE_EVENTS[]` from the envelope reader.
-- Verdict inheritance from `host_verdict`.
-- Test matrix: (a) chained from ioc-scan (env present),
-  (b) standalone (forensic forks ioc-scan), (c) standalone with
-  ioc-scan absent + remote-fetch fallback.
-- CDN+repo deploy.
+**Phase 3 — DONE** (forensic v0.9.0/0.9.1/0.9.2, commits `b671ad9`,
+`11baaab`, `6a9cb06`)
+- `read_iocs_from_envelope()` added; `OFFENSE_EVENTS[]` populated from
+  signals[]. Stage letters mapped (init/A/B/C/D/E/F/G/X). Timestamp
+  resolution priority: `ts_epoch_first` → `mtime_epoch` → `ts_epoch` →
+  `file_mtime` ISO → `login_time` ISO → `$TS_EPOCH`. Helpers:
+  `json_str_field`, `json_num_field`, `ioc_key_to_stage`,
+  `ioc_signal_epoch` — all bash 4.1 + grep, no `jq` required.
+- Deleted ~760 LOC of duplicated detection (forged-session ladder,
+  Pattern A/B/C/D/F basic checks, the access-log awk pass for E_WS /
+  E_FM / D_REC / D_UA / D_IP). Kept the deep checks ioc-scan doesn't
+  cover: Pattern G mtime forgery, key-comment validation, ssh-rsa
+  material in non-canonical paths; suspect-IP cross-ref.
+- v0.9.1 polish dropped 74 LOC of orphan constants (PATTERN_A_README,
+  KNOWN_BAD_IPS, PROBE_*, etc.) whose only consumers were the deleted
+  detection.
+- v0.9.2 chain UX: forensic stderr flows through to operator under
+  `--chain-forensic` (was being redirected to /dev/null with stdout);
+  banner suppressed when chained (signaled by SESSIONSCRIBE_IOC_JSON).
 
-**Phase 4 — verification**
-- Re-run on host2 (and the cpanel_client lab hosts). Forensic must
-  now reproduce ioc-scan's verdict exactly. Any divergence is a bug
-  in the envelope contract, not an IOC-detection difference.
+**Phase 4 — pending operator verification**
+- Re-run on host2 / intent-wolves / maple2 / cpanel_client lab hosts.
+  Forensic must now reproduce ioc-scan's host_verdict exactly. Any
+  divergence is a bug in the envelope contract, not detection drift.
 
 ## Risk register
 

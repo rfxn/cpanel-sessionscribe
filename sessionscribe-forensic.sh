@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.3
+# sessionscribe-forensic.sh v0.9.4
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.3"
+VERSION="0.9.4"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -376,6 +376,35 @@ declare -a DEFENSE_EVENTS=()   # "epoch|key|note"
 declare -a OFFENSE_EVENTS=()   # "epoch|pattern|key|note|defenses_required"
 declare -a RECONCILED=()       # "verdict|delta_seconds|epoch|pattern|key"
 
+# Parallel to OFFENSE_EVENTS (same index). One row per IOC carrying the
+# forensic primitives we surface in the pretty kill-chain renderer and
+# persist into the bundle for offline reconstruction. Fields are joined
+# with ASCII US (0x1f) so consecutive empties survive `read` (whitespace
+# IFS collapses adjacent separators; US is non-whitespace so it doesn't).
+# Columns: area | ip | path | log_file | count | hits_2xx | status | line
+# Bundle TSV output uses real TABs - this is internal-only.
+PRIM_SEP=$'\x1f'
+declare -a IOC_PRIMITIVES=()
+
+# Envelope-root metadata (populated by read_envelope_meta when chained from
+# ioc-scan via $SESSIONSCRIBE_IOC_JSON). These are the canonical IOC verdict
+# fields - forensic inherits them rather than re-deriving.
+ENV_HOST_VERDICT=""
+ENV_CODE_VERDICT=""
+ENV_SCORE=""
+ENV_IOC_TOOL_VERSION=""
+ENV_IOC_RUN_ID=""
+ENV_IOC_TS=""
+ENV_STRONG=""
+ENV_FIXED=""
+ENV_INCONCLUSIVE=""
+ENV_IOC_CRITICAL=""
+ENV_IOC_REVIEW=""
+
+# Captured pretty-print of the kill chain (ANSI-stripped) for the bundle
+# kill-chain.md sibling. Populated by render_kill_chain.
+KILL_CHAIN_RENDERED=""
+
 N_DEF=0; N_OFF=0; N_PRE=0; N_POST=0
 
 emit_signal() {
@@ -485,6 +514,41 @@ epoch_to_iso() {
     local e="$1"
     [[ -z "$e" || "$e" == "0" ]] && { echo ""; return; }
     date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
+# Pipe-delimited record decoder for record shapes whose LAST field is
+# free-form text that may legitimately contain '|' (notes carrying
+# access_log lines, paths, attacker payloads, CRLF-injected session
+# attributes). Avoids the silent truncation that bare
+# `IFS='|' read -r f1 f2 ... fLAST` produces when the last field has
+# embedded pipes.
+#
+# Usage:
+#   IFS=$'\t' read -r f1 f2 ... fN < <(decode_pipe_tail "$record" N)
+#
+# Output: NFIELDS values TAB-separated on stdout (no trailing newline).
+# The first NFIELDS-1 fields map 1:1 with parts[0..NFIELDS-2]; the
+# Nth field absorbs parts[NFIELDS-1..end] re-joined with '|'.
+#
+# Why TAB as output separator: forensic record fields (epochs, key
+# tokens, notes from log lines / paths / IOC values) are not expected
+# to contain a literal TAB. If a future record ever does, the failure
+# mode is a partial decode at the call site, not silent truncation.
+#
+# Bash 4.1 / EL6 floor compatible (array slice + local IFS for join
+# are 3.0+; printf is POSIX).
+decode_pipe_tail() {
+    local _rec="$1" _nfields="$2"
+    local -a _parts
+    IFS='|' read -r -a _parts <<< "$_rec"
+    local _i
+    for (( _i = 0; _i < _nfields - 1; _i++ )); do
+        printf '%s\t' "${_parts[_i]:-}"
+    done
+    if (( ${#_parts[@]} >= _nfields )); then
+        local IFS='|'
+        printf '%s' "${_parts[*]:_nfields-1}"
+    fi
 }
 
 ###############################################################################
@@ -843,9 +907,74 @@ ioc_signal_epoch() {
     printf '%s' "$TS_EPOCH"
 }
 
+# Extract a root-level (NOT signal-array) JSON field from a pretty-printed
+# envelope. Used to read the envelope's host_verdict / score / etc. without
+# descending into the signals[] array (where the same field name may
+# collide). ioc-scan emits each root field on its own line, but we accept
+# the field anywhere outside a signal row by skipping any line that starts
+# with `{"host":` (signal rows). String and numeric values are both handled.
+envelope_root_field() {
+    local env="$1" key="$2" raw v
+    raw=$(grep -vE '^[[:space:]]*\{\"host\":' "$env" 2>/dev/null \
+          | grep -oE "\"${key}\":[[:space:]]*(\"[^\"]*\"|-?[0-9]+(\.[0-9]+)?)" \
+          | head -1)
+    [[ -z "$raw" ]] && return 0
+    v="${raw#*:}"
+    v="${v# }"
+    v="${v#\"}"
+    v="${v%\"}"
+    printf '%s' "$v"
+}
+
+# Populate ENV_* globals from the envelope's root section. Cheap (a handful
+# of grep + parameter-expansion calls). Idempotent - safe to call twice.
+read_envelope_meta() {
+    local env="${SESSIONSCRIBE_IOC_JSON:-}"
+    [[ -n "$env" && -f "$env" ]] || return 0
+    ENV_HOST_VERDICT=$(envelope_root_field "$env" host_verdict)
+    ENV_CODE_VERDICT=$(envelope_root_field "$env" code_verdict)
+    ENV_SCORE=$(envelope_root_field "$env" score)
+    ENV_IOC_TOOL_VERSION=$(envelope_root_field "$env" tool_version)
+    ENV_IOC_RUN_ID=$(envelope_root_field "$env" run_id)
+    ENV_IOC_TS=$(envelope_root_field "$env" ts)
+    # summary block lives on a single line: "summary": {"strong":N,...},
+    local summary
+    summary=$(grep -E '^[[:space:]]+"summary":' "$env" 2>/dev/null | head -1)
+    if [[ -n "$summary" ]]; then
+        ENV_STRONG=$(echo "$summary"        | grep -oE '"strong":[0-9]+'        | cut -d: -f2)
+        ENV_FIXED=$(echo "$summary"         | grep -oE '"fixed":[0-9]+'         | cut -d: -f2)
+        ENV_INCONCLUSIVE=$(echo "$summary"  | grep -oE '"inconclusive":[0-9]+'  | cut -d: -f2)
+        ENV_IOC_CRITICAL=$(echo "$summary"  | grep -oE '"ioc_critical":[0-9]+'  | cut -d: -f2)
+        ENV_IOC_REVIEW=$(echo "$summary"    | grep -oE '"ioc_review":[0-9]+'    | cut -d: -f2)
+    fi
+}
+
+# Build an internal-format primitives row for IOC_PRIMITIVES. US-delimited
+# (0x1f) so empty middle fields don't collapse on `IFS=US read`. Embedded
+# tabs/newlines in `line` are squashed to single spaces so the bundle TSV
+# output stays well-formed when this row is later expanded.
+ioc_primitive_row() {
+    local area="$1" ip="$2" path="$3" log_file="$4" count="$5" h2xx="$6" status="$7" line="$8"
+    local clean="${line//$'\t'/ }"
+    clean="${clean//$'\n'/ }"
+    clean="${clean//$'\r'/ }"
+    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s' \
+        "${area:-}"     "$PRIM_SEP" \
+        "${ip:-}"       "$PRIM_SEP" \
+        "${path:-}"     "$PRIM_SEP" \
+        "${log_file:-}" "$PRIM_SEP" \
+        "${count:-}"    "$PRIM_SEP" \
+        "${h2xx:-}"     "$PRIM_SEP" \
+        "${status:-}"   "$PRIM_SEP" \
+        "$clean"
+}
+
 # Read kill-chain-relevant signals from $SESSIONSCRIBE_IOC_JSON and append
 # to OFFENSE_EVENTS in the shape phase_reconcile expects:
 #   "epoch|stage|key|note|defenses_required"
+# Also captures envelope-root metadata + per-IOC primitives (ip / path /
+# log_file / count / hits_2xx / status / line excerpt) into IOC_PRIMITIVES,
+# parallel-indexed with OFFENSE_EVENTS, for the kill-chain renderer + bundle.
 # Sample-row emits are skipped - the parent has the aggregated count + ts.
 read_iocs_from_envelope() {
     local env="${SESSIONSCRIBE_IOC_JSON:-}"
@@ -860,7 +989,10 @@ read_iocs_from_envelope() {
         return 1
     fi
 
+    read_envelope_meta
+
     local line area severity key note ts stage n_added=0
+    local p_ip p_path p_log p_count p_h2xx p_status p_line p_row
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
         area=$(json_str_field "$line" area)
@@ -880,7 +1012,24 @@ read_iocs_from_envelope() {
         note=$(json_str_field "$line" note)
         ts=$(ioc_signal_epoch "$line")
         stage=$(ioc_key_to_stage "$key")
+        # Forensic primitives - one of these is usually populated per signal,
+        # depending on the area:
+        #   logs       -> ip, log_file, line, status, count, hits_2xx
+        #   sessions   -> path, ip, count
+        #   destruction -> path, file_mtime
+        p_ip=$(json_str_field "$line" ip)
+        [[ -z "$p_ip" ]] && p_ip=$(json_str_field "$line" src_ip)
+        p_path=$(json_str_field "$line" path)
+        [[ -z "$p_path" ]] && p_path=$(json_str_field "$line" file)
+        p_log=$(json_str_field "$line" log_file)
+        p_count=$(json_num_field "$line" count)
+        p_h2xx=$(json_num_field "$line" hits_2xx)
+        p_status=$(json_str_field "$line" status)
+        p_line=$(json_str_field "$line" line)
+        p_row=$(ioc_primitive_row "$area" "$p_ip" "$p_path" "$p_log" "$p_count" "$p_h2xx" "$p_status" "$p_line")
+
         OFFENSE_EVENTS+=("$ts|$stage|$key|${note:-$key}|patch,modsec")
+        IOC_PRIMITIVES+=("$p_row")
         n_added=$((n_added+1))
         emit_signal offense fail "$key" "${note:-$key}" \
             epoch "$ts" stage "$stage" envelope "$(basename "$env")"
@@ -919,7 +1068,10 @@ pattern_g_deep_checks() {
                     "$ak mtime matches IC-5790 backdate stamp" \
                     file "$ak" forged_mtime_wall "$PATTERN_G_FORGED_MTIME_WALL" \
                     actual_mtime_utc "$mt_utc" actual_mtime_local "$mt_local"
-                [[ -n "$ctime_pre" ]] && OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_forged_mtime|backdated ssh key|patch,modsec")
+                if [[ -n "$ctime_pre" ]]; then
+                    OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_forged_mtime|backdated ssh key|patch,modsec")
+                    IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "" "" "" "" "mtime forged to $PATTERN_G_FORGED_MTIME_WALL")")
+                fi
             fi
         fi
 
@@ -947,7 +1099,10 @@ pattern_g_deep_checks() {
         done < "$ak"
         if (( susp_count > 0 )); then
             say_ioc "PATTERN-G: $susp_count non-standard ssh key(s) in $ak"
-            [[ -n "$ctime_pre" ]] && OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|non-standard ssh key (ctime)|patch,modsec")
+            if [[ -n "$ctime_pre" ]]; then
+                OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|non-standard ssh key (ctime)|patch,modsec")
+                IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "" "$susp_count" "" "" "non-standard ssh key comments")")
+            fi
         fi
     done
 
@@ -969,7 +1124,10 @@ pattern_g_deep_checks() {
             emit_signal offense fail pattern_g_offpath_key \
                 "ssh-rsa/ed25519 in $f (out of band of ~/.ssh)" \
                 file "$f" mtime_epoch "$m" ctime_epoch "$c"
-            [[ -n "$c" ]] && OFFENSE_EVENTS+=("$c|G|pattern_g_offpath|ssh key in non-canonical path|patch,modsec")
+            if [[ -n "$c" ]]; then
+                OFFENSE_EVENTS+=("$c|G|pattern_g_offpath|ssh key in non-canonical path|patch,modsec")
+                IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$f" "" "" "" "" "ssh key out of ~/.ssh")")
+            fi
         done <<< "$ssh_rsa_locations"
     fi
 }
@@ -1210,6 +1368,503 @@ phase_reconcile() {
 }
 
 ###############################################################################
+# Kill-chain renderer - presents the reconstructed kill chain in a single
+# operator-readable view (defense timeline + offense timeline + verdict +
+# defense lag), plus a captured ANSI-stripped copy for the bundle.
+#
+# All output goes to stderr (like the rest of the sectioned report) so it
+# never contaminates --jsonl/--json on stdout. Suppressed under --quiet.
+###############################################################################
+
+# Order stages canonically for the offense timeline. init is the recon
+# pre-cursor; A-G map to the IC-5790 pattern letters; X is forged-session
+# evidence that doesn't fit a destruction stage; ? is anything unmapped
+# (a v0.9.x ioc_key_to_stage gap caught at runtime).
+STAGE_ORDER=(init A B C D E F G X "?")
+declare -A STAGE_LABEL=(
+    [init]="recon / harvest"
+    [A]="ransom / encryptor"
+    [B]="data destruction"
+    [C]="malware deploy"
+    [D]="persistence (reseller token)"
+    [E]="websocket / fileman harvest"
+    [F]="harvester shell"
+    [G]="ssh key persistence"
+    [X]="forged session"
+    ["?"]="unmapped"
+)
+
+# Strip CSI sequences from a string. Used to capture an ANSI-free copy of
+# the rendered kill chain for kill-chain.md inside the bundle. Bash 4.1
+# safe (no `${var//pat/repl}` extended regex requirement; uses sed -r).
+ansi_strip() {
+    sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g'
+}
+
+# Render one offense row in the canonical pretty form. Caller passes the
+# decomposed reconcile fields and the matching IOC_PRIMITIVES TSV row.
+# Outputs two indented lines: a header (verdict + ts + stage + key) and
+# a primitives sub-line (ip / path / log_file / count). Sub-line is
+# omitted when no primitive is present (e.g. forensic-only deep checks
+# that only have a path).
+render_offense_row() {
+    local verdict="$1" delta="$2" ts_iso="$3" stage="$4" key="$5" note="$6" prims="$7"
+    local color label
+    case "$verdict" in
+        PRE-DEFENSE)  color="$C_RED"; label="PRE-DEFENSE " ;;
+        UNDEFENDED)   color="$C_RED"; label="UNDEFENDED  " ;;
+        POST-DEFENSE) color="$C_GRN"; label="POST-DEFENSE" ;;
+        POST-PARTIAL) color="$C_YEL"; label="POST-PARTIAL" ;;
+        *)            color="$C_DIM"; label="$verdict" ;;
+    esac
+
+    # Header row: [verdict] ISO  stage  key
+    printf '    %s[%s]%s %s  %s%s%s  %s%s%s\n' \
+        "$color" "$label" "$C_NC" \
+        "$ts_iso" \
+        "$C_BLD" "stage=$stage" "$C_NC" \
+        "$C_CYN" "$key" "$C_NC"
+
+    # Primitives sub-line(s) - one per non-empty field. PRIM_SEP-delimited
+    # (US 0x1f) so consecutive empty middles don't collapse on read.
+    #   1=area 2=ip 3=path 4=log_file 5=count 6=hits_2xx 7=status 8=line
+    local area ip path log_file count h2xx status line
+    IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
+
+    local detail=""
+    [[ -n "$ip"        ]] && detail+="ip=$ip "
+    [[ -n "$status"    ]] && detail+="status=$status "
+    [[ -n "$count"     ]] && detail+="count=$count "
+    [[ -n "$h2xx"      ]] && detail+="hits_2xx=$h2xx "
+    if [[ -n "$detail" ]]; then
+        printf '         %s%s%s\n' "$C_DIM" "${detail% }" "$C_NC"
+    fi
+    if [[ -n "$path" ]]; then
+        printf '         %spath:%s %s\n' "$C_DIM" "$C_NC" "$path"
+    fi
+    if [[ -n "$log_file" ]]; then
+        printf '         %slog: %s %s\n' "$C_DIM" "$C_NC" "$log_file"
+    fi
+    if [[ -n "$line" ]]; then
+        # Truncate raw log line to keep one-screen rendering predictable.
+        local trim="${line:0:120}"
+        printf '         %sevidence:%s %s\n' "$C_DIM" "$C_NC" "$trim"
+    fi
+    if [[ -n "$note" && -z "$ip" && -z "$path" && -z "$log_file" && -z "$line" ]]; then
+        printf '         %snote:%s %s\n' "$C_DIM" "$C_NC" "$note"
+    fi
+
+    # Trailing delta line - human-readable timing relative to defense.
+    local delta_human="$delta"
+    if [[ "$delta" =~ ^-?[0-9]+$ ]]; then
+        local abs="$delta"
+        (( abs < 0 )) && abs=$(( -abs ))
+        if   (( abs >= 86400 )); then delta_human=$(printf '%dd %dh' "$(( abs / 86400 ))" "$(( (abs % 86400) / 3600 ))")
+        elif (( abs >= 3600  )); then delta_human=$(printf '%dh %dm' "$(( abs / 3600 ))"  "$(( (abs % 3600) / 60 ))")
+        elif (( abs >= 60    )); then delta_human=$(printf '%dm %ds' "$(( abs / 60 ))"    "$(( abs % 60 ))")
+        else                          delta_human="${abs}s"
+        fi
+        if (( delta < 0 )); then
+            delta_human="${delta_human} after defense"
+        else
+            delta_human="${delta_human} before defense"
+        fi
+    elif [[ "$delta" == partial:* ]]; then
+        delta_human="only ${delta#partial:} was up"
+    fi
+    printf '         %sΔ defense:%s %s\n' "$C_DIM" "$C_NC" "$delta_human"
+}
+
+render_kill_chain() {
+    (( QUIET )) && return 0
+
+    # Buffer the entire render once so we can both print to stderr AND
+    # capture an ANSI-stripped copy for the bundle in a single pass. This
+    # avoids re-running the renderer twice or re-scanning arrays.
+    local buf
+    buf=$({
+        printf '\n%s== kill chain ==%s %s%s%s\n' \
+            "$C_BLD" "$C_NC" "$C_DIM" "CVE-2026-41940 / IC-5790" "$C_NC"
+
+        # Header banner: envelope-derived verdict + score, defense state.
+        local hv="${ENV_HOST_VERDICT:-}"
+        local hv_color="$C_GRN"
+        case "$hv" in
+            COMPROMISED) hv_color="$C_RED" ;;
+            SUSPICIOUS)  hv_color="$C_YEL" ;;
+            CLEAN)       hv_color="$C_GRN" ;;
+            "")          hv_color="$C_DIM"; hv="(no envelope)" ;;
+        esac
+        printf '\n  host: %s%s%s    cpanel: %s    os: %s\n' \
+            "$C_BLD" "$HOSTNAME_FQDN" "$C_NC" "${CPANEL_NORM:-unknown}" "$OS_PRETTY"
+        printf '  ioc-scan verdict: %s%s%s' "$hv_color" "$hv" "$C_NC"
+        [[ -n "$ENV_SCORE"        ]] && printf '    score: %s' "$ENV_SCORE"
+        [[ -n "$ENV_CODE_VERDICT" ]] && printf '    code: %s' "$ENV_CODE_VERDICT"
+        [[ -n "$ENV_IOC_TOOL_VERSION" ]] && printf '    ioc-scan v%s' "$ENV_IOC_TOOL_VERSION"
+        printf '\n'
+
+        if [[ -n "$ENV_STRONG$ENV_FIXED$ENV_INCONCLUSIVE$ENV_IOC_CRITICAL$ENV_IOC_REVIEW" ]]; then
+            printf '  envelope counters: strong=%s fixed=%s inconclusive=%s ioc_critical=%s ioc_review=%s\n' \
+                "${ENV_STRONG:-0}" "${ENV_FIXED:-0}" "${ENV_INCONCLUSIVE:-0}" \
+                "${ENV_IOC_CRITICAL:-0}" "${ENV_IOC_REVIEW:-0}"
+        fi
+
+        # Defense badges - per-layer state.
+        local dline=""
+        if [[ -n "$DEF_PATCH_TIME" ]]; then
+            dline+="  patch=${C_GRN}up${C_NC} ($(epoch_to_iso "$DEF_PATCH_TIME"))"
+        else
+            dline+="  patch=${C_RED}absent${C_NC}"
+        fi
+        if [[ -n "$DEF_MODSEC_TIME" ]]; then
+            dline+="  modsec=${C_GRN}up${C_NC}"
+        else
+            dline+="  modsec=${C_RED}absent${C_NC}"
+        fi
+        if [[ -n "$DEF_CSF_TIME" ]]; then
+            dline+="  csf=${C_GRN}clean${C_NC}"
+        else
+            dline+="  csf=${C_YEL}dirty${C_NC}"
+        fi
+        if [[ -n "$DEF_MITIGATE_LAST" ]]; then
+            dline+="  mitigate=${C_GRN}ran${C_NC}"
+        else
+            dline+="  mitigate=${C_RED}never${C_NC}"
+        fi
+        printf '  defenses:%s\n' "$dline"
+
+        # Defense timeline - chronological.
+        printf '\n  %sDEFENSE TIMELINE%s\n' "$C_BLD" "$C_NC"
+        if (( ${#DEFENSE_EVENTS[@]} == 0 )); then
+            printf '    %s(none captured - host appears UNDEFENDED)%s\n' "$C_RED" "$C_NC"
+        else
+            local sorted_def
+            sorted_def=$(
+                local de
+                for de in "${DEFENSE_EVENTS[@]}"; do
+                    printf '%s\n' "$de"
+                done | sort -t'|' -k1,1n
+            )
+            # Pipe-tolerant per-line decode: notes may legitimately carry
+            # '|' chars (log lines, paths, attacker payloads). decode_pipe_tail
+            # rejoins parts[N-1..end] into the trailing field.
+            local de_epoch de_key de_note _de_line
+            while IFS= read -r _de_line; do
+                [[ -z "$_de_line" ]] && continue
+                IFS=$'\t' read -r de_epoch de_key de_note < <(decode_pipe_tail "$_de_line" 3)
+                [[ -z "$de_epoch" ]] && continue
+                printf '    %s[DEF-OK]%s %s  %s%-12s%s  %s\n' \
+                    "$C_GRN" "$C_NC" "$(epoch_to_iso "$de_epoch")" \
+                    "$C_BLD" "$de_key" "$C_NC" "$de_note"
+            done <<< "$sorted_def"
+        fi
+
+        # Offense timeline - reconciled rows, grouped by stage in canonical
+        # order, sorted by epoch within each stage. Indices into RECONCILED
+        # match IOC_PRIMITIVES; we pull both per row.
+        printf '\n  %sATTACK TIMELINE%s\n' "$C_BLD" "$C_NC"
+        if (( ${#RECONCILED[@]} == 0 )); then
+            printf '    %s(no IOCs reconciled - host is CLEAN)%s\n' "$C_GRN" "$C_NC"
+        else
+            local stage_iter idx
+            local -a stage_indices
+            for stage_iter in "${STAGE_ORDER[@]}"; do
+                stage_indices=()
+                for (( idx=0; idx<${#RECONCILED[@]}; idx++ )); do
+                    local rec="${RECONCILED[$idx]}"
+                    local r_pat
+                    r_pat=$(echo "$rec" | cut -d'|' -f4)
+                    [[ "$r_pat" == "$stage_iter" ]] || continue
+                    stage_indices+=("$idx")
+                done
+                (( ${#stage_indices[@]} == 0 )) && continue
+
+                printf '\n    %sstage %s%s  %s%s%s\n' \
+                    "$C_BLD" "$stage_iter" "$C_NC" \
+                    "$C_DIM" "${STAGE_LABEL[$stage_iter]:-}" "$C_NC"
+
+                # Sort this stage's indices by epoch (RECONCILED field 3).
+                local i_sorted
+                i_sorted=$(
+                    local i ts
+                    for i in "${stage_indices[@]}"; do
+                        ts=$(echo "${RECONCILED[$i]}" | cut -d'|' -f3)
+                        printf '%s\t%s\n' "${ts:-0}" "$i"
+                    done | sort -n -k1,1 | cut -f2
+                )
+                local i
+                while IFS= read -r i; do
+                    [[ -z "$i" ]] && continue
+                    local rec="${RECONCILED[$i]}"
+                    local prims="${IOC_PRIMITIVES[$i]:-}"
+                    local r_verdict r_delta r_epoch r_pat r_key r_note
+                    # Pipe-tolerant decode: r_note absorbs trailing parts
+                    # so notes containing '|' (log lines, paths, attacker
+                    # payloads) round-trip intact. The pre-fix
+                    # `cut -d'|' -f4` band-aid that re-pulled from
+                    # OFFENSE_EVENTS had the same truncation bug; with
+                    # this decoder both arrays carry full notes.
+                    IFS=$'\t' read -r r_verdict r_delta r_epoch r_pat r_key r_note \
+                        < <(decode_pipe_tail "$rec" 6)
+                    render_offense_row "$r_verdict" "$r_delta" \
+                        "$(epoch_to_iso "$r_epoch")" "$r_pat" "$r_key" \
+                        "$r_note" "$prims"
+                done <<< "$i_sorted"
+            done
+        fi
+
+        # Headline: defense lag (earliest IOC vs latest defense). Reuses
+        # phase_reconcile's logic without re-duplicating the calculation.
+        if (( ${#OFFENSE_EVENTS[@]} > 0 )); then
+            local min_off="" max_def="" oe ts
+            for oe in "${OFFENSE_EVENTS[@]}"; do
+                ts=$(echo "$oe" | cut -d'|' -f1)
+                [[ -z "$ts" ]] && continue
+                if [[ -z "$min_off" ]] || (( ts < min_off )); then min_off="$ts"; fi
+            done
+            local de
+            for de in "${DEFENSE_EVENTS[@]}"; do
+                ts=$(echo "$de" | cut -d'|' -f1)
+                [[ -z "$ts" ]] && continue
+                if [[ -z "$max_def" ]] || (( ts > max_def )); then max_def="$ts"; fi
+            done
+            printf '\n  %sHEADLINE%s\n' "$C_BLD" "$C_NC"
+            [[ -n "$min_off" ]] && printf '    earliest IOC:    %s\n' "$(epoch_to_iso "$min_off")"
+            [[ -n "$max_def" ]] && printf '    latest defense:  %s\n' "$(epoch_to_iso "$max_def")"
+            if [[ -n "$min_off" && -n "$max_def" ]]; then
+                local gap=$(( max_def - min_off ))
+                local lag_color="$C_GRN" lag_word="EARLY"
+                if (( gap > 0 )); then lag_color="$C_RED"; lag_word="LATE"; fi
+                local abs="$gap"
+                (( abs < 0 )) && abs=$(( -abs ))
+                local human
+                if   (( abs >= 86400 )); then human=$(printf '%dd %dh' "$(( abs / 86400 ))" "$(( (abs % 86400) / 3600 ))")
+                elif (( abs >= 3600  )); then human=$(printf '%dh %dm' "$(( abs / 3600 ))"  "$(( (abs % 3600) / 60 ))")
+                else                          human="${abs}s"
+                fi
+                printf '    defense lag:     %s%s%s (%s %s first compromise)\n' \
+                    "$lag_color" "$human" "$C_NC" "$lag_word" \
+                    "$( (( gap > 0 )) && echo after || echo before)"
+            fi
+        fi
+
+        printf '\n  %scounters:%s defenses=%d  iocs=%d  pre_defense=%d  post_defense=%d\n' \
+            "$C_BLD" "$C_NC" \
+            "${#DEFENSE_EVENTS[@]}" "${#OFFENSE_EVENTS[@]}" \
+            "$N_PRE" "$N_POST"
+    } 2>&1)
+
+    printf '%s\n' "$buf" >&2
+    KILL_CHAIN_RENDERED=$(printf '%s\n' "$buf" | ansi_strip)
+}
+
+###############################################################################
+# Kill-chain primitives writer - persists the inputs the renderer consumed
+# into the bundle dir so the chain can be reconstructed offline (no need to
+# re-run forensic on the host). Three siblings:
+#
+#   kill-chain.tsv    grep/awk-friendly: one row per IOC plus DEF-* rows
+#   kill-chain.jsonl  one JSON object per row, machine-parseable
+#   kill-chain.md     ANSI-stripped copy of render_kill_chain output for humans
+#
+# Called from phase_bundle so it lives next to the tarballs and is included
+# in the outer upload tarball.
+###############################################################################
+
+write_kill_chain_primitives() {
+    local bdir="${BUNDLE_BDIR:-}"
+    [[ -z "$bdir" || ! -d "$bdir" ]] && return 0
+
+    local tsv="$bdir/kill-chain.tsv"
+    local jsonl="$bdir/kill-chain.jsonl"
+    local md="$bdir/kill-chain.md"
+
+    # Effective defense times mirror phase_reconcile's calculation - kept
+    # local so we don't leak globals or re-shape RECONCILED.
+    local eff_patch="" eff_modsec="$DEF_MODSEC_TIME"
+    if [[ -n "$DEF_PATCH_TIME" && -n "$DEF_CPSRVD_RESTART" ]]; then
+        if (( DEF_CPSRVD_RESTART >= DEF_PATCH_TIME )); then
+            eff_patch="$DEF_CPSRVD_RESTART"
+        fi
+    fi
+
+    # TSV header + DEF rows + IOC rows.
+    {
+        printf 'kind\tts_epoch\tts_iso\tstage\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tline\n'
+
+        # Defense rows.
+        local de de_epoch de_key de_note _de_line
+        local sorted_def
+        sorted_def=$(
+            local d
+            for d in "${DEFENSE_EVENTS[@]}"; do printf '%s\n' "$d"; done | sort -t'|' -k1,1n
+        )
+        # Pipe-tolerant decode (notes may contain '|').
+        while IFS= read -r _de_line; do
+            [[ -z "$_de_line" ]] && continue
+            IFS=$'\t' read -r de_epoch de_key de_note < <(decode_pipe_tail "$_de_line" 3)
+            [[ -z "$de_epoch" ]] && continue
+            printf 'DEF\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t-\t\t\t\t\t\t\t\n' \
+                "$de_epoch" "$(epoch_to_iso "$de_epoch")" "$de_key" "$de_note"
+        done <<< "$sorted_def"
+
+        # Offense rows. Iterate parallel arrays in canonical stage order.
+        local stage_iter idx
+        local -a stage_indices
+        for stage_iter in "${STAGE_ORDER[@]}"; do
+            stage_indices=()
+            for (( idx=0; idx<${#RECONCILED[@]}; idx++ )); do
+                local r_pat
+                r_pat=$(echo "${RECONCILED[$idx]}" | cut -d'|' -f4)
+                [[ "$r_pat" == "$stage_iter" ]] || continue
+                stage_indices+=("$idx")
+            done
+            (( ${#stage_indices[@]} == 0 )) && continue
+
+            local i_sorted
+            i_sorted=$(
+                local i ts
+                for i in "${stage_indices[@]}"; do
+                    ts=$(echo "${RECONCILED[$i]}" | cut -d'|' -f3)
+                    printf '%s\t%s\n' "${ts:-0}" "$i"
+                done | sort -n -k1,1 | cut -f2
+            )
+
+            local i
+            while IFS= read -r i; do
+                [[ -z "$i" ]] && continue
+                local rec="${RECONCILED[$i]}"
+                local prims="${IOC_PRIMITIVES[$i]:-}"
+                local r_verdict r_delta r_epoch r_pat r_key r_note
+                # Pipe-tolerant decode: r_note absorbs trailing parts so
+                # notes containing '|' round-trip intact. The pre-fix
+                # `cut -d'|' -f4` band-aid is removed; it had the same
+                # truncation bug as the original IFS='|' read.
+                IFS=$'\t' read -r r_verdict r_delta r_epoch r_pat r_key r_note \
+                    < <(decode_pipe_tail "$rec" 6)
+
+                # Compute defenses_at_ioc - which were already up at the
+                # time this IOC fired. Comma-list, "" when undefended.
+                local dactive=""
+                [[ -n "$eff_patch"  ]] && (( r_epoch >= eff_patch  )) && dactive+="patch,"
+                [[ -n "$eff_modsec" ]] && (( r_epoch >= eff_modsec )) && dactive+="modsec,"
+                dactive="${dactive%,}"
+
+                # Primitives are PRIM_SEP-separated internally. Squash any
+                # embedded newlines for safety - ioc_primitive_row already
+                # cleaned line, but be defensive at write time too.
+                local clean="${prims//$'\n'/ }"
+                clean="${clean//$'\r'/ }"
+
+                local area ip path log_file count h2xx status line
+                IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$clean"
+                # Embedded literal tabs (rare) would collide with the bundle
+                # TSV column separator; flatten to spaces.
+                line="${line//$'\t'/ }"
+                # r_note may contain literal tabs from upstream emit - sanitize.
+                local nclean="${r_note//$'\t'/ }"
+                nclean="${nclean//$'\n'/ }"
+
+                printf 'IOC\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
+                    "$r_pat" "$r_verdict" "$r_delta" "$dactive" \
+                    "$r_key" "$nclean" \
+                    "${area:-}" "${ip:-}" "${path:-}" "${log_file:-}" \
+                    "${count:-}" "${h2xx:-}" "${status:-}" "${line:-}"
+            done <<< "$i_sorted"
+        done
+    } > "$tsv"
+    chmod 0600 "$tsv" 2>/dev/null
+
+    # JSONL - same data, machine-parseable. Header row replaced by a single
+    # "meta" object on line 1; each subsequent line is a kind=DEF or kind=IOC
+    # record with envelope-root metadata embedded for self-attribution.
+    {
+        printf '{"kind":"meta","host":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
+            "$HOSTNAME_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" \
+            "$VERSION" "$INCIDENT_ID" "$RUN_ID" \
+            "$(json_esc "$ENV_IOC_RUN_ID")" "$(json_esc "$ENV_IOC_TOOL_VERSION")" "$(json_esc "$ENV_IOC_TS")" \
+            "$(json_esc "$ENV_HOST_VERDICT")" "$(json_esc "$ENV_CODE_VERDICT")" "$(json_esc "$ENV_SCORE")" \
+            "${eff_patch:-}" "${eff_modsec:-}"
+
+        local de de_epoch de_key de_note _de_line
+        local sorted_def
+        sorted_def=$(
+            local d
+            for d in "${DEFENSE_EVENTS[@]}"; do printf '%s\n' "$d"; done | sort -t'|' -k1,1n
+        )
+        # Pipe-tolerant decode (notes may contain '|').
+        while IFS= read -r _de_line; do
+            [[ -z "$_de_line" ]] && continue
+            IFS=$'\t' read -r de_epoch de_key de_note < <(decode_pipe_tail "$_de_line" 3)
+            [[ -z "$de_epoch" ]] && continue
+            printf '{"kind":"DEF","epoch":%s,"ts":"%s","key":"%s","note":"%s"}\n' \
+                "$de_epoch" "$(epoch_to_iso "$de_epoch")" \
+                "$(json_esc "$de_key")" "$(json_esc "$de_note")"
+        done <<< "$sorted_def"
+
+        local stage_iter idx
+        local -a stage_indices
+        for stage_iter in "${STAGE_ORDER[@]}"; do
+            stage_indices=()
+            for (( idx=0; idx<${#RECONCILED[@]}; idx++ )); do
+                local r_pat
+                r_pat=$(echo "${RECONCILED[$idx]}" | cut -d'|' -f4)
+                [[ "$r_pat" == "$stage_iter" ]] || continue
+                stage_indices+=("$idx")
+            done
+            (( ${#stage_indices[@]} == 0 )) && continue
+            local i_sorted
+            i_sorted=$(
+                local i ts
+                for i in "${stage_indices[@]}"; do
+                    ts=$(echo "${RECONCILED[$i]}" | cut -d'|' -f3)
+                    printf '%s\t%s\n' "${ts:-0}" "$i"
+                done | sort -n -k1,1 | cut -f2
+            )
+            local i
+            while IFS= read -r i; do
+                [[ -z "$i" ]] && continue
+                local rec="${RECONCILED[$i]}"
+                local prims="${IOC_PRIMITIVES[$i]:-}"
+                local r_verdict r_delta r_epoch r_pat r_key r_note
+                # Pipe-tolerant decode (notes may contain '|').
+                IFS=$'\t' read -r r_verdict r_delta r_epoch r_pat r_key r_note \
+                    < <(decode_pipe_tail "$rec" 6)
+                local dactive=""
+                [[ -n "$eff_patch"  ]] && (( r_epoch >= eff_patch  )) && dactive+="patch,"
+                [[ -n "$eff_modsec" ]] && (( r_epoch >= eff_modsec )) && dactive+="modsec,"
+                dactive="${dactive%,}"
+                local area ip path log_file count h2xx status line
+                IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
+
+                printf '{"kind":"IOC","epoch":%s,"ts":"%s","stage":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","line":"%s"}\n' \
+                    "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
+                    "$(json_esc "$r_pat")" "$(json_esc "$r_verdict")" \
+                    "$(json_esc "$r_delta")" "$(json_esc "$dactive")" \
+                    "$(json_esc "$r_key")" "$(json_esc "$r_note")" \
+                    "$(json_esc "$area")" "$(json_esc "$ip")" \
+                    "$(json_esc "$path")" "$(json_esc "$log_file")" \
+                    "$(json_esc "$count")" "$(json_esc "$h2xx")" \
+                    "$(json_esc "$status")" "$(json_esc "$line")"
+            done <<< "$i_sorted"
+        done
+    } > "$jsonl"
+    chmod 0600 "$jsonl" 2>/dev/null
+
+    # Pretty-printed copy (ANSI-stripped) for human review from the bundle.
+    if [[ -n "$KILL_CHAIN_RENDERED" ]]; then
+        printf '%s\n' "$KILL_CHAIN_RENDERED" > "$md"
+        chmod 0600 "$md" 2>/dev/null
+    fi
+
+    say_info "kill-chain primitives: kill-chain.tsv kill-chain.jsonl kill-chain.md"
+    emit_signal bundle info kill_chain_primitives \
+        "wrote kill-chain.tsv/jsonl/md to bundle dir" \
+        tsv "kill-chain.tsv" jsonl "kill-chain.jsonl" md "kill-chain.md"
+}
+
+###############################################################################
 # Bundle - tarball of raw artifacts for offline forensics
 ###############################################################################
 
@@ -1321,6 +1976,10 @@ phase_bundle() {
         echo "since_epoch=${SINCE_EPOCH:-}"
         echo "max_bundle_mb=$MAX_BUNDLE_MB"
     } > "$bdir/manifest.txt"
+
+    # Kill-chain primitives next to the manifest. These are tiny (KB-scale)
+    # so they're always written - independent of any per-tarball size cap.
+    write_kill_chain_primitives
 
     # 1. cPanel sessions - forensically-relevant subtrees only. /var/cpanel/
     # sessions/cache + tmpcache are the bulk of session-dir size on busy
@@ -1634,6 +2293,7 @@ fi
 phase_defense
 phase_offense
 phase_reconcile
+render_kill_chain
 phase_bundle
 phase_upload
 
