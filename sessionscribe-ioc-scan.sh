@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.0
+# sessionscribe-ioc-scan.sh v1.5.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -512,7 +512,7 @@ emit() {
 print_signal_human() {
     (( QUIET )) && return
     local area="$1" id="$2" severity="$3" key="$4"; shift 4
-    local icon color note=""
+    local icon color
     case "$severity" in
         strong)   icon="✗"; color="$RED" ;;
         evidence) icon="!"; color="$YELLOW" ;;
@@ -529,16 +529,89 @@ print_signal_human() {
         *) icon=" "; color="$DIM" ;;
     esac
 
-    # Pull a note out of the kv pairs for inline display
+    # Extract the display-relevant fields from kv pairs. Operators need
+    # explicit pointers (path / log line / IP / user) to verify every
+    # finding without having to re-grep. Three sub-line groups:
+    #   1. WHERE  - path / sample_path / file   ("→ /…/<file>")
+    #   2. WHO    - user / src_ip / login_time / file_mtime / sha256
+    #   3. WHAT   - sample / access_log_line / line / raw  (the evidence
+    #               itself, truncated for terminal readability)
+    # All three are optional; rendered only when populated. Full content
+    # always lands in JSONL (this function only formats the human view).
+    local note="" path="" sample_path="" file=""
+    local user="" src_ip="" login_time="" file_mtime="" mtime=""
+    local sample="" access_log_line="" line="" raw=""
+    local sha256="" count=""
     while (( $# >= 2 )); do
-        if [[ "$1" == note ]]; then note="$2"; fi
+        case "$1" in
+            note)             note="$2" ;;
+            path)             path="$2" ;;
+            sample_path)      sample_path="$2" ;;
+            file)             file="$2" ;;
+            user)             user="$2" ;;
+            src_ip|ip)        src_ip="$2" ;;
+            login_time)       login_time="$2" ;;
+            file_mtime)       file_mtime="$2" ;;
+            mtime)            mtime="$2" ;;
+            sample)           sample="$2" ;;
+            access_log_line)  access_log_line="$2" ;;
+            line)             line="$2" ;;
+            raw)              raw="$2" ;;
+            sha256)           sha256="$2" ;;
+            count)            count="$2" ;;
+        esac
         shift 2
     done
 
+    # Header line: id + note (or key as fallback)
     if [[ -n "$note" ]]; then
         printf '   %s%s%s %-44s %s%s%s\n' "$color" "$icon" "$NC" "$id" "$DIM" "$note" "$NC" >&2
     else
         printf '   %s%s%s %-44s %s%s%s\n' "$color" "$icon" "$NC" "$id" "$DIM" "$key" "$NC" >&2
+    fi
+
+    # Suppress detail for known-clean info rows + the per-row sample
+    # emits whose entire payload IS the detail (no value-add to repeat).
+    case "$key" in
+        no_ioc_hits|no_session_iocs|patched_per_build|patch_marker_present| \
+        ancillary_bug_fixed|acl_machinery_present_informational|ioc_sample| \
+        anomalous_session_path)
+            return ;;
+    esac
+
+    # 1. WHERE - filesystem pointer the operator can stat/read directly
+    local location="${path:-${sample_path:-$file}}"
+    if [[ -n "$location" ]]; then
+        printf '       %s→ %s%s\n' "$DIM" "$location" "$NC" >&2
+    fi
+
+    # 2. WHO - identity + provenance KPIs (compact one-liner)
+    local kpi=""
+    [[ -n "$user" ]]        && kpi+="user=$user  "
+    [[ -n "$src_ip" ]]      && kpi+="src=$src_ip  "
+    [[ -n "$login_time" ]]  && kpi+="login=$login_time  "
+    if [[ -n "$file_mtime" ]]; then
+        kpi+="mtime=$file_mtime  "
+    elif [[ -n "$mtime" ]]; then
+        kpi+="mtime=$mtime  "
+    fi
+    if [[ -n "$sha256" ]]; then
+        kpi+="sha256=${sha256:0:16}…  "
+    fi
+    [[ -n "$count" && "$count" != "1" ]] && kpi+="count=$count  "
+    if [[ -n "$kpi" ]]; then
+        printf '       %s%s%s\n' "$DIM" "${kpi% }" "$NC" >&2
+    fi
+
+    # 3. WHAT - the actual evidence (log line / matched content). Truncate
+    # to 160 chars for terminal-friendliness; full content stays in JSONL.
+    local ev="${sample:-${access_log_line:-${line:-$raw}}}"
+    if [[ -n "$ev" ]]; then
+        local ev_short="$ev"
+        if (( ${#ev} > 160 )); then
+            ev_short="${ev:0:160} …"
+        fi
+        printf '       %s| %s%s\n' "$DIM" "$ev_short" "$NC" >&2
     fi
 }
 
@@ -1671,7 +1744,7 @@ check_destruction_iocs() {
         if (( oddkey_count > 0 )); then
             emit "destruction" "ioc_pattern_g_oddpath_keys" "warning" \
                  "ioc_pattern_g_keys_in_unexpected_paths" 3 \
-                 "count" "$oddkey_count" "sample" "${oddkeys[0]}" \
+                 "count" "$oddkey_count" "sample_path" "${oddkeys[0]}" \
                  "note" "$oddkey_count authorized_keys file(s) in /etc or /var/spool/cron - non-standard, review."
             ((hits++))
         fi
@@ -2111,10 +2184,30 @@ ledger_write() {
     printf '%s\n' "$line" >> "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
     chmod 0600 "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
     # Per-run envelope. Skip if -o was given (operator captured their own).
+    local envelope=""
     if [[ -z "$OUTPUT_FILE" ]]; then
-        local envelope="$LEDGER_DIR/${RUN_ID}.json"
+        envelope="$LEDGER_DIR/${RUN_ID}.json"
         write_json "$envelope" 2>/dev/null || true
         chmod 0600 "$envelope" 2>/dev/null || true
+    fi
+
+    # Tell the operator where the structured record landed. Without this,
+    # only people who read the source know the ledger exists. Suppressed
+    # in QUIET mode (JSONL/CSV consumers don't need the hint) and only
+    # printed once after the verdict.
+    if (( ! QUIET )); then
+        sayf '\n %sResults stored:%s\n' "$BOLD" "$NC"
+        sayf '   %srun ledger:%s     %s/runs.jsonl   %s(append-only, one line per run)%s\n' \
+             "$DIM" "$NC" "$LEDGER_DIR" "$DIM" "$NC"
+        if [[ -n "$envelope" ]]; then
+            sayf '   %srun envelope:%s   %s   %s(full per-run JSON; this run only)%s\n' \
+                 "$DIM" "$NC" "$envelope" "$DIM" "$NC"
+        fi
+        if [[ -n "$OUTPUT_FILE" ]]; then
+            sayf '   %s--output file:%s  %s   %s(operator-requested)%s\n' \
+                 "$DIM" "$NC" "$OUTPUT_FILE" "$DIM" "$NC"
+        fi
+        sayf '   %srun_id:%s         %s\n' "$DIM" "$NC" "$RUN_ID"
     fi
 }
 
