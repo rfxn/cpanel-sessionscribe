@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.1
+# sessionscribe-ioc-scan.sh v1.5.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -983,20 +983,31 @@ check_attacker_ips() {
     # per-line `warning: escape sequence \. treated as plain .` - a real
     # correctness + noise bug. ENVIRON[] delivers the variable byte-for-
     # byte without escape processing.
+    # Build the EXCLUDES env var separately. ${EXCLUDE_IPS[@]:-} on an
+    # empty array under `set -u` is brittle on bash 4.1 (CL6); compute
+    # the value with explicit length-check for portability.
+    local excludes_env=""
+    if (( ${#EXCLUDE_IPS[@]} > 0 )); then
+        excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
+    fi
+
+    # Single-pass streaming scan. Newline after $( so bash 4.1 (CL6) does
+    # not choke parsing $({ at the start of command substitution - a known
+    # parser quirk in pre-4.4 bash that breaks the case-arm tokenization
+    # several lines later.
     local result
-    result=$({
-        [[ -f "$logdir/access_log" ]] && cat "$logdir/access_log"
-        for f in "$logdir"/access_log-*; do
-            [[ -f "$f" ]] || continue
-            case "$f" in
-                *.gz) zcat "$f" 2>/dev/null ;;
-                *.xz) xzcat "$f" 2>/dev/null ;;
-                *)    cat "$f" ;;
-            esac
-        done
-    } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" \
-        EXCLUDES="$(printf '%s\n' "${EXCLUDE_IPS[@]:-}")" \
-        awk '
+    result=$(
+        {
+            [[ -f "$logdir/access_log" ]] && cat "$logdir/access_log"
+            for f in "$logdir"/access_log-*; do
+                [[ -f "$f" ]] || continue
+                case "$f" in
+                    *.gz) zcat "$f" 2>/dev/null ;;
+                    *.xz) xzcat "$f" 2>/dev/null ;;
+                    *)    cat "$f" ;;
+                esac
+            done
+        } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" EXCLUDES="$excludes_env" awk '
         BEGIN {
             ip_re    = ENVIRON["IP_RE"]
             probe_re = ENVIRON["PROBE_RE"]
@@ -1015,7 +1026,8 @@ check_attacker_ips() {
         END {
             print count
             print sample
-        }')
+        }'
+    )
 
     local filtered_count="${result%%$'\n'*}"
     local sample="${result#*$'\n'}"
