@@ -16,16 +16,21 @@ Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr
 [![License](https://img.shields.io/badge/license-GPL--2.0-22d3ee?labelColor=09090b)](LICENSE)
 [![Hosted](https://img.shields.io/badge/hosted-sh.rfxn.com-4ade80?labelColor=09090b)](https://sh.rfxn.com/)
 
-[Tools](#tools) · [Each tool](#each-tool) · [Affected builds](#affected-builds) · [Priority order](#priority-order) · [References](#references)
+[Tools](#tools) · [The chain](#the-chain) · [Verify](#verify-yourself) · [Each tool](#each-tool) · [Fleet usage](#fleet-usage) · [Affected builds](#affected-builds) · [Priority order](#priority-order) · [Reporting](#reporting) · [References](#references)
 
 </div>
 
+<p align="center">
+<strong><em>Four requests forge a root session. Half the supported tiers got no patch.<br/>
+The architectural fix isn't in the binary — it's at the proxy endpoint.</em></strong>
+</p>
+
 ---
 
-This repo is the operator-side toolkit: one-command active mitigation that
-holds across patched and unpatched tiers, ModSec rules that work today, a
-non-destructive remote probe for fleet sweeps, an on-host IOC scanner, and
-the patch-diff snapshot collector behind the
+This repo is the operator-side toolkit: a phased mitigation orchestrator
+that holds across patched and unpatched tiers, ModSec rules that work
+today, a non-destructive remote probe for fleet sweeps, an on-host IOC
+scanner, and the patch-diff snapshot collector behind the
 [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940).
 
 ```bash
@@ -40,6 +45,14 @@ bash sessionscribe-mitigate.sh --apply
 bash sessionscribe-mitigate.sh --csv
 ```
 
+> [!IMPORTANT]
+> **Tiers 112, 114, 116, 120, 122, 124, 128 have no vendor patch.** Every
+> build on those tiers is vulnerable, and upgrade-or-migrate is the only
+> durable fix. Until then: firewall TCP/2082, 2083, 2086, 2087, 2095, 2096
+> to management CIDRs (the orchestrator's `csf`/`apf`/`runfw` phases do this
+> on `--apply`) and front the remaining surface with the ModSec rule pack.
+
+> [!NOTE]
 > **The primitive in one paragraph.** CRLF injected into the `pass=` line
 > of a preauth session splits the single line into multiple `key=value`
 > lines on disk. Set `user=root`, `hasroot=1`, and
@@ -61,13 +74,76 @@ sections below have full usage detail.
 
 | Artifact | Role | Where it runs |
 |---|---|---|
-| [`sessionscribe-mitigate.sh`](https://sh.rfxn.com/sessionscribe-mitigate.sh) | Active mitigation shim. One phased pass with fleet-friendly JSONL/CSV per host. [Docs](#sessionscribe-mitigatesh---defense-in-depth-shim) | On the cPanel host |
+| [`sessionscribe-mitigate.sh`](https://sh.rfxn.com/sessionscribe-mitigate.sh) | Mitigation orchestrator. Phased pass with fleet-friendly JSONL/CSV per host. [Docs](#sessionscribe-mitigatesh--mitigation-orchestrator) | On the cPanel host |
 | [`modsec-sessionscribe.conf`](https://sh.rfxn.com/modsec-sessionscribe.conf) | ModSecurity rule pack. Phase-1 deny on the CVE primitive + adjacent WHM-token rules. [Docs](#modsec-sessionscribeconf---the-modsecurity-rule-pack) | Apache + mod_security2, in front of cpsrvd |
 | [`sessionscribe-remote-probe.sh`](https://sh.rfxn.com/sessionscribe-remote-probe.sh) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions. [Docs](#sessionscribe-remote-probesh---non-destructive-verdict-per-host) | Anywhere with curl |
 | [`sessionscribe-ioc-scan.sh`](https://sh.rfxn.com/sessionscribe-ioc-scan.sh) | Read-only on-host IOC scanner. Vendor IOCs + co-occurrence detector. [Docs](#sessionscribe-ioc-scansh---on-host-ioc-ladder) | On the cPanel host |
 | [`sessionscribe-revsnap.sh`](https://sh.rfxn.com/sessionscribe-revsnap.sh) | Per-tier RE snapshot (binaries, strings, dynsym, disasm, Perl modules). [Docs](#sessionscribe-revsnapsh---re-snapshot-collector) | On the cPanel host, around `upcp` |
 
 All shell scripts are GPL v2.
+
+---
+
+## How this compares to public material
+
+The vendor advisory documents the patch boundary; the watchTowr PoC
+demonstrates the primitive. This toolkit fills the operator-side gaps
+in between.
+
+| Capability | Vendor advisory | watchTowr PoC | This toolkit |
+|---|---|---|---|
+| Patched-build list | yes | no | yes — incl. EL6 11.86.0.41 + WP² 136.1.7 + EOL handling |
+| Remote detection | no | partial — stage 1+2 only, false-positives on patched hosts | full 4-stage chain, deterministic verdict |
+| On-host IOC scan | partial | no | vendor patterns + co-occurrence + forged-timestamp heuristic |
+| Active mitigation | "patch + reboot" | n/a | mitigation orchestrator + ModSec rules + port lockdown |
+| Patch-dissection collateral | no | no | per-tier RE snapshot collector |
+
+---
+
+## The chain
+
+Four HTTP requests, no auth, no preconditions:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as attacker
+    participant C as cpsrvd
+    participant S as session file
+    A->>C: POST /login/?login_only=1<br/>user=root&pass=wrong
+    C-->>A: Set-Cookie: whostmgrsession=NAME,OBHEX
+    A->>C: GET / · Authorization: Basic b64(root:x\r\n…)<br/>Cookie: whostmgrsession=NAME (OBHEX stripped)
+    C->>S: pass=x\r\nuser=root\r\nhasroot=1\r\n… (CRLFs land verbatim)
+    C-->>A: HTTP 307 · Location: /cpsess<10digits>/
+    A->>C: GET /scripts2/listaccts · cookie only
+    C->>S: propagate raw → cache (forged keys readable)
+    C-->>A: 401 token denied (expected; side-effect already done)
+    A->>C: GET /cpsess<token>/json-api/version
+    C-->>A: 200 OK = VULN · 403 = SAFE
+```
+
+Verdict is the HTTP code at request 4. The on-disk session file at
+`/var/cpanel/sessions/raw/<sessname>` is the only post-hoc forensic
+artifact. `sessionscribe-remote-probe.sh` runs this chain non-destructively
+(canary-tagged session, no state-changing API calls, active logout);
+`sessionscribe-ioc-scan.sh` reads the artifact directly.
+
+---
+
+## Verify yourself
+
+Sixty-second smoke check on any Linux host (no cPanel required):
+
+```bash
+curl -fsSLO https://sh.rfxn.com/sessionscribe-mitigate.sh
+bash sessionscribe-mitigate.sh --list-phases    # surface the phase API
+bash sessionscribe-mitigate.sh --check          # safe read-only audit
+echo "exit=$?"                                  # 0 on a non-cPanel host
+```
+
+The orchestrator detects a non-cPanel host and exits clean — proving
+idempotency without needing a lab. Hosts with `/var/cpanel/` present run
+the full audit.
 
 ---
 
@@ -128,12 +204,12 @@ adjacent identity-injection issue - is in the
 
 ## Each tool
 
-### `sessionscribe-mitigate.sh` - defense-in-depth shim
+### `sessionscribe-mitigate.sh` — mitigation orchestrator
 
-One phased pass that walks a cPanel host into the documented mitigation
-posture. Idempotent (re-run on a healthy host is a no-op), defaults to
-`--check` (read-only), fleet-friendly output with `host`/`os`/
-`cpanel_version` on every JSONL/CSV/JSON record.
+A phased orchestrator that walks a cPanel host into the documented
+mitigation posture. Idempotent (re-run on a healthy host is a no-op),
+defaults to `--check` (read-only), fleet-friendly output with `host`/
+`os`/`cpanel_version` on every JSONL/CSV/JSON record.
 
 | Phase | What it does |
 |---|---|
@@ -385,6 +461,68 @@ between hours and days of analysis.
 
 ---
 
+## Fleet usage
+
+> [!TIP]
+> Every artifact emits structured output (`--json`, `--jsonl`, `--csv`)
+> with `host`, `os`, `cpanel_version`, and `ts` on every record. Designed
+> for `pdsh | jq` or `ansible -m script` roll-up across hundreds of hosts
+> in one pass.
+
+```bash
+# pdsh + JSONL roll-up (mitigation posture)
+pdsh -w cpanel-fleet 'bash -s -- --jsonl --quiet' < sessionscribe-mitigate.sh \
+    | jq -c 'select(.severity != "info")' \
+    > fleet-mitigate.jsonl
+
+# remote probe sweep — exit 2 on any VULN
+bash sessionscribe-remote-probe.sh --csv --quiet \
+    $(awk '{print "--target "$1}' fleet.txt) > fleet-probe.csv
+echo "any_vuln=$?"
+
+# IOC scan via ssh, JSONL to SIEM
+for h in $(cat fleet.txt); do
+    ssh "$h" 'bash -s' < sessionscribe-ioc-scan.sh -- --jsonl --quiet
+done | jq -c '.' > fleet-ioc.jsonl
+
+# ansible script module + CSV merge
+ansible -i hosts cpanel -m script -a 'sessionscribe-mitigate.sh --csv --quiet' \
+    > fleet-mitigate.csv
+```
+
+The probe is independently fleet-safe (canary-tagged sessions, active
+logout, no state-changing API calls). The on-host scripts respect
+`--quiet` + structured-output flags so stdout is parser-clean.
+
+---
+
+## What this toolkit does NOT do
+
+Explicit non-goals:
+
+- **Not a vendor patch.** Does not modify `cpsrvd`, `cpsrvd.so`, or
+  `Cpanel/Session/*.pm`. The cpanel-issued back-port for your tier is the
+  real fix; the toolkit closes the practical attack window in the meantime
+  and stays useful as detection + posture validation after the patch lands.
+- **Not a fix for tiers 112, 114, 116, 120, 122, 124, 128.** Those tiers
+  have no vendor patch. The orchestrator's `proxysub` + firewall phases
+  plus the ModSec rule pack reduce blast radius, but the only durable
+  answer is upgrade or migration.
+- **Not a replacement for port lockdown.** ModSec rules fire only on
+  traffic that traverses Apache. `cpsrvd` listens directly on
+  2082/2083/2086/2087/2095/2096 and is reachable independent of Apache.
+  Pair the rule pack with cpsrvd-port firewalling.
+- **Not exploit code.** The remote probe issues no state-changing API
+  calls, tags every test session with an `nxesec_canary_<nonce>` attribute
+  for forensic cleanup, and actively logs out at end-of-run. It approximates
+  the chain to produce a deterministic verdict; it does not weaponize it.
+- **Not an incident-response substitute.** `sessionscribe-ioc-scan.sh`
+  finds artifacts of prior exploitation; it does not remediate them, hunt
+  across hosts, or correlate with billing/customer data. Treat its
+  `COMPROMISED` verdict as a trigger for full IR, not a conclusion.
+
+---
+
 ## Indicators of compromise
 
 Forged session-file shape (contents of `/var/cpanel/sessions/raw/<sessname>`
@@ -476,6 +614,22 @@ of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-202
 
 ---
 
+## Reporting
+
+> [!TIP]
+> **Found a bug, missed IOC, false positive, or have ops feedback?**
+> [Open a GitHub issue](https://github.com/rfxn/cpanel-sessionscribe/issues/new) —
+> bug reports, IOC variants seen in the wild, detection misses on
+> patched/unpatched hosts, ModSec rule false positives, and general
+> operator feedback are all welcome.
+>
+> Sensitive disclosures (live exploitation evidence, customer data, novel
+> exploit chains not yet public) should go via
+> [Keybase](https://keybase.io/rfxn) or [email](mailto:ryan@rfxn.com),
+> not GH Issues.
+
+---
+
 ## References
 
 - **Research article (full writeup):** [rfxn.com/research/cpanel-sessionscribe-cve-2026-41940](https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940)
@@ -486,6 +640,8 @@ of the [research article](https://rfxn.com/research/cpanel-sessionscribe-cve-202
 
 ## License
 
-GPL v2 - see individual file headers. Additional IOCs or variant samples
-welcome via [Keybase](https://keybase.io/rfxn) or
-[email](mailto:ryan@rfxn.com).
+GPL v2. See individual file headers.
+
+---
+
+*Forged during the SessionScribe incident response — Ryan MacDonald, R-fx Networks.*
