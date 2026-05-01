@@ -4,7 +4,7 @@
 
 | Script | Version | Notes |
 |---|---|---|
-| sessionscribe-ioc-scan.sh | **1.6.3** | `--chain-on-critical` (forensic chain only on COMPROMISED); Pattern G non-canonical-paths walk now skips files where every key is a known-good LW provisioning key (`Parent Child key for <PJID>`, `lwadmin`, `liquidweb`, `nexcess`) |
+| sessionscribe-ioc-scan.sh | **1.6.4** | `--chain-on-critical` (forensic chain only on COMPROMISED); Pattern G non-canonical-paths walk skips known-good LW provisioning keys; `check_attacker_ips` now honors `--since` (was scanning full history → over-firing COMPROMISED on every fleet host with any historical 2xx from blackholed IPs); old hits emit `ioc_attacker_ip_outside_since_window` info-only signal |
 | sessionscribe-forensic.sh | **0.9.5** | pipe-tolerant decoder across phase_reconcile + 6 kill-chain rendering sites (`decode_pipe_tail` helper); cut-based oe_note band-aids removed; non-canonical SSH-key sweep also filters by `SSH_KNOWN_GOOD_RE` |
 | sessionscribe-mitigate.sh | **0.3.1** | forged-session quarantine phase covers raw + preauth + cache; .info sidecar preserves ctime/mtime/atime |
 

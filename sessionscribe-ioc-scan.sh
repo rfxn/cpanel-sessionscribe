@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.3
+# sessionscribe-ioc-scan.sh v1.6.4
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.3"
+VERSION="1.6.4"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -1112,7 +1112,7 @@ check_attacker_ips() {
             esac
         done
     } | IP_RE="$ip_re" PROBE_RE="$PROBE_UA_RE" EXCLUDES="$excludes_env" \
-        awk -v sep="$SEP" '
+        awk -v sep="$SEP" -v floor="${SINCE_EPOCH:-0}" '
         BEGIN {
             FS       = sep
             ip_re    = ENVIRON["IP_RE"]
@@ -1121,6 +1121,7 @@ check_attacker_ips() {
             for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
             total = 0; h2xx = 0; h3xx = 0; h4xx = 0; hother = 0
             nsamp = 0; ts_first = 0
+            historical_drops = 0
         }
         {
             src  = $1
@@ -1141,8 +1142,20 @@ check_attacker_ips() {
             ts = 0
             if (match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
                 ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
-                if (ts > 0 && (ts_first == 0 || ts < ts_first)) ts_first = ts
             }
+
+            # --since gate: when SINCE_EPOCH is set (floor > 0), drop hits
+            # whose log timestamp is older than the cutoff. Lines with
+            # unparseable timestamps (ts == 0) bypass the gate so a corrupt
+            # date stamp never silently hides a real hit. The historical
+            # count is tracked separately so the operator can see how
+            # many in-history hits were filtered.
+            if (floor > 0 && ts > 0 && ts < floor) {
+                historical_drops++
+                next
+            }
+
+            if (ts > 0 && (ts_first == 0 || ts < ts_first)) ts_first = ts
 
             total++
             if      (st ~ /^2/) h2xx++
@@ -1156,32 +1169,53 @@ check_attacker_ips() {
             }
         }
         END {
-            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\t%d\n", total, h2xx, h3xx, h4xx, hother, ts_first
+            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+                total, h2xx, h3xx, h4xx, hother, ts_first, historical_drops
         }' > "$tmp" 2>/dev/null
 
-    local total=0 h2xx=0 h3xx=0 h4xx=0 hother=0 ts_first=0
+    local total=0 h2xx=0 h3xx=0 h4xx=0 hother=0 ts_first=0 historical_drops=0
     local totals_line; totals_line=$(grep '^TOTALS' "$tmp" 2>/dev/null | head -1)
     if [[ -n "$totals_line" ]]; then
-        IFS=$'\t' read -r _ total h2xx h3xx h4xx hother ts_first <<< "$totals_line"
+        IFS=$'\t' read -r _ total h2xx h3xx h4xx hother ts_first historical_drops \
+            <<< "$totals_line"
     fi
     total="${total:-0}"; h2xx="${h2xx:-0}"
     h3xx="${h3xx:-0}"; h4xx="${h4xx:-0}"; hother="${hother:-0}"; ts_first="${ts_first:-0}"
+    historical_drops="${historical_drops:-0}"
+
+    # If --since pruned all in-window hits but historical hits exist,
+    # emit a low-noise informational so fleet aggregation still records
+    # that the host was historically touched - just not within the
+    # window the operator asked about. Does not contribute to
+    # ioc_critical / ioc_review (severity=info, weight=0), so cannot
+    # escalate host_verdict to COMPROMISED or SUSPICIOUS.
+    if (( total == 0 && historical_drops > 0 )); then
+        emit "logs" "ioc_attacker_ip_historical_only" "info" \
+             "ioc_attacker_ip_outside_since_window" 0 \
+             "historical_drops" "$historical_drops" \
+             "since_days" "${SINCE_DAYS:-0}" \
+             "note" "$historical_drops attacker-IP hit(s) found in access_log but ALL outside --since ${SINCE_DAYS:-0}d window; no in-window evidence."
+    fi
 
     if (( total > 0 )); then
         # Only 2xx is exploitation. 4xx/3xx is probing - SUSPICIOUS, not
         # COMPROMISED.
-        local sev parent_note
+        local sev parent_note window_note=""
+        [[ -n "${SINCE_DAYS:-}" ]] && window_note=" (last ${SINCE_DAYS}d"
+        (( historical_drops > 0 )) && window_note="${window_note}; $historical_drops older hit(s) excluded by --since"
+        [[ -n "$window_note" ]] && window_note="${window_note})"
         if (( h2xx > 0 )); then
             sev="strong"
-            parent_note="$total hit(s) from IC-5790 IPs - $h2xx returned 2xx (EXPLOITATION EVIDENCE - CRITICAL)"
+            parent_note="$total hit(s)${window_note} from IC-5790 IPs - $h2xx returned 2xx (EXPLOITATION EVIDENCE - CRITICAL)"
         else
             sev="warning"
-            parent_note="$total hit(s) from IC-5790 IPs - all rejected ($h4xx 4xx, $h3xx 3xx, $hother other) - probing only, no successful response (REVIEW)"
+            parent_note="$total hit(s)${window_note} from IC-5790 IPs - all rejected ($h4xx 4xx, $h3xx 3xx, $hother other) - probing only, no successful response (REVIEW)"
         fi
         emit "logs" "ioc_attacker_ip" "$sev" \
              "ioc_attacker_ip_in_access_log" 8 \
              "count" "$total" "hits_2xx" "$h2xx" "hits_3xx" "$h3xx" \
              "hits_4xx" "$h4xx" "hits_other" "$hother" \
+             "historical_drops" "$historical_drops" \
              "ts_epoch_first" "$ts_first" \
              "note" "$parent_note"
 
