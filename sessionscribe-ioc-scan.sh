@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.1
+# sessionscribe-ioc-scan.sh v1.6.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -276,6 +276,17 @@ CHAIN_UPLOAD=0
 CHAIN_UPLOAD_URL=""
 CHAIN_UPLOAD_TOKEN=""
 
+# --chain-on-critical: narrow the chain gate from "host_verdict != CLEAN"
+# to "host_verdict == COMPROMISED" (i.e. only when at least one strong
+# host-state IOC fired - ioc_critical > 0). SUSPICIOUS hosts (review-
+# severity hits like stale tfa, IP-labeled keys without forged mtime,
+# token_denied+cp_security_token without badpass) skip the chain in
+# this mode. Implies --chain-forensic. Useful for fleet runs where
+# forensic's per-host time + bundle size matters and operators only
+# want full kill-chain reconstruction on hosts with conclusive
+# exploitation evidence.
+CHAIN_ON_CRITICAL=0
+
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
 # Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
@@ -366,6 +377,14 @@ Forensic chaining:
       --upload-token TOKEN   Forward --upload-token TOKEN to forensic.
                              Resolution: this flag > $RFXN_INTAKE_TOKEN
                              env > forensic's built-in convenience token.
+      --chain-on-critical    Narrow the chain gate to host_verdict==
+                             COMPROMISED (strong host-state IOC fired).
+                             SUSPICIOUS hosts skip forensic in this mode.
+                             Implies --chain-forensic. Useful for fleet
+                             runs where you only want kill-chain
+                             reconstruction on conclusively-exploited
+                             hosts. Combine with --chain-upload for
+                             COMPROMISED-only bundle submission.
 
 Misc:
       --timeout N            Probe timeout in seconds (default 8).
@@ -398,6 +417,7 @@ while [[ $# -gt 0 ]]; do
         --chain-upload)       CHAIN_UPLOAD=1; CHAIN_FORENSIC=1; shift ;;
         --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
         --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
+        --chain-on-critical)  CHAIN_ON_CRITICAL=1; CHAIN_FORENSIC=1; shift ;;
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
@@ -2645,6 +2665,16 @@ chain_forensic_dispatch() {
     if [[ "$HOST_VERDICT" == "CLEAN" ]]; then
         emit "chain" "forensic_skip" "info" "chain_forensic_skipped_clean" 0 \
              "note" "host_verdict=CLEAN; not chaining forensic."
+        return 0
+    fi
+    # --chain-on-critical narrows the gate to COMPROMISED only. SUSPICIOUS
+    # hosts (review-severity IOCs without a critical hit) emit a distinct
+    # skip signal so fleet aggregations can still see the host needed
+    # forensic attention - just not auto-dispatched.
+    if (( CHAIN_ON_CRITICAL )) && [[ "$HOST_VERDICT" != "COMPROMISED" ]]; then
+        emit "chain" "forensic_skip" "info" "chain_forensic_skipped_below_critical" 0 \
+             "host_verdict" "$HOST_VERDICT" \
+             "note" "host_verdict=$HOST_VERDICT; --chain-on-critical limits chain to COMPROMISED."
         return 0
     fi
     local self_dir; self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
