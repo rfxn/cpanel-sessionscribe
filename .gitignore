@@ -1,0 +1,11 @@
+# Internal / non-upstream artifacts kept alongside the canonical toolkit
+# but intentionally not published. Add new local-only files here rather
+# than placing them outside the repo — single canonical location for
+# all SessionScribe scripts.
+
+# Pre-codename internal probe variant (superseded by sessionscribe-remote-probe.sh)
+nxesec-whmscribe-b-probe.sh
+
+# Original watchTowr public PoC (saved locally for reference; upstream
+# lives at github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE)
+watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py
