@@ -78,6 +78,7 @@ sections below have full usage detail.
 | [`modsec-sessionscribe.conf`](https://sh.rfxn.com/modsec-sessionscribe.conf) | ModSecurity rule pack. Phase-1 deny on the CVE primitive + adjacent WHM-token rules. [Docs](#modsec-sessionscribeconf---the-modsecurity-rule-pack) | Apache + mod_security2, in front of cpsrvd |
 | [`sessionscribe-remote-probe.sh`](https://sh.rfxn.com/sessionscribe-remote-probe.sh) | Non-destructive remote probe. Verdict by HTTP code; canary-tagged sessions. [Docs](#sessionscribe-remote-probesh---non-destructive-verdict-per-host) | Anywhere with curl |
 | [`sessionscribe-ioc-scan.sh`](https://sh.rfxn.com/sessionscribe-ioc-scan.sh) | Read-only on-host IOC scanner. Vendor IOCs + co-occurrence detector. [Docs](#sessionscribe-ioc-scansh---on-host-ioc-ladder) | On the cPanel host |
+| [`sessionscribe-forensic.sh`](https://sh.rfxn.com/sessionscribe-forensic.sh) | Read-only kill-chain reconstruction + evidence bundle. Per-IOC defense reconciliation (PRE-DEFENSE / POST-DEFENSE / UNDEFENDED). [Docs](#sessionscribe-forensicsh---kill-chain-reconstruction--evidence-bundle) | On the cPanel host |
 | [`sessionscribe-revsnap.sh`](https://sh.rfxn.com/sessionscribe-revsnap.sh) | Per-tier RE snapshot (binaries, strings, dynsym, disasm, Perl modules). [Docs](#sessionscribe-revsnapsh---re-snapshot-collector) | On the cPanel host, around `upcp` |
 
 All shell scripts are GPL v2.
@@ -492,6 +493,168 @@ Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
 
 </details>
 
+### `sessionscribe-forensic.sh` - kill-chain reconstruction + evidence bundle
+
+Where `sessionscribe-ioc-scan.sh` answers *"is this host compromised?"*,
+`sessionscribe-forensic.sh` answers *"when was each indicator first
+present, and was the relevant defense in place at that time?"* It is the
+read-only kill-chain reconstruction tool for the IC-5790 cohort —
+extracts timestamps for every defense activation AND every observed
+compromise indicator, then reconciles them per-IOC. Captures a
+per-host evidence bundle (raw artifacts) for offline analysis.
+
+| Phase | What it does |
+|---|---|
+| `defense` | Extract timestamps for every defense layer that landed: cpanel patch (`Load.pm` mtime), cpsrvd restart-after-patch, `sessionscribe-mitigate.sh` runs, ModSec rule 1500030/1500031 install, CSF/APF cpsrvd port closures, proxysub enable, `upcp` summary log |
+| `offense` | Extract timestamps for every observed compromise indicator: forged sessions (Pattern X), `sptadm` reseller / `WHM_FullRoot` tokens (Pattern D), websocket Shell + Fileman API harvest (Pattern E), automated harvester shell envelope (Pattern F), SSH-key persistence (Pattern G), `.sorry` encryptor + `/root/sshd` (Pattern A), BTC ransom drop + `/var/lib/mysql/mysql` wipe (Pattern B), `nuclear.x86` + flameblox C2 (Pattern C) |
+| `reconcile` | Per-indicator: was the relevant defense active when the indicator first appeared? Output: **PRE-DEFENSE** \| **POST-DEFENSE** \| **POST-PARTIAL** \| **UNDEFENDED**, plus the time delta to the relevant defense activation |
+| `bundle` | Tarball of raw artifacts: sessions (raw+preauth), access logs (cpanel + apache + cpsrvd `incoming_http_requests`/`error_log`), system auth logs (`secure`/`messages`/`audit`), cpanel control-plane state, per-account state, persistence (ssh keys, cron-all, systemd units, sudoers + drop-in, root histories), defense state, process/network/iptables snapshot |
+
+The reconciliation answers the operationally important question: *"for
+each indicator of compromise we found on this host, was our mitigation
+present at the time?"* A PRE-DEFENSE verdict means the host was open to
+the exploit when it was used; POST-DEFENSE means the indicator is
+collateral or pre-mitigation noise.
+
+**Customer-domain web access logs (`domlogs`) are not bundled.** Only
+control-plane logs (cpsrvd, global Apache) and system auth logs are
+captured. `/etc/shadow` is not bundled (no Pattern depends on hash
+material); `/etc/sudoers` + `/etc/sudoers.d/` are bundled instead to
+catch attacker-planted `NOPASSWD:ALL` rules.
+
+Bundle output dir: `/root/.ic5790-forensic/<TS>-<RUN_ID>/` (mode `0700`),
+seven tarballs + manifest + ps/ss/iptables snapshots. Per-tarball cap
+defaults to 2 GB (`--max-bundle-mb`); oversize candidates are skipped
+individually with a warning.
+
+Exit codes: `0` = no IOCs found, `1` = IOCs found and all post-defense,
+`2` = IOCs found and at least one pre-defense (high-attention case),
+`3` = tool error.
+
+```bash
+# default sectioned report on stderr + JSONL on stdout
+bash sessionscribe-forensic.sh
+
+# JSONL only (SIEM ingest)
+bash sessionscribe-forensic.sh --jsonl > forensic-host.jsonl
+
+# single JSON envelope (one document per host)
+bash sessionscribe-forensic.sh --json -o forensic-host.json
+
+# correlate with ioc-scan via shared run_id
+SESSIONSCRIBE_RUN_ID=$(date +%s)-$$ \
+    bash sessionscribe-ioc-scan.sh --jsonl --quiet > ioc.jsonl
+SESSIONSCRIBE_RUN_ID=$(date +%s)-$$ \
+    bash sessionscribe-forensic.sh --jsonl > forensic.jsonl
+
+# Pattern A host (avoid stat'ing the encryptor + bundling /root)
+bash sessionscribe-forensic.sh --no-bundle --jsonl
+
+# narrow IR window (default is 90 days back from now)
+bash sessionscribe-forensic.sh --since 14
+
+# unbounded scan + custom bundle dir + tighter per-tarball cap
+bash sessionscribe-forensic.sh \
+    --since all \
+    --bundle-dir /var/forensic/ic5790 \
+    --max-bundle-mb 512
+
+# expand archived rotations into a scratch dir, scan with extra-logs
+mkdir -p /tmp/cp-archive && \
+    tar -C /tmp/cp-archive -xzf /usr/local/cpanel/logs/archive/2026-02.tar.gz
+bash sessionscribe-forensic.sh --extra-logs /tmp/cp-archive
+
+# fleet — note --no-bundle is recommended for fleet sweeps to avoid
+# 20,000 evidence bundles; collect bundles only on hosts that exit 2
+ansible -i hosts all -m script \
+    -a 'sessionscribe-forensic.sh --jsonl --no-bundle'
+```
+
+<details>
+<summary><b>Full <code>--help</code> reference</b> (click to expand)</summary>
+
+```
+sessionscribe-forensic.sh v0.6.0
+
+Read-only kill-chain reconstruction for CVE-2026-41940 (IC-5790).
+
+USAGE
+  sessionscribe-forensic.sh [OUTPUT] [BUNDLE] [MISC]
+
+OUTPUT
+  (default)         ANSI report on stderr + JSONL on stdout
+  --jsonl           JSONL only on stdout
+  --json            Single JSON envelope on stdout
+  --quiet           Suppress sectioned report
+  -o, --output FILE Write final JSON envelope to FILE
+
+BUNDLE
+  --bundle             Capture artifact tarball (default)
+  --no-bundle          Skip artifact tarball (recommended on Pattern A
+                       hosts and for fleet sweeps)
+  --bundle-dir DIR     Root for bundle output
+                       (default: /root/.ic5790-forensic)
+  --max-bundle-mb N    Per-tarball cap in MB. Pre-flight `du` runs per
+                       candidate set; oversize sets are skipped with a
+                       warning. (default: 2048 MB / 2 GB). Use 0 for
+                       no cap. Cap is per-tarball, not bundle-wide.
+  --no-history         Skip /home/*/.bash_history capture (privacy)
+
+LOGS / TIME WINDOW
+  --extra-logs DIR     Additional access-log directory to scan. Point at
+                       an expanded /usr/local/cpanel/logs/archive/*.tar.gz
+                       to include rotated logs from older incident windows.
+                       Detection-only - extra logs are not bundled.
+  --since DAYS         Limit log + session-file scans + bundle to last N
+                       days. Default: 90 days (covers any pre-disclosure
+                       exploitation since CVE-2026-41940 was released).
+  --since all          Disable the time window - scan every retained
+                       session and access-log, no upper bound on bundle.
+
+MISC
+  --no-color        Disable ANSI color (NO_COLOR=1 also honored)
+  -h, --help        Show this help
+
+EXIT CODES
+  0  no IOCs found
+  1  IOCs found, all post-defense (defense was in place)
+  2  IOCs found, at least one pre-defense (defense was missing) - the
+     high-attention case
+  3  tool error
+
+ENVIRONMENT
+  SESSIONSCRIBE_RUN_ID  Honored if set; correlates this run's output
+                        with a parent ioc-scan dispatch via shared
+                        run_id field on every signal.
+```
+
+</details>
+
+**Bundle layout** (per host, under `/root/.ic5790-forensic/<TS>-<RUN_ID>/`):
+
+```
+manifest.txt              host/uid/cpv/run_id/window/cap
+sessions.tgz              /var/cpanel/sessions/{raw,preauth} (filtered)
+access-logs.tgz           cpsrvd access + incoming_http_requests + error_log
+                          + global Apache access/error (NO domlogs)
+system-logs.tgz           /var/log/{secure,messages,audit/audit.log,auth.log}*
+cpanel-state.tgz          accounting.log + resellers + cpanel.config + api_tokens_v2
+cpanel-users.tgz          /var/cpanel/users/ (split out, per-account state)
+persistence.tgz           ssh keys + all cron tiers + systemd/init.d/profile.d
+                          + rc.local + root histories + passwd/group
+                          + sudoers + sudoers.d/  (NO /etc/shadow)
+defense-state.tgz         mitigate backups + csf/apf/modsec configs + updatelogs
+ps.txt                    `ps auxfww`
+connections.txt           `ss -tnp` (or netstat fallback)
+iptables.txt              `iptables -L -nv`
+pattern-a-binary-metadata.txt   only if /root/sshd present (metadata; binary NOT bundled)
+user-histories/           per-user .bash_history (gated on --no-history)
+```
+
+Typical bundle on a busy cPanel host with the 90-day window: ~250 MB –
+2 GB compressed. Per-tarball 2 GB cap drops oversize candidates
+individually so the rest of the bundle still lands.
+
 ### `sessionscribe-revsnap.sh` - RE snapshot collector
 
 The same collector used for the patch dissection in the writeup. Run it
@@ -567,6 +730,18 @@ done | jq -c '.' > fleet-ioc.jsonl
 # ansible script module + CSV merge
 ansible -i hosts cpanel -m script -a 'sessionscribe-mitigate.sh --csv --quiet' \
     > fleet-mitigate.csv
+
+# kill-chain reconciliation across fleet — --no-bundle on the broad sweep,
+# then collect bundles only on the high-attention hosts that exit 2
+ansible -i hosts cpanel -m script \
+    -a 'sessionscribe-forensic.sh --jsonl --no-bundle' > fleet-forensic.jsonl
+jq -r 'select(.phase=="summary" and .key=="verdict"
+              and .note=="COMPROMISED_PRE_DEFENSE") | .host' \
+    fleet-forensic.jsonl > pre-defense-hosts.txt
+
+# bundle collection on the pre-defense subset
+ansible -i pre-defense-hosts.txt all -m script \
+    -a 'sessionscribe-forensic.sh --jsonl --bundle-dir /root/.ic5790-forensic'
 ```
 
 The probe is independently fleet-safe (canary-tagged sessions, active

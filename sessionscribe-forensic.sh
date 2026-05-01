@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.5.0
+# sessionscribe-forensic.sh v0.6.0
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -66,7 +66,7 @@
 ###############################################################################
 set -u
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -1823,11 +1823,12 @@ phase_bundle() {
 
     # 4. Persistence artifacts - SSH keys, cron (all variants), systemd
     # units, init scripts, profile.d (login-time persistence vector),
-    # root shell histories (all flavors), passwd/shadow/group. Most paths
-    # are small; systemd unit + init.d trees can be a few MB on hosts
-    # with many services. Worth bundling whole - Pattern C only greps for
-    # nuclear.x86 so a hand-crafted backdoor unit would be invisible
-    # without the raw files.
+    # root shell histories (all flavors), passwd/group, sudoers + drop-in.
+    # /etc/shadow is NOT bundled (hash material; no Pattern depends on it).
+    # Most paths are small; systemd unit + init.d trees can be a few MB on
+    # hosts with many services. Worth bundling whole - Pattern C only greps
+    # for nuclear.x86 so a hand-crafted backdoor unit (or NOPASSWD sudo
+    # rule) would be invisible without the raw files.
     local persist=()
     [[ -d /root/.ssh ]] && persist+=(/root/.ssh)
     [[ -d /var/spool/cron ]] && persist+=(/var/spool/cron)
