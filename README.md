@@ -564,6 +564,16 @@ mkdir -p /tmp/cp-archive && \
     tar -C /tmp/cp-archive -xzf /usr/local/cpanel/logs/archive/2026-02.tar.gz
 bash sessionscribe-forensic.sh --extra-logs /tmp/cp-archive
 
+# submit the bundle to the R-fx forensic intake (built-in convenience
+# token is good for ~1000 PUTs across all users; fine for ad-hoc IR but
+# ask R-fx for a private token if you're submitting fleet-scale)
+bash sessionscribe-forensic.sh --upload
+
+# submit with your own token (override the built-in convenience token)
+RFXN_INTAKE_TOKEN=<your-hex-token> bash sessionscribe-forensic.sh --upload
+# or:
+bash sessionscribe-forensic.sh --upload --upload-token <your-hex-token>
+
 # fleet — note --no-bundle is recommended for fleet sweeps to avoid
 # 20,000 evidence bundles; collect bundles only on hosts that exit 2
 ansible -i hosts all -m script \
@@ -574,7 +584,7 @@ ansible -i hosts all -m script \
 <summary><b>Full <code>--help</code> reference</b> (click to expand)</summary>
 
 ```
-sessionscribe-forensic.sh v0.6.0
+sessionscribe-forensic.sh v0.7.0
 
 Read-only kill-chain reconstruction for CVE-2026-41940 (IC-5790).
 
@@ -611,6 +621,21 @@ LOGS / TIME WINDOW
   --since all          Disable the time window - scan every retained
                        session and access-log, no upper bound on bundle.
 
+UPLOAD (off by default - explicit opt-in)
+  --upload             Submit the bundle to the R-fx forensic intake.
+                       Requires --bundle (default). Single PUT of an
+                       outer .tgz archive of the bundle dir; server
+                       returns 201 + JSON with stored filename, sha256,
+                       and remaining_uses.
+  --upload-url URL     Override intake URL (default: https://intake.rfxn.com/).
+  --upload-token TOKEN Override token. Resolution order:
+                         1. --upload-token TOKEN (CLI flag)
+                         2. $RFXN_INTAKE_TOKEN (environment)
+                         3. built-in convenience token (limited use:
+                            server enforces a 1000-PUT cap per token;
+                            for ongoing fleet use, request your own
+                            token from R-fx Networks <proj@rfxn.com>).
+
 MISC
   --no-color        Disable ANSI color (NO_COLOR=1 also honored)
   -h, --help        Show this help
@@ -622,10 +647,15 @@ EXIT CODES
      high-attention case
   3  tool error
 
+  Upload failure does NOT change exit code; it is recorded as an
+  `upload fail` signal in the JSONL stream.
+
 ENVIRONMENT
   SESSIONSCRIBE_RUN_ID  Honored if set; correlates this run's output
                         with a parent ioc-scan dispatch via shared
                         run_id field on every signal.
+  RFXN_INTAKE_TOKEN     Token for --upload (resolution rank 2 - between
+                        CLI flag and built-in convenience token).
 ```
 
 </details>
@@ -654,6 +684,46 @@ user-histories/           per-user .bash_history (gated on --no-history)
 Typical bundle on a busy cPanel host with the 90-day window: ~250 MB –
 2 GB compressed. Per-tarball 2 GB cap drops oversize candidates
 individually so the rest of the bundle still lands.
+
+#### Bundle upload (`--upload`, opt-in)
+
+`--upload` (off by default) submits the captured bundle dir to the R-fx
+forensic intake at `https://intake.rfxn.com/`. The script tars the
+bundle directory into an outer `.tgz` and PUTs it once. The server is
+upload-only — no GET/HEAD surface, no retrieval path, no directory
+listing. On 201 the server returns a JSON envelope with the
+server-generated stored filename, the body sha256, and the token's
+remaining use count.
+
+Token resolution order (highest first):
+
+1. `--upload-token TOKEN` CLI flag
+2. `RFXN_INTAKE_TOKEN` environment variable
+3. **built-in convenience token** — embedded in the script for ad-hoc IR
+   submissions. The intake enforces a per-token cap of 1000 PUTs;
+   sharing it across fleet runs will exhaust it quickly. For ongoing
+   fleet use, request a private token from
+   [proj@rfxn.com](mailto:proj@rfxn.com) and pass it via the env var or
+   flag.
+
+What the server enforces:
+
+| Rule | Failure |
+|---|---|
+| Method must be `PUT` | 405 |
+| `X-Upload-Token` header present | 401 `token_missing` |
+| Token hash matches the store | 401 `token_invalid` |
+| Token has remaining uses | 401 `token_expired` |
+| Body ≤ 2 GiB (Content-Length + live byte count) | 413 `too_large` |
+| First two bytes are gzip magic (`1f 8b`) | 415 `not_gzip` |
+| Body non-empty | 400 `empty_body` |
+| Disk free ≥ 5 GB | 507 `insufficient_storage` |
+
+Upload failures do **not** promote the script's exit code (the script's
+contract is detection, not delivery). A failed upload is logged as an
+`upload fail` JSONL signal and the outer tarball is preserved on disk
+for manual retry. Successful uploads remove the outer tarball and keep
+the bundle dir for local IR review.
 
 ### `sessionscribe-revsnap.sh` - RE snapshot collector
 

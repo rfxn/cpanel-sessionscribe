@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.6.0
+# sessionscribe-forensic.sh v0.7.0
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -66,7 +66,7 @@
 ###############################################################################
 set -u
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -86,9 +86,20 @@ DEFAULT_SINCE_DAYS=90
 # tarball, set --max-bundle-mb low (e.g. 256) so each tarball stays small.
 DEFAULT_MAX_BUNDLE_MB=2048
 
-###############################################################################
-# Constants - mirror sessionscribe-mitigate.sh definitions
-###############################################################################
+# Default upload endpoint - the R-fx Networks forensic intake. PUT-only,
+# token-authenticated, gzip-magic enforced. See:
+#   https://github.com/rfxn/cpanel-sessionscribe#bundle-upload
+INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
+
+# Convenience token for ad-hoc submissions to the public R-fx intake.
+# This is intentionally embedded for one-shot IR use - the server enforces
+# a per-token 1000-PUT cap so blast radius is bounded. For fleet-scale or
+# recurring use, request your own token from R-fx Networks (proj@rfxn.com)
+# and override via --upload-token TOKEN or RFXN_INTAKE_TOKEN env. Sharing
+# this token across many hosts will exhaust it quickly; the server returns
+# 401 token_expired once the quota is gone, until R-fx rotates the token.
+# Upload is opt-in via --upload (NEVER on by default).
+INTAKE_DEFAULT_TOKEN="cd88c9970c3176997c9671a2566fadc84904be0b73edd5e3b071452eade796e1"
 
 # Vendor-published patched builds.
 PATCHED_BUILDS_CPANEL=(
@@ -236,6 +247,9 @@ EXTRA_LOGS_DIR=""
 SINCE_DAYS="$DEFAULT_SINCE_DAYS"
 SINCE_EPOCH=""
 MAX_BUNDLE_MB="$DEFAULT_MAX_BUNDLE_MB"
+DO_UPLOAD=0
+INTAKE_URL="$INTAKE_DEFAULT_URL"
+INTAKE_TOKEN=""
 
 usage() {
     cat <<EOF
@@ -274,6 +288,22 @@ LOGS / TIME WINDOW
   --since all          Disable the time window - scan every retained
                        session and access-log, no upper bound on bundle.
 
+UPLOAD (off by default - explicit opt-in)
+  --upload             Submit the bundle to the R-fx forensic intake after
+                       capture. Off by default. Requires --bundle (the
+                       default). Single PUT of an outer .tgz archive of
+                       the bundle dir; server returns 201 + JSON with the
+                       stored filename, sha256, and remaining_uses.
+  --upload-url URL     Override intake URL.
+                       (default: $INTAKE_DEFAULT_URL)
+  --upload-token TOKEN Override token. Resolution order:
+                         1. --upload-token TOKEN (CLI flag)
+                         2. \$RFXN_INTAKE_TOKEN (environment)
+                         3. built-in convenience token (limited use:
+                            server enforces a 1000-PUT cap per token;
+                            for ongoing fleet use, request your own
+                            token from R-fx Networks <proj@rfxn.com>).
+
 MISC
   --no-color        Disable ANSI color (NO_COLOR=1 also honored)
   -h, --help        Show this help
@@ -296,6 +326,9 @@ while [[ $# -gt 0 ]]; do
         --bundle)       DO_BUNDLE=1; shift ;;
         --no-bundle)    DO_BUNDLE=0; shift ;;
         --bundle-dir)   BUNDLE_DIR_ROOT="$2"; shift 2 ;;
+        --upload)       DO_UPLOAD=1; shift ;;
+        --upload-url)   INTAKE_URL="$2"; shift 2 ;;
+        --upload-token) INTAKE_TOKEN="$2"; shift 2 ;;
         --no-history)   INCLUDE_HOMEDIR_HISTORY=0; shift ;;
         --extra-logs)   EXTRA_LOGS_DIR="$2"; shift 2 ;;
         --since)        SINCE_DAYS="$2"; shift 2 ;;
@@ -322,6 +355,14 @@ case "${SINCE_DAYS,,}" in
         SINCE_EPOCH=$(( $(date -u +%s) - SINCE_DAYS * 86400 ))
         ;;
 esac
+
+# Resolve upload token at runtime. Order: --upload-token > $RFXN_INTAKE_TOKEN
+# > built-in convenience token. Only matters when DO_UPLOAD is set; we don't
+# read $RFXN_INTAKE_TOKEN otherwise so an unrelated env var doesn't influence
+# behavior. Token never appears in stdout/stderr (only sent as PUT header).
+if (( DO_UPLOAD )); then
+    INTAKE_TOKEN="${INTAKE_TOKEN:-${RFXN_INTAKE_TOKEN:-$INTAKE_DEFAULT_TOKEN}}"
+fi
 
 # Validate --max-bundle-mb. 0 = no cap. Must be a non-negative integer.
 if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
@@ -1922,6 +1963,99 @@ phase_bundle() {
 }
 
 ###############################################################################
+# Upload - submit the bundle to the R-fx forensic intake (opt-in, --upload)
+#
+# Single PUT of an outer .tgz wrapping the entire bundle dir. Server-side
+# requirements (see intake spec):
+#   - method PUT
+#   - X-Upload-Token header
+#   - body must start with gzip magic (1f 8b)
+#   - body <= 2 GiB (server enforces; tar -cz of the bundle dir is well
+#     under that on a 90d-window cap-respecting bundle)
+# Server returns 201 + JSON envelope: stored_as, label, bytes, sha256,
+# remaining_uses. We log the envelope as a single signal and rm the outer
+# tarball on success (the bundle dir itself is preserved for local IR).
+###############################################################################
+
+phase_upload() {
+    (( DO_UPLOAD )) || return 0
+    hdr "upload" "submitting bundle to $INTAKE_URL"
+
+    if (( ! DO_BUNDLE )); then
+        say_warn "--no-bundle precludes upload (nothing was captured)"
+        emit_signal upload warn upload_no_bundle "--no-bundle was set; skipping upload"
+        return
+    fi
+    if [[ -z "${BUNDLE_BDIR:-}" || ! -d "$BUNDLE_BDIR" ]]; then
+        say_warn "no bundle directory present; skipping upload"
+        emit_signal upload warn upload_no_bundle_dir "BUNDLE_BDIR unset or missing"
+        return
+    fi
+    if ! have_cmd curl; then
+        say_fail "curl(1) not in PATH; cannot upload"
+        emit_signal upload fail upload_no_curl "curl is required for --upload"
+        return
+    fi
+    if [[ -z "$INTAKE_TOKEN" ]]; then
+        say_fail "no upload token resolved (this should not happen)"
+        emit_signal upload fail upload_no_token "INTAKE_TOKEN empty"
+        return
+    fi
+
+    # Re-archive the bundle directory into a single outer tarball. The
+    # individual tarballs inside are already gzipped; tar -cz over them
+    # yields very little extra compression but produces one upload artifact
+    # per host with valid gzip magic on the outer wrapper.
+    local outer="${BUNDLE_BDIR}.upload.tgz"
+    if ! tar -C "$BUNDLE_DIR_ROOT" -czf "$outer" "$(basename "$BUNDLE_BDIR")" 2>/dev/null; then
+        say_fail "outer tarball build failed: $outer"
+        emit_signal upload fail upload_tar_failed "tar -czf $outer"
+        return
+    fi
+    chmod 0600 "$outer" 2>/dev/null
+    local outer_size
+    outer_size=$(du -sh "$outer" 2>/dev/null | awk '{print $1}')
+    say_info "outer tarball: $outer ($outer_size)"
+
+    # PUT to the intake. --max-time 1800 = 30 minute hard ceiling for slow
+    # links. -w embeds the response code as a sentinel line so we can split
+    # body from status without a second curl call. The token is sent in a
+    # header only - never on the command line where ps could see it.
+    local resp body http_code rc
+    resp=$(curl --silent --show-error \
+                --max-time 1800 \
+                -H "X-Upload-Token: $INTAKE_TOKEN" \
+                -T "$outer" \
+                -w '\n__INTAKE_HTTP__=%{http_code}' \
+                "$INTAKE_URL" 2>&1)
+    rc=$?
+    http_code=$(printf '%s' "$resp" | grep -oE '__INTAKE_HTTP__=[0-9]+' | tail -1 | cut -d= -f2)
+    body=$(printf '%s' "$resp" | sed -E 's/^__INTAKE_HTTP__=[0-9]+$//' \
+           | grep -v '^$' | head -c 2048)
+
+    if (( rc != 0 )) || [[ "$http_code" != "201" ]]; then
+        say_fail "upload failed (curl_rc=$rc http=${http_code:-?})"
+        [[ -n "$body" ]] && say_fail "  response: $body"
+        emit_signal upload fail upload_failed \
+            "curl_rc=$rc http=${http_code:-?}" \
+            curl_rc "$rc" http_code "${http_code:-}" body "$body"
+        # Leave the outer tarball on disk so the operator can retry manually.
+        say_info "outer tarball preserved at $outer for manual retry"
+        return
+    fi
+
+    say_pass "uploaded: http=201"
+    [[ -n "$body" ]] && say_info "  $body"
+    emit_signal upload info upload_complete \
+        "http=201 url=$INTAKE_URL" \
+        url "$INTAKE_URL" body "$body" outer "$outer"
+
+    # Success: drop the outer tarball; the bundle dir itself is kept for
+    # local IR review.
+    rm -f "$outer"
+}
+
+###############################################################################
 # Run
 ###############################################################################
 
@@ -1947,6 +2081,7 @@ phase_defense
 phase_offense
 phase_reconcile
 phase_bundle
+phase_upload
 
 ###############################################################################
 # Final summary
