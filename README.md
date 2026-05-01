@@ -378,28 +378,40 @@ bash sessionscribe-remote-probe.sh --target 1.2.3.4 --all --json | jq .
 bash sessionscribe-remote-probe.sh --cleanup
 ```
 
-### `sessionscribe-ioc-scan.sh` - on-host IOC ladder
+### `sessionscribe-ioc-scan.sh` — on-host IOC ladder
 
 Patched build numbers are not enough. A patched host can still be carrying
-forensic artifacts of prior exploitation. This script is the read-only
-counterpart to the probe: it walks `/var/cpanel/sessions/raw/`, the access
-logs, and the `cpsrvd` binary fingerprint, then returns two independent
-verdict axes:
+forensic artifacts of prior exploitation. This is the read-only counterpart
+to the remote probe: it walks `/var/cpanel/sessions/raw/`, the access logs,
+and the `cpsrvd` binary fingerprint, then returns two independent verdict
+axes. Defaults are safe (no host mutation), fleet-friendly output with
+`host=<fqdn>` on every JSONL signal.
 
-- **`code_verdict`** (`PATCHED` / `VULNERABLE` / `INCONCLUSIVE`) - from
+| Check | What it does |
+|---|---|
+| `version` | `cpanel -V` vs the published patched-build list — drives `code_verdict` |
+| `static-pattern` | Greps `Cpanel/Session/*.pm` for post-patch sentinel patterns (`no-ob:` decode branch, etc.) |
+| `cpsrvd-fingerprint` | cpsrvd binary inspection against patched-build signatures |
+| `access-log` | Apache + cpsrvd logs for exploitation traffic shapes (`--no-logs` to skip) |
+| `session-store` | `/var/cpanel/sessions/raw/` walk: vendor IOCs + 4-way co-occurrence + forged-timestamp heuristic (`--no-sessions` to skip) |
+| `probe` (opt-in) | Single marker GET to `127.0.0.1:2087` — confirms cpsrvd is responsive and access-log flow is healthy. Does **not** attempt the bypass |
+
+Two verdict axes are reported independently:
+
+- **`code_verdict`** (`PATCHED` / `VULNERABLE` / `INCONCLUSIVE`) — from
   version, Perl source patterns, and binary fingerprint.
-- **`host_verdict`** (`CLEAN` / `SUSPICIOUS` / `COMPROMISED`) - from the
+- **`host_verdict`** (`CLEAN` / `SUSPICIOUS` / `COMPROMISED`) — from the
   session-file IOC ladder and access-log scan.
 
 The IOC set is the vendor pattern (token-injection, preauth-with-extauth,
 tfa-with-bad-origin, multi-line `pass`) plus a four-way co-occurrence
-detector and a forged-timestamp heuristic.
+detector and a forged-timestamp heuristic. Sessions tagged by the remote
+probe's `nxesec_canary_<nonce>` are bucketed as `PROBE_ARTIFACT` and do
+not escalate to `COMPROMISED`.
 
 Exit codes (highest priority wins): `0` = PATCHED + CLEAN, `1` = VULNERABLE,
-`2` = INCONCLUSIVE, `4` = COMPROMISED. A patched host can still exit `4` if
-prior exploitation left IOCs on disk. Sessions tagged with the remote
-probe's canary are bucketed as `PROBE_ARTIFACT` and do not escalate to
-COMPROMISED.
+`2` = INCONCLUSIVE, `3` = tool error, `4` = COMPROMISED. A patched host
+can still exit `4` if prior exploitation left IOCs on disk.
 
 ```bash
 # default sectioned report
@@ -408,10 +420,77 @@ bash sessionscribe-ioc-scan.sh
 # JSONL for SIEM ingest
 bash sessionscribe-ioc-scan.sh --jsonl --quiet > sessionscribe-host.jsonl
 
+# CSV summary for fleet roll-up
+bash sessionscribe-ioc-scan.sh --csv --quiet > sessionscribe-host.csv
+
+# host IOCs only — periodic post-patch sweep, last 7 days
+bash sessionscribe-ioc-scan.sh --ioc-only --since 7
+
+# offline forensics on an extracted snapshot tarball
+bash sessionscribe-ioc-scan.sh \
+    --root /tmp/cpanel-122.0.17-extract/usr/local/cpanel \
+    --version-string '11.122.0.17' \
+    --cpsrvd-path /tmp/cpanel-122.0.17-extract/usr/local/cpanel/cpsrvd
+
 # fleet
 ansible -i hosts all -m script -a 'sessionscribe-ioc-scan.sh --jsonl --quiet'
 pdsh -w cpanel-fleet 'bash -s' < sessionscribe-ioc-scan.sh
 ```
+
+<details>
+<summary><b>Full <code>--help</code> reference</b> (click to expand)</summary>
+
+```
+Usage: bash sessionscribe-ioc-scan.sh [OPTIONS]
+
+Scan options:
+      --probe                Send a single marker GET to 127.0.0.1:2087
+                             (does not attempt the bypass - confirms cpsrvd
+                             is responsive and access logs are flowing).
+      --no-logs              Skip access-log IOC scan.
+      --no-sessions          Skip session-store IOC + anomaly scan.
+      --ioc-only             Run only the host-state IOC scans (logs +
+                             sessions + optional probe). Skip version,
+                             static-pattern, and cpsrvd-binary code-state
+                             checks. code_verdict is reported as SKIPPED;
+                             the exit code reflects host_verdict only.
+                             Useful for periodic post-patch sweeps.
+      --since DAYS           Limit log + session-anomaly scans to last N days.
+                             Default: no filter (scan all retained data).
+                             Vendor session IOCs (token-injection / preauth-
+                             extauth / tfa / multiline-pass) always scan the
+                             full /var/cpanel/sessions/raw/ regardless.
+
+Snapshot-testing overrides (offline forensics on extracted tarballs):
+      --root DIR             Override /usr/local/cpanel.
+      --version-string S     Override `cpanel -V` output.
+      --cpsrvd-path P        Override cpsrvd binary path.
+
+Output:
+  -o, --output FILE          Write structured output to FILE. Format follows
+                             the streaming flag in effect: CSV when --csv
+                             is set, JSON otherwise (default).
+      --jsonl                Stream JSONL on stdout (one signal per line,
+                             each prefixed with host=<fqdn> for fleet
+                             aggregation). Suppresses sectioned report.
+      --csv                  Stream per-host summary CSV on stdout (one
+                             header row + one data row). Designed for fleet
+                             roll-up: pipe many hosts through `awk 'NR==1
+                             || FNR>1'` or import into SQL/Excel. Mutually
+                             exclusive with --jsonl. Suppresses sectioned
+                             report.
+      --quiet                Suppress sectioned report.
+      --no-color             Disable ANSI color codes.
+
+Misc:
+      --timeout N            Probe timeout in seconds (default 8).
+  -h, --help                 Show this help.
+
+Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
+            4=COMPROMISED (host IOC hit - overrides patch verdict).
+```
+
+</details>
 
 ### `sessionscribe-revsnap.sh` - RE snapshot collector
 
