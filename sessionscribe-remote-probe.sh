@@ -1,14 +1,14 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-remote-probe.sh v1.1.0
+# sessionscribe-remote-probe.sh v1.2.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
 #
-# sessionscribe-remote-probe.sh   v1.1.0
+# sessionscribe-remote-probe.sh   v1.2.0
 #
-# Detection probe for CVE-2026-41940 (SessionScribe - disclosed 2026-04-28,
+# Detection probe for CVE-2026-41940 (SessionScribe — disclosed 2026-04-28,
 # cPanel KB 40073787579671). Unauthenticated session forgery in cPanel/WHM
 # via CRLF injection into the password field of a preauth session.
 #
@@ -40,8 +40,8 @@
 # ============================================================================
 #
 # The whostmgrsession cookie has the canonical form `:NAME,OBHEX` where:
-#     NAME    random alphanumeric - the session-file basename
-#     OBHEX   1-64 lowercase hex chars - the secret used to construct
+#     NAME    random alphanumeric — the session-file basename
+#     OBHEX   1-64 lowercase hex chars — the secret used to construct
 #             Cpanel::Session::Encoder for the password field
 #
 # Cpanel/Session/Load.pm get_ob_part() (line 122) extracts OBHEX:
@@ -76,18 +76,31 @@
 # ============================================================================
 #
 # Fixed cpsrvd writes `pass=no-ob:<hex>` via hex_encode_only when ob_part is
-# missing - every byte (including CR/LF) becomes ASCII hex, never standalone
+# missing — every byte (including CR/LF) becomes ASCII hex, never standalone
 # session attributes. Patched Cpanel/Session/Load.pm has a companion `no-ob:`
-# branch on the load side. Patched builds:
-#     11.110.0.97   11.118.0.63   11.126.0.54
-#     11.132.0.29   11.134.0.20   11.136.0.5
-# Tiers 112/114/116/120/122/124/128/130 have NO patch - operators must
-# upgrade the major series, migrate, or firewall direct cpsrvd ports
+# branch on the load side. Patched-boundary builds (anything below on the
+# same tier is vulnerable):
+#     11.86.0.41    11.110.0.97   11.118.0.63   11.126.0.54
+#     11.130.0.19   11.132.0.29   11.134.0.20   11.136.0.5
+# Tier 86 received a back-port patch as a courtesy from cPanel but remains
+# EOL for general support — patch_status reports `patched_eol` so triage
+# tooling can tell "safe + supported" from "safe + unsupported tier".
+# Tiers 112/114/116/120/122/124/128 have NO patch — operators must upgrade
+# the major series, migrate, or firewall direct cpsrvd ports
 # (2082/2083/2086/2087/2095/2096).
 #
 # ============================================================================
 # Detection chain
 # ============================================================================
+#
+# Stage 0   GET /login/?login_only=1   (no body, no cookies, no auth)
+#             → harvest cpsrvd build fingerprint:
+#                 - Server: response header (cpsrvd/<MAJ.MIN.REL.BUILD>)
+#                 - cPanel_magic_revision_<digits> token in HTML body
+#             → derive patch_status from build vs. embedded boundary table:
+#                 patched | vulnerable | eol_no_patch | unknown
+#             → side-effect-free, no session created, runs in every probe
+#               by default. Use --fingerprint-only to stop after this stage.
 #
 # Stage 1   POST /login/?login_only=1   user=root&pass=wrong
 #             → mint preauth whostmgrsession cookie (`:NAME,OBHEX`)
@@ -105,7 +118,7 @@
 #                 verdict was structurally wrong).
 #
 # Stage 3   GET /scripts2/listaccts   Cookie: whostmgrsession=:NAME
-#             → 401 "Token denied" - propagates raw→cache so the cpsess
+#             → 401 "Token denied" — propagates raw→cache so the cpsess
 #               token from stage 2's Location becomes readable
 #
 # Stage 4   GET /cpsess<token>/json-api/version   Cookie: whostmgrsession=:NAME
@@ -137,7 +150,7 @@
 #
 # For read-only audits where no privileged session window is tolerable, use
 # --no-verify (stage 1+2 only). NOTE: --no-verify reverts to the pre-v2
-# stage-2 heuristic, which produces FALSE POSITIVES on patched hosts -
+# stage-2 heuristic, which produces FALSE POSITIVES on patched hosts —
 # every cookie-bearing request returns 307 + /cpsess<token>/ regardless of
 # patch state because the redirect is normal URL canonicalization.
 #
@@ -172,6 +185,12 @@
 #   --json      structured JSON with probe-level results + per-target rollup
 #   --cleanup   print the local cleanup command and exit (no probing)
 #
+# --fingerprint-only runs stage 0 only — no preauth session created, no CRLF
+# injection, no propagation, no logout. Verdict is derived purely from build
+# vs. patch-boundary table. Banner-only verdicts are LOWER CONFIDENCE than
+# the full chain (a host can lie about its build, or be misconfigured), so
+# this mode is for fast scoping, not authoritative confirmation.
+#
 # ============================================================================
 # Exit codes
 # ============================================================================
@@ -183,7 +202,7 @@
 # No python, no perl, no openssl.
 
 set -u
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.2"
 
 # --- Defaults ---
 TIMEOUT=10
@@ -199,7 +218,30 @@ NO_COLOR_FLAG=0
 PROGRESS=1
 NO_VERIFY=0    # --no-verify: stage-2-only mode (v1 heuristic; produces false positives)
 EMIT_CLEANUP=0 # --cleanup: print local cleanup command and exit (no probing)
+FINGERPRINT_ONLY=0 # --fingerprint-only: stage 0 only (banner + magic_revision)
 TARGETS=()
+
+# --- Patch-boundary table (CVE-2026-41940) ---
+# Tier MAJ → first patched build on the .0.x stable branch.
+# Hosts on tier MAJ with .0.<build> >= boundary are PATCHED.
+# Hosts on tier MAJ with .0.<build> <  boundary are VULNERABLE.
+# Hosts on a non-stable branch (.1.x / .2.x / .3.x) are UNKNOWN — we don't
+# know which builds carry the patch on those branches, so we refuse to guess.
+declare -A PATCH_BOUNDARY=(
+  [86]=41    [110]=97   [118]=63   [126]=54
+  [130]=19   [132]=29   [134]=20   [136]=5
+)
+# Tiers with no security patch issued — every build is vulnerable.
+# Operators must upgrade the major series, migrate, or firewall direct
+# cpsrvd ports.
+EOL_TIERS=" 112 114 116 120 122 124 128 "
+# Tiers that received a back-port SessionScribe patch but remain EOL for
+# general cPanel support. A host on one of these tiers at-or-above the
+# boundary is NOT vulnerable to CVE-2026-41940, but the tier itself is
+# unsupported — operators should still plan an upgrade. patch_status
+# reports `patched_eol` so triage tooling can distinguish "safe + EOL"
+# from "safe + supported".
+EOL_TIERS_PATCHED=" 86 "
 
 # --- Per-run nonces ---
 NONCE=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
@@ -247,6 +289,17 @@ declare -a R_SCHEME=()
 declare -a R_HOST=()
 declare -a R_PORT=()
 declare -a R_HOSTHDR=()
+# Stage-0 fingerprint, captured per-probe (parallel arrays — same length as R_*)
+declare -a R_BUILD=()
+declare -a R_MAGIC_REV=()
+declare -a R_SERVER_HDR=()
+declare -a R_PATCH_STATUS=()
+# "Current fingerprint" set by each probe_target() before record_result fires.
+# This avoids changing the record_result() signature for every existing caller.
+CUR_BUILD=""
+CUR_MAGIC_REV=""
+CUR_SERVER_HDR=""
+CUR_PATCH_STATUS=""
 
 # Per-target verdict aggregation (highest-severity wins: VULN > INCONCLUSIVE > SAFE)
 declare -A TARGET_VERDICT=()
@@ -261,7 +314,7 @@ N_TOTAL=0
 
 usage() {
   cat <<EOF
-sessionscribe-remote-probe.sh v${SCRIPT_VERSION} - detection probe for CVE-2026-41940 (SessionScribe)
+sessionscribe-remote-probe.sh v${SCRIPT_VERSION} — detection probe for CVE-2026-41940 (SessionScribe)
 
 Usage:
   $0 --target HOST [--port PORT] [--scheme https|http] [--host-header NAME]
@@ -276,12 +329,12 @@ Targeting:
   --scheme https|http      Default https
   --host-header NAME       Override Host: header
   --proxy DOMAIN           Test {whm,cpanel,webmail}.DOMAIN via 443 + 80
-  --all                    Exhaustive sweep - all 6 cpsrvd direct ports
+  --all                    Exhaustive sweep — all 6 cpsrvd direct ports
                            (cPanel/Webmail probes are informational only;
                             see "Known limitation" in the script header)
   --auto-host-discover     Pre-probe /openid_connect/cpanelid for canonical Host
 
-Output modes (mutually exclusive - last one wins):
+Output modes (mutually exclusive — last one wins):
   (default)                Pretty per-probe output + summary
   -q | --quiet             Only print [VULN] hits and the final verdict line
   --oneline                One verdict line per target ("HOST: VULN n=2")
@@ -289,10 +342,19 @@ Output modes (mutually exclusive - last one wins):
   --json                   Structured JSON with probe results + per-target rollup
   --no-color               Disable ANSI color (also honored if env NO_COLOR=1)
   --no-progress            Suppress progress lines on multi-target runs
-  --no-verify              Stage-2-only mode (v1 heuristic - NOTE: produces
+  --no-verify              Stage-2-only mode (v1 heuristic — NOTE: produces
                            FALSE POSITIVES on patched hosts; cpsrvd 307s any
                            cookie-bearing request to /cpsess<token>/ as URL
                            canonicalization. Use only for read-only audits.
+  --fingerprint-only       Stage 0 only — harvest cpsrvd build banner +
+                           cPanel_magic_revision and derive verdict from the
+                           embedded patch-boundary table. Side-effect-free
+                           (no session minted). Banner-only verdicts are
+                           LOWER CONFIDENCE than the full chain; use for
+                           fast scoping at fleet scale. Stage 0 also runs
+                           by default at the start of every full probe; the
+                           extra columns appear in --csv and --json output
+                           regardless of mode.
   --cleanup                Print the local cleanup command (matches all past
                            probe canaries: nxesec_canary_*) and exit. No
                            probing performed. Pipe through ssh or run as
@@ -317,18 +379,23 @@ Examples:
   # exhaustive sweep, JSON to file
   $0 --target 1.2.3.4 --proxy example.com --all --json > result.json
 
-  # fleet - quiet mode, exit 2 if any VULN, easy to chain in scripts
+  # fleet — quiet mode, exit 2 if any VULN, easy to chain in scripts
   for h in \$(cat fleet.txt); do
     $0 --target "\$h" --quiet --no-color || echo "\$h FOUND_VULN"
   done
 
-  # fleet - CSV aggregation across many targets
+  # fleet — CSV aggregation across many targets
   ( $0 --csv \$(cat fleet.txt | sed 's/^/--target /' | xargs) ) > fleet-results.csv
 
   # batch via stdin
   printf 'host1\nhost2\nhost3\n' | $0 --
 
-Detection mechanism (full chain - default):
+Detection mechanism (full chain — default):
+  Stage 0   GET /login/?login_only=1   (passive fingerprint, no session created)
+            → parse Server: cpsrvd/<MAJ.MIN.REL.BUILD>
+            → parse cPanel_magic_revision_<digits> from body
+            → derive patch_status: patched | vulnerable | eol_no_patch | unknown
+            CSV/JSON gain columns: server_header,magic_revision,build_string,patch_status
   Stage 1   POST /login/?login_only=1  user=root&pass=wrong
             → server returns Set-Cookie: whostmgrsession=<sessname>,<obhex>
   Stage 2   GET / with:
@@ -347,7 +414,7 @@ Detection mechanism (full chain - default):
             → HTTP 200 + version JSON  → VULN  (bypass landed)
             → HTTP 5xx + "License"     → VULN  (license-gated past auth)
             → HTTP 401 / 403           → SAFE  (stage 2 was canonicalization)
-  Stage 5   GET <cpsess>/logout + GET /logout - best-effort invalidate
+  Stage 5   GET <cpsess>/logout + GET /logout — best-effort invalidate
 
 Safety: stages 3-5 create a forged session that is root-equivalent for the
 ~1-3s window between stage 3 and stage 5. No state-changing API calls are
@@ -383,7 +450,7 @@ short_role() {
   printf '%s' "$d"
 }
 
-# Scheme cell - 5 chars, padded so http aligns under https
+# Scheme cell — 5 chars, padded so http aligns under https
 scheme_cell() {
   case "$1" in
     https) printf 'https' ;;
@@ -392,11 +459,34 @@ scheme_cell() {
   esac
 }
 
-# Port cell - ":2087" or empty (proxy mode uses 443/80 implicitly via host hdr)
+# Port cell — ":2087" or empty (proxy mode uses 443/80 implicitly via host hdr)
 port_cell() {
   local p=$1
   [[ -z "$p" ]] && p="-"
   printf ':%-5s' "$p"
+}
+
+# Build cell — 12-char colored cell with the stage-0 build fingerprint.
+# Color tracks patch_status so vulnerable/EOL builds visually pop alongside
+# the chain verdict. Falls back to dim "—" when stage 0 produced no
+# parseable build (transport failure, non-cpsrvd response, or sanitized
+# Server: header with no magic_revision).
+build_cell() {
+  local build=$1 status=$2
+  local color
+  case "$status" in
+    patched)                  color="$GREEN" ;;
+    patched_eol)              color="$CYAN" ;;
+    vulnerable|eol_no_patch)  color="$RED" ;;
+    *)                        color="$DIM" ;;
+  esac
+  if [[ -z "$build" ]]; then
+    # em-dash is 3 bytes / 1 column — printf %-12s pads by byte count, so
+    # the empty cell is hand-padded to 12 visual columns to keep alignment.
+    printf '%s—           %s' "$color" "$NC"
+  else
+    printf '%s%-12s%s' "$color" "$build" "$NC"
+  fi
 }
 
 # Box-drawing helpers (text mode)
@@ -448,6 +538,114 @@ build_url() {
   fi
 }
 
+# === Patch-status computation ===
+# Maps a parsed cpsrvd build (e.g. "11.134.0.20") to one of:
+#   patched       — supported tier, build at-or-above the patch boundary
+#   patched_eol   — EOL tier with back-port patch, build at-or-above the
+#                   boundary (safe for THIS CVE but tier is unsupported —
+#                   operators should still plan an upgrade)
+#   vulnerable    — .0.x build below the tier's patch boundary
+#   eol_no_patch  — tier on the no-patch list (every build vulnerable)
+#   unknown       — empty input, unparseable, or non-stable branch (.1/.2/.3.x)
+compute_patch_status() {
+  local build="$1"
+  if [[ -z "$build" ]]; then printf 'unknown'; return; fi
+  local v1 v2 v3 v4
+  IFS='.' read -r v1 v2 v3 v4 <<<"$build"
+  # Expect 11.<MAJ>.<REL>.<BUILD>
+  if [[ "$v1" != "11" ]] || ! [[ "$v2" =~ ^[0-9]+$ ]] || \
+     ! [[ "$v3" =~ ^[0-9]+$ ]] || ! [[ "$v4" =~ ^[0-9]+$ ]]; then
+    printf 'unknown'; return
+  fi
+  # EOL tier — every build is vulnerable, no patch issued
+  if [[ "$EOL_TIERS" == *" $v2 "* ]]; then
+    printf 'eol_no_patch'; return
+  fi
+  # Non-stable branch (RELEASE/CURRENT/EDGE) — patch boundary unknown
+  if [[ "$v3" -ne 0 ]]; then
+    printf 'unknown'; return
+  fi
+  # Tier with a patch boundary — compare build number
+  local boundary="${PATCH_BOUNDARY[$v2]:-}"
+  if [[ -z "$boundary" ]]; then
+    printf 'unknown'; return
+  fi
+  if [[ "$v4" -ge "$boundary" ]]; then
+    if [[ "$EOL_TIERS_PATCHED" == *" $v2 "* ]]; then
+      printf 'patched_eol'
+    else
+      printf 'patched'
+    fi
+  else
+    printf 'vulnerable'
+  fi
+}
+
+# Returns a short human-readable phrase for the patch_status — used in the
+# --fingerprint-only verdict detail string.
+patch_status_phrase() {
+  local status=$1 build=$2
+  local v2; IFS='.' read -r _ v2 _ _ <<<"$build"
+  case "$status" in
+    patched)
+      printf 'build %s ≥ patch boundary 11.%s.0.%s' "$build" "$v2" "${PATCH_BOUNDARY[$v2]:-?}" ;;
+    patched_eol)
+      printf 'build %s ≥ patch boundary 11.%s.0.%s (EOL tier — safe for this CVE, plan upgrade)' \
+        "$build" "$v2" "${PATCH_BOUNDARY[$v2]:-?}" ;;
+    vulnerable)
+      printf 'build %s < patch boundary 11.%s.0.%s' "$build" "$v2" "${PATCH_BOUNDARY[$v2]:-?}" ;;
+    eol_no_patch)
+      printf 'build %s on EOL tier (no patch issued — must migrate)' "$build" ;;
+    unknown)
+      printf 'build %s — patch state not in boundary table' "${build:-<unparsed>}" ;;
+  esac
+}
+
+# === Stage 0: passive fingerprint ===
+# Single GET against /login/?login_only=1 — no body, no cookie, no auth.
+# Harvests:
+#   - Server: response header (cpsrvd/<MAJ.MIN.REL.BUILD> on most builds;
+#     some hardened/proxied configurations strip the version)
+#   - cPanel_magic_revision_<digits> in HTML body (1:1 with build,
+#     survives even when Server: is sanitized)
+#
+# Emits "<status>|<build>|<magic_rev>|<server_hdr>" on stdout.
+#   status = ok          — got a response (build/magic may still be empty)
+#   status = transport_N — curl exit code N (DNS / TCP / TLS failure)
+fingerprint_target() {
+  local url=$1 host_hdr=$2 resolve_pin=${3:-}
+  local hdr_file body_file
+  hdr_file=$(mktemp 2>/dev/null) || hdr_file="/tmp/nxesec-fp-h-$$-$RANDOM"
+  body_file=$(mktemp 2>/dev/null) || body_file="/tmp/nxesec-fp-b-$$-$RANDOM"
+  local args=(
+    --silent --insecure --max-time "$TIMEOUT" --connect-timeout "$CONNECT_TIMEOUT"
+    -A "$UA" -H 'Connection: close' -H 'Accept: text/html,*/*'
+    -D "$hdr_file" -o "$body_file"
+  )
+  [ -n "$host_hdr" ]    && args+=(-H "Host: ${host_hdr}")
+  [ -n "$resolve_pin" ] && args+=(--resolve "$resolve_pin")
+  curl "${args[@]}" "${url}/login/?login_only=1" 2>/dev/null
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$hdr_file" "$body_file"
+    printf 'transport_%d|||' "$rc"
+    return 0
+  fi
+  local server_hdr build magic_rev
+  server_hdr=$(tr -d '\r' < "$hdr_file" | grep -i '^Server:' | head -1 \
+    | sed -E 's/^[Ss]erver:[[:space:]]*//' | tr -d '|')
+  # Build string: prefer the version inside Server: cpsrvd/<X.Y.Z.W>; fall
+  # back to a bare 11.X.Y.Z anywhere in the header (some proxies repack the
+  # Server: line).
+  build=$(printf '%s' "$server_hdr" | grep -oE '11\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  # cPanel_magic_revision_<digits> is embedded in every standard cpsrvd
+  # login page. Survives Server: header stripping — second source of truth.
+  magic_rev=$(grep -oE 'cPanel_magic_revision_[0-9]+' "$body_file" 2>/dev/null \
+    | head -1 | sed 's/cPanel_magic_revision_//')
+  rm -f "$hdr_file" "$body_file"
+  printf 'ok|%s|%s|%s' "$build" "$magic_rev" "$server_hdr"
+}
+
 # === Stage 1: mint preauth session ===
 # resolve_pin (optional) is passed to curl --resolve as HOSTNAME:PORT:IP so
 # proxy-domain probes get SNI right under HTTP/2's strict-Host enforcement
@@ -455,13 +653,13 @@ build_url() {
 #
 # Emits "<reason>|<cookie>" on stdout. On success: "ok|<cookie-value>".
 # On failure: reason is one of:
-#   dns_failed         - couldn't resolve host (curl exit 6)
-#   connect_refused    - TCP refused (curl exit 7, fast)
-#   connect_timeout    - TCP timed out (curl exit 7/28; port firewalled)
-#   tls_failed         - SSL/TLS handshake failed (curl exits 35/52/56/60)
-#   http_421           - Apache HTTP/2 SNI≠Host (Misdirected Request)
-#   http_<code>_no_cookie  - got a status, but no whostmgrsession cookie
-#   transport_<code>   - other curl exit code
+#   dns_failed         — couldn't resolve host (curl exit 6)
+#   connect_refused    — TCP refused (curl exit 7, fast)
+#   connect_timeout    — TCP timed out (curl exit 7/28; port firewalled)
+#   tls_failed         — SSL/TLS handshake failed (curl exits 35/52/56/60)
+#   http_421           — Apache HTTP/2 SNI≠Host (Misdirected Request)
+#   http_<code>_no_cookie  — got a status, but no whostmgrsession cookie
+#   transport_<code>   — other curl exit code
 mint_preauth() {
   local url=$1 host_hdr=$2 resolve_pin=${3:-}
   local hdr_file
@@ -500,7 +698,7 @@ mint_preauth() {
     printf 'http_421|'
   elif [ -n "$status" ] && [ "${status:0:1}" = "3" ] && [[ "$loc" == https://* ]]; then
     # cpsrvd "force HTTPS" config: this surface 301s to its SSL counterpart.
-    # Same daemon, same patch state - emit a SKIP signal, not INCONC.
+    # Same daemon, same patch state — emit a SKIP signal, not INCONC.
     printf 'redirect_to_ssl|%s' "$loc"
   elif [ -n "$status" ]; then
     printf 'http_%s_no_cookie|' "$status"
@@ -514,9 +712,9 @@ mint_preauth() {
 # is first-wins on 11.122 and last-wins on 11.134 for user=, so injecting
 # it produces inconsistent cross-version behavior. Stage 3 propagation
 # (next handler) will write user=root regardless. We inject only:
-#   successful_internal_auth_with_timestamp  - gates the bypass
-#   hasroot=0                                - defense-in-depth (newer respects)
-#   nxesec_canary_<nonce>=1                  - forensic signature
+#   successful_internal_auth_with_timestamp  — gates the bypass
+#   hasroot=0                                — defense-in-depth (newer respects)
+#   nxesec_canary_<nonce>=1                  — forensic signature
 inject_probe() {
   local url=$1 host_hdr=$2 session_base=$3 resolve_pin=${4:-}
   local now; now=$(date +%s)
@@ -607,7 +805,7 @@ verify_session() {
 # === Stage 5: best-effort session invalidation ===
 # Calls /cpsess<token>/logout and /logout with the cookie. cpsrvd marks the
 # session expired on logout, closing the privileged window faster than the
-# default ~30 min idle timeout. Returns nothing - fire and (mostly) forget.
+# default ~30 min idle timeout. Returns nothing — fire and (mostly) forget.
 invalidate_session() {
   local url=$1 host_hdr=$2 session_base=$3 cpsess=$4 resolve_pin=${5:-}
   local cookie_enc; cookie_enc=$(urlencode_cookie "$session_base")
@@ -652,7 +850,9 @@ reach_check() {
 }
 
 # === Per-probe output (text mode) ===
-# columns: │  <icon> <verdict-7>  <scheme-5>  <port-6>  <role-12>  <detail>
+# columns: │  <icon> <verdict-7>  <scheme-5>  <port-6>  <role-12>  <build-12>  <detail>
+# The build cell shows the stage-0 fingerprint colored by patch_status —
+# captured on every probe by default, so surfacing it costs nothing.
 emit_probe_line() {
   local desc=$1 verdict=$2 detail=$3 http=$4 loc=$5
   local sch=${6:-} host=${7:-} port=${8:-} hh=${9:-}
@@ -662,43 +862,49 @@ emit_probe_line() {
       local scell; scell=$(scheme_cell "$sch")
       local pcell; pcell=$(port_cell "$port")
       local rcell; printf -v rcell '%-12s' "$role"
+      local bcell; bcell=$(build_cell "$CUR_BUILD" "$CUR_PATCH_STATUS")
       case "$verdict" in
         "$V_VULN")
-          printf '  %s%s%s  %s%s  %-7s%s  %s  %s  %s  %s\n' \
+          printf '  %s%s%s  %s%s  %-7s%s  %s  %s  %s  %s  %s\n' \
             "$DIM" "$BOX_V" "$NC" \
             "$RED" "$ICON_VULN" "VULN" "$NC" \
-            "$scell" "$pcell" "$rcell" "${RED}${detail}${NC}"
+            "$scell" "$pcell" "$rcell" "$bcell" "${RED}${detail}${NC}"
           ;;
         "$V_SAFE")
-          printf '  %s%s%s  %s%s  %-7s%s  %s  %s  %s  %s\n' \
+          printf '  %s%s%s  %s%s  %-7s%s  %s  %s  %s  %s  %s\n' \
             "$DIM" "$BOX_V" "$NC" \
             "$GREEN" "$ICON_SAFE" "SAFE" "$NC" \
-            "$scell" "$pcell" "$rcell" "$detail"
+            "$scell" "$pcell" "$rcell" "$bcell" "$detail"
           ;;
         "$V_INCONCLUSIVE")
-          printf '  %s%s%s  %s%s  %-7s%s  %s  %s  %s  %s\n' \
+          printf '  %s%s%s  %s%s  %-7s%s  %s  %s  %s  %s  %s\n' \
             "$DIM" "$BOX_V" "$NC" \
             "$YELLOW" "$ICON_INC" "INCONC" "$NC" \
-            "$scell" "$pcell" "$rcell" "$detail"
+            "$scell" "$pcell" "$rcell" "$bcell" "$detail"
           ;;
         "$V_SKIP")
-          printf '  %s%s%s  %s%s  %-7s  %s  %s  %s  %s%s\n' \
+          printf '  %s%s%s  %s%s  %-7s  %s  %s  %s  %s  %s%s\n' \
             "$DIM" "$BOX_V" "$NC" \
             "$DIM" "$ICON_SKIP" "SKIP" \
-            "$scell" "$pcell" "$rcell" "$detail" "$NC"
+            "$scell" "$pcell" "$rcell" "$bcell" "$detail" "$NC"
           ;;
       esac
       ;;
     quiet)
       [[ "$verdict" = "$V_VULN" ]] && \
-        printf ' %s%s VULN%s  %s://%s%s  %s  %s\n' \
+        printf ' %s%s VULN%s  %s://%s%s  %s  %s  %s\n' \
           "$RED" "$ICON_VULN" "$NC" \
           "$sch" "$host" "${port:+:$port}" \
-          "$(short_role "$desc")" "$detail"
+          "$(short_role "$desc")" \
+          "$(build_cell "$CUR_BUILD" "$CUR_PATCH_STATUS")" \
+          "$detail"
       ;;
     csv)
-      printf '%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
-        "${host}" "${desc}" "${sch}" "${hh}" "${port}" "${verdict}" "${http}" "${loc}" "${detail//\"/\"\"}"
+      # CUR_* are set by the active probe_target() call before record_result
+      # invokes emit_probe_line — same source the parallel R_* arrays read.
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,"%s","%s",%s,%s,%s\n' \
+        "${host}" "${desc}" "${sch}" "${hh}" "${port}" "${verdict}" "${http}" "${loc}" "${detail//\"/\"\"}" \
+        "${CUR_SERVER_HDR//\"/\"\"}" "${CUR_MAGIC_REV}" "${CUR_BUILD}" "${CUR_PATCH_STATUS}"
       ;;
     # oneline / json: don't print per-probe; emitted in summary
   esac
@@ -711,6 +917,9 @@ record_result() {
   R_DESC+=("$desc"); R_TARGET+=("$target"); R_VERDICT+=("$verdict")
   R_HTTPCODE+=("$http"); R_LOCATION+=("$loc"); R_DETAIL+=("$detail")
   R_SCHEME+=("$sch"); R_HOST+=("$host"); R_PORT+=("$port"); R_HOSTHDR+=("$hh")
+  # Snapshot per-probe stage-0 fingerprint (CUR_* set by probe_target()).
+  R_BUILD+=("$CUR_BUILD"); R_MAGIC_REV+=("$CUR_MAGIC_REV")
+  R_SERVER_HDR+=("$CUR_SERVER_HDR"); R_PATCH_STATUS+=("$CUR_PATCH_STATUS")
   N_TOTAL=$((N_TOTAL+1))
   case "$verdict" in
     "$V_VULN")         N_VULN=$((N_VULN+1)) ;;
@@ -723,7 +932,7 @@ record_result() {
   # surface (e.g. :2087) returns a conclusive SAFE, the host is patched
   # regardless of whether other ports (e.g. :2086) couldn't be probed.
   # SKIP is informational (e.g. force-SSL redirect) and never participates
-  # in the rollup - it neither initializes nor changes the target verdict.
+  # in the rollup — it neither initializes nor changes the target verdict.
   if [[ "$verdict" != "$V_SKIP" ]]; then
     if [[ -z "${TARGET_VERDICT[$host]:-}" ]]; then
       TARGET_VERDICT[$host]="$verdict"
@@ -776,7 +985,65 @@ probe_target() {
   log_v "[$desc] target: ${url}"
   log_v "[$desc] Host header: ${effective_hdr:-<URL hostname>}"
 
-  # Stage 1 - returns "<reason>|<cookie>"
+  # Stage 0 — passive fingerprint (always runs; populates CUR_* used by
+  # record_result for CSV/JSON column population)
+  CUR_BUILD=""; CUR_MAGIC_REV=""; CUR_SERVER_HDR=""; CUR_PATCH_STATUS=""
+  local fp_result fp_status fp_rest
+  fp_result=$(fingerprint_target "$url" "$effective_hdr" "$resolve_pin")
+  fp_status="${fp_result%%|*}"; fp_rest="${fp_result#*|}"
+  CUR_BUILD="${fp_rest%%|*}";    fp_rest="${fp_rest#*|}"
+  CUR_MAGIC_REV="${fp_rest%%|*}"; CUR_SERVER_HDR="${fp_rest#*|}"
+  CUR_PATCH_STATUS=$(compute_patch_status "$CUR_BUILD")
+  log_v "[$desc] stage 0 build: ${CUR_BUILD:-<none>}"
+  log_v "[$desc] stage 0 magic_revision: ${CUR_MAGIC_REV:-<none>}"
+  log_v "[$desc] stage 0 server header: ${CUR_SERVER_HDR:-<none>}"
+  log_v "[$desc] stage 0 patch_status: ${CUR_PATCH_STATUS}"
+
+  # --fingerprint-only: derive verdict from patch_status table and return.
+  # No preauth session minted, no exploit chain, side-effect free.
+  if [[ "$FINGERPRINT_ONLY" = "1" ]]; then
+    local fp_verdict fp_detail
+    if [[ "$fp_status" != "ok" ]]; then
+      fp_verdict="$V_INCONCLUSIVE"
+      case "$fp_status" in
+        transport_6)        fp_detail="stage 0 — DNS resolution failed" ;;
+        transport_7)        fp_detail="stage 0 — TCP refused/timeout (cpsrvd unreachable)" ;;
+        transport_28)       fp_detail="stage 0 — TCP timeout (port firewalled)" ;;
+        transport_35|transport_52|transport_56|transport_60)
+                            fp_detail="stage 0 — TLS handshake failed" ;;
+        *)                  fp_detail="stage 0 — curl ${fp_status}" ;;
+      esac
+    else
+      case "$CUR_PATCH_STATUS" in
+        patched)
+          fp_verdict="$V_SAFE"
+          fp_detail="banner-only fingerprint: $(patch_status_phrase patched "$CUR_BUILD")" ;;
+        patched_eol)
+          fp_verdict="$V_SAFE"
+          fp_detail="banner-only fingerprint: $(patch_status_phrase patched_eol "$CUR_BUILD")" ;;
+        vulnerable)
+          fp_verdict="$V_VULN"
+          fp_detail="banner-only fingerprint: $(patch_status_phrase vulnerable "$CUR_BUILD") — no chain confirmation" ;;
+        eol_no_patch)
+          fp_verdict="$V_VULN"
+          fp_detail="banner-only fingerprint: $(patch_status_phrase eol_no_patch "$CUR_BUILD") — no chain confirmation" ;;
+        unknown|*)
+          fp_verdict="$V_INCONCLUSIVE"
+          if [[ -n "$CUR_BUILD" ]]; then
+            fp_detail="banner-only fingerprint: $(patch_status_phrase unknown "$CUR_BUILD")"
+          elif [[ -n "$CUR_MAGIC_REV" ]]; then
+            fp_detail="banner-only fingerprint: Server: header lacks build; magic_revision=${CUR_MAGIC_REV}"
+          else
+            fp_detail="banner-only fingerprint: no build / no magic_revision parsed (response not from cpsrvd?)"
+          fi
+          ;;
+      esac
+    fi
+    record_result "$desc" "$url" "$fp_verdict" "$fp_detail" "" "" "$scheme" "$host" "$port" "$effective_hdr"
+    return
+  fi
+
+  # Stage 1 — returns "<reason>|<cookie>"
   local s1_result s1_reason cookie
   s1_result=$(mint_preauth "$url" "$effective_hdr" "$resolve_pin")
   s1_reason="${s1_result%%|*}"
@@ -787,23 +1054,23 @@ probe_target() {
   if [[ "$s1_reason" != "ok" ]]; then
     local detail verdict="$V_INCONCLUSIVE"
     case "$s1_reason" in
-      dns_failed)         detail="stage 1 - DNS resolution failed" ;;
-      connect_refused)    detail="stage 1 - TCP refused (cpsrvd not listening on this port)" ;;
-      connect_timeout)    detail="stage 1 - TCP timeout (port firewalled or host unreachable)" ;;
-      tls_failed)         detail="stage 1 - TLS handshake failed" ;;
-      http_421)           detail="stage 1 - HTTP 421 Misdirected (SNI/Host mismatch; try --auto-host-discover)" ;;
+      dns_failed)         detail="stage 1 — DNS resolution failed" ;;
+      connect_refused)    detail="stage 1 — TCP refused (cpsrvd not listening on this port)" ;;
+      connect_timeout)    detail="stage 1 — TCP timeout (port firewalled or host unreachable)" ;;
+      tls_failed)         detail="stage 1 — TLS handshake failed" ;;
+      http_421)           detail="stage 1 — HTTP 421 Misdirected (SNI/Host mismatch; try --auto-host-discover)" ;;
       redirect_to_ssl)
-        # cpsrvd's "force HTTPS" config - this surface just redirects to its
+        # cpsrvd's "force HTTPS" config — this surface just redirects to its
         # SSL counterpart, which is the same daemon. SKIP, not INCONC.
         verdict="$V_SKIP"
-        detail="redirected to ${cookie} - see paired SSL probe"
+        detail="redirected to ${cookie} — see paired SSL probe"
         ;;
       http_*_no_cookie)
         local _code="${s1_reason#http_}"; _code="${_code%_no_cookie}"
-        detail="stage 1 - HTTP ${_code}; no whostmgrsession (response not from cpsrvd?)"
+        detail="stage 1 — HTTP ${_code}; no whostmgrsession (response not from cpsrvd?)"
         ;;
-      transport_*)        detail="stage 1 - curl transport failure (${s1_reason})" ;;
-      *)                  detail="stage 1 - ${s1_reason}" ;;
+      transport_*)        detail="stage 1 — curl transport failure (${s1_reason})" ;;
+      *)                  detail="stage 1 — ${s1_reason}" ;;
     esac
     record_result "$desc" "$url" "$verdict" "$detail" "" "" "$scheme" "$host" "$port" "$effective_hdr"
     return
@@ -812,7 +1079,7 @@ probe_target() {
   # ob_part strip
   local session_base="${cookie%%,*}"
   if [[ "$session_base" = "$cookie" ]]; then
-    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 1 - cookie has no ob_part (unusual cpsrvd configuration)" "" "" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 1 — cookie has no ob_part (unusual cpsrvd configuration)" "" "" "$scheme" "$host" "$port" "$effective_hdr"
     return
   fi
   log_v "[$desc] session_base (ob-stripped): ${session_base}"
@@ -821,7 +1088,7 @@ probe_target() {
   local result status loc
   result=$(inject_probe "$url" "$effective_hdr" "$session_base" "$resolve_pin")
   if [[ -z "$result" ]]; then
-    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 2 - curl transport failure" "" "" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 2 — curl transport failure" "" "" "$scheme" "$host" "$port" "$effective_hdr"
     return
   fi
   status="${result%%|*}"; loc="${result#*|}"
@@ -837,39 +1104,39 @@ probe_target() {
     record_result "$desc" "$url" "$V_SAFE" "HTTP ${status} at stage 2; no /cpsess leak" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
     return
   elif [[ -z "$status" ]]; then
-    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 2 - no HTTP status received" "" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 2 — no HTTP status received" "" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
     return
   else
-    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 2 HTTP ${status}; no /cpsess leak - manual review" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 2 HTTP ${status}; no /cpsess leak — manual review" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
     return
   fi
 
   # --no-verify: stop at stage 2 (v1 heuristic; produces false positives on
   # patched hosts because cpsrvd 307s any cookie-bearing request to /cpsess/)
   if [[ "$NO_VERIFY" = "1" ]]; then
-    record_result "$desc" "$url" "$V_VULN" "HTTP 307; leaked ${cpsess} (stage-2 only - may false-positive)" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_VULN" "HTTP 307; leaked ${cpsess} (stage-2 only — may false-positive)" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
     return
   fi
 
-  # Stage 3 - propagate raw → cache so stage 4 can read the injected session
+  # Stage 3 — propagate raw → cache so stage 4 can read the injected session
   local s3_status
   s3_status=$(propagate_session "$url" "$effective_hdr" "$session_base" "$resolve_pin")
   log_v "[$desc] stage 3 HTTP: ${s3_status:-<none>}"
 
-  # Stage 4 - verify the leaked cpsess actually grants session access
+  # Stage 4 — verify the leaked cpsess actually grants session access
   local s4_result s4_status s4_body
   s4_result=$(verify_session "$url" "$effective_hdr" "$session_base" "$cpsess" "$resolve_pin")
   if [[ -z "$s4_result" ]]; then
     # Stage 5 cleanup even if stage 4 failed (session may still be live)
     invalidate_session "$url" "$effective_hdr" "$session_base" "$cpsess" "$resolve_pin"
-    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 4 - curl transport failure (session left live; auto-expires)" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 4 — curl transport failure (session left live; auto-expires)" "$status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
     return
   fi
   s4_status="${s4_result%%|*}"; s4_body="${s4_result#*|}"
   log_v "[$desc] stage 4 HTTP: ${s4_status:-<none>}"
   log_v "[$desc] stage 4 body: ${s4_body}"
 
-  # Stage 5 - invalidate the forged session (best-effort)
+  # Stage 5 — invalidate the forged session (best-effort)
   invalidate_session "$url" "$effective_hdr" "$session_base" "$cpsess" "$resolve_pin"
 
   # Verdict on stage-4 result
@@ -880,7 +1147,7 @@ probe_target() {
   elif [[ "$s4_status" = "401" ]] || [[ "$s4_status" = "403" ]]; then
     record_result "$desc" "$url" "$V_SAFE" "HTTP 307 was URL canonicalization; verify HTTP ${s4_status} (bypass blocked)" "$s4_status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
   elif [[ -z "$s4_status" ]]; then
-    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 4 - no HTTP status received" "" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
+    record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 4 — no HTTP status received" "" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
   else
     record_result "$desc" "$url" "$V_INCONCLUSIVE" "stage 4 HTTP ${s4_status}; manual review" "$s4_status" "$loc" "$scheme" "$host" "$port" "$effective_hdr"
   fi
@@ -898,7 +1165,7 @@ probe_direct_ports_whm() {
 
 probe_direct_ports_all() {
   # Note: cPanel/Webmail probes use the WHM cookie name (whostmgrsession) so
-  # they will INCONCLUSIVE on those ports - those daemons issue cpsession=
+  # they will INCONCLUSIVE on those ports — those daemons issue cpsession=
   # and webmailsession= respectively. The watchTowr public PoC is WHM-only.
   local target=$1
   for tuple in \
@@ -939,6 +1206,7 @@ emit_json() {
   printf '  "probe_nonce": "%s",\n' "$NONCE"
   printf '  "probe_canary": "%s",\n' "$CANARY"
   printf '  "no_verify": %s,\n' "$([ "$NO_VERIFY" = 1 ] && echo true || echo false)"
+  printf '  "fingerprint_only": %s,\n' "$([ "$FINGERPRINT_ONLY" = 1 ] && echo true || echo false)"
   printf '  "summary": {"vuln":%d,"safe":%d,"inconclusive":%d,"total":%d},\n' \
     "$N_VULN" "$N_SAFE" "$N_INC" "$N_TOTAL"
   printf '  "targets": [\n'
@@ -953,7 +1221,7 @@ emit_json() {
   first=1
   for ((i=0; i<n; i++)); do
     [[ $first -eq 0 ]] && printf ',\n'; first=0
-    printf '    {"description": "%s", "target": "%s", "scheme": "%s", "host": "%s", "port": "%s", "host_header": "%s", "verdict": "%s", "http_code": "%s", "location": "%s", "detail": "%s"}' \
+    printf '    {"description": "%s", "target": "%s", "scheme": "%s", "host": "%s", "port": "%s", "host_header": "%s", "verdict": "%s", "http_code": "%s", "location": "%s", "detail": "%s", "server_header": "%s", "magic_revision": "%s", "build_string": "%s", "patch_status": "%s"}' \
       "$(json_escape "${R_DESC[$i]}")" \
       "$(json_escape "${R_TARGET[$i]}")" \
       "$(json_escape "${R_SCHEME[$i]}")" \
@@ -963,14 +1231,18 @@ emit_json() {
       "$(json_escape "${R_VERDICT[$i]}")" \
       "$(json_escape "${R_HTTPCODE[$i]}")" \
       "$(json_escape "${R_LOCATION[$i]}")" \
-      "$(json_escape "${R_DETAIL[$i]}")"
+      "$(json_escape "${R_DETAIL[$i]}")" \
+      "$(json_escape "${R_SERVER_HDR[$i]}")" \
+      "$(json_escape "${R_MAGIC_REV[$i]}")" \
+      "$(json_escape "${R_BUILD[$i]}")" \
+      "$(json_escape "${R_PATCH_STATUS[$i]}")"
   done
   printf '\n  ]\n'
   printf '}\n'
 }
 
 emit_csv_header() {
-  printf 'host,description,scheme,host_header,port,verdict,http_code,location,detail\n'
+  printf 'host,description,scheme,host_header,port,verdict,http_code,location,detail,server_header,magic_revision,build_string,patch_status\n'
 }
 
 emit_oneline() {
@@ -1013,7 +1285,7 @@ emit_summary() {
     printf '  %s%s%s\n' "$DIM" "$RULE_SINGLE" "$NC"
   fi
 
-  # Verdict line (printed in text + quiet) - based on TARGET rollup, not
+  # Verdict line (printed in text + quiet) — based on TARGET rollup, not
   # probe-level counts. A target with one SAFE + one INCONC is patched.
   if [[ "$OUTPUT_MODE" = "text" || "$OUTPUT_MODE" = "quiet" ]]; then
     local vlabel vcolor
@@ -1070,6 +1342,8 @@ parse_args() {
       --no-color)           NO_COLOR_FLAG=1 ;;
       --no-progress)        PROGRESS=0 ;;
       --no-verify)          NO_VERIFY=1 ;;
+      --fingerprint-only|--fp-only)
+                            FINGERPRINT_ONLY=1 ;;
       --cleanup)            EMIT_CLEANUP=1 ;;
       -v|--verbose)         VERBOSE=1 ;;
       -h|--help)            init_colors; usage; exit 0 ;;
@@ -1099,7 +1373,7 @@ main() {
   # cleans sessions left by ANY past probe run (any nonce).
   if [[ "$EMIT_CLEANUP" = "1" ]]; then
     cat <<'CLEANUP_EOF'
-# sessionscribe-remote-probe cleanup - removes session files left by past probe runs.
+# sessionscribe-remote-probe cleanup — removes session files left by past probe runs.
 # Matches nxesec_canary_* (all probe nonces). Run as root on each target.
 grep -l "nxesec_canary_" \
      /var/cpanel/sessions/raw/* \
@@ -1138,6 +1412,10 @@ CLEANUP_EOF
     printf '  %sTargets%s    %d\n'  "$DIM" "$NC" "${#TARGETS[@]}"
     if [[ "$NO_VERIFY" = "1" ]]; then
       printf '  %sMode%s       %s--no-verify (stage-2 heuristic; FALSE POSITIVES on patched hosts)%s\n' \
+        "$DIM" "$NC" "$YELLOW" "$NC"
+    fi
+    if [[ "$FINGERPRINT_ONLY" = "1" ]]; then
+      printf '  %sMode%s       %s--fingerprint-only (stage 0 banner only — lower confidence than full chain)%s\n' \
         "$DIM" "$NC" "$YELLOW" "$NC"
     fi
   fi
@@ -1186,7 +1464,7 @@ CLEANUP_EOF
     text|quiet) emit_summary ;;
   esac
 
-  # Exit code - based on TARGET-level rollup
+  # Exit code — based on TARGET-level rollup
   local et_vuln=0 et_inc=0 et_safe=0
   for h in "${TARGET_ORDER[@]}"; do
     case "${TARGET_VERDICT[$h]}" in
