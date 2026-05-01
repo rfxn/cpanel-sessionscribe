@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.5.7
+# sessionscribe-ioc-scan.sh v1.5.8
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.5.7"
+VERSION="1.5.8"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -264,6 +264,17 @@ SYSLOG=0
 # with the same RUN_ID for correlation. Default off; opt-in only.
 CHAIN_FORENSIC=0
 
+# --chain-upload: forward --upload to the chained forensic so its bundle is
+# PUT to the R-fx intake (default https://intake.rfxn.com/, overridable).
+# Implies --chain-forensic. CLEAN hosts still skip the entire chain (and
+# thus the upload) - we don't ship empty bundles.
+# --upload-url / --upload-token: pass-through for forensic's --upload-url /
+# --upload-token. Empty defaults => forensic uses its own built-in defaults
+# and RFXN_INTAKE_TOKEN env resolution.
+CHAIN_UPLOAD=0
+CHAIN_UPLOAD_URL=""
+CHAIN_UPLOAD_TOKEN=""
+
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
 # Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
@@ -344,6 +355,16 @@ Forensic chaining:
                              exit code is reported as a chain.forensic_exit
                              signal but does not override this script's
                              exit code.
+      --chain-upload         Forward --upload to the chained forensic so
+                             its bundle is submitted to the R-fx intake.
+                             Implies --chain-forensic. CLEAN hosts skip
+                             the chain (and the upload) - empty bundles
+                             are not shipped.
+      --upload-url URL       Forward --upload-url URL to forensic
+                             (default https://intake.rfxn.com/).
+      --upload-token TOKEN   Forward --upload-token TOKEN to forensic.
+                             Resolution: this flag > $RFXN_INTAKE_TOKEN
+                             env > forensic's built-in convenience token.
 
 Misc:
       --timeout N            Probe timeout in seconds (default 8).
@@ -373,6 +394,9 @@ while [[ $# -gt 0 ]]; do
         --ledger-dir)         LEDGER_DIR="$2"; shift 2 ;;
         --syslog)             SYSLOG=1; shift ;;
         --chain-forensic)     CHAIN_FORENSIC=1; shift ;;
+        --chain-upload)       CHAIN_UPLOAD=1; CHAIN_FORENSIC=1; shift ;;
+        --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
+        --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
@@ -2547,9 +2571,18 @@ chain_forensic_dispatch() {
     fi
     local args=(--quiet --no-color)
     [[ -n "$SINCE_DAYS" ]] && args+=(--since "$SINCE_DAYS")
+    if (( CHAIN_UPLOAD )); then
+        args+=(--upload)
+        [[ -n "$CHAIN_UPLOAD_URL" ]]   && args+=(--upload-url   "$CHAIN_UPLOAD_URL")
+        [[ -n "$CHAIN_UPLOAD_TOKEN" ]] && args+=(--upload-token "$CHAIN_UPLOAD_TOKEN")
+    fi
     section "Chaining sessionscribe-forensic.sh (run_id=$RUN_ID, origin=$forensic_origin)"
+    local upload_note=""
+    (( CHAIN_UPLOAD )) && upload_note=" upload=on(${CHAIN_UPLOAD_URL:-default})"
     emit "chain" "forensic_dispatch" "info" "chain_forensic_started" 0 \
-         "path" "$forensic_path" "origin" "$forensic_origin" "run_id" "$RUN_ID"
+         "path" "$forensic_path" "origin" "$forensic_origin" "run_id" "$RUN_ID" \
+         "upload" "$CHAIN_UPLOAD" \
+         "note" "dispatching forensic chain${upload_note}"
     local fexit=0
     SESSIONSCRIBE_RUN_ID="$RUN_ID" \
         bash "$forensic_path" "${args[@]}" >/dev/null 2>&1 || fexit=$?
