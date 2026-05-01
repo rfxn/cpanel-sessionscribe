@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.4
+# sessionscribe-forensic.sh v0.9.5
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.4"
+VERSION="0.9.5"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -1115,9 +1115,21 @@ pattern_g_deep_checks() {
         | grep -vE '^(/etc/ssh/ssh_host_|/etc/ssh/sshd_config|/etc/skel/\.ssh/|/etc/cpanel-known-hosts|'"$MITIGATE_BACKUP_ROOT"')' \
         | head -100)
     if [[ -n "$ssh_rsa_locations" ]]; then
-        local f m c
+        local f m c f_total f_known f_unknown
         while IFS= read -r f; do
             [[ -z "$f" ]] && continue
+            # Filter out files where every ssh-* line is a known-good LW
+            # provisioning key (Parent Child key for <PJID>, lwadmin,
+            # liquidweb, nexcess). Legitimate placements in /etc and
+            # /var/spool/cron should not surface as Pattern G IOCs.
+            f_total=$(grep -cE 'ssh-(rsa|ed25519|ecdsa|dss)[[:space:]]+[A-Za-z0-9+/=]{20,}' "$f" 2>/dev/null)
+            f_total="${f_total:-0}"
+            if (( f_total > 0 )); then
+                f_known=$(grep -cE "ssh-(rsa|ed25519|ecdsa|dss)[[:space:]]+[A-Za-z0-9+/=]{20,}.*${SSH_KNOWN_GOOD_RE}" "$f" 2>/dev/null)
+                f_known="${f_known:-0}"
+                f_unknown=$(( f_total - f_known ))
+                (( f_unknown <= 0 )) && continue
+            fi
             m=$(stat -c %Y "$f" 2>/dev/null)
             c=$(stat -c %Z "$f" 2>/dev/null)
             say_ioc "PATTERN-G: ssh key material in non-canonical location: $f"
