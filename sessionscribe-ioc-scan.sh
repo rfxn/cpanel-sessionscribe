@@ -891,21 +891,21 @@ emit() {
 print_signal_human() {
     (( QUIET )) && return
     local area="$1" id="$2" severity="$3" key="$4"; shift 4
-    local icon color
+    local tag color
     case "$severity" in
-        strong)   icon="✗"; color="$RED" ;;
-        evidence) icon="!"; color="$YELLOW" ;;
-        warning)  icon="⚠"; color="$YELLOW" ;;
-        advisory) icon="⚐"; color="$CYAN" ;;
-        error)    icon="X"; color="$RED" ;;
+        strong)   tag="[IOC]";      color="$RED"    ;;
+        evidence) tag="[EVIDENCE]"; color="$YELLOW" ;;
+        warning)  tag="[WARN]";     color="$YELLOW" ;;
+        advisory) tag="[ADVISORY]"; color="$CYAN"   ;;
+        error)    tag="[ERR]";      color="$RED"    ;;
         info)
             case "$key" in
                 patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs)
-                    icon="✓"; color="$GREEN" ;;
-                *) icon="·"; color="$DIM" ;;
+                    tag="[OK]"; color="$GREEN" ;;
+                *)  tag="[..]"; color="$DIM"   ;;
             esac
             ;;
-        *) icon=" "; color="$DIM" ;;
+        *) tag="[..]"; color="$DIM" ;;
     esac
 
     # Extract the display-relevant fields from kv pairs. Operators need
@@ -945,11 +945,11 @@ print_signal_human() {
         shift 2
     done
 
-    # Header line: id + note (or key as fallback)
+    # Header line: tag + id + note (or key as fallback)
     if [[ -n "$note" ]]; then
-        printf '   %s%s%s %-44s %s%s%s\n' "$color" "$icon" "$NC" "$id" "$DIM" "$note" "$NC" >&2
+        printf '  %s%-10s%s %-44s %s%s%s\n' "$color" "$tag" "$NC" "$id" "$DIM" "$note" "$NC" >&2
     else
-        printf '   %s%s%s %-44s %s%s%s\n' "$color" "$icon" "$NC" "$id" "$DIM" "$key" "$NC" >&2
+        printf '  %s%-10s%s %-44s %s%s%s\n' "$color" "$tag" "$NC" "$id" "$DIM" "$key" "$NC" >&2
     fi
 
     # Suppress detail for known-clean info rows whose payload is meaningless.
