@@ -84,19 +84,21 @@
 
 set -u
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 ###############################################################################
 # Constants
 ###############################################################################
 
 # Vendor-published patched builds (cPanel KB 40073787579671, post-04/29
-# advisory revision: tier 130 added at .19; EL6 path 11.86.0.41 included).
-# WP Squared product line: separate patch at build 136.1.7.
+# advisory revision: tier 130 added at .19; tier 124 .35 added; EL6 path
+# 11.86.0.41 included). WP Squared product line: separate patch at build
+# 136.1.7.
 PATCHED_BUILDS_CPANEL=(
   "11.86.0.41"
   "11.110.0.97"
   "11.118.0.63"
+  "11.124.0.35"
   "11.126.0.54"
   "11.130.0.19"
   "11.132.0.29"
@@ -106,7 +108,9 @@ PATCHED_BUILDS_CPANEL=(
 PATCHED_BUILD_WPSQUARED="136.1.7"
 
 # Tiers explicitly excluded from the patch list - no in-place fix exists.
-UNPATCHED_TIERS=(112 114 116 120 122 124 128)
+# Tier 124 was here pre-advisory; given a .35 in-place patch and moved
+# into PATCHED_BUILDS_CPANEL above.
+UNPATCHED_TIERS=(112 114 116 120 122 128)
 
 # cpsrvd direct-listener ports. cPanel/WHM/Webmail (non-SSL/SSL pairs).
 CPSRVD_PORTS=(2082 2083 2086 2087 2095 2096)
