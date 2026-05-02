@@ -829,5 +829,5 @@ All four now use `split($N, p, " ")` matching the canonical awk signature and th
 - Manual extraction on host2 against a real access_log line: `ip=80.75.212.14 path=/cpsess.../json-api/version status=200` (was `path=[] status=[]` pre-fix)
 - Live re-run on host2 (post-deploy) — kill-chain.tsv structured field check (gate 5)
 
-**Status:** COMPLETE — pre10 @ <commit-hash>
+**Status:** COMPLETE — pre10 @ b37cb92
 
