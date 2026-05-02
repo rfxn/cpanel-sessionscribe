@@ -225,6 +225,7 @@ Establish the new key vocabulary and pattern-letter mappings without changing an
 ---
 
 ### Phase 2: cpsess-split for `ioc_attacker_ip_in_access_log` (THE HEADLINE)
+**Status:** COMPLETE — pre2 @ (pending commit)
 
 Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on URLs containing `/cpsess<10digits>/` is **real exploitation evidence** (severity=strong, key=`ioc_attacker_ip_2xx_on_cpsess`, pattern=X); 2xx on any other path is **reconnaissance only** (severity=info, key=`ioc_attacker_ip_recon_only`, pattern=init). 4xx-only retains its warning-tier emit. The legacy key `ioc_attacker_ip_in_access_log` is kept as a parent rollup signal at info-tier so existing fleet aggregator queries continue to find a key for "T1 IPs were observed."
 
@@ -257,7 +258,7 @@ Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on U
   - **No 2xx, all 4xx:** same as today — warning-tier `ioc_attacker_ip_in_access_log_probes_only` (rename of today's path-agnostic warning). Optionally rename to remove `in_access_log` for symmetry; not required.
 - **Regression-case**: live regression on host2 — pre/post diff of stderr verdict block. Expected delta: identical patterns/destruction signals; new strong emit `ioc_attacker_ip_2xx_on_cpsess`; legacy `ioc_attacker_ip_in_access_log` either disappears (if fully replaced) or demotes to info-tier rollup. HOST_VERDICT stays COMPROMISED. Total `ioc_critical` count may shift by ±1 depending on legacy-emit handling.
 
-- [ ] **Step 1: Extend the awk pass to count `2xx_on_cpsess` separately**
+- [x] **Step 1: Extend the awk pass to count `2xx_on_cpsess` separately**
 
   Location: `sessionscribe-ioc-scan.sh` lines ~3580-3650 (the awk block inside `check_attacker_ips`). Add a second 2xx counter that increments only when the path matches `/cpsess<10digits>/`:
 
@@ -281,7 +282,7 @@ Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on U
 
   Update the bash `IFS=$'\t' read` line to absorb the two new fields.
 
-- [ ] **Step 2: Replace the strong-on-any-2xx emit with the path-aware emit chain**
+- [x] **Step 2: Replace the strong-on-any-2xx emit with the path-aware emit chain**
 
   Location: `sessionscribe-ioc-scan.sh` lines 3672-3692.
 
@@ -326,7 +327,7 @@ Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on U
   fi
   ```
 
-- [ ] **Step 3: Preserve the per-event sample emits but key them to the new parent**
+- [x] **Step 3: Preserve the per-event sample emits but key them to the new parent**
 
   Location: `sessionscribe-ioc-scan.sh` lines 3694-3702 (the per-event sample loop). The `ioc_attacker_ip_sample` info emits stay info-severity (already filtered out of OFFENSE_EVENTS). No structural change — but update the log message to reference whichever parent fired.
 
