@@ -383,6 +383,19 @@ CHAIN_UPLOAD_TOKEN=""
 # exploitation evidence.
 CHAIN_ON_CRITICAL=0
 
+# Forensic / merged-mode defaults (post-merge v2.0.0).
+FULL_MODE=0                             # 1 if --full set (or back-compat chain flag)
+REPLAY_PATH=""                          # set by --replay PATH
+REPLAY_MODE=0                           # 1 if --replay PATH set (skip detection)
+DO_BUNDLE=1                             # default ON when --full active; --no-bundle disables
+BUNDLE_DIR_ROOT="$DEFAULT_BUNDLE_DIR_ROOT"
+MAX_BUNDLE_MB="$DEFAULT_MAX_BUNDLE_MB"
+EXTRA_LOGS_DIR=""
+INCLUDE_HOMEDIR_HISTORY=1
+DO_UPLOAD=0
+INTAKE_URL="$INTAKE_DEFAULT_URL"
+INTAKE_TOKEN=""
+
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
 # Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
@@ -454,34 +467,50 @@ Run ledger (default ON):
       --syslog               Emit a one-line summary via logger -t
                              sessionscribe-ioc -p auth.notice on completion.
 
-Forensic chaining:
-      --chain-forensic       After scan, if host_verdict != CLEAN, exec
-                             sessionscribe-forensic.sh with
-                             --since/--no-color/--quiet inherited and a
-                             shared RUN_ID. Resolution order: (1) sibling
-                             of this script, (2) PATH, (3) GitHub raw
-                             (rfxn/cpanel-sessionscribe@main). Forensic
-                             exit code is reported as a chain.forensic_exit
-                             signal but does not override this script's
-                             exit code.
-      --chain-upload         Forward --upload to the chained forensic so
-                             its bundle is submitted to the R-fx intake.
-                             Implies --chain-forensic. CLEAN hosts skip
-                             the chain (and the upload) - empty bundles
-                             are not shipped.
-      --upload-url URL       Forward --upload-url URL to forensic
-                             (default https://intake.rfxn.com/).
-      --upload-token TOKEN   Forward --upload-token TOKEN to forensic.
-                             Resolution: this flag > $RFXN_INTAKE_TOKEN
-                             env > forensic's built-in convenience token.
-      --chain-on-critical    Narrow the chain gate to host_verdict==
-                             COMPROMISED (strong host-state IOC fired).
-                             SUSPICIOUS hosts skip forensic in this mode.
-                             Implies --chain-forensic. Useful for fleet
-                             runs where you only want kill-chain
-                             reconstruction on conclusively-exploited
-                             hosts. Combine with --chain-upload for
-                             COMPROMISED-only bundle submission.
+Mode (post-merge v2.0.0):
+      --triage               Detection only (default). Writes envelope to
+                             run-ledger; no defense timeline / kill-chain /
+                             bundle. Same shape as ioc-scan v1.x.
+      --full                 Detection + forensic phases (defense / offense /
+                             reconcile / kill-chain / bundle). Artifact
+                             capture on by default; disable with no-bundle
+                             for kill-chain reconstruction without a tar.
+      --replay PATH          Skip detection; replay forensic phases against
+                             a saved envelope (.json file), bundle directory
+                             (containing the envelope), or bundle tarball
+                             (.tgz / .tar.gz -- envelope extracted to /tmp).
+                             Bundle and upload flags still respected if set.
+                             Useful for re-rendering the kill chain or
+                             re-submitting a captured bundle without re-
+                             scanning the host.
+
+Bundle (active in full or replay mode):
+      --bundle               Capture artifact tarball to $BUNDLE_DIR_ROOT/
+                             <ts>-<run_id>/ (default ON in full mode)
+      --no-bundle            Skip bundle capture (recommended on Pattern A
+                             hosts where du+tar would compete with the
+                             encryptor for IO)
+      --bundle-dir DIR       Override $BUNDLE_DIR_ROOT
+                             (default: /root/.ic5790-forensic)
+      --max-bundle-mb N      Per-tarball size cap in MB (0 = no cap;
+                             default: 2048)
+      --extra-logs DIR       Additional access-log directory to scan (e.g.
+                             an expanded archive of rotated logs)
+      --no-history           Skip /home/*/.bash_history bundle capture
+
+Upload (off by default):
+      --upload               Submit bundle to $INTAKE_URL after capture.
+                             Intake URL and token can be overridden via the
+                             upload-url / upload-token flags documented in
+                             the Misc section below. Token resolution order:
+                             flag > $RFXN_INTAKE_TOKEN env > built-in token
+                             (1000-PUT cap; proj@rfxn.com for fleet token).
+
+Back-compat aliases (deprecated; set full-mode + the relevant gate):
+      --chain-forensic       equivalent to full mode (no host-verdict gate)
+      --chain-on-critical    full mode only if host_verdict == COMPROMISED
+                             (CLEAN/SUSPICIOUS skip forensic phases)
+      --chain-upload         full mode with upload enabled
 
 Misc:
       --timeout N            Probe timeout in seconds (default 8).
@@ -510,11 +539,29 @@ while [[ $# -gt 0 ]]; do
         --no-ledger)          NO_LEDGER=1; shift ;;
         --ledger-dir)         LEDGER_DIR="$2"; shift 2 ;;
         --syslog)             SYSLOG=1; shift ;;
-        --chain-forensic)     CHAIN_FORENSIC=1; shift ;;
-        --chain-upload)       CHAIN_UPLOAD=1; CHAIN_FORENSIC=1; shift ;;
+        --triage)             FULL_MODE=0; REPLAY_MODE=0; shift ;;
+        --full)               FULL_MODE=1; shift ;;
+        --replay)             REPLAY_MODE=1
+                              if [[ $# -ge 2 ]]; then
+                                  REPLAY_PATH="$2"; shift 2
+                              else
+                                  REPLAY_PATH=""; shift
+                              fi
+                              ;;
+        --bundle)             DO_BUNDLE=1; shift ;;
+        --no-bundle)          DO_BUNDLE=0; shift ;;
+        --bundle-dir)         BUNDLE_DIR_ROOT="$2"; shift 2 ;;
+        --max-bundle-mb)      MAX_BUNDLE_MB="$2"; shift 2 ;;
+        --extra-logs)         EXTRA_LOGS_DIR="$2"; shift 2 ;;
+        --no-history)         INCLUDE_HOMEDIR_HISTORY=0; shift ;;
+        --upload)             DO_UPLOAD=1; shift ;;
+        # Back-compat aliases -- set --full + the legacy gate flags so the
+        # main-flow gating logic (Phase 5) honors the original semantics.
+        --chain-forensic)     FULL_MODE=1; CHAIN_FORENSIC=1; shift ;;
+        --chain-upload)       FULL_MODE=1; DO_UPLOAD=1; CHAIN_UPLOAD=1; CHAIN_FORENSIC=1; shift ;;
         --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
         --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
-        --chain-on-critical)  CHAIN_ON_CRITICAL=1; CHAIN_FORENSIC=1; shift ;;
+        --chain-on-critical)  FULL_MODE=1; CHAIN_ON_CRITICAL=1; CHAIN_FORENSIC=1; shift ;;
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
@@ -530,11 +577,49 @@ if (( CSV && JSONL )); then
     exit 3
 fi
 
+# --replay requires a path arg.
+if (( REPLAY_MODE )) && [[ -z "$REPLAY_PATH" ]]; then
+    echo "Error: --replay requires PATH (envelope .json, bundle directory, or .tgz)" >&2
+    exit 3
+fi
+# --replay implies --full (forensic phases are the whole point of replay).
+(( REPLAY_MODE )) && FULL_MODE=1
+# --upload requires --full or --replay (something to upload).
+if (( DO_UPLOAD )) && ! (( FULL_MODE || REPLAY_MODE )); then
+    echo "Error: --upload requires --full or --replay (no bundle without forensic mode)" >&2
+    exit 3
+fi
+# --full requires the envelope on disk so forensic phases can read it via
+# the same code path as --replay. --no-ledger disables that write -- silently
+# producing an empty kill-chain. Reject the combination explicitly.
+if (( FULL_MODE )) && (( ! REPLAY_MODE )) && (( NO_LEDGER )); then
+    echo "Error: --full is incompatible with --no-ledger (forensic phases require the envelope on disk; use --ledger-dir to override the location instead)" >&2
+    exit 3
+fi
+# Resolve upload token at parse time. Order: --upload-token > env > built-in.
+if (( DO_UPLOAD )); then
+    INTAKE_TOKEN="${CHAIN_UPLOAD_TOKEN:-${RFXN_INTAKE_TOKEN:-$INTAKE_DEFAULT_TOKEN}}"
+    [[ -n "$CHAIN_UPLOAD_URL" ]] && INTAKE_URL="$CHAIN_UPLOAD_URL"
+fi
+# Validate --max-bundle-mb is a non-negative integer.
+if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
+    echo "Error: --max-bundle-mb requires a non-negative integer (MB)" >&2
+    exit 3
+fi
+
 # Compute --since cutoff from days-back if requested.
 if [[ -n "$SINCE_DAYS" ]]; then
     if ! [[ "$SINCE_DAYS" =~ ^[0-9]+$ ]]; then
         echo "Error: --since requires a positive integer (days)" >&2; exit 3
     fi
+    SINCE_EPOCH=$(( $(date -u +%s) - SINCE_DAYS * 86400 ))
+fi
+
+# Forensic mode default --since: 90 days (covers full pre-disclosure window
+# for CVE-2026-41940). Triage default remains "no filter" for backward
+# compatibility with v1.x ioc-scan.
+if (( FULL_MODE || REPLAY_MODE )) && [[ -z "$SINCE_DAYS" ]]; then
+    SINCE_DAYS="$DEFAULT_FORENSIC_SINCE_DAYS"
     SINCE_EPOCH=$(( $(date -u +%s) - SINCE_DAYS * 86400 ))
 fi
 
