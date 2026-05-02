@@ -5179,6 +5179,11 @@ aggregate_verdict() {
     REASONS=()
     IOC_KEYS=()
     ADVISORIES=()
+    # Reset per-area verdict tracking. Worst-wins ladder:
+    #   [IOC] > [VULN] > [WARN] > [ADVISORY] > [OK] > [..] (skipped/empty)
+    SECTION_VERDICT=()
+    SECTION_COUNTS=()
+    SECTION_KEYS=()
     # Length-check guard: SIGNALS may be empty (e.g. snapshot mode skipping
     # the destruction scan with no upstream IOC emits). Bash 4.1 (CL6) trips
     # `set -u` on ${arr[@]} of an empty declared array.
@@ -5195,6 +5200,53 @@ aggregate_verdict() {
                 probe_canary_session|probe_artifact_count)
                     ((probe_artifact_count++)) ;;
             esac
+            # Per-section verdict: track worst tag observed per area.
+            # Worst-wins ladder: [IOC] > [VULN] > [WARN] > [ADVISORY] > [OK].
+            # local _tag="" re-initializes on each loop iteration (local is
+            # function-scoped in bash, not loop-scoped; the declaration is
+            # idempotent after the first pass). The per-iteration reset
+            # prevents a high-tier tag from bleeding into the next SIGNALS[]
+            # row when a later row's severity has no tag mapping.
+            local _tag=""
+            case "$sev" in
+                strong)
+                    if [[ "$key" == ioc_* ]]; then _tag="[IOC]"; else _tag="[VULN]"; fi ;;
+                evidence|warning) _tag="[WARN]" ;;
+                advisory)         _tag="[ADVISORY]" ;;
+                info)
+                    case "$key" in
+                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs)
+                            _tag="[OK]" ;;
+                    esac
+                    ;;
+            esac
+            if [[ -n "$_tag" ]]; then
+                local _cur="${SECTION_VERDICT[$area]:-}"
+                if [[ -z "$_cur" ]] \
+                   || [[ "$_cur" == "[OK]" ]] \
+                   || [[ "$_cur" == "[ADVISORY]" && "$_tag" =~ ^\[(WARN|VULN|IOC)\]$ ]] \
+                   || [[ "$_cur" == "[WARN]" && "$_tag" =~ ^\[(VULN|IOC)\]$ ]] \
+                   || [[ "$_cur" == "[VULN]" && "$_tag" == "[IOC]" ]]; then
+                    SECTION_VERDICT[$area]="$_tag"
+                fi
+            fi
+            # Per-area roll-up counts (used in matrix detail column).
+            case "$sev" in
+                strong)   SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} ioc" ;;
+                warning|evidence) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} warn" ;;
+                advisory) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} advisory" ;;
+                info)
+                    case "$key" in
+                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs)
+                            SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} ok" ;;
+                    esac
+                    ;;
+            esac
+            # Per-area unique key list (used by --verbose matrix expansion).
+            # Append to a space-joined string; print_section_matrix dedupes via sort -u.
+            if [[ "$sev" == "strong" || "$sev" == "warning" || "$sev" == "evidence" || "$sev" == "advisory" ]]; then
+                SECTION_KEYS[$area]="${SECTION_KEYS[$area]:-} $key"
+            fi
             weight="${weight:-0}"
             case "$sev" in
                 strong)
@@ -5317,9 +5369,64 @@ aggregate_verdict() {
     fi
 }
 
+# Per-section verdict matrix - mitigate-style 7-row table rendered at the
+# top of print_verdict. Reads SECTION_VERDICT[] + SECTION_COUNTS[] populated
+# by aggregate_verdict(). Each row: <tag> <section_label> <count_summary>.
+# Areas with no signals render as [..] / "skipped".
+print_section_matrix() {
+    (( QUIET )) && return
+    local area label tag counts color tok
+    local n_ioc n_warn n_adv n_ok detail
+    for area in "${SECTION_ORDER[@]}"; do
+        label="${SECTION_LABEL[$area]:-$area}"
+        tag="${SECTION_VERDICT[$area]:-[..]}"
+        counts="${SECTION_COUNTS[$area]:-}"
+        n_ioc=0; n_warn=0; n_adv=0; n_ok=0
+        for tok in $counts; do
+            case "$tok" in
+                ioc)      ((n_ioc++)) ;;
+                warn)     ((n_warn++)) ;;
+                advisory) ((n_adv++)) ;;
+                ok)       ((n_ok++)) ;;
+            esac
+        done
+        if [[ -z "$counts" ]]; then
+            detail="skipped"
+        else
+            detail=""
+            (( n_ioc  > 0 )) && detail+="${detail:+, }${n_ioc} ioc"
+            (( n_warn > 0 )) && detail+="${detail:+, }${n_warn} warn"
+            (( n_adv  > 0 )) && detail+="${detail:+, }${n_adv} advisory"
+            (( n_ok   > 0 )) && detail+="${detail:+, }${n_ok} ok"
+        fi
+        color="$DIM"
+        case "$tag" in
+            "[IOC]"|"[VULN]"|"[ERR]") color="$RED"    ;;
+            "[WARN]")                  color="$YELLOW" ;;
+            "[ADVISORY]")              color="$CYAN"   ;;
+            "[OK]")                    color="$GREEN"  ;;
+            "[..]")                    color="$DIM"    ;;
+        esac
+        printf '  %s%-10s%s %-10s %s%s%s\n' \
+            "$color" "$tag" "$NC" "$label" "$DIM" "$detail" "$NC" >&2
+        # --verbose: list unique IOC keys for this area, indented under the row.
+        # Restores per-section signal vocabulary that the count-only form summarizes.
+        if (( VERBOSE )) && [[ -n "${SECTION_KEYS[$area]:-}" ]]; then
+            local k
+            for k in $(printf '%s\n' ${SECTION_KEYS[$area]} | sort -u); do
+                printf '             %s%s%s\n' "$DIM" "$k" "$NC" >&2
+            done
+        fi
+    done
+    printf '\n' >&2
+}
+
 print_verdict() {
     (( QUIET )) && return
     hdr_section "summary" "code state + host posture"
+    sayf '  host: %s   os: %s   cpanel: %s\n\n' \
+        "$HOSTNAME_FQDN" "${OS_PRETTY:-unknown}" "${CPANEL_NORM:-unknown}"
+    print_section_matrix
     sayf '   strong-vuln signals : %s%d%s\n' "$RED" "$STRONG_COUNT" "$NC"
     sayf '   patched signals     : %s%d%s\n' "$GREEN" "$FIXED_COUNT" "$NC"
     sayf '   inconclusive        : %s%d%s\n' "$YELLOW" "$INCONCLUSIVE_COUNT" "$NC"
