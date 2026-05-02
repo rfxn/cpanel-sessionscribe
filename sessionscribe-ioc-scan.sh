@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -152,6 +152,18 @@ PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
 # Forgery cleartext like `pass=x` is single-digit. Anything below this floor
 # combined with successful_*_auth_with_timestamp is treated as forgery evidence.
 PASS_FORGERY_MAX_LEN=12
+
+# Pattern E proximity window vs ioc_attacker_ip_2xx_on_cpsess (seconds).
+# Pattern E (websocket/Shell access) and 2xx_on_cpsess (token successfully
+# used) co-occur within an operator session - typically minutes-to-hours
+# apart for a single attacker engagement, occasionally across a multi-day
+# operator window. 7 days is wide enough to capture multi-day attacker
+# sessions while excluding unrelated months-apart events (testdev pattern:
+# Pattern E 2025-11-24, 2xx_on_cpsess 2026-03-26, both pre-CRLF noise).
+# Used by the v2.4.0 pre-compromise gate to distinguish post-CRLF
+# exploitation Pattern E from orphan Pattern E with no nearby exploitation
+# success.
+PATTERN_E_2XX_PROXIMITY_SEC=604800
 
 # Session-file mtime/ctime divergence threshold (seconds). cpsrvd's
 # write-session path sets both timestamps atomically, so a legitimate
@@ -722,6 +734,24 @@ CODE_VERDICT="UNKNOWN"
 VERDICT="UNKNOWN"
 EXIT_CODE=0
 
+# v2.4.0 pre-compromise gate state. Populated during check_logs:
+#   LOGS_CRLF_CHAIN_FIRST_EPOCH   first ts of ioc_cve_2026_41940_crlf_access_chain
+#                                 (set by check_crlf_access_primitive). 0 if CRLF
+#                                 chain did not fire on this host. The "is the
+#                                 host actually compromised via CVE-2026-41940?"
+#                                 anchor — second-order signals (token
+#                                 consumption, websocket Shell access) before
+#                                 this epoch are pre-compromise noise.
+#   LOGS_2XX_CPSESS_FIRST_EPOCH   first ts of ioc_attacker_ip_2xx_on_cpsess
+#                                 (set by check_attacker_ips, only when the
+#                                 emit passes the CRLF gate at strong tier).
+#                                 Used as proximity anchor for Pattern E gate
+#                                 in check_destruction_iocs (Pattern E should
+#                                 be co-temporal with successful token use,
+#                                 within PATTERN_E_2XX_PROXIMITY_SEC window).
+LOGS_CRLF_CHAIN_FIRST_EPOCH=0
+LOGS_2XX_CPSESS_FIRST_EPOCH=0
+
 # PATCHED_BUILDS_CPANEL / PATCHED_BUILD_WPSQUARED / CPANEL_NORM / PRIMARY_IP /
 # OS_PRETTY / LP_UID / INCIDENT_ID: referenced by write_kill_chain_primitives
 # and phase_defense. Set during main flow (check_version / banner / local_init);
@@ -1185,6 +1215,14 @@ ioc_key_to_pattern() {
     # Specific keys MUST appear before the ioc_attacker_ip* glob or the
     # glob captures them first (case is first-match, not best-match).
     case "$1" in
+        # v2.4.0 pre-compromise gate keys (advisory tier, not real
+        # exploitation). MUST appear before ioc_pattern_e_* + ioc_attacker_ip*
+        # globs so the case-first-match rule routes them to init (kill-chain
+        # reconstruction skips advisory severity, but mapping defensively
+        # protects against future filter changes).
+        (ioc_pattern_e_websocket_shell_hits_pre_compromise) echo init ;;
+        (ioc_pattern_e_websocket_shell_hits_orphan)         echo init ;;
+        (ioc_attacker_ip_2xx_on_cpsess_pre_compromise)      echo init ;;
         (ioc_pattern_a_*)                       echo A ;;
         (ioc_pattern_b_*)                       echo B ;;
         (ioc_pattern_c_*)                       echo C ;;
@@ -3574,20 +3612,29 @@ check_logs() {
     fi
     rm -f "$tmp"
 
-    # ---- attacker-IP cross-ref -------------------------------------------
-    # Independent signal: count access_log hits from the consolidated
-    # IC-5790 attacker IP list. Excludes probe-UA traffic and any
-    # operator-supplied --exclude-ip values. A hit here doesn't imply
-    # successful exploitation (the IP may have been blackholed before
-    # request landed) but does mean the attacker reached this host.
-    check_attacker_ips "$logdir"
-
     # ---- CRLF auth-bypass primitive (deterministic) ----------------------
     # Direct fingerprint of the CVE-2026-41940 exploitation chain in the
     # access log: 401 POST /login/?login_only=1 immediately followed by a
     # 2xx GET /cpsess<N>/* as user "root" from the same IP within 2s.
     # Independent of session-store evidence; survives mitigate purging.
+    # MUST run BEFORE check_attacker_ips so the CRLF first-epoch is
+    # available as the temporal anchor for the v2.4.0 pre-compromise gate
+    # on ioc_attacker_ip_2xx_on_cpsess (and Pattern E downstream in
+    # check_destruction_iocs). Without CRLF as anchor, second-order
+    # signals (token consumption + websocket Shell access) cannot be
+    # distinguished from pre-disclosure noise (testdev pattern).
     check_crlf_access_primitive "$logdir"
+
+    # ---- attacker-IP cross-ref -------------------------------------------
+    # Independent signal: count access_log hits from the consolidated
+    # IC-5790 attacker IP list. Excludes probe-UA traffic and any
+    # operator-supplied --exclude-ip values. A hit here doesn't imply
+    # successful exploitation (the IP may have been blackholed before
+    # request landed) but does mean the attacker reached this host. The
+    # ioc_attacker_ip_2xx_on_cpsess strong-tier emit consults the
+    # LOGS_CRLF_CHAIN_FIRST_EPOCH set by check_crlf_access_primitive
+    # above to distinguish post-CRLF exploitation from pre-CRLF noise.
+    check_attacker_ips "$logdir"
 }
 
 # Cross-reference access_log against the dossier attacker-IP list. Pulled
@@ -3797,16 +3844,52 @@ check_attacker_ips() {
             if [[ "$_c_path" =~ /cpsess([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])/ ]]; then
                 _c_token="${BASH_REMATCH[1]}"
             fi
-            emit "logs" "ioc_attacker_ip_2xx_on_cpsess" "strong" \
-                 "ioc_attacker_ip_2xx_on_cpsess" 8 \
+            # v2.4.0 pre-compromise gate. ioc_attacker_ip_2xx_on_cpsess is a
+            # second-order signal (an attacker IP successfully consumed a
+            # cpsess token) - it requires a first-order CVE-2026-41940
+            # exploitation primitive to anchor it as compromise evidence.
+            # Without the deterministic CRLF chain firing AT OR BEFORE
+            # ts_first, the 2xx-on-cpsess hits are most likely:
+            #   (a) shared-infra T1-IP coincidence (the IP also hosts
+            #       legitimate cPanel customers elsewhere);
+            #   (b) recycled cpsess from a long-prior legitimate session;
+            #   (c) pre-disclosure recon that did not yield a successful
+            #       exploit chain (the testdev pattern: 2xx_on_cpsess
+            #       2026-03-26, but no CRLF chain until 2026-04-30).
+            # In any of these cases the hit is pre-compromise enrichment,
+            # not exploitation evidence — demote to advisory (weight 0)
+            # so it does NOT escalate host_verdict but still surfaces in
+            # ADVISORIES + signals[] for fleet aggregator visibility.
+            local _gate_sev="strong" _gate_key="ioc_attacker_ip_2xx_on_cpsess" _gate_weight=8
+            local _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
+            if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
+               || ! [[ "$ts_first" =~ ^[0-9]+$ ]] \
+               || (( ts_first == 0 )) \
+               || (( ts_first < LOGS_CRLF_CHAIN_FIRST_EPOCH )); then
+                _gate_sev="advisory"
+                _gate_key="ioc_attacker_ip_2xx_on_cpsess_pre_compromise"
+                _gate_weight=0
+                if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )); then
+                    _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths but NO CVE-2026-41940 CRLF access-chain detected on this host - 2xx-on-cpsess is second-order (token consumption) and requires CRLF as compromise anchor. Likely pre-compromise / shared-infra coincidence / pre-disclosure recon (REVIEW; does not escalate host_verdict)."
+                else
+                    _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths but ts_first ($ts_first) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity, mtime-pollution risk for cluster-onset analysis (REVIEW; does not escalate host_verdict)."
+                fi
+            else
+                # Strong-tier emit passed the gate; record first epoch as
+                # the proximity anchor for the Pattern E gate downstream.
+                LOGS_2XX_CPSESS_FIRST_EPOCH="$ts_first"
+            fi
+            emit "logs" "ioc_attacker_ip_2xx_on_cpsess" "$_gate_sev" \
+                 "$_gate_key" "$_gate_weight" \
                  "count" "$total" "hits_2xx_cpsess" "$h2xx_cpsess" \
                  "hits_2xx_recon" "$h2xx_recon" "hits_3xx" "$h3xx" \
                  "hits_4xx" "$h4xx" "hits_other" "$hother" \
                  "historical_drops" "$historical_drops" \
                  "ts_epoch_first" "$ts_first" \
+                 "crlf_first_epoch" "$LOGS_CRLF_CHAIN_FIRST_EPOCH" \
                  "ip" "$_c_ip" "path" "$_c_path" "status" "$_c_status" \
                  "cpsess_token" "${_c_token:-}" \
-                 "note" "$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
+                 "note" "$_gate_note"
         elif (( h2xx_recon > 0 )); then
             emit "logs" "ioc_attacker_ip_recon_only" "info" \
                  "ioc_attacker_ip_recon_only" 0 \
@@ -3910,6 +3993,16 @@ check_crlf_access_primitive() {
              "log_file" "$log" \
              "line" "${crlf_sample:0:240}" \
              "note" "$crlf_hits CRLF-bypass chain(s) in $log: POST /login → 401 then GET /cpsess<N>/* → 2xx as root within 2s. Deterministic CVE-2026-41940 exploitation evidence (CRITICAL)."
+        # v2.4.0: record CRLF first epoch globally so the downstream
+        # second-order signals (ioc_attacker_ip_2xx_on_cpsess in
+        # check_attacker_ips, ioc_pattern_e_websocket_shell_hits in
+        # check_destruction_iocs) can demote pre-compromise events to
+        # advisory tier instead of polluting host_verdict + cluster-
+        # onset timeline (testdev pattern). Numeric coercion via
+        # arithmetic context normalizes empty/non-numeric values to 0.
+        if [[ "$crlf_ts_first" =~ ^[0-9]+$ ]]; then
+            LOGS_CRLF_CHAIN_FIRST_EPOCH="$crlf_ts_first"
+        fi
     fi
 }
 
@@ -5374,18 +5467,74 @@ check_destruction_iocs() {
             if [[ "$_e_path" =~ /cpsess([0-9]{10})/ ]]; then
                 _e_token="${BASH_REMATCH[1]}"
             fi
-            emit "destruction" "ioc_pattern_e_websocket" "strong" \
-                 "ioc_pattern_e_websocket_shell_hits" 10 \
+            # v2.4.0 pre-compromise gate. Pattern E (websocket Shell access
+            # at IC-5790 attacker fingerprint dimensions) is a post-RCE
+            # toolchain signal that requires:
+            #   (1) the host actually being compromised via CVE-2026-41940
+            #       (anchor: ioc_cve_2026_41940_crlf_access_chain), AND
+            #   (2) co-temporal successful token consumption
+            #       (anchor: ioc_attacker_ip_2xx_on_cpsess within
+            #        PATTERN_E_2XX_PROXIMITY_SEC of Pattern E first epoch).
+            # Without (1), Pattern E hits are pre-compromise / orphan -
+            # most likely shared-infra attacker IP that ALSO ran legitimate
+            # WHM Terminal sessions on this host, OR pre-disclosure recon
+            # at the attacker dimensions that did not yield successful
+            # exploitation. Without (2), Pattern E is exploitation-detached:
+            # post-CRLF in time but no nearby successful token use - either
+            # operator never escalated past shell open, or the 2xx_on_cpsess
+            # gate above demoted the matching token-use event.
+            # Demote to advisory (weight 0): does NOT escalate host_verdict
+            # to COMPROMISED. Surfaces in ADVISORIES + signals[] for fleet
+            # aggregator visibility; ss-aggregate.py can use the new keys
+            # to discount these events when computing first_x_epoch /
+            # cluster-onset / threat-actor bucketing.
+            local _gate_sev="strong" _gate_key="ioc_pattern_e_websocket_shell_hits" _gate_weight=10
+            local _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
+            if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
+               || ! [[ "$ts_first_ext" =~ ^[0-9]+$ ]] \
+               || (( ts_first_ext == 0 )) \
+               || (( ts_first_ext < LOGS_CRLF_CHAIN_FIRST_EPOCH )); then
+                _gate_sev="advisory"
+                _gate_key="ioc_pattern_e_websocket_shell_hits_pre_compromise"
+                _gate_weight=0
+                if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )); then
+                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions but NO CVE-2026-41940 CRLF access-chain detected on this host - Pattern E is post-RCE toolchain and requires CRLF anchor as compromise evidence. Likely shared-infra coincidence or pre-disclosure noise (REVIEW; does not escalate host_verdict)."
+                else
+                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions but ts_first ($ts_first_ext) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity (REVIEW; does not escalate host_verdict)."
+                fi
+            elif (( LOGS_2XX_CPSESS_FIRST_EPOCH > 0 )); then
+                # Co-temporal proximity check vs. successful token-consumption
+                # event. Compute |delta| via arithmetic + parameter-strip of
+                # the leading sign. Skip the proximity demotion when 2xx_on_cpsess
+                # did not fire at strong tier (LOGS_2XX_CPSESS_FIRST_EPOCH == 0):
+                # in that case, the host has CRLF-anchored compromise but no
+                # in-window token-use evidence, and Pattern E by itself is
+                # still real RCE evidence (operator opened shell, didn't
+                # subsequently re-use token). Strong stands.
+                local _e_delta=$((ts_first_ext - LOGS_2XX_CPSESS_FIRST_EPOCH))
+                local _e_abs="${_e_delta#-}"
+                if (( _e_abs > PATTERN_E_2XX_PROXIMITY_SEC )); then
+                    _gate_sev="advisory"
+                    _gate_key="ioc_pattern_e_websocket_shell_hits_orphan"
+                    _gate_weight=0
+                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions, post-CRLF, but ts_first ($ts_first_ext) is ${_e_abs}s away from successful token-use event ($LOGS_2XX_CPSESS_FIRST_EPOCH) - exceeds ${PATTERN_E_2XX_PROXIMITY_SEC}s operator-session window. Pattern E is exploitation-detached / orphan (REVIEW; does not escalate host_verdict)."
+                fi
+            fi
+            emit "destruction" "ioc_pattern_e_websocket" "$_gate_sev" \
+                 "$_gate_key" "$_gate_weight" \
                  "count" "$ext_2xx_known" "external_total" "$ext_total" \
                  "external_2xx_total" "$ext_2xx" \
                  "external_2xx_unknown_dim" "$ext_2xx_unknown" \
                  "internal_2xx" "$int_2xx" \
                  "dimensions" "${dim_csv:-(none)}" \
                  "ts_epoch_first" "$ts_first_ext" \
+                 "crlf_first_epoch" "$LOGS_CRLF_CHAIN_FIRST_EPOCH" \
+                 "twoxx_first_epoch" "$LOGS_2XX_CPSESS_FIRST_EPOCH" \
+                 "proximity_sec" "$PATTERN_E_2XX_PROXIMITY_SEC" \
                  "ip" "$_e_ip" "path" "$_e_path" "status" "$_e_status" \
                  "cpsess_token" "${_e_token:-}" \
                  "sample" "${_e_src:0:200}" \
-                 "note" "$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
+                 "note" "$_gate_note"
             ((hits++))
         elif (( ext_2xx_unknown > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "warning" \
