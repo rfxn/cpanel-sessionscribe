@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.10.0
+# sessionscribe-forensic.sh v0.10.1
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.10.0"
+VERSION="0.10.1"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -145,9 +145,20 @@ MODSEC_USER_CONFS=(
 MODSEC_USER_CONF="${MODSEC_USER_CONFS[0]}"
 
 # Pattern A encryptor binary - bundled in raw artifacts when present.
-# (All other Pattern A/B/C/D/F constants moved to ioc-scan; this script
+# (All other Pattern A/B/C/D/F/H constants moved to ioc-scan; this script
 # consumes their detection results via the run envelope.)
 PATTERN_A_BINARY="/root/sshd"
+
+# Pattern H seobot dropper file - matched against every cPanel docroot
+# during phase_bundle for explicit capture into pattern-h-seobot-metadata.txt.
+PATTERN_H_DROPPER_FILE="seobot.php"
+
+# Pattern I (IC-5794, surfaced 2026-05-01) - file paths mirrored from the
+# ioc-scan PATTERN_I_* constants for offline-bundle metadata capture. The
+# binary itself is NOT bundled (mirrors the Pattern A safety policy:
+# capture stat + sha256, not the executable).
+PATTERN_I_BINARY="/root/.local/bin/system-service"
+PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 
 # Pattern G - SSH key persistence anchors. Comments matching these literal
 # IP labels are attacker-planted jumphost-mimic keys.
@@ -2432,6 +2443,99 @@ phase_bundle() {
             file "$PATTERN_A_BINARY" 2>&1
         } > "$bdir/pattern-a-binary-metadata.txt"
         say_warn "Pattern A binary metadata captured (binary itself NOT bundled)"
+    fi
+
+    # 7b. Pattern H artifacts - seobot.php across cPanel docroots. Capture
+    # stat + sha256 + first 256 bytes (PHP shells fingerprint via opening
+    # tag); cap at 50 entries to bound output on big shared hosts. Docroot
+    # discovery mirrors ioc-scan's H1 logic.
+    local h_seobot_meta="$bdir/pattern-h-seobot-metadata.txt"
+    local h_seobot_count=0
+    {
+        echo "# Pattern H seobot.php capture (IC-5790 dossier rev3)"
+        echo "# captured_at=$TS_ISO host=$HOSTNAME_FQDN"
+        echo
+        local _dr_list_inner
+        _dr_list_inner=$({
+            if [[ -d /var/cpanel/userdata ]]; then
+                grep -rh '^documentroot:' /var/cpanel/userdata/*/ 2>/dev/null \
+                  | awk '{print $2}' | sort -u
+            fi
+            local _d
+            for _d in /home/*/public_html; do
+                [[ -d "$_d" ]] && printf '%s\n' "$_d"
+            done
+        } | sort -u)
+        local _dr _h
+        while IFS= read -r _dr; do
+            [[ -d "$_dr" ]] || continue
+            while IFS= read -r -d '' _h; do
+                h_seobot_count=$((h_seobot_count + 1))
+                if (( h_seobot_count > 50 )); then
+                    echo "# (capture capped at 50 entries; more present on host)"
+                    break 2
+                fi
+                echo "=== seobot.php hit #$h_seobot_count ==="
+                stat "$_h" 2>&1
+                sha256sum "$_h" 2>&1
+                file "$_h" 2>&1
+                echo "--- first 256 bytes ---"
+                head -c 256 "$_h" 2>/dev/null
+                echo
+                echo
+            done < <(find "$_dr" -maxdepth 3 -name "$PATTERN_H_DROPPER_FILE" -print0 2>/dev/null)
+        done <<< "$_dr_list_inner"
+    } > "$h_seobot_meta" 2>/dev/null
+    if (( h_seobot_count > 0 )); then
+        say_warn "Pattern H captured: $h_seobot_count seobot.php hit(s)"
+        emit_signal bundle warn pattern_h_seobot_captured \
+            "seobot.php captured ($h_seobot_count hits)" \
+            path "pattern-h-seobot-metadata.txt" count "$h_seobot_count"
+    else
+        rm -f "$h_seobot_meta"
+    fi
+
+    # 7c. Pattern I artifacts - system-service binary at /root/.local/bin.
+    # Capture metadata only (NOT the binary itself - mirrors Pattern A
+    # safety policy; binary may be a miner or beacon worth quarantining
+    # intact rather than spreading via bundle copies).
+    if [[ -f "$PATTERN_I_BINARY" ]]; then
+        local i_meta="$bdir/pattern-i-system-service-metadata.txt"
+        {
+            echo "# Pattern I system-service binary capture (IC-5790 dossier rev3)"
+            echo "# captured_at=$TS_ISO host=$HOSTNAME_FQDN"
+            echo "# binary path: $PATTERN_I_BINARY"
+            echo
+            echo "=== stat ==="
+            stat "$PATTERN_I_BINARY" 2>&1
+            echo
+            echo "=== sha256 ==="
+            sha256sum "$PATTERN_I_BINARY" 2>&1
+            echo
+            echo "=== md5 ==="
+            md5sum "$PATTERN_I_BINARY" 2>&1
+            echo
+            echo "=== file ==="
+            file "$PATTERN_I_BINARY" 2>&1
+            if have_cmd ldd; then
+                echo
+                echo "=== ldd ==="
+                ldd "$PATTERN_I_BINARY" 2>&1 || echo "(ldd failed - likely statically linked or non-ELF)"
+            fi
+        } > "$i_meta" 2>/dev/null
+        say_warn "Pattern I binary metadata captured (binary itself NOT bundled)"
+        emit_signal bundle warn pattern_i_binary_captured \
+            "system-service binary metadata captured" \
+            path "pattern-i-system-service-metadata.txt" \
+            bin "$PATTERN_I_BINARY"
+    fi
+    # Pattern I profile.d hook - already swept into persistence.tgz via the
+    # /etc/profile.d directory bundle. Emit an explicit info signal so the
+    # bundle log records the IOC artifact is present without re-bundling.
+    if [[ -f "$PATTERN_I_PROFILED" ]]; then
+        emit_signal bundle info pattern_i_hook_in_persistence_tgz \
+            "system_profiled_service.sh present in persistence.tgz" \
+            path "$PATTERN_I_PROFILED"
     fi
 
     # 8. Per-user bash histories (optional, gated on --no-history).
