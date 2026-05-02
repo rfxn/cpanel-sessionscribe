@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.0.0
+# sessionscribe-ioc-scan.sh v2.4.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.4.0"
+VERSION="2.4.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -1352,15 +1352,37 @@ read_iocs_from_envelope() {
         [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
         area=$(json_str_field "$line" area)
         severity=$(json_str_field "$line" severity)
+        # Hoisted: $key is needed by the advisory allow-list below, which
+        # must run before the area filter falls through. Pre-fix the key
+        # was assigned AFTER the severity case, so the v2.4.1 advisory
+        # branch saw an empty $key (carried over from a prior iteration
+        # or never set), causing every advisory line to fall through the
+        # inner `(*) continue`. Net effect: the kill-chain renderer
+        # showed advisory=0 even when the envelope contained the gate keys.
+        key=$(json_str_field "$line" key)
         case "$area" in
             (logs|sessions|destruction) ;;
             (*) continue ;;
         esac
+        # v2.4.0 admits the three pre-compromise gate keys (severity=advisory,
+        # weight=0) into kill-chain reconstruction so the visual timeline
+        # surfaces them as PRE-COMPROMISE / EXPLOITATION-DETACHED context
+        # zones rather than dropping them silently. The keys do NOT escalate
+        # host_verdict (advisory severity is invisible to ioc_critical /
+        # ioc_review aggregation) but they ARE part of the operator's
+        # forensic narrative and were artificially hidden in v2.4.0. A
+        # narrow allow-list (not a blanket advisory pass) keeps the filter
+        # tight: any future advisory keys default to filtered-out.
         case "$severity" in
             (strong|warning) ;;
+            (advisory)
+                case "$key" in
+                    (ioc_pattern_e_websocket_shell_hits_pre_compromise|ioc_pattern_e_websocket_shell_hits_orphan|ioc_attacker_ip_2xx_on_cpsess_pre_compromise) ;;
+                    (*) continue ;;
+                esac
+                ;;
             (*) continue ;;
         esac
-        key=$(json_str_field "$line" key)
         case "$key" in
             (ioc_sample|ioc_attacker_ip_sample|session_shape_sample) continue ;;
         esac
@@ -1923,59 +1945,87 @@ phase_reconcile() {
             ev_note=""
         fi
 
-        # Determine verdict:
-        #   pre-defense    if event happened before BOTH effective defenses
-        #   post-defense   if event happened after AT LEAST ONE effective defense
-        #   ambiguous      if defense times unknown
-        local pre_patch=0 pre_modsec=0
-        if [[ -n "$effective_patch_time" ]]; then
-            (( ev_epoch < effective_patch_time )) && pre_patch=1
-        else
-            pre_patch=1   # no effective patch -> event is "before" patch
-        fi
-        if [[ -n "$effective_modsec_time" ]]; then
-            (( ev_epoch < effective_modsec_time )) && pre_modsec=1
-        else
-            pre_modsec=1
-        fi
+        # Reset per-iteration verdict/delta — both are function-scope locals
+        # that would otherwise carry over from the prior loop iteration if
+        # the v2.4.0 advisory short-circuit branch below does not assign them.
+        verdict=""
+        delta=""
 
-        if [[ -z "$effective_patch_time" && -z "$effective_modsec_time" ]]; then
-            verdict="UNDEFENDED"
-            delta="n/a"
-            N_PRE=$((N_PRE+1))
-        elif (( pre_patch && pre_modsec )); then
-            verdict="PRE-DEFENSE"
-            # Delta to whichever defense landed first.
-            local first_def
-            if [[ -n "$effective_patch_time" && -n "$effective_modsec_time" ]]; then
-                first_def=$(( effective_patch_time < effective_modsec_time ? effective_patch_time : effective_modsec_time ))
-            elif [[ -n "$effective_patch_time" ]]; then
-                first_def="$effective_patch_time"
+        # v2.4.0 pre-compromise gate keys short-circuit the defense
+        # comparison: they are advisory by design (host wasn't actually
+        # compromised by these events; CRLF anchor is missing or pre-dates
+        # them) so PRE-DEFENSE / POST-DEFENSE / UNDEFENDED bucketing does
+        # not apply. Routed to dedicated verdict slots so the kill-chain
+        # renderer can group them in a clearly-labeled context zone
+        # without mixing them into the actual attack chronology. They do
+        # NOT increment N_PRE / N_POST (those count real attack events).
+        case "$ev_key" in
+            (*_pre_compromise)
+                verdict="ADVISORY-PRE-COMPROMISE"
+                delta="n/a"
+                ;;
+            (*_orphan)
+                verdict="ADVISORY-ORPHAN"
+                delta="n/a"
+                ;;
+        esac
+
+        if [[ -z "$verdict" ]]; then
+            # Determine verdict:
+            #   pre-defense    if event happened before BOTH effective defenses
+            #   post-defense   if event happened after AT LEAST ONE effective defense
+            #   ambiguous      if defense times unknown
+            local pre_patch=0 pre_modsec=0
+            if [[ -n "$effective_patch_time" ]]; then
+                (( ev_epoch < effective_patch_time )) && pre_patch=1
             else
-                first_def="$effective_modsec_time"
+                pre_patch=1   # no effective patch -> event is "before" patch
             fi
-            delta=$(( first_def - ev_epoch ))
-            N_PRE=$((N_PRE+1))
-        elif (( ! pre_patch && ! pre_modsec )); then
-            verdict="POST-DEFENSE"
-            delta=$(( ev_epoch - (effective_patch_time > effective_modsec_time ? effective_modsec_time : effective_patch_time) ))
-            N_POST=$((N_POST+1))
-        else
-            verdict="POST-PARTIAL"
-            # Only one defense was up. Highlight which.
-            local up_def="modsec"
-            (( pre_modsec )) && up_def="patch"
-            delta="partial:$up_def"
-            N_POST=$((N_POST+1))
+            if [[ -n "$effective_modsec_time" ]]; then
+                (( ev_epoch < effective_modsec_time )) && pre_modsec=1
+            else
+                pre_modsec=1
+            fi
+
+            if [[ -z "$effective_patch_time" && -z "$effective_modsec_time" ]]; then
+                verdict="UNDEFENDED"
+                delta="n/a"
+                N_PRE=$((N_PRE+1))
+            elif (( pre_patch && pre_modsec )); then
+                verdict="PRE-DEFENSE"
+                # Delta to whichever defense landed first.
+                local first_def
+                if [[ -n "$effective_patch_time" && -n "$effective_modsec_time" ]]; then
+                    first_def=$(( effective_patch_time < effective_modsec_time ? effective_patch_time : effective_modsec_time ))
+                elif [[ -n "$effective_patch_time" ]]; then
+                    first_def="$effective_patch_time"
+                else
+                    first_def="$effective_modsec_time"
+                fi
+                delta=$(( first_def - ev_epoch ))
+                N_PRE=$((N_PRE+1))
+            elif (( ! pre_patch && ! pre_modsec )); then
+                verdict="POST-DEFENSE"
+                delta=$(( ev_epoch - (effective_patch_time > effective_modsec_time ? effective_modsec_time : effective_patch_time) ))
+                N_POST=$((N_POST+1))
+            else
+                verdict="POST-PARTIAL"
+                # Only one defense was up. Highlight which.
+                local up_def="modsec"
+                (( pre_modsec )) && up_def="patch"
+                delta="partial:$up_def"
+                N_POST=$((N_POST+1))
+            fi
         fi
 
         local color
         case "$verdict" in
-            PRE-DEFENSE)  color="$C_RED" ;;
-            UNDEFENDED)   color="$C_RED" ;;
-            POST-DEFENSE) color="$C_GRN" ;;
-            POST-PARTIAL) color="$C_YEL" ;;
-            *)            color="$C_DIM" ;;
+            PRE-DEFENSE)              color="$C_RED" ;;
+            UNDEFENDED)               color="$C_RED" ;;
+            POST-DEFENSE)             color="$C_GRN" ;;
+            POST-PARTIAL)             color="$C_YEL" ;;
+            ADVISORY-PRE-COMPROMISE|ADVISORY-ORPHAN) color="$C_CYN" ;;
+            *)                        color="$C_DIM" ;;
         esac
 
         if (( ! QUIET )); then
@@ -2104,10 +2154,15 @@ render_offense_row() {
     local verdict="$1" delta="$2" ts_iso="$3" pattern="$4" key="$5" note="$6" prims="$7" anno="${8:-}"
     local color
     case "$verdict" in
-        PRE-DEFENSE|UNDEFENDED) color="$C_RED" ;;
-        POST-DEFENSE)           color="$C_GRN" ;;
-        POST-PARTIAL)           color="$C_YEL" ;;
-        *)                      color="$C_DIM" ;;
+        PRE-DEFENSE|UNDEFENDED)                  color="$C_RED" ;;
+        POST-DEFENSE)                            color="$C_GRN" ;;
+        POST-PARTIAL)                            color="$C_YEL" ;;
+        # v2.4.0 advisory verdicts render in cyan to match their zone
+        # header — visible in the timeline but visually distinct from
+        # the red/green/yellow attack-chain palette so operators can
+        # tell at a glance which rows are real exploitation evidence.
+        ADVISORY-PRE-COMPROMISE|ADVISORY-ORPHAN) color="$C_CYN" ;;
+        *)                                       color="$C_DIM" ;;
     esac
 
     local area ip path log_file count h2xx status line
@@ -2352,11 +2407,13 @@ render_kill_chain() {
                     local _v
                     _v=$(printf '%s' "$_rec" | cut -d'|' -f1)
                     case "$_v" in
-                        PRE-DEFENSE)             row_zone="pre"   ;;
-                        UNDEFENDED)              row_zone="undef" ;;
-                        POST-DEFENSE)            row_zone="post"  ;;
-                        POST-PARTIAL)            row_zone="partial" ;;
-                        *)                       row_zone="other" ;;
+                        PRE-DEFENSE)              row_zone="pre"   ;;
+                        UNDEFENDED)               row_zone="undef" ;;
+                        POST-DEFENSE)             row_zone="post"  ;;
+                        POST-PARTIAL)             row_zone="partial" ;;
+                        ADVISORY-PRE-COMPROMISE)  row_zone="adv_pre"    ;;
+                        ADVISORY-ORPHAN)          row_zone="adv_orphan" ;;
+                        *)                        row_zone="other" ;;
                     esac
                 fi
 
@@ -2390,12 +2447,20 @@ render_kill_chain() {
                 IFS='|' read -r z_id z_first z_last z_count <<< "$zone_rec"
                 local z_color="$C_DIM" z_label="$z_id"
                 case "$z_id" in
-                    pre)     z_color="$C_RED";  z_label="PRE-DEFENSE"   ;;
-                    undef)   z_color="$C_RED";  z_label="UNDEFENDED"    ;;
-                    def)     z_color="$C_GRN";  z_label="DEFENSES"      ;;
-                    post)    z_color="$C_GRN";  z_label="POST-DEFENSE"  ;;
-                    partial) z_color="$C_YEL";  z_label="POST-PARTIAL"  ;;
-                    *)       z_color="$C_DIM";  z_label="$z_id"         ;;
+                    pre)         z_color="$C_RED";  z_label="PRE-DEFENSE"   ;;
+                    undef)       z_color="$C_RED";  z_label="UNDEFENDED"    ;;
+                    def)         z_color="$C_GRN";  z_label="DEFENSES"      ;;
+                    post)        z_color="$C_GRN";  z_label="POST-DEFENSE"  ;;
+                    partial)     z_color="$C_YEL";  z_label="POST-PARTIAL"  ;;
+                    # v2.4.0 advisory zones — pre-compromise context
+                    # (signals fired before / without the CRLF anchor) and
+                    # exploitation-detached (signals after CRLF but with no
+                    # nearby successful token use). Cyan + explicit ADVISORY
+                    # prefix differentiates them from the actual attack
+                    # chronology while still giving operators visibility.
+                    adv_pre)     z_color="$C_CYN";  z_label="ADVISORY (PRE-COMPROMISE CONTEXT)" ;;
+                    adv_orphan)  z_color="$C_CYN";  z_label="ADVISORY (EXPLOITATION-DETACHED)" ;;
+                    *)           z_color="$C_DIM";  z_label="$z_id"         ;;
                 esac
                 local zone_count_str=""
                 if [[ "$z_id" != "def" ]]; then
@@ -2509,17 +2574,29 @@ render_kill_chain() {
         fi
 
         # ── Counters ────────────────────────────────────────────────────
-        # Surface UNDEFENDED separately - rolled into N_PRE during reconcile
-        # but the operator wants to see it broken out. Walk RECONCILED.
-        local n_undef=0 _r _v
+        # Surface UNDEFENDED + ADVISORY breakouts separately. UNDEFENDED is
+        # rolled into N_PRE during reconcile; advisory rows live in
+        # OFFENSE_EVENTS but never increment N_PRE / N_POST (they're
+        # context, not attack chain). One pass over RECONCILED computes
+        # both breakouts.
+        local n_undef=0 n_adv=0 _r _v
         (( ${#RECONCILED[@]} > 0 )) && for _r in "${RECONCILED[@]}"; do
             _v=$(printf '%s' "$_r" | cut -d'|' -f1)
-            [[ "$_v" == "UNDEFENDED" ]] && n_undef=$(( n_undef + 1 ))
+            case "$_v" in
+                UNDEFENDED) n_undef=$(( n_undef + 1 )) ;;
+                ADVISORY-*) n_adv=$(( n_adv + 1 )) ;;
+            esac
         done
-        printf '\n  %scounters%s defenses=%d  iocs=%d  pre=%d  undef=%d  post=%d  attackers=%d\n' \
+        # iocs counter shows the count of attack-chain events (excludes
+        # advisory rows which are reported separately) so operators can
+        # read it as "how many real exploitation events fired" without
+        # mental subtraction.
+        local n_iocs_real=$(( ${#OFFENSE_EVENTS[@]} - n_adv ))
+        (( n_iocs_real < 0 )) && n_iocs_real=0
+        printf '\n  %scounters%s defenses=%d  iocs=%d  pre=%d  undef=%d  post=%d  advisory=%d  attackers=%d\n' \
             "$C_BLD" "$C_NC" \
-            "${#DEFENSE_EVENTS[@]}" "${#OFFENSE_EVENTS[@]}" \
-            "$(( N_PRE - n_undef ))" "$n_undef" "$N_POST" "$ATTACKER_IP_TOTAL"
+            "${#DEFENSE_EVENTS[@]}" "$n_iocs_real" \
+            "$(( N_PRE - n_undef ))" "$n_undef" "$N_POST" "$n_adv" "$ATTACKER_IP_TOTAL"
     } 2>&1)
 
     printf '%s\n' "$buf" >&2
