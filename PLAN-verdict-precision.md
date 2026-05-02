@@ -533,7 +533,7 @@ Populate `ip`/`path`/`status`/`cpsess_token` structured fields at emit-time for 
 ---
 
 ### Phase 6: Add exit code 3 = SUSPICIOUS
-**Status:** COMPLETE — pre6 @ (pending commit)
+**Status:** COMPLETE — pre6 @ eec42c7
 
 Disambiguate host-state SUSPICIOUS from code-state INCONCLUSIVE on the exit code axis. Today both produce EXIT_CODE=2 — the collision is invisible to operators reading exit codes for fleet aggregation. Phase 6 splits them: code-state INCONCLUSIVE keeps exit 2; host-state SUSPICIOUS becomes exit 3.
 
