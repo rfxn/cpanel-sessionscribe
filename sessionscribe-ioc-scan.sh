@@ -68,6 +68,7 @@
 #   --jsonl     stream one JSON signal per line on stdout (suppresses sectioned)
 #   --csv       one summary row per host on stdout (suppresses sectioned)
 #   --quiet     suppress sectioned report
+#   --verbose   expand matrix detail; future-proof escape for elided info
 #
 # Verdict axes (independent):
 #   code_verdict  PATCHED / VULNERABLE / INCONCLUSIVE   - derived from version,
@@ -307,6 +308,7 @@ OUTPUT_FILE=""
 JSONL=0
 CSV=0
 QUIET=0
+VERBOSE=0
 NO_COLOR=0
 NO_LOGS=0
 NO_SESSIONS=0
@@ -459,6 +461,10 @@ Output:
                              exclusive with --jsonl. Suppresses sectioned
                              report.
       --quiet                Suppress sectioned report.
+      --verbose, -v          Expand the per-section verdict matrix to
+                             include matching IOC keys per row. Reserved
+                             for future renderer changes that elide
+                             operator-relevant detail.
       --no-color             Disable ANSI color codes.
 
 Run ledger (default ON):
@@ -532,6 +538,7 @@ while [[ $# -gt 0 ]]; do
         --jsonl)              JSONL=1; shift ;;
         --csv)                CSV=1; shift ;;
         --quiet)              QUIET=1; shift ;;
+        --verbose|-v)         VERBOSE=1; shift ;;
         --no-color)           NO_COLOR=1; shift ;;
         --no-logs)            NO_LOGS=1; shift ;;
         --no-sessions)        NO_SESSIONS=1; shift ;;
@@ -716,6 +723,28 @@ PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 # Bundle output paths (set by phase_bundle, read by phase_upload).
 BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
 BUNDLE_TGZ=""           # tarball path (set when phase_upload prepares submission)
+
+###############################################################################
+# Per-section verdict tracking (output primitive v2.1.0)
+# SECTION_ORDER drives the summary matrix row sequence + section ID display.
+# SECTION_LABEL maps the emit() area to the human-facing matrix row label.
+# SECTION_VERDICT[area] is filled by aggregate_verdict() (worst-wins) and
+# consumed by print_verdict() to render the 7-row matrix at the top of
+# the summary block.
+###############################################################################
+SECTION_ORDER=(version static binary logs sessions destruction probe)
+declare -A SECTION_LABEL=(
+    [version]="version"
+    [static]="patterns"
+    [binary]="cpsrvd"
+    [logs]="iocscan"
+    [sessions]="sessions"
+    [destruction]="destruct"
+    [probe]="probe"
+)
+declare -A SECTION_VERDICT=()      # area -> worst tag observed in SIGNALS[]
+declare -A SECTION_COUNTS=()       # area -> "ioc=N warn=M ok=K" rollup string
+declare -A SECTION_KEYS=()         # area -> space-joined unique IOC keys (verbose mode only)
 
 # Resolved by write_ledger() to the per-run JSON envelope path. Forensic
 # v0.9+ reads this via SESSIONSCRIBE_IOC_JSON instead of re-detecting IOCs.
@@ -985,7 +1014,7 @@ print_signal_human() {
 # All output goes to stderr (never contaminates --jsonl/--json on stdout).
 ###############################################################################
 
-hdr()           { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
+hdr_section()   { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
 say_pass()      { (( QUIET )) || printf '  %s[OK]%s %s\n'        "$C_GRN" "$C_NC" "$*" >&2; }
 say_info()      { (( QUIET )) || printf '  %s[INFO]%s %s\n'      "$C_DIM" "$C_NC" "$*" >&2; }
 say_warn()      { (( QUIET )) || printf '  %s[WARN]%s %s\n'      "$C_YEL" "$C_NC" "$*" >&2; }
@@ -1439,7 +1468,7 @@ suspect_ip_correlation() {
 }
 
 phase_defense() {
-    hdr "defense" "extracting timestamps for every mitigation layer"
+    hdr_section "defense" "extracting timestamps for every mitigation layer"
 
     # 1. cpanel patch landing time. PATCH_STATE distinguishes:
     #    PATCHED      build matches vendor cutoff list - upgrade complete
@@ -1710,7 +1739,7 @@ phase_defense() {
 }
 
 phase_offense() {
-    hdr "offense" "ingesting IOCs from canonical detector + deep checks"
+    hdr_section "offense" "ingesting IOCs from canonical detector + deep checks"
     read_iocs_from_envelope "${ENVELOPE_PATH:-}" || true
     pattern_g_deep_checks
     suspect_ip_correlation
@@ -1724,7 +1753,7 @@ phase_offense() {
 ###############################################################################
 
 phase_reconcile() {
-    hdr "reconcile" "comparing defense activation vs compromise timestamps"
+    hdr_section "reconcile" "comparing defense activation vs compromise timestamps"
 
     if (( ${#OFFENSE_EVENTS[@]} == 0 )); then
         say_pass "no compromise indicators - nothing to reconcile"
@@ -2694,7 +2723,7 @@ bundle_tar() {
 }
 
 phase_bundle() {
-    hdr "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
+    hdr_section "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
 
     if (( ! DO_BUNDLE )); then
         say_info "--no-bundle: skipping artifact capture"
@@ -3038,7 +3067,7 @@ phase_bundle() {
 
 phase_upload() {
     (( DO_UPLOAD )) || return 0
-    hdr "upload" "submitting bundle to $INTAKE_URL"
+    hdr_section "upload" "submitting bundle to $INTAKE_URL"
 
     if (( ! DO_BUNDLE )); then
         say_warn "--no-bundle precludes upload (nothing was captured)"
