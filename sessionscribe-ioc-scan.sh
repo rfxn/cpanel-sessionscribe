@@ -555,6 +555,27 @@ OFFENSE_EVENTS=()       # "epoch|pattern|key|note|defenses_required" strings
 IOC_PRIMITIVES=()       # parallel-indexed with OFFENSE_EVENTS; TSV row per IOC
 IOC_ANNOTATIONS=()      # parallel-indexed; renderer-side annotations (Pattern E dim)
 RECONCILED_EVENTS=()    # "epoch|pattern|key|verdict|delta|note" strings
+
+# PRIM_SEP: ASCII Unit Separator (0x1f) used to join ioc_primitive_row fields.
+# Non-whitespace so consecutive empty fields survive IFS-based read.
+# Columns: area | ip | path | log_file | count | hits_2xx | status | line
+PRIM_SEP=$'\x1f'
+
+# ENV_* globals populated by read_envelope_meta() when --full or --replay
+# is in effect. They mirror the envelope's root-level fields so the kill-
+# chain renderer can show host_verdict/score/tool_version without re-
+# parsing the envelope on every render call.
+ENV_HOST_VERDICT=""
+ENV_CODE_VERDICT=""
+ENV_SCORE=""
+ENV_IOC_TOOL_VERSION=""
+ENV_IOC_RUN_ID=""
+ENV_IOC_TS=""
+ENV_STRONG=""
+ENV_FIXED=""
+ENV_INCONCLUSIVE=""
+ENV_IOC_CRITICAL=""
+ENV_IOC_REVIEW=""
 N_PRE=0                 # PRE-DEFENSE event count (set in phase_reconcile)
 N_POST=0                # POST-DEFENSE event count (set in phase_reconcile)
 
@@ -830,6 +851,258 @@ print_signal_human() {
         fi
         printf '       %s| %s%s\n' "$DIM" "$ev_short" "$NC" >&2
     fi
+}
+
+###############################################################################
+# Forensic helpers (post-merge v2.0.0) — used by phase_defense / phase_offense
+# / phase_reconcile / render_kill_chain / phase_bundle / phase_upload.
+# No-op in default --triage mode (the phase functions aren't called).
+###############################################################################
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Verbatim from forensic. Handles cpanel MM/DD/YYYY:HH:MM:SS
+# bracket form AND apache CLF DD/Mon/YYYY:HH:MM:SS bracket form. Returns
+# epoch seconds (or empty string on failure).
+to_epoch() {
+    local s="$1"
+    [[ -z "$s" ]] && { echo ""; return; }
+    # Strip surrounding [] if present.
+    s="${s#[}"; s="${s%]}"
+    # Apache CLF: 30/Apr/2026:09:30:50 +0000 -> 30 Apr 2026 09:30:50 +0000
+    if [[ "$s" =~ ^[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}: ]]; then
+        s=$(echo "$s" | sed -E 's|^([0-9]{1,2})/([A-Za-z]{3})/([0-9]{4}):([0-9:]+)([[:space:]]+(.*))?$|\1 \2 \3 \4\5|')
+        date -u -d "$s" +%s 2>/dev/null
+        return
+    fi
+    # cpanel: 04/30/2026:09:30:50 -0500. date(1) won't parse MM/DD/YYYY-
+    # with the colon separator; rebuild as "YYYY-MM-DD HH:MM:SS TZ".
+    if [[ "$s" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4}):([0-9:]+)([[:space:]]+([+-][0-9]{4}))?$ ]]; then
+        local mm="${BASH_REMATCH[1]}" dd="${BASH_REMATCH[2]}" yyyy="${BASH_REMATCH[3]}"
+        local hms="${BASH_REMATCH[4]}" tz="${BASH_REMATCH[6]:-+0000}"
+        date -u -d "${yyyy}-${mm}-${dd} ${hms} ${tz}" +%s 2>/dev/null
+        return
+    fi
+    date -u -d "$s" +%s 2>/dev/null
+}
+
+extract_log_ts() {
+    local line="$1" m
+    m=$(grep -oE '\[[0-9]{2}/[0-9]{2}/[0-9]{4}:[0-9:]+( [+-][0-9]{4})?\]' <<< "$line" | head -1)
+    [[ -z "$m" ]] && m=$(grep -oE '\[[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}:[0-9:]+( [+-][0-9]{4})?\]' <<< "$line" | head -1)
+    echo "$m"
+}
+
+mtime_of() {
+    local f="$1"
+    [[ -e "$f" ]] || { echo ""; return; }
+    stat -c %Y "$f" 2>/dev/null
+}
+
+cat_log() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    case "$f" in
+        (*.gz)  have_cmd zcat  && zcat  "$f" 2>/dev/null ;;
+        (*.xz)  have_cmd xzcat && xzcat "$f" 2>/dev/null ;;
+        (*.bz2) have_cmd bzcat && bzcat "$f" 2>/dev/null ;;
+        (*)     cat "$f" 2>/dev/null ;;
+    esac
+}
+
+epoch_to_iso() {
+    local e="$1"
+    [[ -z "$e" || "$e" == "0" ]] && { echo ""; return; }
+    date -u -d "@$e" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null
+}
+
+decode_pipe_tail() {
+    local _rec="$1" _nfields="$2"
+    local -a _parts
+    IFS='|' read -r -a _parts <<< "$_rec"
+    local _i
+    for (( _i = 0; _i < _nfields - 1; _i++ )); do
+        printf '%s\t' "${_parts[_i]:-}"
+    done
+    if (( ${#_parts[@]} >= _nfields )); then
+        local IFS='|'
+        printf '%s' "${_parts[*]:$(( _nfields - 1 ))}"
+    fi
+}
+
+json_str_field() {
+    local line="$1" key="$2" v
+    v=$(printf '%s\n' "$line" | grep -oE "\"$key\":\"([^\"\\\\]|\\\\.)*\"" | head -1)
+    [[ -z "$v" ]] && return 0
+    v="${v#*\":\"}"
+    v="${v%\"}"
+    v="${v//\\\"/\"}"
+    v="${v//\\\\/\\}"
+    printf '%s' "$v"
+}
+
+json_num_field() {
+    local line="$1" key="$2" v
+    v=$(printf '%s\n' "$line" | grep -oE "\"$key\":(\"[0-9.+-]*\"|-?[0-9]+(\.[0-9]+)?)" | head -1)
+    [[ -z "$v" ]] && return 0
+    v="${v#*\":}"
+    v="${v#\"}"
+    v="${v%\"}"
+    printf '%s' "$v"
+}
+
+ioc_key_to_pattern() {
+    case "$1" in
+        (ioc_pattern_a_*)            echo A ;;
+        (ioc_pattern_b_*)            echo B ;;
+        (ioc_pattern_c_*)            echo C ;;
+        (ioc_pattern_d_*)            echo D ;;
+        (ioc_pattern_e_*)            echo E ;;
+        (ioc_pattern_f_*)            echo F ;;
+        (ioc_pattern_g_*)            echo G ;;
+        (ioc_pattern_h_*)            echo H ;;
+        (ioc_pattern_i_*)            echo I ;;
+        (ioc_attacker_ip*|ioc_hits)  echo init ;;
+        (ioc_token_*|ioc_preauth_*|ioc_short_pass*|ioc_multiline_*|ioc_badpass*|ioc_cve_2026_41940*|ioc_hasroot*|ioc_malformed*|ioc_forged_*|ioc_tfa*|anomalous_root_sessions)
+                                     echo X ;;
+        (*)                          echo ? ;;
+    esac
+}
+
+ioc_signal_epoch() {
+    local line="$1" v iso k
+    for k in ts_epoch_first mtime_epoch ts_epoch; do
+        v=$(json_num_field "$line" "$k")
+        [[ -n "$v" && "$v" != "0" ]] && { printf '%s' "$v"; return; }
+    done
+    for k in file_mtime login_time; do
+        iso=$(json_str_field "$line" "$k")
+        if [[ -n "$iso" ]]; then
+            v=$(date -u -d "$iso" +%s 2>/dev/null)
+            [[ -n "$v" ]] && { printf '%s' "$v"; return; }
+        fi
+    done
+    printf '%s' "$TS_EPOCH"
+}
+
+envelope_root_field() {
+    local env="$1" key="$2" raw v
+    raw=$(grep -vE '^[[:space:]]*\{\"host\":' "$env" 2>/dev/null \
+          | grep -oE "\"${key}\":[[:space:]]*(\"[^\"]*\"|-?[0-9]+(\.[0-9]+)?)" \
+          | head -1)
+    [[ -z "$raw" ]] && return 0
+    v="${raw#*:}"
+    v="${v# }"
+    v="${v#\"}"
+    v="${v%\"}"
+    printf '%s' "$v"
+}
+
+# Modified from forensic: takes envelope path as $1 with
+# $SESSIONSCRIBE_IOC_JSON as fallback, so --replay can pass any envelope
+# path without exporting the env var. Body otherwise verbatim.
+read_envelope_meta() {
+    local env="${1:-${SESSIONSCRIBE_IOC_JSON:-}}"
+    [[ -n "$env" && -f "$env" ]] || return 0
+    ENV_HOST_VERDICT=$(envelope_root_field "$env" host_verdict)
+    ENV_CODE_VERDICT=$(envelope_root_field "$env" code_verdict)
+    ENV_SCORE=$(envelope_root_field "$env" score)
+    ENV_IOC_TOOL_VERSION=$(envelope_root_field "$env" tool_version)
+    ENV_IOC_RUN_ID=$(envelope_root_field "$env" run_id)
+    ENV_IOC_TS=$(envelope_root_field "$env" ts)
+    # summary block lives on a single line: "summary": {"strong":N,...},
+    local summary
+    summary=$(grep -E '^[[:space:]]+"summary":' "$env" 2>/dev/null | head -1)
+    if [[ -n "$summary" ]]; then
+        ENV_STRONG=$(echo "$summary"        | grep -oE '"strong":[0-9]+'        | cut -d: -f2)
+        ENV_FIXED=$(echo "$summary"         | grep -oE '"fixed":[0-9]+'         | cut -d: -f2)
+        ENV_INCONCLUSIVE=$(echo "$summary"  | grep -oE '"inconclusive":[0-9]+'  | cut -d: -f2)
+        ENV_IOC_CRITICAL=$(echo "$summary"  | grep -oE '"ioc_critical":[0-9]+'  | cut -d: -f2)
+        ENV_IOC_REVIEW=$(echo "$summary"    | grep -oE '"ioc_review":[0-9]+'    | cut -d: -f2)
+    fi
+}
+
+ioc_primitive_row() {
+    local area="$1" ip="$2" path="$3" log_file="$4" count="$5" h2xx="$6" status="$7" line="$8"
+    local clean="${line//$'\t'/ }"
+    clean="${clean//$'\n'/ }"
+    clean="${clean//$'\r'/ }"
+    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s' \
+        "${area:-}"     "$PRIM_SEP" \
+        "${ip:-}"       "$PRIM_SEP" \
+        "${path:-}"     "$PRIM_SEP" \
+        "${log_file:-}" "$PRIM_SEP" \
+        "${count:-}"    "$PRIM_SEP" \
+        "${h2xx:-}"     "$PRIM_SEP" \
+        "${status:-}"   "$PRIM_SEP" \
+        "$clean"
+}
+
+# Modified from forensic: takes envelope path as $1 with
+# $SESSIONSCRIBE_IOC_JSON as fallback. Otherwise verbatim. Reads the
+# envelope from disk, populates OFFENSE_EVENTS[], IOC_PRIMITIVES[],
+# IOC_ANNOTATIONS[]. Returns 1 with a non-fatal say_warn if envelope is
+# absent — preserves forensic's standalone-mode tolerance.
+read_iocs_from_envelope() {
+    local env="${1:-${SESSIONSCRIBE_IOC_JSON:-}}"
+    if [[ -z "$env" ]]; then
+        say_warn "no envelope path - run via --full or --replay PATH"
+        emit_signal offense warn no_envelope "envelope unavailable; deep checks only"
+        return 1
+    fi
+    if [[ ! -f "$env" ]]; then
+        say_warn "envelope path missing: $env"
+        emit_signal offense warn envelope_missing "envelope path unreadable" path "$env"
+        return 1
+    fi
+
+    read_envelope_meta "$env"
+
+    local line area severity key note ts pattern n_added=0
+    local p_ip p_path p_log p_count p_h2xx p_status p_line p_row p_anno
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
+        area=$(json_str_field "$line" area)
+        severity=$(json_str_field "$line" severity)
+        case "$area" in
+            (logs|sessions|destruction) ;;
+            (*) continue ;;
+        esac
+        case "$severity" in
+            (strong|warning) ;;
+            (*) continue ;;
+        esac
+        key=$(json_str_field "$line" key)
+        case "$key" in
+            (ioc_sample|ioc_attacker_ip_sample|session_shape_sample) continue ;;
+        esac
+        note=$(json_str_field "$line" note)
+        ts=$(ioc_signal_epoch "$line")
+        pattern=$(ioc_key_to_pattern "$key")
+        p_ip=$(json_str_field "$line" ip)
+        [[ -z "$p_ip" ]] && p_ip=$(json_str_field "$line" src_ip)
+        p_path=$(json_str_field "$line" path)
+        [[ -z "$p_path" ]] && p_path=$(json_str_field "$line" file)
+        p_log=$(json_str_field "$line" log_file)
+        p_count=$(json_num_field "$line" count)
+        p_h2xx=$(json_num_field "$line" hits_2xx)
+        p_status=$(json_str_field "$line" status)
+        p_line=$(json_str_field "$line" line)
+        p_row=$(ioc_primitive_row "$area" "$p_ip" "$p_path" "$p_log" "$p_count" "$p_h2xx" "$p_status" "$p_line")
+        p_anno=""
+        if [[ "$key" == "ioc_pattern_e_websocket_shell_hits" ]]; then
+            p_anno=$(json_str_field "$line" dimensions)
+        fi
+        OFFENSE_EVENTS+=("$ts|$pattern|$key|${note:-$key}|patch,modsec")
+        IOC_PRIMITIVES+=("$p_row")
+        IOC_ANNOTATIONS+=("$p_anno")
+        n_added=$((n_added+1))
+        emit_signal offense fail "$key" "${note:-$key}" \
+            epoch "$ts" pattern "$pattern" envelope "$(basename "$env")"
+    done < "$env"
+
+    say_info "envelope: imported $n_added IOC(s) from $(basename "$env")"
+    return 0
 }
 
 ###############################################################################
