@@ -770,5 +770,31 @@ The sole remaining user of exit code 3 is now the SUSPICIOUS host-state assignme
 - `bash -n` + `shellcheck -S error` clean
 - Help text (lines 533-544) unchanged; runtime now matches documented contract
 
-**Status:** COMPLETE — pre7 @ <commit-hash>
+**Status:** COMPLETE — pre7 @ a958a18
+
+### pre8 — SHOULD-FIX bundle (Sentinel Findings 2, 3, 4, 5 + Pass 4 locals)
+
+**Bundle of 5 related correctness fixes.** Landed together because Phase 7 live regression on host.elegantthemesdemo.com depends on Pattern E structured-field correctness (Fix A); the rest are schema/scope hygiene.
+
+- **A:** Pattern E sample line filtered to attacker-known dimensions. Added `ext_known_sample` awk variable captured inside `if (d in known)` block; strong emit's `ip` / `path` / `status` / `cpsess_token` / `sample` fields now read from this dedicated sample (was: any external line, including 4xx probes and unknown-dim admin sessions). Defensive `${ext_known_sample:-$ext_sample}` fallback retained.
+- **B:** IOC-J `ioc_failed_exploit_attempt_*` (warning-tier) now requires `! SF_CP_TOKEN` to be strictly disjoint from IOC-E `ioc_token_attempt_*` (evidence-tier). Both share the parent key `ioc_failed_exploit_attempt`; without the new guard ss-aggregate.py double-counts when `cp_security_token` is present in a badpass+token_denied+pass-line session with no auth markers.
+- **C:** JSONL meta row bumped `schema_version` 2 → 3 with appended `_schema_changes` entry: `{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"}`. In-line printf comment also updated.
+- **D:** kill-chain.tsv `cpsess_token` column moved from position 17 (mid-row, between `status` and `line`) to position 18 (end-of-row), preserving column-index stability for external operator scripts that parse TSV by index. IOC printf args reordered correspondingly. (DEF row pre-existing 17-column shape unchanged — separate pre-existing schema mismatch, out of scope.)
+- **E:** `read_iocs_from_envelope` `local` declarations updated: added `key_for_warn` and `p_cpsess_token` to prevent function-global scope leak under `set -u`.
+
+**Verification:**
+- `bash -n` + `shellcheck -S error` clean
+- Meta JSONL row parses as valid JSON (`python3 -c 'json.loads(...)'`); schema_version=3, two `_schema_changes` entries
+- TSV header column count = 18; `cpsess_token` is column 18
+- IOC printf positional args match header order (line=17, cpsess_token=18)
+- gawk-3.x compat probes (interval, 3-arg match) still pass; no `{n}` in awk regexes; only commented references to 3-arg match()
+- `--bogus-flag` still returns exit 2; `--help` still returns exit 0
+
+**Judgment notes:**
+- DEF row at line 2523 has 17 columns vs the 18-column header (pre-existing — present in d848770). Not in scope for pre8.
+- `SF_CP_TOKEN` was already populated in `analyze_session()` (declared line 3928, set from cp_token field); no additional awk-pass changes needed.
+- Apostrophe-in-comment hazard: comments inside the awk single-quoted block must avoid apostrophes (would close the heredoc string). Caught locally during pre8 lint-fix; recorded here so future contributors avoid it.
+
+**Status:** COMPLETE — pre8 @ <commit-hash>
+
 
