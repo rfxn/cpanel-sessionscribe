@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.4
+# sessionscribe-ioc-scan.sh v1.6.5
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.4"
+VERSION="1.6.5"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -1788,20 +1788,24 @@ check_destruction_iocs() {
     while IFS= read -r rf; do
         [[ -f "$rf" ]] && readme_hits+=("$rf")
     done < <(find /home -maxdepth 2 -name 'README.md' 2>/dev/null)
+    # Length-check guard: ${arr[@]} on a declared-but-empty array trips
+    # `set -u` on bash 4.1 (CL6). Matches the EXCLUDE_IPS pattern above.
     local rf
-    for rf in "${readme_hits[@]}"; do
-        if grep -qE "qtox|TOX ID|Sorry-ID|${PATTERN_A_TOX_ID}" "$rf" 2>/dev/null; then
-            local rf_mtime tox_match=0
-            rf_mtime=$(stat -c %Y "$rf" 2>/dev/null)
-            grep -qF "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && tox_match=1
-            emit "destruction" "ioc_pattern_a_readme" "strong" \
-                 "ioc_pattern_a_ransom_readme" 10 \
-                 "path" "$rf" "tox_id_match" "$tox_match" \
-                 "mtime_epoch" "${rf_mtime:-0}" \
-                 "note" "qTox ransom README at $rf (tox_id_exact_match=$tox_match) - Pattern A drop (CRITICAL)."
-            ((hits++))
-        fi
-    done
+    if (( ${#readme_hits[@]} > 0 )); then
+        for rf in "${readme_hits[@]}"; do
+            if grep -qE "qtox|TOX ID|Sorry-ID|${PATTERN_A_TOX_ID}" "$rf" 2>/dev/null; then
+                local rf_mtime tox_match=0
+                rf_mtime=$(stat -c %Y "$rf" 2>/dev/null)
+                grep -qF "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && tox_match=1
+                emit "destruction" "ioc_pattern_a_readme" "strong" \
+                     "ioc_pattern_a_ransom_readme" 10 \
+                     "path" "$rf" "tox_id_match" "$tox_match" \
+                     "mtime_epoch" "${rf_mtime:-0}" \
+                     "note" "qTox ransom README at $rf (tox_id_exact_match=$tox_match) - Pattern A drop (CRITICAL)."
+                ((hits++))
+            fi
+        done
+    fi
     # Live socket to .sorry C2. Cheap if `ss` exists; silently skip otherwise.
     if command -v ss >/dev/null 2>&1; then
         if ss -tn 2>/dev/null | grep -qF "$PATTERN_A_C2_IP"; then
