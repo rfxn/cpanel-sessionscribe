@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.5
+# sessionscribe-ioc-scan.sh v1.6.6
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.5"
+VERSION="1.6.6"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -2238,72 +2238,77 @@ aggregate_verdict() {
     REASONS=()
     IOC_KEYS=()
     ADVISORIES=()
-    for row in "${SIGNALS[@]}"; do
-        IFS=$'\t' read -r area id sev key weight kv <<< "$row"
-        # Authoritative version-string check - record presence regardless of
-        # severity. These keys come from check_version's tier_class emit.
-        case "$key" in
-            vulnerable_per_build|vulnerable_no_vendor_patch|vulnerable_eol)
-                version_says_vuln=1 ;;
-            patched_per_build)
-                version_says_patched=1 ;;
-            probe_canary_session|probe_artifact_count)
-                ((probe_artifact_count++)) ;;
-        esac
-        weight="${weight:-0}"
-        case "$sev" in
-            strong)
-                score=$((score + (weight > 0 ? weight : 5)))
-                ((strong_count++))
-                REASONS+=("$key")
-                # Host-state axis: IOC-prefixed strong signals are exploitation
-                # evidence, not code-state evidence.
-                if [[ "$key" == ioc_* ]]; then
-                    ((ioc_critical++))
-                    IOC_KEYS+=("$key")
-                fi
-                ;;
-            evidence)
-                score=$((score + 2))
-                REASONS+=("$key")
-                ;;
-            warning)
-                ((inconclusive_count++))
-                if [[ "$key" == ioc_* ]]; then
-                    ((ioc_review++))
-                    IOC_KEYS+=("$key")
-                    # Surface review-tier IOCs in the verdict reasons line
-                    # so operators see "ioc_attacker_ip_in_access_log" even
-                    # when host_verdict is SUSPICIOUS not COMPROMISED.
+    # Length-check guard: SIGNALS may be empty (e.g. snapshot mode skipping
+    # the destruction scan with no upstream IOC emits). Bash 4.1 (CL6) trips
+    # `set -u` on ${arr[@]} of an empty declared array.
+    if (( ${#SIGNALS[@]} > 0 )); then
+        for row in "${SIGNALS[@]}"; do
+            IFS=$'\t' read -r area id sev key weight kv <<< "$row"
+            # Authoritative version-string check - record presence regardless of
+            # severity. These keys come from check_version's tier_class emit.
+            case "$key" in
+                vulnerable_per_build|vulnerable_no_vendor_patch|vulnerable_eol)
+                    version_says_vuln=1 ;;
+                patched_per_build)
+                    version_says_patched=1 ;;
+                probe_canary_session|probe_artifact_count)
+                    ((probe_artifact_count++)) ;;
+            esac
+            weight="${weight:-0}"
+            case "$sev" in
+                strong)
+                    score=$((score + (weight > 0 ? weight : 5)))
+                    ((strong_count++))
                     REASONS+=("$key")
-                fi
-                ;;
-            info)
-                # acl_machinery_present_informational is NOT in this list:
-                # the binary strings signal cannot discriminate vuln vs patched
-                # on 134+ tier; version-string patched_per_build carries the
-                # verdict.
-                case "$key" in
-                    patched_per_build|no_ioc_hits|no_session_iocs)
-                        score=$((score - (weight > 0 ? weight : 3)))
-                        ((fixed_count++))
-                        ;;
-                esac
-                ;;
-            advisory)
-                # Ancillary findings - never affect code_verdict, never count
-                # toward inconclusive. Surfaced separately for operator awareness.
-                ((advisory_count++))
-                # Extract human-readable note from the json kv blob for display.
-                local note=""
-                if [[ "$kv" == *'"note":"'* ]]; then
-                    note="${kv#*\"note\":\"}"
-                    note="${note%%\"*}"
-                fi
-                ADVISORIES+=("${id}|${key}|${note}")
-                ;;
-        esac
-    done
+                    # Host-state axis: IOC-prefixed strong signals are exploitation
+                    # evidence, not code-state evidence.
+                    if [[ "$key" == ioc_* ]]; then
+                        ((ioc_critical++))
+                        IOC_KEYS+=("$key")
+                    fi
+                    ;;
+                evidence)
+                    score=$((score + 2))
+                    REASONS+=("$key")
+                    ;;
+                warning)
+                    ((inconclusive_count++))
+                    if [[ "$key" == ioc_* ]]; then
+                        ((ioc_review++))
+                        IOC_KEYS+=("$key")
+                        # Surface review-tier IOCs in the verdict reasons line
+                        # so operators see "ioc_attacker_ip_in_access_log" even
+                        # when host_verdict is SUSPICIOUS not COMPROMISED.
+                        REASONS+=("$key")
+                    fi
+                    ;;
+                info)
+                    # acl_machinery_present_informational is NOT in this list:
+                    # the binary strings signal cannot discriminate vuln vs patched
+                    # on 134+ tier; version-string patched_per_build carries the
+                    # verdict.
+                    case "$key" in
+                        patched_per_build|no_ioc_hits|no_session_iocs)
+                            score=$((score - (weight > 0 ? weight : 3)))
+                            ((fixed_count++))
+                            ;;
+                    esac
+                    ;;
+                advisory)
+                    # Ancillary findings - never affect code_verdict, never count
+                    # toward inconclusive. Surfaced separately for operator awareness.
+                    ((advisory_count++))
+                    # Extract human-readable note from the json kv blob for display.
+                    local note=""
+                    if [[ "$kv" == *'"note":"'* ]]; then
+                        note="${kv#*\"note\":\"}"
+                        note="${note%%\"*}"
+                    fi
+                    ADVISORIES+=("${id}|${key}|${note}")
+                    ;;
+            esac
+        done
+    fi
 
     SCORE="$score"
     STRONG_COUNT="$strong_count"
@@ -2475,25 +2480,31 @@ write_json() {
         printf '  "advisories": [\n'
         first=1
         local entry adv_id adv_key adv_note
-        for entry in "${ADVISORIES[@]}"; do
-            IFS='|' read -r adv_id adv_key adv_note <<< "$entry"
-            (( first )) || printf ',\n'
-            first=0
-            printf '    {"id":"%s","key":"%s","note":"%s"}' \
-                "$(json_esc "$adv_id")" "$(json_esc "$adv_key")" "$(json_esc "$adv_note")"
-        done
+        # Length-check guards: empty advisories[]/signals[] are valid JSON
+        # output, but ${arr[@]} on an empty array trips `set -u` on bash 4.1.
+        if (( ${#ADVISORIES[@]} > 0 )); then
+            for entry in "${ADVISORIES[@]}"; do
+                IFS='|' read -r adv_id adv_key adv_note <<< "$entry"
+                (( first )) || printf ',\n'
+                first=0
+                printf '    {"id":"%s","key":"%s","note":"%s"}' \
+                    "$(json_esc "$adv_id")" "$(json_esc "$adv_key")" "$(json_esc "$adv_note")"
+            done
+        fi
         printf '\n  ],\n'
         printf '  "signals": [\n'
         first=1
-        for row in "${SIGNALS[@]}"; do
-            IFS=$'\t' read -r area id sev key weight kv <<< "$row"
-            (( first )) || printf ',\n'
-            first=0
-            # Per-signal host prefix mirrors the JSONL stream so each row is
-            # self-attributing when the signals[] array is flattened across hosts.
-            printf '    {"host":"%s","area":"%s","id":"%s","severity":"%s","key":"%s","weight":%s%s}' \
-                "$HOSTNAME_JSON" "$area" "$id" "$sev" "$key" "${weight:-0}" "${kv:+,$kv}"
-        done
+        if (( ${#SIGNALS[@]} > 0 )); then
+            for row in "${SIGNALS[@]}"; do
+                IFS=$'\t' read -r area id sev key weight kv <<< "$row"
+                (( first )) || printf ',\n'
+                first=0
+                # Per-signal host prefix mirrors the JSONL stream so each row is
+                # self-attributing when the signals[] array is flattened across hosts.
+                printf '    {"host":"%s","area":"%s","id":"%s","severity":"%s","key":"%s","weight":%s%s}' \
+                    "$HOSTNAME_JSON" "$area" "$id" "$sev" "$key" "${weight:-0}" "${kv:+,$kv}"
+            done
+        fi
         printf '\n  ]\n'
         printf '}\n'
     } > "$out"
