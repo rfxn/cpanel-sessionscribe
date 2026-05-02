@@ -1,12 +1,12 @@
-# State — 2026-05-01
+# State — 2026-05-02
 
 ## Shipped versions
 
 | Script | Version | Notes |
 |---|---|---|
-| sessionscribe-ioc-scan.sh | **1.6.4** | `--chain-on-critical` (forensic chain only on COMPROMISED); Pattern G non-canonical-paths walk skips known-good LW provisioning keys; `check_attacker_ips` now honors `--since` (was scanning full history → over-firing COMPROMISED on every fleet host with any historical 2xx from blackholed IPs); old hits emit `ioc_attacker_ip_outside_since_window` info-only signal |
-| sessionscribe-forensic.sh | **0.9.5** | pipe-tolerant decoder across phase_reconcile + 6 kill-chain rendering sites (`decode_pipe_tail` helper); cut-based oe_note band-aids removed; non-canonical SSH-key sweep also filters by `SSH_KNOWN_GOOD_RE` |
-| sessionscribe-mitigate.sh | **0.3.1** | forged-session quarantine phase covers raw + preauth + cache; .info sidecar preserves ctime/mtime/atime |
+| sessionscribe-ioc-scan.sh | **1.8.0** | (rev4 expansion; uncommitted) Pattern A anti-forensic detection (`ioc_pattern_a_evidence_targeted`); Pattern D `.sorry` fallback + `/var/cpanel/users/$reseller` second-source; Pattern E per-dimension breakout + 15-min handoff-burst signal; deterministic CRLF auth-bypass primitive in access_log (`ioc_cve_2026_41940_crlf_access_chain`); Pattern F embedded `#<epoch>` parsing for accurate kill-chain ordering; ATTACKER_IPS rev4 (+5 DigitalOcean operators). Prior shipped: v1.7.0 (Pattern H + Pattern I), v1.6.8 (Pattern F multi-shell + Pattern B nested + LeakIX UA), v1.6.7 (rev3 ATTACKER_IPS) |
+| sessionscribe-forensic.sh | **0.11.0** | (uncommitted) `IOC_ANNOTATIONS[]` parallel array; renderer appends `(dim: …)` to Pattern E websocket-shell rows from envelope dimensions field; index alignment maintained at all IOC_PRIMITIVES append sites. Prior shipped: v0.10.1 (Pattern H/I bundle capture), v0.10.0 (stage→pattern vocab refactor + JSONL schema_version=2) |
+| sessionscribe-mitigate.sh | **0.4.0** | (uncommitted) anti-forensic awareness in `phase_preflight`: detects `accounting.log.sorry` and warns operator that Pattern D detection is lossy; suggests `/var/cpanel/users/$reseller` direct verification |
 
 CDN sha256 / LOC columns will be re-stamped on next CDN sync. Repo:
 `https://github.com/rfxn/cpanel-sessionscribe`. CDN:
@@ -73,11 +73,11 @@ priority chain: `ts_epoch_first` → `mtime_epoch` → `ts_epoch` →
 
 ## Pending
 
-- **Phase 4 verification:** re-run on host2 / intent-wolves / maple2 /
-  cpanel_client lab hosts. Forensic should reproduce ioc-scan's
+- **Phase 4 verification:** re-run on lab hosts (see INTERNAL-NOTES.md
+  for the active roster). Forensic should reproduce ioc-scan's
   host_verdict exactly. Any divergence is an envelope-contract bug.
 - **schema_version field at envelope root:** future-proofing per the
-  v0.9 risk register. Not yet pinned. forensic v0.9.x reads any v1.6.x
+  v0.9 risk register. Not yet pinned. forensic v0.10.x+ reads any v1.6.x or v1.7.x or v1.8.x
   envelope.
 
 ## Bash floor

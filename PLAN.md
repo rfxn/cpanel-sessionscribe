@@ -681,11 +681,13 @@ JSONL schema downgrade (rolling forensic back from v0.10.0 to v0.9.9):
 
 ## Open items / tracking
 
-- [ ] Phase 0 — Forensic vocab refactor + JSONL schema_version hint
-- [ ] Phase 1 — ATTACKER_IPS dossier rev3 expansion
-- [ ] Phase 2 — Pattern F multi-shell + Pattern B nested + Pattern E comment + LeakIX UA
-- [ ] Phase 3 — Pattern H detection (4 sub-signals)
-- [ ] Phase 4 — Pattern I detection (4 sub-signals)
-- [ ] Phase 5 — Forensic Pattern H/I bundle capture
-- [ ] Phase 6 — Verification gate (per-phase + synthetic harness)
-- [ ] Phase 7 — CDN deploy + live sha256 parity check
+- [x] Phase 0 — Forensic vocab refactor + JSONL schema_version hint *(130da17)*
+- [x] Phase 1 — ATTACKER_IPS dossier rev3 expansion *(d87d6f0)*
+- [x] Phase 2 — Pattern F multi-shell + Pattern B nested + Pattern E comment + LeakIX UA *(c687a14)*
+- [x] Phase 3 — Pattern H detection (4 sub-signals) *(652e30d)*
+- [x] Phase 4 — Pattern I detection (4 sub-signals) *(652e30d)*
+- [x] Phase 5 — Forensic Pattern H/I bundle capture *(703d042)*
+- [x] Phase 6 — Verification gate (per-phase + synthetic harness) *(verified inline)*
+- [x] Phase 7 — CDN deploy + live sha256 parity check *(deployed; cdn==repo verified)*
+
+**Status (2026-05-01 end-of-session):** PLAN complete. All 5 code commits + 1 docs commit pushed to origin/main @ `703d042`. ioc-scan v1.7.0 + forensic v0.10.1 live on https://sh.rfxn.com/. Self-sentinel review (4-pass) found zero defects. *Note: a follow-on PLAN-v0.10.md was started in-parallel for v1.8.0 / v0.11.0 / mitigate v0.4.0 work; that effort is independent of this plan.*
