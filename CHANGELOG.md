@@ -4,6 +4,56 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.4.1 — 2026-05-02
+
+### Added
+- **Visual kill-chain rendering for v2.4.0 advisory entries.** The
+  pre-compromise gate keys (`ioc_pattern_e_websocket_shell_hits_pre_compromise`,
+  `ioc_pattern_e_websocket_shell_hits_orphan`,
+  `ioc_attacker_ip_2xx_on_cpsess_pre_compromise`) were filtered out of
+  `read_iocs_from_envelope` in v2.4.0 (severity ∈ {strong, warning}
+  filter excluded advisory), so they were invisible in the kill-chain
+  timeline. v2.4.1 admits them via a narrow allow-list (specific keys,
+  not blanket advisory-pass) so operators see the full forensic
+  picture. They render in dedicated zones with cyan styling so they
+  remain clearly distinct from the actual attack chronology.
+- New verdict types in `phase_reconcile`:
+  - `ADVISORY-PRE-COMPROMISE` — for `*_pre_compromise` keys (no CRLF
+    anchor or event predates first CRLF chain).
+  - `ADVISORY-ORPHAN` — for `*_orphan` keys (post-CRLF but >7 days
+    from nearest 2xx_on_cpsess).
+  Both short-circuit the standard PRE/POST defense comparison and
+  do NOT increment `N_PRE` / `N_POST` (advisory rows are context, not
+  attack-chain events).
+- New zone IDs in `render_kill_chain`: `adv_pre` (header label
+  "ADVISORY (PRE-COMPROMISE CONTEXT)") and `adv_orphan` ("ADVISORY
+  (EXPLOITATION-DETACHED)"), both rendered in cyan + bold via the
+  existing zone-header machinery so they appear as labeled bands in
+  the timeline above/around the real attack zones.
+- `render_offense_row` colors `ADVISORY-*` verdicts in cyan to match
+  their zone header — visible in the timeline but visually distinct
+  from the red/green/yellow attack-chain palette.
+- New `counters` line breakout: `advisory=N` shows the count of
+  advisory rows; the existing `iocs=N` field now shows attack-chain
+  events only (`#OFFENSE_EVENTS - n_advisory`) so operators can read
+  it directly without mental subtraction.
+
+### Changed
+- `kill-chain.tsv` and `kill-chain.jsonl` will now carry rows with
+  verdict values `ADVISORY-PRE-COMPROMISE` / `ADVISORY-ORPHAN` for
+  hosts where the v2.4.0 gate demoted Pattern E or 2xx_on_cpsess.
+  Aggregator-side: ss-aggregate.py should pattern-match `ADVISORY-*`
+  to bucket these separately from the real PRE/POST/UNDEFENDED
+  attack-chain rows.
+- VERSION 2.4.0 → 2.4.1.
+
+### Notes
+- Defense-bypass risk surface — none. Advisory severity is still
+  invisible to `ioc_critical` / `ioc_review` aggregation; admitting
+  them into the kill-chain renderer does NOT change `host_verdict`,
+  exit code, or score. The new `iocs=N` counter in the kill-chain
+  block now excludes advisory rows so it matches `#REASONS` accurately.
+
 ## sessionscribe-ioc-scan.sh v2.4.0 — 2026-05-02
 
 ### Added
