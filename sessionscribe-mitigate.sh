@@ -40,6 +40,14 @@
 #
 # Phases (in order; selectable via --only, --no-PHASE, or --list-phases):
 #
+#   snapshot    pre-mitigation evidence capture: tarball /var/cpanel/users/,
+#               accounting.log/audit.log, sessions/{raw,preauth,cache}/,
+#               cpanel.config, and `whmapi1 get_tweaksetting` output for
+#               proxysub keys to <BACKUP_DIR>/pre-mitigate-state.tgz BEFORE
+#               any mutating phase runs. Captures rogue artifacts (WHM API
+#               tokens, attacker accounts, accounting-log persistence) that
+#               later mitigation steps + cpsrvd state churn would otherwise
+#               destroy by the time a forensic bundle is taken.
 #   patch       cpanel -V vs published patched-build cutoffs
 #   preflight   epel-release present; threatdown.repo absent; broken
 #               non-base repos disabled (centos/alma/rocky baseos/appstream/
@@ -84,7 +92,7 @@
 
 set -u
 
-VERSION="0.4.2"
+VERSION="0.5.0"
 
 ###############################################################################
 # Constants
@@ -140,6 +148,12 @@ MODSEC_SRC_CANDIDATES=(
 # Backup root for any mutating action.
 BACKUP_ROOT_DEFAULT="/var/cpanel/sessionscribe-mitigation"
 
+# Pre-mitigation snapshot tier-2 (sessions corpus) size cap. Tier-1
+# (accounts/accounting/audit) is always captured (typically <1MB). The
+# session corpus can grow to hundreds of MB on busy hosts; cap so a
+# runaway session store doesn't blow the BACKUP_ROOT filesystem.
+MAX_SNAPSHOT_MB_DEFAULT=500
+
 # Marker tag stamped into every backup path so undo logic can find them.
 BACKUP_MARKER='nxesec-sessionscribe-mitigate'
 
@@ -157,9 +171,10 @@ PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
 # Phase registry - ordered list of (id, function, description, default-on)
 ###############################################################################
 
-PHASE_IDS=(patch preflight upcp proxysub csf apf runfw apache modsec sessions probe)
-PHASE_DEFAULT_ON=(1     1         1    1        1   1   1     1      1      1        0)
+PHASE_IDS=(snapshot patch preflight upcp proxysub csf apf runfw apache modsec sessions probe)
+PHASE_DEFAULT_ON=(1        1     1         1    1        1   1   1     1      1      1        0)
 declare -A PHASE_DESC=(
+    [snapshot]="pre-mitigation evidence capture (sessions, users, accounting.log)"
     [patch]="cpanel -V vs published patched-build cutoffs"
     [preflight]="epel-release; threatdown.repo absent; broken-repo sweep"
     [upcp]="if patch=UNPATCHED, kick off /scripts/upcp --force --bg"
@@ -188,6 +203,7 @@ QUIET=0
 NO_COLOR_FLAG=0
 OUTPUT_FILE=""
 BACKUP_ROOT="$BACKUP_ROOT_DEFAULT"
+MAX_SNAPSHOT_MB="$MAX_SNAPSHOT_MB_DEFAULT"
 ASSUME_YES=0
 
 usage() {
@@ -211,10 +227,10 @@ PHASE SELECTION
     --only LIST            Run only the named phases (CSV, or "all").
                            Phases: $(IFS=,; echo "${PHASE_IDS[*]}")
     --no-PHASE             Skip a phase. Per-phase opt-outs:
-                             --no-patch     --no-preflight   --no-upcp
-                             --no-proxysub  --no-csf         --no-apf
-                             --no-runfw     --no-apache      --no-modsec
-                             --no-sessions
+                             --no-snapshot  --no-patch       --no-preflight
+                             --no-upcp      --no-proxysub    --no-csf
+                             --no-apf       --no-runfw       --no-apache
+                             --no-modsec    --no-sessions
     --no-fw                Shorthand for --no-csf --no-apf --no-runfw.
     --probe                Enable the optional probe phase (opt-in).
                            Runs sessionscribe-remote-probe.sh against
@@ -238,6 +254,13 @@ MISC
     --no-color             Disable ANSI color. NO_COLOR=1 env also honored.
     --backup-root DIR      Backup directory for any mutation
                            (default: $BACKUP_ROOT_DEFAULT).
+    --max-snapshot-mb MB   Cap on the pre-mitigation session-tier snapshot
+                           (default: $MAX_SNAPSHOT_MB_DEFAULT). Tier-1 (accounts,
+                           accounting.log, audit.log, cpanel.config) is
+                           always captured. If sessions/{raw,preauth,cache}
+                           combined size exceeds the cap, the session tier
+                           is skipped with a WARN; other tiers proceed.
+                           0 = skip session tier entirely.
     --yes, -y              Non-interactive; assume yes (no prompts).
     -h, --help             Show this help.
 
@@ -290,9 +313,11 @@ while [[ $# -gt 0 ]]; do
         --apply)            MODE="apply";  shift ;;
         --only)             ONLY_LIST="$2"; shift 2 ;;
         --probe)            DO_PROBE=1; shift ;;
+        --no-snapshot)      PHASE_DISABLED[snapshot]=1; shift ;;
         --no-upcp)          PHASE_DISABLED[upcp]=1; shift ;;
         --no-modsec)        PHASE_DISABLED[modsec]=1; shift ;;
         --no-sessions)      PHASE_DISABLED[sessions]=1; shift ;;
+        --max-snapshot-mb)  MAX_SNAPSHOT_MB="$2"; shift 2 ;;
         --no-fw)            PHASE_DISABLED[csf]=1; PHASE_DISABLED[apf]=1; PHASE_DISABLED[runfw]=1; shift ;;
         --no-csf)           PHASE_DISABLED[csf]=1; shift ;;
         --no-apf)           PHASE_DISABLED[apf]=1; shift ;;
@@ -321,6 +346,13 @@ done
 # Apply requires root.
 if [[ "$MODE" == "apply" && $EUID -ne 0 ]]; then
     echo "Error: --apply must be run as root" >&2
+    exit 3
+fi
+
+# Validate --max-snapshot-mb is a non-negative integer (0 = skip session
+# tier entirely; tier1 still captured).
+if ! [[ "$MAX_SNAPSHOT_MB" =~ ^[0-9]+$ ]]; then
+    echo "Error: --max-snapshot-mb requires a non-negative integer (MB)" >&2
     exit 3
 fi
 
@@ -547,6 +579,239 @@ backup_file() {
     ensure_backup_dir || return 1
     local rel; rel=$(echo "$f" | sed 's|/|_|g; s/^_//')
     cp -a "$f" "$BACKUP_DIR/${rel}" 2>/dev/null
+}
+
+###############################################################################
+# 0. snapshot - pre-mitigation evidence capture
+###############################################################################
+#
+# Runs FIRST in the phase order so attacker-touchable state is preserved
+# before any mutating phase (csf/apf/modsec edits, sessions quarantine,
+# proxysub whmapi1 mutation) perturbs it. Three drivers:
+#
+#   1. Mitigation-driven evidence destruction. Operator timeline:
+#      attack at T -> mitigate.sh at T+1d -> forensic bundle at T+2d.
+#      Between mitigate-time and bundle-time, cpsrvd state churn +
+#      session quarantine narrow the live snapshot. Pre-mitigation
+#      capture freezes the state at mitigate-time so the bundle can
+#      ship two snapshots (pre + post mitigation).
+#
+#   2. proxysub whmapi1 mutation has no per-file backup target. Capture
+#      `whmapi1 get_tweaksetting` output for proxysubdomains and
+#      proxysubdomainsfornewaccounts BEFORE phase_proxysub runs so undo
+#      info is preserved.
+#
+#   3. /var/cpanel/users/ holds rogue WHM API tokens (.api files) that
+#      can't be reconstructed from access_log alone if the system or
+#      operator purges them later.
+#
+# Capture tiers (size-bounded):
+#
+#   tier1 (always captured):
+#       /var/cpanel/users/                   - WHM accounts + .api tokens
+#       /var/cpanel/accounting.log[.*]       - createacct/setupreseller/setacls
+#       /var/cpanel/audit.log[.*]            - audit trail (if present)
+#       /var/cpanel/cpanel.config            - pre-proxysub state
+#       pre-mitigate-tweaksettings.txt       - whmapi1 get_tweaksetting output
+#
+#   tier2 (capped via --max-snapshot-mb):
+#       /var/cpanel/sessions/raw/            - full session corpus
+#       /var/cpanel/sessions/preauth/        - pre-promotion markers
+#       /var/cpanel/sessions/cache/          - propagated session store
+#
+# Output: <BACKUP_DIR>/pre-mitigate-state.tgz + .info sidecar with sha256.
+# ioc-scan's phase_bundle already includes the entire BACKUP_ROOT in
+# defense-state.tgz so this artifact rides into forensic bundles for free.
+
+phase_snapshot() {
+    P_CUR=snapshot
+    phase_begin snapshot
+
+    # Tier-1 path inventory. Hardcoded set + rotated logs from glob.
+    local tier1_paths=(
+        /var/cpanel/users
+        /var/cpanel/accounting.log
+        /var/cpanel/audit.log
+        /var/cpanel/cpanel.config
+    )
+    if [[ -d /var/cpanel ]]; then
+        local rot
+        while IFS= read -r -d '' rot; do
+            tier1_paths+=("$rot")
+        done < <(find /var/cpanel -maxdepth 1 -type f \
+                       \( -name 'accounting.log.*' -o -name 'audit.log.*' \) \
+                       -print0 2>/dev/null)
+    fi
+
+    local snap_targets=()
+    local total_kb=0
+    local p kb
+    local tier1_present=0
+    # Empty-array guard for set -u + bash 4.1: tier1_paths is hardcoded
+    # non-empty above, but consistency with the project's empty-array
+    # discipline (see CLAUDE.md "Empty-array iteration") - cheap and safe.
+    if (( ${#tier1_paths[@]} > 0 )); then
+        for p in "${tier1_paths[@]}"; do
+            if [[ -e "$p" ]]; then
+                kb=$(du -sk "$p" 2>/dev/null | awk '{print $1+0}')
+                snap_targets+=("$p")
+                total_kb=$((total_kb + kb))
+                tier1_present=$((tier1_present+1))
+            fi
+        done
+    fi
+
+    # Tier-2: session corpus.
+    local sess_dirs=("$SESSIONS_DIR/raw" "$SESSIONS_DIR/preauth" "$SESSIONS_DIR/cache")
+    local sessions_targets=()
+    local sess_kb=0
+    for p in "${sess_dirs[@]}"; do
+        if [[ -d "$p" ]]; then
+            kb=$(du -sk "$p" 2>/dev/null | awk '{print $1+0}')
+            sessions_targets+=("$p")
+            sess_kb=$((sess_kb + kb))
+        fi
+    done
+
+    local cap_kb=$((MAX_SNAPSHOT_MB * 1024))
+    sk inventory \
+       tier1_paths "$tier1_present" \
+       tier1_kb "$total_kb" \
+       sessions_paths "${#sessions_targets[@]}" \
+       sessions_kb "$sess_kb" \
+       cap_mb "$MAX_SNAPSHOT_MB"
+
+    say_info "tier1 (accounts/accounting/audit/cpanel.config): $tier1_present paths, $((total_kb/1024)) MB"
+    say_info "sessions corpus: ${#sessions_targets[@]} paths, $((sess_kb/1024)) MB (cap: ${MAX_SNAPSHOT_MB} MB)"
+
+    # Apply size cap to sessions tier. tier1 is never capped.
+    local include_sessions=1
+    if (( sess_kb > cap_kb )); then
+        include_sessions=0
+        sk sessions_oversize sess_kb "$sess_kb" cap_kb "$cap_kb"
+        say_warn "sessions corpus $((sess_kb/1024)) MB exceeds cap ${MAX_SNAPSHOT_MB} MB; skipping (raise with --max-snapshot-mb)"
+    fi
+    if (( include_sessions )) && (( ${#sessions_targets[@]} > 0 )); then
+        local s
+        for s in "${sessions_targets[@]}"; do snap_targets+=("$s"); done
+    fi
+
+    # whmapi1 get_tweaksetting capture for proxysub keys (closes the
+    # phase_proxysub backup gap). Written to a temp file inside BACKUP_DIR
+    # in --apply mode; in --check mode just informational.
+    local tweak_lines=""
+    if have_cmd whmapi1; then
+        local tk tv
+        tweak_lines+="# whmapi1 get_tweaksetting snapshot ${TS_ISO}"$'\n'
+        tweak_lines+="# host=${HOSTNAME_FQDN} run_id=${RUN_ID} tool_version=${VERSION}"$'\n'
+        for tk in proxysubdomains proxysubdomainsfornewaccounts; do
+            tv=$(whmapi1 get_tweaksetting key="$tk" 2>/dev/null \
+                 | awk -F: '/^[[:space:]]+value:/ {sub(/^[[:space:]]+value:[[:space:]]*/,""); print; exit}')
+            tweak_lines+="${tk}=${tv:-<unset>}"$'\n'
+        done
+    fi
+
+    if [[ "$MODE" != "apply" ]]; then
+        if (( ${#snap_targets[@]} == 0 )); then
+            say_skip "no captureable paths present (host has no /var/cpanel/users etc)"
+            phase_set snapshot SKIPPED "nothing to snapshot"
+            return
+        fi
+        say_warn "would write pre-mitigate-state.tgz ($((total_kb/1024)) MB tier1$( ((include_sessions)) && echo " + $((sess_kb/1024)) MB sessions" || echo ""))"
+        phase_set snapshot WARN "needs --apply"
+        return
+    fi
+
+    ensure_backup_dir || { phase_set snapshot FAIL "backup dir creation failed"; return; }
+
+    if (( ${#snap_targets[@]} == 0 )); then
+        say_skip "no captureable paths present (host has no /var/cpanel/users etc)"
+        phase_set snapshot SKIPPED "nothing to snapshot"
+        return
+    fi
+
+    local snap_tgz="$BACKUP_DIR/pre-mitigate-state.tgz"
+    local snap_info="$BACKUP_DIR/pre-mitigate-state.info"
+    local list_file
+    list_file=$(mktemp /tmp/sessionscribe-snap.XXXXXX) || {
+        say_fail "mktemp failed for snapshot list"
+        phase_set snapshot FAIL "mktemp failed"
+        return
+    }
+
+    # Null-delimited path list for tar --null -T -. Avoids quoting issues.
+    local sp
+    for sp in "${snap_targets[@]}"; do
+        printf '%s\0' "$sp"
+    done > "$list_file"
+
+    # Write the tweaksettings capture into BACKUP_DIR and add to the tar
+    # list. Lives next to the tgz so it's visible without extracting.
+    local tweak_file=""
+    if [[ -n "$tweak_lines" ]]; then
+        tweak_file="$BACKUP_DIR/pre-mitigate-tweaksettings.txt"
+        printf '%s' "$tweak_lines" > "$tweak_file" 2>/dev/null
+        chmod 0600 "$tweak_file" 2>/dev/null
+        printf '%s\0' "$tweak_file" >> "$list_file"
+    fi
+
+    # tar rc=1 ("file changed as we read it" / "file removed before reading"
+    # under /var/cpanel/sessions/) is non-fatal - sessions churn during the
+    # capture window and that is expected. rc>=2 is real failure.
+    #
+    # Symlink handling: GNU tar's default is to STORE symlinks as symlinks
+    # for files encountered during recursive directory traversal; only
+    # top-level command-line arguments are dereferenced (and even those
+    # only with -h/--dereference, which we do NOT pass). Our top-level
+    # entries are directories (/var/cpanel/sessions/{raw,preauth,cache})
+    # and tier-1 regular files - so an attacker-planted symlink inside
+    # /var/cpanel/sessions/raw/ archives as a symlink, NOT its target.
+    # Do not add -h/--dereference here.
+    local tar_rc=0
+    tar --null -czf "$snap_tgz" -T "$list_file" 2>/dev/null || tar_rc=$?
+    rm -f "$list_file" 2>/dev/null
+
+    if (( tar_rc != 0 && tar_rc != 1 )); then
+        say_fail "tar failed (rc=$tar_rc) writing $snap_tgz"
+        phase_set snapshot FAIL "tar rc=$tar_rc"
+        return
+    fi
+
+    chmod 0600 "$snap_tgz" 2>/dev/null
+    local snap_bytes
+    snap_bytes=$(stat -c %s "$snap_tgz" 2>/dev/null)
+    snap_bytes="${snap_bytes:-0}"
+
+    local snap_sha=""
+    if have_cmd sha256sum; then
+        snap_sha=$(sha256sum -- "$snap_tgz" 2>/dev/null | awk '{print $1}')
+    fi
+
+    {
+        printf '%s\n' \
+            "# sessionscribe-mitigate pre-mitigation snapshot record" \
+            "tool=sessionscribe-mitigate" \
+            "tool_version=$VERSION" \
+            "run_id=$RUN_ID" \
+            "snapshot_ts=$TS_ISO" \
+            "host=$HOSTNAME_FQDN" \
+            "snapshot_path=$snap_tgz" \
+            "snapshot_bytes=$snap_bytes" \
+            "snapshot_sha256=${snap_sha:-}" \
+            "tier1_paths_count=$tier1_present" \
+            "tier1_kb=$total_kb" \
+            "sessions_paths_count=${#sessions_targets[@]}" \
+            "sessions_kb=$sess_kb" \
+            "sessions_included=$include_sessions" \
+            "max_snapshot_mb=$MAX_SNAPSHOT_MB" \
+            "tar_rc=$tar_rc"
+    } > "$snap_info" 2>/dev/null
+    chmod 0600 "$snap_info" 2>/dev/null
+
+    sk wrote bytes "$snap_bytes" sha256 "${snap_sha:-}" path "$snap_tgz" \
+       tar_rc "$tar_rc" sessions_included "$include_sessions"
+    say_action "wrote pre-mitigate-state.tgz ($((snap_bytes/1024/1024)) MB, sha256 ${snap_sha:0:12}...) to $BACKUP_DIR/"
+    phase_set snapshot ACTION "snapshot $((snap_bytes/1024/1024)) MB"
 }
 
 ###############################################################################
@@ -1409,11 +1674,18 @@ phase_sessions() {
         # This check catches the residual: a fabricated origin carrying
         # tfa_verified=1. ATTEMPT-class.
         #
-        # Maintenance note: when bumping the patched-tier floor, audit
-        # Cpanel/Security/Authn/TwoFactorAuth/Verify.pm and Cpanel/Server.pm
-        # in the new build. Any new origin method that legitimately mints
-        # tfa_verified=1 must be added to the has_kg list below or IOC-2
-        # will FP on legitimate sessions.
+        # SOURCE-OF-TRUTH for the known-good list: re-audit on each
+        # cpsrvd patch tier bump. Files to diff:
+        #   Cpanel/Security/Authn/TwoFactorAuth/Verify.pm
+        #   Cpanel/Server.pm
+        # Specifically, every callsite that writes tfa_verified=1 must
+        # route through one of {handle_form_login, create_user_session,
+        # handle_auth_transfer}. If a future patched-tier introduces a
+        # new origin method that legitimately mints tfa_verified=1,
+        # extend has_kg below to include it (else FP IOC-2 will fire).
+        # Floor patched tiers as of v0.5.0: 11.86.0.41, 11.110.0.97,
+        # 11.118.0.63, 11.126.0.54, 11.130.0.19, 11.132.0.29,
+        # 11.134.0.20, 11.136.0.5.
         session_shape=$(awk -v now="$now_epoch" -v floor="$PASS_FORGERY_MAX_LEN" \
                             -v canary_re="$PROBE_CANARY_PAT" '
             BEGIN { line_idx=0; pass_count=0; pass_at=0 }
@@ -1538,11 +1810,14 @@ phase_sessions() {
             local would_msg="ioc=$reasons; would quarantine"
             (( has_b ))     && would_msg+=" + preauth"
             (( has_cache )) && would_msg+=" + cache"
-            # Display-only class split (quarantine action under --apply is
-            # identical for both - per spec). ATTEMPT-class shapes
-            # (D2-only / 2-only) tag as "attempt session:" so operators can
-            # tell forensic-grade hits from session-level attempt residue
-            # without parsing reason letters. Any confirmed-class reason
+            # ATTEMPT-class shapes (D2-only / 2-only) tag as "attempt
+            # session:" so operators can tell forensic-grade hits from
+            # session-level attempt residue without parsing reason letters.
+            # Any confirmed-class reason (A/B/D/E/E2/F/H/I) wins.
+            # Quarantine action is identical for both classes; the split is
+            # display-only so --check output reads "attempt session:" vs
+            # "forged session:" without operators having to parse reason
+            # letters. Confirmed-class wins on co-occurrence, so any of
             # A/B/C/D/E/E2/F/H/I in $reasons keeps class_tag="forged".
             local class_tag="forged"
             case ",$reasons," in
@@ -1925,6 +2200,7 @@ run_phase() {
         return 0
     fi
     case "$pid" in
+        snapshot)   phase_snapshot ;;
         patch)      phase_patch ;;
         preflight)  phase_preflight ;;
         upcp)       phase_upcp ;;
