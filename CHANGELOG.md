@@ -4,6 +4,41 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.5.0 — 2026-05-02
+
+### Added
+- **`--chain-on-all` / `--chain-always` flag** — runs the forensic
+  chain (defense + offense + reconcile + kill-chain + bundle) for
+  EVERY host scanned, regardless of `host_verdict`. Overrides the
+  default CLEAN-skip and overrides `--chain-on-critical`. Pair with
+  `--upload` to ship every bundle to intake. Use cases:
+  - Fleet baseline collection (snapshot of every host's defense + IOC
+    state for trend analysis).
+  - Post-incident "are we definitely clean?" verification (CLEAN
+    verdict + clean kill-chain artifact = strong evidence).
+  - Threat-intel data-lake construction (every scan contributes a
+    bundle for cross-fleet pattern mining).
+- Forensic-gate priority documented in main flow (highest first):
+  `--chain-on-all` > `--chain-on-critical` > default `--full`.
+  When both `--chain-on-all` and `--chain-on-critical` are set,
+  `--chain-on-all` wins (operator's explicit "I want everything"
+  override).
+- `forensic_chain_on_all` info signal emitted when the override
+  fires, so envelope consumers can attribute the bundle to an
+  unconditional run vs. a verdict-gated one.
+- `forensic_skipped_clean` note now hints at `--chain-on-all` as
+  the explicit override path, so operators discover the flag from
+  the existing skip message.
+
+### Changed
+- VERSION 2.4.1 → 2.5.0 (additive flag = minor bump).
+
+### Notes
+- `--chain-on-all` does NOT change verdict semantics — host_verdict,
+  exit_code, and score are computed the same way regardless of which
+  gate decides whether forensic phases run. The flag only controls
+  whether the kill-chain artifact + bundle get produced.
+
 ## sessionscribe-ioc-scan.sh v2.4.1 — 2026-05-02
 
 ### Added

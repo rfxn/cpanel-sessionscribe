@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.4.1
+# sessionscribe-ioc-scan.sh v2.5.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.4.1"
+VERSION="2.5.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -418,6 +418,18 @@ CHAIN_UPLOAD_TOKEN=""
 # exploitation evidence.
 CHAIN_ON_CRITICAL=0
 
+# --chain-on-all: widen the chain gate to "always run forensic phases"
+# (overrides the default CLEAN-skip AND overrides --chain-on-critical).
+# Useful for fleet baseline collection, post-incident "are we definitely
+# clean?" verification, or threat-intel data-lake construction where
+# operators want a kill-chain artifact + envelope + (optionally) bundle
+# upload for EVERY host scanned, regardless of host_verdict. Implies
+# --chain-forensic. Pair with --upload to ship every bundle to intake.
+# When both --chain-on-all and --chain-on-critical are set, this wins
+# (more inclusive — chain-on-all is the operator's explicit "I want
+# everything" override).
+CHAIN_ON_ALL=0
+
 # Forensic / merged-mode defaults (post-merge v2.0.0).
 FULL_MODE=0                             # 1 if --full set (or back-compat chain flag)
 REPLAY_PATH=""                          # set by --replay PATH
@@ -549,6 +561,11 @@ Back-compat aliases (deprecated; set full-mode + the relevant gate):
       --chain-forensic       equivalent to full mode (no host-verdict gate)
       --chain-on-critical    full mode only if host_verdict == COMPROMISED
                              (CLEAN/SUSPICIOUS skip forensic phases)
+      --chain-on-all         full mode for EVERY host_verdict, including
+      --chain-always         CLEAN (overrides default CLEAN-skip + overrides
+                             --chain-on-critical). Pair with --upload to
+                             ship every bundle to intake (fleet baseline /
+                             threat-intel data-lake collection).
       --chain-upload         full mode with upload enabled
 
 Misc:
@@ -612,6 +629,10 @@ while [[ $# -gt 0 ]]; do
         --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
         --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
         --chain-on-critical)  FULL_MODE=1; CHAIN_ON_CRITICAL=1; CHAIN_FORENSIC=1; shift ;;
+        # v2.5.0 chain-on-all override — runs forensic phases for EVERY
+        # host (including CLEAN). Pair with --upload for unconditional
+        # bundle submission across the fleet. Implies --full.
+        --chain-on-all|--chain-always) FULL_MODE=1; CHAIN_ON_ALL=1; CHAIN_FORENSIC=1; shift ;;
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
@@ -6380,14 +6401,25 @@ RUN_FORENSIC=0
 if (( REPLAY_MODE )); then
     RUN_FORENSIC=1
 elif (( FULL_MODE )); then
-    # Apply legacy chain gates if set (--chain-on-critical etc.).
-    if (( CHAIN_ON_CRITICAL )) && [[ "$HOST_VERDICT" != "COMPROMISED" ]]; then
+    # Gate priority (highest first):
+    #   --chain-on-all       run forensic for EVERY host_verdict (overrides
+    #                        --chain-on-critical AND the default CLEAN-skip).
+    #                        Operator's explicit "I want everything" override.
+    #   --chain-on-critical  run forensic only for COMPROMISED.
+    #   (default --full)     run forensic for SUSPICIOUS / COMPROMISED;
+    #                        skip CLEAN (we don't ship empty bundles by default).
+    if (( CHAIN_ON_ALL )); then
+        emit "summary" "forensic_run" "info" "forensic_chain_on_all" 0 \
+             "host_verdict" "$HOST_VERDICT" \
+             "note" "host_verdict=$HOST_VERDICT; --chain-on-all forces forensic phases regardless of verdict."
+        RUN_FORENSIC=1
+    elif (( CHAIN_ON_CRITICAL )) && [[ "$HOST_VERDICT" != "COMPROMISED" ]]; then
         emit "summary" "forensic_skip" "info" "forensic_skipped_below_critical" 0 \
              "host_verdict" "$HOST_VERDICT" \
              "note" "host_verdict=$HOST_VERDICT; --chain-on-critical limits forensic to COMPROMISED."
     elif [[ "$HOST_VERDICT" == "CLEAN" ]]; then
         emit "summary" "forensic_skip" "info" "forensic_skipped_clean" 0 \
-             "note" "host_verdict=CLEAN; not running forensic phases."
+             "note" "host_verdict=CLEAN; not running forensic phases (use --chain-on-all to override)."
     else
         RUN_FORENSIC=1
     fi
