@@ -4,6 +4,35 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.5.0 — 2026-05-02
+
+### Added
+- New `phase_snapshot` runs FIRST in the phase order; captures the
+  pre-mitigation state of `/var/cpanel/users/`, `accounting.log[.*]`,
+  `audit.log[.*]`, `cpanel.config`, and `sessions/{raw,preauth,cache}/`
+  to `<BACKUP_DIR>/pre-mitigate-state.tgz` BEFORE any mutating phase
+  perturbs it. Closes Gap 8 from the v3/v4 IOC-scan recommendations:
+  rogue WHM API tokens / accounts / accounting-log persistence are no
+  longer destroyed by the gap between mitigate-time and forensic-bundle
+  capture time.
+- `whmapi1 get_tweaksetting` output for `proxysubdomains` and
+  `proxysubdomainsfornewaccounts` is captured into
+  `pre-mitigate-tweaksettings.txt` next to the tarball, closing the
+  per-file backup gap that previously left `phase_proxysub` mutations
+  with no undo path.
+- `.info` sidecar with sha256 of the tarball, byte size, tier1/tier2
+  inventory, sessions-included flag, and tar return code.
+- New CLI flags: `--no-snapshot` opt-out, `--max-snapshot-mb MB`
+  (default 500) caps the session-corpus tier; tier-1 always captured.
+- `ioc-scan`'s `phase_bundle` already includes the entire
+  `MITIGATE_BACKUP_ROOT` in `defense-state.tgz`, so the new artifact
+  rides into forensic bundles without an ioc-scan-side change.
+
+### Changed
+- Phase order now begins with `snapshot`; existing operators relying on
+  the prior bare `--apply` behavior should add `--no-snapshot` if they
+  want the v0.4.x behavior.
+
 ## sessionscribe-mitigate.sh v0.4.2 — 2026-05-02
 
 ### Added
