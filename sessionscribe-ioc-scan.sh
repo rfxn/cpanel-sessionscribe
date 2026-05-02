@@ -103,17 +103,20 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 
-# Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
-# moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
-# advisory revision. WP Squared product line: separate patch at build 136.1.7.
-PATCHED_TIERS_KEYS=(110 118 126 130 132 134 136)
-PATCHED_TIERS_VALS=(97  63  54  18  29  20  5)
+# Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
+# vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
+# bumped from .18 to .19. WP Squared product line: separate patch at build
+# 136.1.7 (tracked in mitigate/forensic, not in this tier-keyed map).
+PATCHED_TIERS_KEYS=(86 110 118 124 126 130 132 134 136)
+PATCHED_TIERS_VALS=(41 97  63  35  54  19  29  20  5)
 
 # Tiers explicitly excluded from the vendor patch list. In-place patch
-# unavailable; hosts must be upgraded to a patched tier.
-UNPATCHED_TIERS="112 114 116 120 122 124 128"
+# unavailable; hosts must be upgraded to a patched tier. Tier 124 was
+# in this list pre-advisory but was given an in-place patch (.35), so
+# is now moved into PATCHED_TIERS_KEYS above.
+UNPATCHED_TIERS="112 114 116 120 122 128"
 
 # cpsrvd ACL machinery strings - present (>=8 unique) in patched cpsrvd,
 # absent (0) in vulnerable cpsrvd we examined.
