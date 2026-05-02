@@ -92,7 +92,7 @@
 
 set -u
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 
 ###############################################################################
 # Constants
@@ -467,7 +467,7 @@ declare -A P_NOTES=()          # phase -> "; " joined extra notes (info)
 declare -a PHASE_ORDER_RUN=()  # the actual phases that ran, in order
 
 # Per-signal storage (for JSONL streaming and end-of-run summary).
-declare -ga SIGNALS_JSON=()    # JSONL strings (already escaped + assembled)
+declare -a SIGNALS_JSON=()     # JSONL strings (already escaped + assembled)
 
 N_OK=0; N_WARN=0; N_FAIL=0; N_ACTION=0; N_SKIPPED=0
 
