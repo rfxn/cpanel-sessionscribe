@@ -1,0 +1,3 @@
+origin_as_string=app=whostmgr,host=10.0.0.1,method=badpass
+pass=line1
+pass=line2

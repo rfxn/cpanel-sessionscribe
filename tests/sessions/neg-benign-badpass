@@ -1,0 +1,3 @@
+origin_as_string=app=whostmgr,host=10.0.0.1,method=badpass
+token_denied=1
+cp_security_token=/cpsess1234567890

@@ -84,7 +84,7 @@
 
 set -u
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 
 ###############################################################################
 # Constants
@@ -1382,12 +1382,38 @@ phase_sessions() {
 
         # Single awk pass extracts the session shape and emits one of:
         #   PROBE_ARTIFACT          - skip (probe collateral)
-        #   FORGED:<reason-list>    - forged; reasons is CSV of A/B-cand/C/D/E/E2/F/H/I
+        #   FORGED:<reason-list>    - forged; reasons is CSV of A/B-cand/C/D/E/E2/F/H/I/D2/2
         #   OK                      - clean
         # B-cand is "candidate IOC-B" - confirmed in bash by checking for
         # a paired preauth companion file (cpsrvd's write_session removes
         # the preauth marker on auth promotion, so paired existence is
         # structurally impossible in benign flow).
+        #
+        # IOC-D2: single-line pass= on a badpass session with no auth
+        # markers. saveSession (Cpanel/Session.pm:181) writes pass= only
+        # when length($session_ref->{pass}) > 0. The badpass call site
+        # (Cpanel/Server.pm:1244-1252) does not pass `pass` to newsession.
+        # A legitimate badpass session therefore has no pass= line. Any
+        # pass= line on a badpass session is the footprint of an injection
+        # that tampered with a user-controlled field on the badpass-bound
+        # request. IOC-D catches the multi-line / stranded variant
+        # (watchTowr CRLF chain); IOC-D2 catches the residual single-line
+        # well-formed case. ATTEMPT-class.
+        #
+        # IOC-2 (standalone): tfa_verified=1 outside known-good origins.
+        # tfa_verified=1 is written by exactly two paths
+        # (Cpanel/Security/Authn/TwoFactorAuth/Verify.pm:122 and
+        # Cpanel/Server.pm:2295). Both produce one of three legitimate
+        # origin methods (handle_form_login, create_user_session,
+        # handle_auth_transfer). The badpass+tfa case is covered by IOC-E.
+        # This check catches the residual: a fabricated origin carrying
+        # tfa_verified=1. ATTEMPT-class.
+        #
+        # Maintenance note: when bumping the patched-tier floor, audit
+        # Cpanel/Security/Authn/TwoFactorAuth/Verify.pm and Cpanel/Server.pm
+        # in the new build. Any new origin method that legitimately mints
+        # tfa_verified=1 must be added to the has_kg list below or IOC-2
+        # will FP on legitimate sessions.
         session_shape=$(awk -v now="$now_epoch" -v floor="$PASS_FORGERY_MAX_LEN" \
                             -v canary_re="$PROBE_CANARY_PAT" '
             BEGIN { line_idx=0; pass_count=0; pass_at=0 }
@@ -1396,7 +1422,13 @@ phase_sessions() {
             /^cp_security_token=/   { has_cp=1 }
             /^origin_as_string=/ {
                 origin=substr($0, index($0,"=")+1)
-                if (origin ~ /method=badpass/) has_bp=1
+                if (origin ~ /method=badpass/)              has_bp=1
+                # Known-good origin methods - the only legitimate cpsrvd
+                # tfa_verified=1 producers (see IOC-2 comment block above).
+                if (origin ~ /method=handle_form_login/)    has_kg=1
+                if (origin ~ /method=create_user_session/)  has_kg=1
+                if (origin ~ /method=handle_auth_transfer/) has_kg=1
+                has_origin=1
             }
             /^successful_external_auth_with_timestamp=/ {
                 has_ext=1; ts_val=substr($0, index($0,"=")+1)
@@ -1404,7 +1436,7 @@ phase_sessions() {
             /^successful_internal_auth_with_timestamp=/ {
                 has_int=1; ts_val=substr($0, index($0,"=")+1)
             }
-            /^tfa_verified=1/       { has_tfa=1 }
+            /^tfa_verified=1$/      { has_tfa=1 }
             /^hasroot=1/            { has_hasroot=1 }
             $0 ~ canary_re          { has_canary=1 }
             /^pass=/ {
@@ -1444,6 +1476,17 @@ phase_sessions() {
                 if (has_hasroot) reasons = reasons "H,"
                 # IOC-I: malformed (non-blank line not matching key=value).
                 if (malformed) reasons = reasons "I,"
+                # IOC-D2: single-line pass= on badpass session, structurally
+                # well-formed, no auth markers. Distinct from IOC-D which
+                # requires pass_count>1 || stranded. Closes parity gap with
+                # the cPanel reference IOC-5.
+                if (has_bp && pass_count == 1 && !stranded \
+                    && !has_ext && !has_int) reasons = reasons "D2,"
+                # IOC-2: tfa_verified=1 with non-badpass non-known-good
+                # origin. The badpass+tfa case is covered by IOC-E. Closes
+                # parity gap with the cPanel reference IOC-2.
+                if (has_tfa && has_origin && !has_bp && !has_kg)
+                    reasons = reasons "2,"
                 sub(/,$/, "", reasons)
                 if (reasons == "") print "OK"
                 else print "FORGED:" reasons
@@ -1495,7 +1538,18 @@ phase_sessions() {
             local would_msg="ioc=$reasons; would quarantine"
             (( has_b ))     && would_msg+=" + preauth"
             (( has_cache )) && would_msg+=" + cache"
-            say_warn "forged session: $f ($would_msg)"
+            # Display-only class split (quarantine action under --apply is
+            # identical for both - per spec). ATTEMPT-class shapes
+            # (D2-only / 2-only) tag as "attempt session:" so operators can
+            # tell forensic-grade hits from session-level attempt residue
+            # without parsing reason letters. Any confirmed-class reason
+            # A/B/C/D/E/E2/F/H/I in $reasons keeps class_tag="forged".
+            local class_tag="forged"
+            case ",$reasons," in
+                (*,A,*|*,B,*|*,C,*|*,D,*|*,E,*|*,E2,*|*,F,*|*,H,*|*,I,*) ;;
+                (*,D2,*|*,2,*) class_tag="attempt" ;;
+            esac
+            say_warn "$class_tag session: $f ($would_msg)"
             continue
         fi
 
