@@ -745,3 +745,30 @@ Bump `VERSION` to `2.2.0`, update STATE.md / CLAUDE.md / README.md to document t
 - host2 stderr verdict block: ASCII-only, no Unicode glyphs (per CLAUDE.md ASCII-only output convention)
 - Tag column width still ≤10 chars after any new tags introduced (Phase 6 may render `[SUSPECT]` 9-char if exit-code rendering changes — verify)
 - No double-counted ioc_critical or ioc_review (Phase 2 may emit both legacy + new keys for the same access_log scan; verify aggregate_verdict() doesn't count both)
+
+---
+
+## Sentinel Fixups (post-pre6)
+
+### pre7 — MUST-FIX: exit code 3 collision (Sentinel Finding 1)
+
+**Problem:** Phase 6's plan said exit 3 was unused; it was actually used by 16 tool-error / pre-scan sites (8 in the argument parser + /var/cpanel gate, plus 8 in `resolve_replay_envelope` path resolution). Phase 6 help-text documented tool errors at exit 2 but the runtime continued exit 3. Operators reading `$?` could not distinguish "host SUSPICIOUS" (legitimate IOC review tier) from "bad arguments / unreadable replay path" (tool error), corrupting Phase 7 gate 3 measurement (q1_weak_noise hosts dropping to exit 3 / SUSPICIOUS).
+
+**Fix:** Changed all 16 `exit 3` calls to `exit 2`:
+- Argument parser block: lines 595 (unknown option), 602 (--csv+--jsonl), 608 (--replay missing path), 615 (--upload without --full/--replay), 622 (--full + --no-ledger), 632 (--max-bundle-mb), 638 (--since)
+- Pre-scan gate: line 785 (/var/cpanel missing)
+- `resolve_replay_envelope` path resolution: 8 sites at lines 5907, 5918, 5922, 5932, 5936, 5944, 5953, 5959 (empty path, mktemp fail, tar extract fail, no-json, multi-json, bad-extension, dir-no-json, path-not-exist)
+- Header comment at ~line 5898 ("exits 3 on ambiguity") updated to "exits 2"
+
+The sole remaining user of exit code 3 is now the SUSPICIOUS host-state assignment (`EXIT_CODE=3`) inside `aggregate_verdict`.
+
+**Verification:**
+- `grep -cE 'exit 3' sessionscribe-ioc-scan.sh` → 0 (no direct exit 3)
+- `grep -cE 'EXIT_CODE=3' sessionscribe-ioc-scan.sh` → 1 (SUSPICIOUS assignment only)
+- `bash sessionscribe-ioc-scan.sh --bogus-flag-name` → exit 2
+- `bash sessionscribe-ioc-scan.sh --help` → exit 0
+- `bash -n` + `shellcheck -S error` clean
+- Help text (lines 533-544) unchanged; runtime now matches documented contract
+
+**Status:** COMPLETE — pre7 @ <commit-hash>
+

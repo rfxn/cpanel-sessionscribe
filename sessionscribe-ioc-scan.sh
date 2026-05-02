@@ -592,34 +592,34 @@ while [[ $# -gt 0 ]]; do
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
         --timeout)            TIMEOUT="$2"; shift 2 ;;
         -h|--help)            usage ;;
-        *) echo "Unknown option: $1" >&2; echo "Try --help" >&2; exit 3 ;;
+        *) echo "Unknown option: $1" >&2; echo "Try --help" >&2; exit 2 ;;
     esac
 done
 
 # --csv and --jsonl both want stdout - mutual exclusion.
 if (( CSV && JSONL )); then
     echo "Error: --csv and --jsonl both stream to stdout; pick one." >&2
-    exit 3
+    exit 2
 fi
 
 # --replay requires a path arg.
 if (( REPLAY_MODE )) && [[ -z "$REPLAY_PATH" ]]; then
     echo "Error: --replay requires PATH (envelope .json, bundle directory, or .tgz)" >&2
-    exit 3
+    exit 2
 fi
 # --replay implies --full (forensic phases are the whole point of replay).
 (( REPLAY_MODE )) && FULL_MODE=1
 # --upload requires --full or --replay (something to upload).
 if (( DO_UPLOAD )) && ! (( FULL_MODE || REPLAY_MODE )); then
     echo "Error: --upload requires --full or --replay (no bundle without forensic mode)" >&2
-    exit 3
+    exit 2
 fi
 # --full requires the envelope on disk so forensic phases can read it via
 # the same code path as --replay. --no-ledger disables that write -- silently
 # producing an empty kill-chain. Reject the combination explicitly.
 if (( FULL_MODE )) && (( ! REPLAY_MODE )) && (( NO_LEDGER )); then
     echo "Error: --full is incompatible with --no-ledger (forensic phases require the envelope on disk; use --ledger-dir to override the location instead)" >&2
-    exit 3
+    exit 2
 fi
 # Resolve upload token at parse time. Order: --upload-token > env > built-in.
 if (( DO_UPLOAD )); then
@@ -629,13 +629,13 @@ fi
 # Validate --max-bundle-mb is a non-negative integer.
 if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
     echo "Error: --max-bundle-mb requires a non-negative integer (MB)" >&2
-    exit 3
+    exit 2
 fi
 
 # Compute --since cutoff from days-back if requested.
 if [[ -n "$SINCE_DAYS" ]]; then
     if ! [[ "$SINCE_DAYS" =~ ^[0-9]+$ ]]; then
-        echo "Error: --since requires a positive integer (days)" >&2; exit 3
+        echo "Error: --since requires a positive integer (days)" >&2; exit 2
     fi
     SINCE_EPOCH=$(( $(date -u +%s) - SINCE_DAYS * 86400 ))
 fi
@@ -782,7 +782,7 @@ if [[ -z "${ROOT_OVERRIDE}${VERSION_OVERRIDE}${CPSRVD_OVERRIDE}" ]] \
    && [[ ! -d /var/cpanel ]]; then
     echo "Error: /var/cpanel not found - this host does not appear to run cPanel/WHM." >&2
     echo "       For offline snapshot forensics use --root / --version-string / --cpsrvd-path." >&2
-    exit 3
+    exit 2
 fi
 
 ###############################################################################
@@ -5895,8 +5895,8 @@ syslog_emit() {
 #   PATH.json                — used directly
 #   PATH/                    — looks for *.json (envelope.json or <run_id>.json)
 #   PATH.tgz, PATH.tar.gz    — extracts the envelope to /tmp/sessionscribe-replay-<RUN_ID>/
-# Sets RESOLVED_ENVELOPE_PATH on success; emits to stderr + exits 3 on
-# ambiguity or unreadability.
+# Sets RESOLVED_ENVELOPE_PATH on success; emits to stderr + exits 2 on
+# ambiguity or unreadability (tool error -- pre-scan path resolution).
 ###############################################################################
 RESOLVED_ENVELOPE_PATH=""
 REPLAY_TMPDIR=""
@@ -5904,7 +5904,7 @@ resolve_replay_envelope() {
     local p="$1"
     if [[ -z "$p" ]]; then
         echo "Error: resolve_replay_envelope called with empty path" >&2
-        exit 3
+        exit 2
     fi
     if [[ -f "$p" ]]; then
         case "$p" in
@@ -5915,11 +5915,11 @@ resolve_replay_envelope() {
             (*.tgz|*.tar.gz)
                 REPLAY_TMPDIR=$(mktemp -d "/tmp/sessionscribe-replay-${RUN_ID}.XXXXXX") || {
                     echo "Error: mktemp failed for replay extraction" >&2
-                    exit 3
+                    exit 2
                 }
                 if ! tar -xzf "$p" -C "$REPLAY_TMPDIR" 2>/dev/null; then
                     echo "Error: failed to extract $p (not a valid gzip tarball?)" >&2
-                    exit 3
+                    exit 2
                 fi
                 # Bundle layout: <tmp>/<bundle-dir-name>/<run_id>.json (forensic
                 # bundle convention) OR <tmp>/envelope.json (legacy). Multi-match
@@ -5929,11 +5929,11 @@ resolve_replay_envelope() {
                 n_cand=$(find "$REPLAY_TMPDIR" -maxdepth 3 -type f -name '*.json' 2>/dev/null | wc -l)
                 if (( n_cand == 0 )); then
                     echo "Error: no .json envelope found inside $p" >&2
-                    exit 3
+                    exit 2
                 elif (( n_cand > 1 )); then
                     echo "Error: $n_cand .json files found inside $p — ambiguous; extract manually and pass the envelope file directly with --replay" >&2
                     find "$REPLAY_TMPDIR" -maxdepth 3 -type f -name '*.json' >&2
-                    exit 3
+                    exit 2
                 fi
                 cand=$(find "$REPLAY_TMPDIR" -maxdepth 3 -type f -name '*.json' 2>/dev/null | head -1)
                 RESOLVED_ENVELOPE_PATH="$cand"
@@ -5941,7 +5941,7 @@ resolve_replay_envelope() {
                 ;;
             (*)
                 echo "Error: --replay file must be .json, .tgz, or .tar.gz (got $p)" >&2
-                exit 3
+                exit 2
                 ;;
         esac
     elif [[ -d "$p" ]]; then
@@ -5950,13 +5950,13 @@ resolve_replay_envelope() {
         cand=$(find "$p" -maxdepth 1 -type f -name '*.json' 2>/dev/null | head -1)
         if [[ -z "$cand" ]]; then
             echo "Error: no .json envelope found in directory $p" >&2
-            exit 3
+            exit 2
         fi
         RESOLVED_ENVELOPE_PATH="$cand"
         return 0
     else
         echo "Error: --replay PATH does not exist: $p" >&2
-        exit 3
+        exit 2
     fi
 }
 
