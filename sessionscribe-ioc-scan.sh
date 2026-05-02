@@ -240,6 +240,18 @@ PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 PATTERN_I_BINARY="/root/.local/bin/system-service"
 PATTERN_I_PROCNAME="system-service"
 
+# Pattern G - SSH key persistence anchors. Comments matching these literal
+# IP labels are attacker-planted jumphost-mimic keys (per IC-5790 dossier).
+PATTERN_G_BAD_KEY_LABELS=(
+    "209.59.141.49"
+    "50.28.104.57"
+)
+# Forged mtime stamp the attackers used (`touch -d "2019-12-13 12:59:16"`).
+# date(1) interprets in local TZ so the stored epoch depends on host offset;
+# forensic pattern_g_deep_checks compares the wall-clock string under both
+# UTC and localtime to catch either interpretation.
+PATTERN_G_FORGED_MTIME_WALL="2019-12-13 12:59:16"
+
 # Known-good SSH key labels - must mirror sessionscribe-forensic.sh's
 # SSH_KNOWN_GOOD_RE. Real LW provisioning keys carry "Parent Child key
 # for <PJID>" comments (the PJID is a 6-char alnum project tag). The
@@ -318,6 +330,29 @@ NO_DESTRUCTION_IOCS=0
 NO_LEDGER=0
 LEDGER_DIR_DEFAULT="/var/cpanel/sessionscribe-ioc"
 LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
+
+# Forensic phase defaults (post-merge v2.0.0 — used when --full or --replay
+# is supplied; no-op in default --triage mode).
+DEFAULT_BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
+DEFAULT_MAX_BUNDLE_MB=2048      # per-tarball cap (NOT bundle-wide)
+DEFAULT_FORENSIC_SINCE_DAYS=90  # forensic-mode default --since when unspecified
+INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
+# Convenience token for ad-hoc intake submissions; server enforces 1000-PUT
+# cap per token. For fleet use, supply --upload-token or RFXN_INTAKE_TOKEN.
+INTAKE_DEFAULT_TOKEN="cd88c9970c3176997c9671a2566fadc84904be0b73edd5e3b071452eade796e1"
+
+# cpanel build cutoff list (was forensic-side PATCHED_BUILDS_CPANEL).
+# Mirrors the list ioc-scan check_version already uses; declared here so
+# phase_defense can reuse one source of truth.
+PATCH_CANARY_FILE="/usr/local/cpanel/Cpanel/Session/Load.pm"
+MITIGATE_BACKUP_ROOT="/var/cpanel/sessionscribe-mitigation"
+MODSEC_USER_CONFS=(
+    "/etc/apache2/conf.d/modsec/modsec2.user.conf"   # EA4 (cPanel default)
+    "/etc/httpd/conf.d/modsec/modsec2.user.conf"     # non-EA4 fallback
+    "/etc/httpd/conf.d/modsec2.user.conf"            # legacy non-EA4
+)
+MODSEC_USER_CONF="${MODSEC_USER_CONFS[0]}"
+CPSRVD_PORTS=(2082 2083 2086 2087 2095 2096)
 
 # Optional syslog one-liner for SIEM ingestion. Off by default.
 SYSLOG=0
@@ -509,6 +544,33 @@ fi
 TS_EPOCH=$(date -u +%s)
 RUN_ID="${SESSIONSCRIBE_RUN_ID:-${TS_EPOCH}-$$}"
 
+###############################################################################
+# Forensic state (post-merge v2.0.0)
+###############################################################################
+# When the operator runs --full or --replay, the forensic phases populate
+# these arrays. They stay empty in default --triage mode. All forensic
+# findings flow through emit() into the unified SIGNALS[] stream.
+DEFENSE_EVENTS=()       # "epoch|kind|note" strings, sorted at render time
+OFFENSE_EVENTS=()       # "epoch|pattern|key|note|defenses_required" strings
+IOC_PRIMITIVES=()       # parallel-indexed with OFFENSE_EVENTS; TSV row per IOC
+IOC_ANNOTATIONS=()      # parallel-indexed; renderer-side annotations (Pattern E dim)
+RECONCILED_EVENTS=()    # "epoch|pattern|key|verdict|delta|note" strings
+N_PRE=0                 # PRE-DEFENSE event count (set in phase_reconcile)
+N_POST=0                # POST-DEFENSE event count (set in phase_reconcile)
+
+# Defense extraction outputs (set by phase_defense, read by phase_reconcile +
+# write_kill_chain_primitives). Empty = "defense state unknown".
+DEF_PATCH_TIME=""       # cpanel patch landed (Load.pm mtime if patched)
+DEF_CPSRVD_RESTART=""   # cpsrvd PID start time (epoch)
+DEF_MITIGATE_FIRST=""   # earliest sessionscribe-mitigate.sh run dir
+DEF_MITIGATE_LAST=""    # most recent sessionscribe-mitigate.sh run dir
+DEF_MODSEC_TIME=""      # mtime of modsec2.user.conf if it contains 1500030
+PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
+
+# Bundle output paths (set by phase_bundle, read by phase_upload).
+BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
+BUNDLE_TGZ=""           # tarball path (set when phase_upload prepares submission)
+
 # Resolved by write_ledger() to the per-run JSON envelope path. Forensic
 # v0.9+ reads this via SESSIONSCRIBE_IOC_JSON instead of re-detecting IOCs.
 ENVELOPE_PATH=""
@@ -542,6 +604,38 @@ if (( NO_COLOR )) || [[ ! -t 2 ]]; then
 else
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
     CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+fi
+
+# Glyph table (post-merge v2.0.0) — Unicode for UTF-8 TTYs, ASCII fallback
+# otherwise. Forensic renderers and the kill-chain markdown depend on these.
+if [[ -t 2 ]] && [[ "${LC_ALL:-}${LANG:-}${LC_CTYPE:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
+GLYPH_BOX_TL='┌'; GLYPH_BOX_TR='┐'; GLYPH_BOX_BL='└'; GLYPH_BOX_BR='┘'
+GLYPH_BOX_H='─'; GLYPH_BOX_V='│'
+GLYPH_OFFENSE='⚡'; GLYPH_DEFENSE='✓'; GLYPH_ARROW='↳'
+GLYPH_OK='✓';     GLYPH_BAD='✗';     GLYPH_WARN='⚠'
+GLYPH_ELLIPSIS='…'; GLYPH_TIMES='×'
+# Forensic-side color aliases — UTF-8 branch (post-merge v2.0.0).
+C_RED="$RED"
+C_GRN="$GREEN"
+C_YEL="$YELLOW"
+C_CYN="$CYAN"
+C_BLD="$BOLD"
+C_DIM="$DIM"
+C_NC="$NC"
+else
+GLYPH_BOX_TL='+'; GLYPH_BOX_TR='+'; GLYPH_BOX_BL='+'; GLYPH_BOX_BR='+'
+GLYPH_BOX_H='-'; GLYPH_BOX_V='|'
+GLYPH_OFFENSE='!'; GLYPH_DEFENSE='+'; GLYPH_ARROW='->'
+GLYPH_OK='+';     GLYPH_BAD='x';     GLYPH_WARN='!'
+GLYPH_ELLIPSIS='...'; GLYPH_TIMES='x'
+# Forensic-side color aliases — ASCII branch (post-merge v2.0.0).
+C_RED="$RED"
+C_GRN="$GREEN"
+C_YEL="$YELLOW"
+C_CYN="$CYAN"
+C_BLD="$BOLD"
+C_DIM="$DIM"
+C_NC="$NC"
 fi
 
 # All decorative output goes to stderr; stdout is reserved for JSONL.
