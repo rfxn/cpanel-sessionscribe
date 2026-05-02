@@ -16,7 +16,7 @@
 
 **Plan Version:** 1.0.0
 
-**Status:** COMPLETE — Phases 1-8 shipped at v2.2.0 @ <commit-hash> (Phase 8 commit; placeholder updated post-commit).
+**Status:** COMPLETE — Phases 1-8 shipped at v2.2.0 @ 2ad1751 (Phase 8 commit).
 
 ---
 
