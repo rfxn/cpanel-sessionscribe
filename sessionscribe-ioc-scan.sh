@@ -4949,6 +4949,15 @@ check_destruction_iocs() {
                 kn = split(ENVIRON["KNOWN_DIMS"], kd_arr, ",")
                 for (i = 1; i <= kn; i++) if (kd_arr[i] != "") known[kd_arr[i]] = 1
                 ext_total = 0; ext_2xx = 0; int_2xx = 0; int_other = 0
+                # Split ext_2xx by dimension class:
+                #   _known   = 2xx hits whose terminal dim is in the IC-5790
+                #              attacker fingerprint set (24x80/120/134/200 etc)
+                #   _unknown = 2xx hits at dimensions outside that set —
+                #              typically legitimate WHM Terminal admin sessions
+                #              from a real browser. Without this split, every
+                #              cPanel admin from a wide Mac window (24x165 etc)
+                #              trips Pattern E STRONG as "RCE landed".
+                ext_2xx_known = 0; ext_2xx_unknown = 0
                 ext_sample = ""; int_sample = ""; unknown_dim_sample = ""
                 ts_first_ext = 0; burst_n = 0
             }
@@ -4994,12 +5003,24 @@ check_destruction_iocs() {
                         ext_2xx++
                         if (d != "") {
                             dim_count[d]++
-                            if (!(d in known) && unknown_dim_sample == "") {
-                                unknown_dim_sample = $0
+                            if (d in known) {
+                                # Attacker-fingerprint dim — strong-tier signal.
+                                ext_2xx_known++
+                                # Handoff-burst tracking only counts attacker-
+                                # dimension hits; legitimate admin teams from
+                                # multiple IPs in 15min should not trip the
+                                # multi-operator burst.
+                                burst_n++
+                                burst_ts[burst_n] = ts
+                                burst_ip[burst_n] = ip
+                            } else {
+                                # Outside attacker fingerprint — typically a
+                                # legitimate WHM Terminal admin session. Keep
+                                # the unknown-dim sample for the separate
+                                # ioc_pattern_e_unknown_dimension review emit.
+                                ext_2xx_unknown++
+                                if (unknown_dim_sample == "") unknown_dim_sample = $0
                             }
-                            burst_n++
-                            burst_ts[burst_n] = ts
-                            burst_ip[burst_n] = ip
                         }
                     }
                     if (ext_sample == "") ext_sample = $0
@@ -5035,35 +5056,55 @@ check_destruction_iocs() {
                     }
                     if (win_n > burst_max) burst_max = win_n
                 }
-                printf "%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", \
-                       ext_total, ext_2xx, int_2xx, int_other, \
+                printf "%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", \
+                       ext_total, ext_2xx, ext_2xx_known, ext_2xx_unknown, \
+                       int_2xx, int_other, \
                        ts_first_ext, burst_max, dim_csv, unknown_csv
                 print ext_sample
                 print int_sample
                 print unknown_dim_sample
             }')
-        local ext_total=0 ext_2xx=0 int_2xx=0 int_other=0 ts_first_ext=0
+        local ext_total=0 ext_2xx=0 ext_2xx_known=0 ext_2xx_unknown=0
+        local int_2xx=0 int_other=0 ts_first_ext=0
         local burst_max=0 dim_csv="" unknown_csv=""
         local ext_sample="" int_sample="" unknown_dim_sample=""
         {
-            IFS=$'\t' read -r ext_total ext_2xx int_2xx int_other ts_first_ext burst_max dim_csv unknown_csv
+            IFS=$'\t' read -r ext_total ext_2xx ext_2xx_known ext_2xx_unknown int_2xx int_other ts_first_ext burst_max dim_csv unknown_csv
             IFS= read -r ext_sample
             IFS= read -r int_sample
             IFS= read -r unknown_dim_sample
         } <<< "$ws_result"
         ext_total="${ext_total:-0}"; ext_2xx="${ext_2xx:-0}"
+        ext_2xx_known="${ext_2xx_known:-0}"; ext_2xx_unknown="${ext_2xx_unknown:-0}"
         int_2xx="${int_2xx:-0}"; int_other="${int_other:-0}"
         ts_first_ext="${ts_first_ext:-0}"; burst_max="${burst_max:-0}"
 
-        if (( ext_2xx > 0 )); then
+        # Split-by-dimension verdict gate:
+        #   ext_2xx_known  > 0 → strong (attacker fingerprint matched, RCE)
+        #   ext_2xx_unknown> 0 → warning (admin session most likely; review)
+        #   ext_total      > 0 → warning (probes only, host repelled)
+        if (( ext_2xx_known > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "strong" \
                  "ioc_pattern_e_websocket_shell_hits" 10 \
-                 "count" "$ext_2xx" "external_total" "$ext_total" \
+                 "count" "$ext_2xx_known" "external_total" "$ext_total" \
+                 "external_2xx_total" "$ext_2xx" \
+                 "external_2xx_unknown_dim" "$ext_2xx_unknown" \
                  "internal_2xx" "$int_2xx" \
                  "dimensions" "${dim_csv:-(none)}" \
                  "ts_epoch_first" "$ts_first_ext" \
                  "sample" "${ext_sample:0:200}" \
-                 "note" "$ext_2xx external IP(s) reached /cpsess*/websocket/Shell with 2xx - Pattern E interactive RCE (CRITICAL)."
+                 "note" "$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (24x80/120/134/200) - Pattern E interactive RCE (CRITICAL)."
+            ((hits++))
+        elif (( ext_2xx_unknown > 0 )); then
+            emit "destruction" "ioc_pattern_e_websocket" "warning" \
+                 "ioc_pattern_e_websocket_shell_unknown_dim_only" 4 \
+                 "count" "$ext_2xx_unknown" "external_total" "$ext_total" \
+                 "internal_2xx" "$int_2xx" \
+                 "dimensions" "${dim_csv:-(none)}" \
+                 "unknown_dimensions" "${unknown_csv:-(none)}" \
+                 "ts_epoch_first" "$ts_first_ext" \
+                 "sample" "${unknown_dim_sample:0:200}" \
+                 "note" "$ext_2xx_unknown external IP(s) reached /cpsess*/websocket/Shell with 2xx, but ALL dimensions ($unknown_csv) are outside the IC-5790 attacker fingerprint - likely legitimate WHM Terminal admin sessions from non-canonical browsers. Confirm via the parallel ioc_pattern_e_unknown_dimension review (REVIEW)."
             ((hits++))
         elif (( ext_total > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "warning" \
