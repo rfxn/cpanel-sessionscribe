@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.8.1
+# sessionscribe-ioc-scan.sh v1.8.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.8.1"
+VERSION="1.8.2"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -1045,7 +1045,7 @@ check_logs() {
             # DD/Mon/YYYY). gawk mktime needs "YYYY MM DD HH MM SS".
             # 2-arg match() + substr/split for gawk 3.1.x (CL6 floor) - the
             # 3-arg match(s, /re/, arr) form is gawk 4.0+ only.
-            if (match(line, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+            if (match(line, /\[[0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
                 _d = substr(line, RSTART+1, RLENGTH-1)
                 split(_d, _p, /[\/:]/)
                 ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
@@ -1203,7 +1203,7 @@ check_attacker_ips() {
 
             ts = 0
             # 2-arg match() + substr/split for gawk 3.1.x (CL6 floor).
-            if (match(line, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+            if (match(line, /\[[0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
                 _d = substr(line, RSTART+1, RLENGTH-1)
                 split(_d, _p, /[\/:]/)
                 ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
@@ -1324,7 +1324,7 @@ check_crlf_access_primitive() {
         # gawk 3.1.x (CL6 floor) lacks 3-arg match(s, /re/, arr); use the
         # 2-arg form with RSTART/RLENGTH + substr/split to extract groups.
         function ts_of(s,    d, n, p) {
-            if (match(s, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+            if (match(s, /\[[0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
                 d = substr(s, RSTART+1, RLENGTH-1)
                 n = split(d, p, /[\/:]/)
                 return mktime(p[3]" "p[1]" "p[2]" "p[4]" "p[5]" "p[6])
@@ -2220,7 +2220,7 @@ check_destruction_iocs() {
         local f_mtime f_smark_epoch
         f_mtime=$(stat -c %Y "$f_hit" 2>/dev/null)
         f_smark_epoch=$(awk -v mark="$PATTERN_F_S_MARK" '
-            /^#[0-9]{9,11}$/ { last=substr($0,2); next }
+            /^#[0-9]+$/ { last=substr($0,2); next }
             index($0, mark) { if (last != "") { print last; exit } }
         ' "$f_hit" 2>/dev/null)
         f_smark_epoch="${f_smark_epoch:-0}"
@@ -2361,7 +2361,7 @@ check_destruction_iocs() {
         local h_kill_mtime h_kill_epoch
         h_kill_mtime=$(stat -c %Y "$h_kill_hit" 2>/dev/null)
         h_kill_epoch=$(awk -v re="$PATTERN_H_KILL_PRELUDE" '
-            /^#[0-9]{9,11}$/ { last=substr($0,2); next }
+            /^#[0-9]+$/ { last=substr($0,2); next }
             $0 ~ re { if (last != "") { print last; exit } }
         ' "$h_kill_hit" 2>/dev/null)
         h_kill_epoch="${h_kill_epoch:-0}"
@@ -2532,7 +2532,7 @@ check_destruction_iocs() {
                 }
                 ts = 0
                 # gawk 3.1.x: 2-arg match() + substr/split (no 3-arg form).
-                if (match($0, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                if (match($0, /\[[0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
                     _d = substr($0, RSTART+1, RLENGTH-1)
                     split(_d, _p, /[\/:]/)
                     ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
