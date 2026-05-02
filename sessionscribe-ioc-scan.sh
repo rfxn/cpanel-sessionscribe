@@ -155,9 +155,10 @@ PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 
 ###############################################################################
 # Destruction-stage IOCs (Patterns A-I). Cheap host-state probes - bounded
-# stat / hash / grep checks suitable for fleet triage. Heavyweight kill-chain
-# reconstruction lives in sessionscribe-forensic.sh; this set just answers
-# "does this host carry visible compromise residue?"
+# stat / hash / grep checks suitable for fleet triage. The heavyweight
+# kill-chain reconstruction now runs inline under --full / --replay (same
+# script); this set just answers "does this host carry visible compromise
+# residue?"
 #
 # Last updated from incident dossier: 2026-05-01.
 ###############################################################################
@@ -252,8 +253,9 @@ PATTERN_G_BAD_KEY_LABELS=(
 # UTC and localtime to catch either interpretation.
 PATTERN_G_FORGED_MTIME_WALL="2019-12-13 12:59:16"
 
-# Known-good SSH key labels - must mirror sessionscribe-forensic.sh's
-# SSH_KNOWN_GOOD_RE. Real LW provisioning keys carry "Parent Child key
+# Known-good SSH key labels — single canonical list now that the forensic
+# script is merged in (matched in inline pattern_g_deep_checks below).
+# Real LW provisioning keys carry "Parent Child key
 # for <PJID>" comments (the PJID is a 6-char alnum project tag). The
 # lwadmin / lw-admin / liquidweb / nexcess prefixes cover the operator-
 # tooling key cohort. A line whose key-comment matches this pattern is
@@ -357,8 +359,9 @@ CPSRVD_PORTS=(2082 2083 2086 2087 2095 2096)
 # Optional syslog one-liner for SIEM ingestion. Off by default.
 SYSLOG=0
 
-# --chain-forensic: when host_verdict != CLEAN, exec sessionscribe-forensic.sh
-# with the same RUN_ID for correlation. Default off; opt-in only.
+# --chain-forensic: v1.x back-compat alias — equivalent to --full (no
+# host-verdict gate). The forensic phases are now inline; the alias
+# remains so deployed v1.x curl one-liners keep working.
 CHAIN_FORENSIC=0
 
 # --chain-upload: forward --upload to the chained forensic so its bundle is
@@ -4305,7 +4308,7 @@ check_destruction_iocs() {
              "ioc_pattern_a_sorry_files_present" 10 \
              "sample_path" "$first_sorry" \
              "mtime_epoch" "${sorry_mtime:-0}" \
-             "note" "found .sorry-encrypted files (Pattern A); use sessionscribe-forensic for full enumeration (CRITICAL)."
+             "note" "found .sorry-encrypted files (Pattern A); re-run with --full for the full kill-chain + bundle (CRITICAL)."
         ((hits++))
     fi
     # qTox ransom README. Drop locations: /root/README.md (canonical) +

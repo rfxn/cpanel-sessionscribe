@@ -251,14 +251,15 @@ during retry/redirect flows.
 
 ### Pattern letters → ioc_key prefix mapping
 
-The `ioc_key_to_pattern()` function in forensic maps emit keys to
-single-letter pattern codes for the kill-chain renderer. New IOC keys
-MUST get a case branch — otherwise they render as `?` and end up in
-the "unmapped" bucket. After adding a new `ioc_pattern_*` or
-`ioc_cve_*` emit key, grep both files for the mapping:
+The `ioc_key_to_pattern()` function (now inline in
+`sessionscribe-ioc-scan.sh`) maps emit keys to single-letter pattern
+codes for the kill-chain renderer. New IOC keys MUST get a case branch
+— otherwise they render as `?` and end up in the "unmapped" bucket.
+After adding a new `ioc_pattern_*` or `ioc_cve_*` emit key, grep the
+script for the mapping:
 
 ```bash
-grep -E 'ioc_key_to_pattern|PATTERN_ORDER|PATTERN_LABEL' sessionscribe-forensic.sh
+grep -E 'ioc_key_to_pattern|PATTERN_ORDER|PATTERN_LABEL' sessionscribe-ioc-scan.sh
 ```
 
 ---
@@ -306,9 +307,11 @@ memory). gawk version on the lab can be confirmed with `awk --version`
 
 ## Merged-script architecture (v2.0.0+)
 
-As of v2.0.0, `sessionscribe-forensic.sh` is merged into
-`sessionscribe-ioc-scan.sh`. The two-script chain (with envelope-as-IPC)
-is replaced by a single script with three operator-facing modes:
+As of v2.0.0, the forensic phases live inline in
+`sessionscribe-ioc-scan.sh` and the standalone `sessionscribe-forensic.sh`
+has been removed from the repo. The two-script chain (with
+envelope-as-IPC) is replaced by a single script with three
+operator-facing modes:
 
 | Mode | Flag | What it does |
 |---|---|---|
@@ -351,10 +354,10 @@ vocabulary maps:
 All forensic findings flow into the unified `SIGNALS[]` stream and
 appear in the same envelope as detection signals.
 
-### Deprecation shim
+### Removed: standalone forensic script
 
-`sessionscribe-forensic.sh` is now a ~50-line v0.99.0 shim that prints
-a one-line deprecation notice and `exec`s
-`sessionscribe-ioc-scan.sh --replay <path>`. It preserves the
-`sh.rfxn.com` and `raw.githubusercontent.com` URLs for operators still
-on the v1.x curl one-liner. The shim will be removed in a future release.
+`sessionscribe-forensic.sh` was carried as a v0.99.0 deprecation shim
+during the v2.0.0 grace period and has now been removed. The
+`sh.rfxn.com` and `raw.githubusercontent.com` URLs return 404 — point
+operators at `sessionscribe-ioc-scan.sh --full` (live capture) or
+`--replay PATH` (re-render against a saved envelope/bundle).
