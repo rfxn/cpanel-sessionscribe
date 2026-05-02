@@ -5093,7 +5093,7 @@ check_destruction_iocs() {
                  "dimensions" "${dim_csv:-(none)}" \
                  "ts_epoch_first" "$ts_first_ext" \
                  "sample" "${ext_sample:0:200}" \
-                 "note" "$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (24x80/120/134/200) - Pattern E interactive RCE (CRITICAL)."
+                 "note" "$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
             ((hits++))
         elif (( ext_2xx_unknown > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "warning" \
@@ -5256,7 +5256,7 @@ aggregate_verdict() {
                 advisory)         _tag="[ADVISORY]" ;;
                 info)
                     case "$key" in
-                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs)
+                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|no_destruction_iocs|request_complete|marker_logged)
                             _tag="[OK]" ;;
                     esac
                     ;;
@@ -5278,7 +5278,7 @@ aggregate_verdict() {
                 advisory) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} advisory" ;;
                 info)
                     case "$key" in
-                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs)
+                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|no_destruction_iocs|request_complete|marker_logged)
                             SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} ok" ;;
                     esac
                     ;;
