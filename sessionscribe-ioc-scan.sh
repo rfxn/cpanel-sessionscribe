@@ -82,9 +82,14 @@
 # Exit codes (highest priority wins):
 #   0  PATCHED  + CLEAN
 #   1  VULNERABLE                       (code-state vulnerable)
-#   2  INCONCLUSIVE
-#   3  Tool error (bad args, missing dependencies)
-#   4  COMPROMISED                      (host-state IOC hit; overrides 0/1/2 -
+#   2  INCONCLUSIVE                     (code-state ambiguous; also tool error
+#                                        for bad args / missing deps)
+#   3  SUSPICIOUS                       (host-state: ioc_review > 0 — warning-
+#                                        tier IOC hits, includes
+#                                        ioc_failed_exploit_attempt, recon-only
+#                                        attacker-IP traffic, anomalous root
+#                                        sessions)
+#   4  COMPROMISED                      (host-state IOC hit; overrides 0/1/2/3 -
 #                                        a patched host can still be compromised
 #                                        from prior exploitation)
 #
@@ -525,8 +530,18 @@ Misc:
       --timeout N            Probe timeout in seconds (default 8).
   -h, --help                 Show this help.
 
-Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
-            4=COMPROMISED (host IOC hit - overrides patch verdict).
+Exit codes:
+  0  PATCHED+CLEAN       host clean, no IOCs, code state patched
+  1  VULNERABLE          code-state: cpsrvd binary unpatched
+  2  INCONCLUSIVE        code-state: version ambiguous; also tool error
+                         (bad args, missing dependencies - exits before scan)
+  3  SUSPICIOUS          host-state: ioc_review > 0 (warning-tier IOC;
+                         includes ioc_failed_exploit_attempt, recon-only
+                         attacker-IP traffic, anomalous root sessions)
+  4  COMPROMISED         host-state: ioc_critical > 0 (strong-tier IOC;
+                         includes destruction patterns, cpsess-bearing 2xx
+                         from T1 IPs, session-side injection markers;
+                         overrides all lower exit codes)
 EOF
     exit 0
 }
@@ -5538,14 +5553,14 @@ aggregate_verdict() {
     # Host-state axis (the exploitation question). COMPROMISED dominates the
     # exit code: a patched host can still carry forensic evidence of prior
     # exploitation, and we want fleet-aggregation to triage these first.
+    # SUSPICIOUS now exits 3 unconditionally (in all modes, including --ioc-only).
+    # This disambiguates from code-state INCONCLUSIVE which keeps exit 2.
     if (( ioc_critical > 0 )); then
         HOST_VERDICT="COMPROMISED"
         EXIT_CODE=4
     elif (( ioc_review > 0 )); then
         HOST_VERDICT="SUSPICIOUS"
-        # In --ioc-only mode there is no code-state exit code competing for
-        # the slot, so SUSPICIOUS bumps to 2 instead of being silently 0.
-        (( IOC_ONLY )) && EXIT_CODE=2
+        EXIT_CODE=3
     else
         HOST_VERDICT="CLEAN"
     fi
