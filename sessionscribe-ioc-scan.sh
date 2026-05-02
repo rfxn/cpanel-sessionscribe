@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.8
+# sessionscribe-ioc-scan.sh v1.7.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.8"
+VERSION="1.7.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -151,7 +151,7 @@ PASS_FORGERY_MAX_LEN=12
 PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 
 ###############################################################################
-# Destruction-stage IOCs (Patterns A-G). Cheap host-state probes - bounded
+# Destruction-stage IOCs (Patterns A-I). Cheap host-state probes - bounded
 # stat / hash / grep checks suitable for fleet triage. Heavyweight kill-chain
 # reconstruction lives in sessionscribe-forensic.sh; this set just answers
 # "does this host carry visible compromise residue?"
@@ -214,6 +214,29 @@ PATTERN_F_E_MARK="__E_MARK__"
 # /etc/, /var/spool/cron/ is a candidate.
 PATTERN_G_FORGED_MTIME="2019-12-13"
 
+# Pattern H - seobot SEO defacement / per-site PHP webshell drop. Surfaced
+# 2026-05-01 14:59 CDT on host.quickfix17.com. Distinct actor from the
+# nuclear.x86 campaign - actively kills rival infections (xmrig, kswapd01)
+# before deploying. Four independent signals; H1/H2/H4 are dispositive,
+# H3 (ALLDONE marker) is corroborating only.
+PATTERN_H_DROPPER_FILE="seobot.php"
+PATTERN_H_END_MARKER="ALLDONE"
+PATTERN_H_KILL_PRELUDE='pkill -9 nuclear\.x86 kswapd01 xmrig'
+PATTERN_H_ZIP_PATH="/tmp/seobot.zip"
+# base64-encoded prefix of the H-specific dropper zip header. Operator
+# self-cleans /tmp/seobot.zip on success; this catches interrupted runs.
+PATTERN_H_ZIP_MAGIC_B64="UEsDBBQACAAIAMhEkVw"
+
+# Pattern I - system-service profile.d backdoor (IC-5794 cohort, surfaced
+# 2026-05-01 on web01.guestreservations.com). Fires on every interactive
+# shell login - more discreet than cron. Likely Hyper Global-specific
+# (lateral from bastion, not direct CVE-2026-41940), but worth fleet-
+# wide hunting. Filename and binary path are unique to the dossier; no
+# benign system component creates these.
+PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
+PATTERN_I_BINARY="/root/.local/bin/system-service"
+PATTERN_I_PROCNAME="system-service"
+
 # Known-good SSH key labels - must mirror sessionscribe-forensic.sh's
 # SSH_KNOWN_GOOD_RE. Real LW provisioning keys carry "Parent Child key
 # for <PJID>" comments (the PJID is a 6-char alnum project tag). The
@@ -271,7 +294,7 @@ CPSRVD_OVERRIDE=""
 SINCE_DAYS=""            # default: no time filter - scan all retained logs/sessions
 SINCE_EPOCH=""           # computed from SINCE_DAYS at parse time
 
-# Destruction-IOC scan (Patterns A-G). Cheap host-state probes; default ON
+# Destruction-IOC scan (Patterns A-I). Cheap host-state probes; default ON
 # because the late-stage payload may be all that survives if initial-access
 # sessions have rotated out of /var/cpanel/sessions/raw/.
 NO_DESTRUCTION_IOCS=0
@@ -332,10 +355,11 @@ Scan options:
                              is responsive and access logs are flowing).
       --no-logs              Skip access-log IOC scan.
       --no-sessions          Skip session-store IOC + anomaly scan.
-      --no-destruction-iocs  Skip destruction-stage probes (Patterns A-G:
+      --no-destruction-iocs  Skip destruction-stage probes (Patterns A-I:
                              /root/sshd encryptor, mysql-wipe, BTC index,
                              nuclear.x86, sptadm reseller, __S_MARK__
-                             harvester, suspect SSH keys). Use for the
+                             harvester, suspect SSH keys, seobot dropper,
+                             system-service backdoor). Use for the
                              original-shape ioc-scan triage when only
                              session/log signals are wanted.
       --ioc-only             Run only the host-state IOC scans (logs +
@@ -1733,7 +1757,7 @@ check_sessions() {
     fi
 }
 
-# ---- destruction-stage IOC scan (Patterns A-G) ---------------------------
+# ---- destruction-stage IOC scan (Patterns A-I) ---------------------------
 # Cheap, bounded host-state probes for late-stage compromise residue.
 # Scoped to /home, /var/www, /root, /etc, /var/spool/cron, /tmp, /var/tmp -
 # operator-overrideable via $CPANEL_ROOT? No: these paths are filesystem
@@ -1742,12 +1766,12 @@ check_sessions() {
 check_destruction_iocs() {
     (( NO_DESTRUCTION_IOCS )) && return
     if [[ -n "$ROOT_OVERRIDE" ]]; then
-        section "Destruction IOC scan (Patterns A-G)"
+        section "Destruction IOC scan (Patterns A-I)"
         emit "destruction" "destruction_scan" "info" "skipped_snapshot_mode" 0 \
              "note" "destruction probes skip snapshot/--root mode (no host filesystem)"
         return
     fi
-    section "Destruction IOC scan (Patterns A-G)"
+    section "Destruction IOC scan (Patterns A-I)"
     local hits=0
 
     # History files swept by Pattern F harvester and Pattern H markers
@@ -2110,6 +2134,157 @@ check_destruction_iocs() {
         fi
     fi
 
+    # ---- Pattern H: seobot defacement / SEO spam dropper -----------------
+    # Four independent signals - any one of H1/H2/H4 is dispositive (strong);
+    # H3 (ALLDONE) is warning-tier because the marker is generic enough to
+    # FP without corroboration.
+
+    # H1: seobot.php in any cPanel-managed docroot. Derive docroots from
+    # /var/cpanel/userdata/<user>/<site> (canonical); fall back to
+    # /home/*/public_html for hosts where userdata is sparse. Stop at first
+    # hit (a single placement is enough to flag; forensic captures the rest).
+    local h_seobot_hit=""
+    local docroot_list; docroot_list=$(mktemp /tmp/ssioc.docroots.XXXXXX)
+    {
+        if [[ -d /var/cpanel/userdata ]]; then
+            grep -rh '^documentroot:' /var/cpanel/userdata/*/ 2>/dev/null \
+              | awk '{print $2}' | sort -u
+        fi
+        local _d
+        for _d in /home/*/public_html; do
+            [[ -d "$_d" ]] && printf '%s\n' "$_d"
+        done
+    } | sort -u > "$docroot_list"
+    if [[ -s "$docroot_list" ]]; then
+        local _dr _found
+        while IFS= read -r _dr; do
+            [[ -d "$_dr" ]] || continue
+            _found=$(find "$_dr" -maxdepth 3 -name "$PATTERN_H_DROPPER_FILE" -print -quit 2>/dev/null)
+            if [[ -n "$_found" ]]; then
+                h_seobot_hit="$_found"
+                break
+            fi
+        done < "$docroot_list"
+    fi
+    rm -f "$docroot_list"
+    if [[ -n "$h_seobot_hit" ]]; then
+        local h_mtime
+        h_mtime=$(stat -c %Y "$h_seobot_hit" 2>/dev/null)
+        emit "destruction" "ioc_pattern_h_seobot_php" "strong" \
+             "ioc_pattern_h_seobot_dropper_present" 10 \
+             "sample_path" "$h_seobot_hit" "mtime_epoch" "${h_mtime:-0}" \
+             "note" "$PATTERN_H_DROPPER_FILE planted in $h_seobot_hit - Pattern H SEO defacement (CRITICAL)."
+        ((hits++))
+    fi
+
+    # H2: kill-prelude (`pkill -9 nuclear.x86 kswapd01 xmrig`) in any history
+    # file. Reuses HISTORY_FILES_GLOB hoisted at the top of this function.
+    local h_kill_hit=""
+    h_kill_hit=$(grep -lE "$PATTERN_H_KILL_PRELUDE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
+    if [[ -n "$h_kill_hit" ]]; then
+        local h_kill_mtime
+        h_kill_mtime=$(stat -c %Y "$h_kill_hit" 2>/dev/null)
+        emit "destruction" "ioc_pattern_h_kill_prelude" "strong" \
+             "ioc_pattern_h_competitor_kill" 8 \
+             "sample_path" "$h_kill_hit" "mtime_epoch" "${h_kill_mtime:-0}" \
+             "note" "Pattern H competitor-kill prelude in $h_kill_hit (kills nuclear.x86/kswapd01/xmrig before drop)."
+        ((hits++))
+    fi
+
+    # H3: ALLDONE end marker. Warning-tier - generic enough to FP, useful
+    # only alongside H1/H2/H4.
+    local h_alldone_hit=""
+    h_alldone_hit=$(grep -lF "$PATTERN_H_END_MARKER" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
+    if [[ -n "$h_alldone_hit" ]]; then
+        local h_alldone_mtime
+        h_alldone_mtime=$(stat -c %Y "$h_alldone_hit" 2>/dev/null)
+        emit "destruction" "ioc_pattern_h_alldone" "warning" \
+             "ioc_pattern_h_alldone_marker" 5 \
+             "sample_path" "$h_alldone_hit" "mtime_epoch" "${h_alldone_mtime:-0}" \
+             "note" "Pattern H operator end-marker '$PATTERN_H_END_MARKER' in $h_alldone_hit - review for corroborating signals."
+        ((hits++))
+    fi
+
+    # H4: dropper archive on disk. Self-cleans per dossier; this catches
+    # slow operators or interrupted runs. Encode first 16 bytes (raw zip
+    # magic + extra-field header) as base64 and prefix-match against the
+    # dossier-published H signature.
+    if [[ -f "$PATTERN_H_ZIP_PATH" ]]; then
+        local h_zip_b64=""
+        if command -v base64 >/dev/null 2>&1; then
+            h_zip_b64=$(head -c 16 "$PATTERN_H_ZIP_PATH" 2>/dev/null | base64 -w0 2>/dev/null)
+        fi
+        if [[ -n "$h_zip_b64" && "$h_zip_b64" == "${PATTERN_H_ZIP_MAGIC_B64}"* ]]; then
+            local h_zip_mtime
+            h_zip_mtime=$(stat -c %Y "$PATTERN_H_ZIP_PATH" 2>/dev/null)
+            emit "destruction" "ioc_pattern_h_zip_dropper" "strong" \
+                 "ioc_pattern_h_dropper_archive" 10 \
+                 "path" "$PATTERN_H_ZIP_PATH" "mtime_epoch" "${h_zip_mtime:-0}" \
+                 "note" "Pattern H dropper archive at $PATTERN_H_ZIP_PATH (base64 zip header matches H signature - operator did not self-clean)."
+            ((hits++))
+        fi
+    fi
+
+    # ---- Pattern I: system-service profile.d backdoor --------------------
+    # Three primary signals - profile.d hook, binary present, process
+    # running. Any one is strong. I4 (failed-chmod log signature) is
+    # corroborating evidence that confirms the hook actually fired for
+    # non-root logins.
+
+    # I1: profile.d hook file. Filename is unique per dossier; no benign
+    # system component creates this exact filename.
+    if [[ -f "$PATTERN_I_PROFILED" ]]; then
+        local i_hook_mtime
+        i_hook_mtime=$(stat -c %Y "$PATTERN_I_PROFILED" 2>/dev/null)
+        emit "destruction" "ioc_pattern_i_profiled_hook" "strong" \
+             "ioc_pattern_i_profiled_hook_present" 10 \
+             "path" "$PATTERN_I_PROFILED" "mtime_epoch" "${i_hook_mtime:-0}" \
+             "note" "Pattern I profile.d backdoor hook at $PATTERN_I_PROFILED - fires on every interactive login (CRITICAL)."
+        ((hits++))
+    fi
+
+    # I2: binary at non-standard /root/.local/bin path. Capture mtime only;
+    # forensic v0.10.1+ hashes the binary into bundle metadata.
+    if [[ -f "$PATTERN_I_BINARY" ]]; then
+        local i_bin_mtime
+        i_bin_mtime=$(stat -c %Y "$PATTERN_I_BINARY" 2>/dev/null)
+        emit "destruction" "ioc_pattern_i_binary" "strong" \
+             "ioc_pattern_i_binary_present" 10 \
+             "path" "$PATTERN_I_BINARY" "mtime_epoch" "${i_bin_mtime:-0}" \
+             "note" "Pattern I binary at $PATTERN_I_BINARY - non-standard daemon path, masquerades as user-installed (CRITICAL)."
+        ((hits++))
+    fi
+
+    # I3: running process. pgrep is cheap and won't hang.
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -x "$PATTERN_I_PROCNAME" >/dev/null 2>&1; then
+            emit "destruction" "ioc_pattern_i_running" "strong" \
+                 "ioc_pattern_i_process_running" 10 \
+                 "procname" "$PATTERN_I_PROCNAME" \
+                 "note" "Pattern I process '$PATTERN_I_PROCNAME' currently running - active backdoor (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+
+    # I4: failed-chmod log signature in /var/log/secure (or rotation).
+    # Eaton's discovery path - non-root user logs in via SSH, profile.d
+    # hook tries chmod, hits permission-denied, logs to secure. Confirms
+    # the hook is actively firing in the wild.
+    local i_log_hit=""
+    i_log_hit=$(grep -lF "chmod: cannot access '$PATTERN_I_BINARY'" \
+                    /var/log/secure /var/log/secure.[0-9]* /var/log/secure-* \
+                    /var/log/messages /var/log/messages.[0-9]* /var/log/messages-* \
+                    2>/dev/null | head -1)
+    if [[ -n "$i_log_hit" ]]; then
+        local i_log_mtime
+        i_log_mtime=$(stat -c %Y "$i_log_hit" 2>/dev/null)
+        emit "destruction" "ioc_pattern_i_failed_chmod" "warning" \
+             "ioc_pattern_i_hook_fired_for_non_root" 4 \
+             "sample_path" "$i_log_hit" "mtime_epoch" "${i_log_mtime:-0}" \
+             "note" "Pattern I hook fire signature in $i_log_hit (failed chmod from non-root login) - corroborating evidence."
+        ((hits++))
+    fi
+
     # ---- Pattern E: websocket/Shell access-log signature ---------------
     # cPanel exposes an interactive shell via /cpsess<id>/websocket/Shell -
     # the WHM "Terminal" feature. ANY hit was previously flagged CRITICAL,
@@ -2214,7 +2389,7 @@ check_destruction_iocs() {
 
     if (( hits == 0 )); then
         emit "destruction" "destruction_scan" "info" "no_destruction_iocs" 0 \
-             "note" "no destruction-stage residue (Patterns A-G) found"
+             "note" "no destruction-stage residue (Patterns A-I) found"
     fi
 }
 
