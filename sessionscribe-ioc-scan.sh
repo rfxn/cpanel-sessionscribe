@@ -1692,7 +1692,7 @@ phase_defense() {
 
 phase_offense() {
     hdr "offense" "ingesting IOCs from canonical detector + deep checks"
-    read_iocs_from_envelope || true
+    read_iocs_from_envelope "${ENVELOPE_PATH:-}" || true
     pattern_g_deep_checks
     suspect_ip_correlation
     if (( ${#OFFENSE_EVENTS[@]} == 0 )); then
@@ -2235,7 +2235,7 @@ render_kill_chain() {
             local r_str r_ts r_kind r_idx r_zone
             local row_i=0
 
-            for zone_rec in "${zones[@]}"; do
+            (( ${#zones[@]} > 0 )) && for zone_rec in "${zones[@]}"; do
                 IFS='|' read -r z_id z_first z_last z_count <<< "$zone_rec"
                 local z_color="$C_DIM" z_label="$z_id"
                 case "$z_id" in
@@ -2298,12 +2298,12 @@ render_kill_chain() {
         # Defense lag line. Computed from min(offense epoch) vs max(defense
         # epoch) - matches phase_reconcile's calculation.
         local min_off="" max_def="" _oe _de _ts
-        for _oe in "${OFFENSE_EVENTS[@]}"; do
+        (( ${#OFFENSE_EVENTS[@]} > 0 )) && for _oe in "${OFFENSE_EVENTS[@]}"; do
             _ts=$(printf '%s' "$_oe" | cut -d'|' -f1)
             [[ -z "$_ts" ]] && continue
             [[ -z "$min_off" ]] || (( _ts < min_off )) && min_off="$_ts"
         done
-        for _de in "${DEFENSE_EVENTS[@]}"; do
+        (( ${#DEFENSE_EVENTS[@]} > 0 )) && for _de in "${DEFENSE_EVENTS[@]}"; do
             _ts=$(printf '%s' "$_de" | cut -d'|' -f1)
             [[ -z "$_ts" ]] && continue
             [[ -z "$max_def" ]] || (( _ts > max_def )) && max_def="$_ts"
@@ -2351,7 +2351,7 @@ render_kill_chain() {
                 printf '  %s%s                 %s%s%s\n' \
                     "$C_DIM" "$GLYPH_BOX_V" "$C_DIM" "$ATTACKER_IP_OVERFLOW" "$C_NC"
             local ann
-            for ann in "${ATTACKER_IP_ANNOTATED[@]}"; do
+            (( ${#ATTACKER_IP_ANNOTATED[@]} > 0 )) && for ann in "${ATTACKER_IP_ANNOTATED[@]}"; do
                 printf '  %s%s                 %s%s%s %s\n' \
                     "$C_DIM" "$GLYPH_BOX_V" "$C_DIM" "$GLYPH_ARROW" "$C_NC" "$ann"
             done
@@ -2361,7 +2361,7 @@ render_kill_chain() {
         # Surface UNDEFENDED separately - rolled into N_PRE during reconcile
         # but the operator wants to see it broken out. Walk RECONCILED.
         local n_undef=0 _r _v
-        for _r in "${RECONCILED[@]}"; do
+        (( ${#RECONCILED[@]} > 0 )) && for _r in "${RECONCILED[@]}"; do
             _v=$(printf '%s' "$_r" | cut -d'|' -f1)
             [[ "$_v" == "UNDEFENDED" ]] && n_undef=$(( n_undef + 1 ))
         done
