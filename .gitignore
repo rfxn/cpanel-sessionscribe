@@ -9,3 +9,9 @@ nxesec-whmscribe-b-probe.sh
 # Original watchTowr public PoC (saved locally for reference; upstream
 # lives at github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE)
 watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py
+
+# Internal-only attribution doc - customer hostnames, named individuals,
+# per-host kill-chain examples. NEVER push: contains PII / customer
+# operational detail. Patterns themselves stay in PATTERNS.md (mechanical
+# only); this file holds the attribution layer.
+INTERNAL-NOTES.md
