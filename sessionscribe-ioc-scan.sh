@@ -3885,7 +3885,7 @@ analyze_session() {
     SF_EXT_AUTH=0;     SF_INT_AUTH=0; SF_TFA=0;     SF_HASROOT=0
     SF_CANARY=0;       SF_ROOT_USER=0; SF_ACLLIST=0; SF_STRANDED=0
     SF_MALFORMED=0;    SF_MALFORMED_SAMPLE=""
-    SF_PASS_COUNT=0;   SF_PASS_LEN=0
+    SF_PASS_COUNT=0;   SF_PASS_LEN=0; SF_PASS_PRESENT_NONEMPTY=0
     SF_TD_VAL="";      SF_CP_VAL="";   SF_ORIGIN="";  SF_AUTH_TS=""
     # Identity + provenance KPIs - always populated when present in the
     # session file. These travel with EVERY ioc_* emit so fleet aggregators
@@ -3930,6 +3930,7 @@ analyze_session() {
             probe_canary)    SF_CANARY=$_v ;;
             pass_count)      SF_PASS_COUNT=$_v ;;
             pass_len)        SF_PASS_LEN=$_v ;;
+            pass_present_nonempty) SF_PASS_PRESENT_NONEMPTY=$_v ;;
             stranded)        SF_STRANDED=$_v ;;
             malformed)       SF_MALFORMED=$_v ;;
             malformed_sample) SF_MALFORMED_SAMPLE=$_v ;;
@@ -3940,7 +3941,7 @@ analyze_session() {
             login_time_val)  SF_LOGIN_TIME=$_v ;;
         esac
     done < <(awk -v canary_re="$PROBE_CANARY_PAT" '
-        BEGIN { line_idx=0; pass_at=0; pass_count=0 }
+        BEGIN { line_idx=0; pass_at=0; pass_count=0; pass_present_nonempty=0 }
         { line_idx++ }
         /^token_denied=/        { has_td=1;        td_val=substr($0,index($0,"=")+1) }
         /^cp_security_token=/   { has_cp=1;        cp_val=substr($0,index($0,"=")+1) }
@@ -3956,7 +3957,11 @@ analyze_session() {
         $0 ~ canary_re          { has_canary=1 }
         /^pass=/ {
             if (pass_count == 0) { pass_val=substr($0,index($0,"=")+1); pass_at=line_idx }
-            pass_count++; next
+            pass_count++
+            # Non-empty pass= line: value length > 0.
+            # /^pass=.+/ is equivalent (gawk 3.x supports .+).
+            if (match($0, /^pass=.+/)) pass_present_nonempty=1
+            next
         }
         pass_at > 0 && line_idx == pass_at + 1 && /./ && !/^[a-zA-Z_][a-zA-Z0-9_]*=/ { stranded=1 }
         # Broader malformed-line detector (per WebPros IOC-3): any non-blank
@@ -4016,6 +4021,7 @@ analyze_session() {
             print "probe_canary=" (has_canary?1:0)
             print "pass_count=" (pass_count+0)
             print "pass_len=" length(pass_val)
+            print "pass_present_nonempty=" (pass_present_nonempty?1:0)
             print "stranded=" (stranded?1:0)
             print "malformed=" (malformed?1:0)
             print "malformed_sample=" malformed_sample
@@ -4301,6 +4307,29 @@ check_sessions() {
                      "ioc_tfa_verified_without_login_origin" 3 \
                      "path" "$f" "origin" "$SF_ORIGIN" \
                      "note" "tfa_verified=1 but origin is not a valid login flow - review."
+                ((ioc_hits++))
+            fi
+
+            # IOC-J: Failed exploit attempt - cPanel IOC 5 analog. Session has
+            # the newline-injection-attempted footprint but the injection did not
+            # promote (no auth markers). Per cPanel's reference checker:
+            # origin=badpass + token_denied present + pass= line present (non-
+            # empty) + no auth markers = the attacker tried, the auth-marker
+            # injection failed, the session is probing cp_security_token without
+            # success.
+            #
+            # Severity=warning so this counts toward ioc_review (SUSPICIOUS) but
+            # NOT ioc_critical (COMPROMISED). Distinct from IOC-E2 which fires
+            # CRITICAL when auth markers ARE present (real compromise). Mutually
+            # exclusive with IOC-E2: the auth-marker guards below prevent double-
+            # firing on the same session.
+            if (( SF_BADPASS && SF_TOKEN_DENIED && SF_PASS_PRESENT_NONEMPTY \
+                  && ! SF_INT_AUTH && ! SF_EXT_AUTH \
+                  && ! SF_HASROOT && ! SF_TFA )); then
+                emit_session "ioc_failed_exploit_attempt_$session_name" "warning" \
+                     "ioc_failed_exploit_attempt" 3 \
+                     "path" "$f" "origin" "$SF_ORIGIN" \
+                     "note" "Failed CVE-2026-41940 attempt: badpass origin + token_denied + pass= line + no auth markers - injection did not promote (REVIEW)."
                 ((ioc_hits++))
             fi
         done
