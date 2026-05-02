@@ -249,6 +249,43 @@ side-effect and the operator's tool used it on the next request.
 legitimate browser sessions where the GET-after-401 pattern occurs
 during retry/redirect flows.
 
+### Primitive selection for COMPROMISED-tier signals
+
+When designing a strong-severity emit-site that escalates
+`host_verdict` to COMPROMISED via the `ioc_critical` axis, the input
+primitive MUST be unique to compromise. Acceptable primitives:
+
+- **Token value** (`cp_security_token`) — unique per session, near-zero
+  FP when matched in access_log + 2xx
+- **Structurally impossible session shape** (`hasroot=1`, malformed
+  line, forged future timestamp) — by-design unreachable in legitimate
+  cpsrvd code paths
+- **Destruction artifact on disk** (Pattern A/B/C/H file evidence) —
+  file presence is conclusive
+- **CRLF chain primitive** (POST 401 → cpsess 2xx within 2s, same
+  source IP) — deterministic exploitation footprint
+
+Reusable primitives (IP address, generic 2xx response,
+`cp_security_token` field PRESENCE without value match) escalate to
+**warning-tier at most**.
+
+The 2026-05-02 fleet-triage incident showed: IP-keyed gating (T1 IP +
+any 2xx) produced ~90% FP COMPROMISED rate on a 9659-host sample
+because T1 IPs do non-exploit things (login enumeration, recon scans,
+scanner traffic). Token-value matching is unique to actual session use
+and doesn't FP. v2.2.0 split `ioc_attacker_ip_in_access_log` strong
+into:
+
+- `ioc_attacker_ip_2xx_on_cpsess` — strong (cpsess-bearing 2xx, real
+  exploitation)
+- `ioc_attacker_ip_recon_only` — info (recon-only 2xx)
+- `ioc_attacker_ip_in_access_log_probes_only` — warning (4xx-only
+  probing)
+
+When refactoring a strong emit, check: is the primitive **unique to
+compromise**, or **reusable across legitimate and exploit traffic**?
+If reusable, demote.
+
 ### Pattern letters → ioc_key prefix mapping
 
 The `ioc_key_to_pattern()` function (now inline in

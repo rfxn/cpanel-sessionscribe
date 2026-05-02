@@ -501,9 +501,23 @@ and Patterns A–G destruction probes. Sessions tagged by the remote
 probe's `nxesec_canary_<nonce>` are bucketed as `PROBE_ARTIFACT` and do
 not escalate to `COMPROMISED`.
 
-Exit codes (highest priority wins): `0` = PATCHED + CLEAN, `1` =
-VULNERABLE, `2` = INCONCLUSIVE, `3` = tool error, `4` = COMPROMISED. A
-patched host can still exit `4` if prior exploitation left IOCs on disk.
+Exit codes (highest priority wins, host-state overrides code-state):
+
+| Exit | Code-state    | Host-state   | Triage action |
+|---|---|---|---|
+| 0 | CLEAN/PATCHED | CLEAN | none |
+| 1 | VULNERABLE | (any) | patch cpsrvd |
+| 2 | INCONCLUSIVE | (any) | manual code-state review (also: tool error - bad args, missing deps) |
+| 3 | (any) | SUSPICIOUS | review session/access logs |
+| 4 | (any) | COMPROMISED | full IR; bundle + upload |
+
+A patched host can still exit `4` if prior exploitation left IOCs on
+disk. Tool errors (bad args, missing deps, unreadable replay path)
+report at exit `2`, not `3` — exit `3` is reserved for the SUSPICIOUS
+host-state assignment. As of v2.2.0 the ioc-scan tool reports
+SUSPICIOUS when `ioc_review > 0` (warning-tier IOC: includes
+`ioc_failed_exploit_attempt`, recon-only attacker-IP traffic, and
+anomalous root sessions).
 
 A run ledger is written to `/var/cpanel/sessionscribe-ioc/` by default
 (`--no-ledger` to disable). `--full` runs forensic phases inline in the
@@ -596,8 +610,9 @@ Misc:
       --timeout N            Probe timeout in seconds (default 8).
   -h, --help                 Show this help.
 
-Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
-            4=COMPROMISED (host IOC hit - overrides patch verdict).
+Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE (also: tool error -
+            bad args, missing deps), 3=SUSPICIOUS (host-state: ioc_review > 0),
+            4=COMPROMISED (host-state: ioc_critical > 0; overrides 0/1/2/3).
 ```
 
 </details>
@@ -616,12 +631,12 @@ Sample (sanitised, from a real lab host post-exploitation):
 +-- CVE-2026-41940 / IC-5790 --------------------------------------------
 | host         cpanel.example.com ()
 | cpanel       unknown   os unknown
-| verdict      COMPROMISED   score 315   ioc-scan v2.0.0
+| verdict      COMPROMISED   score 315   ioc-scan v2.2.0
 | defenses     patch x absent   modsec + up   csf + clean   mitigate + ran
 +------------------------------------------------------------------------
 
   |  -- PRE-DEFENSE (32 events) --
-  |  2026-03-25T09:43:19Z  ! pattern init  ioc_attacker_ip_in_access_log         219 hit(s) (last 90d) from IC-5790 IPs - 160 returned 2xx
+  |  2026-03-25T09:43:19Z  ! pattern X     ioc_attacker_ip_2xx_on_cpsess         57 hit(s) (last 90d) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation
   |  2026-04-28T14:35:56Z  ! pattern X     ioc_cve_2026_41940_crlf_access_chain  15 CRLF-bypass chain(s) — POST /login 401 then GET /cpsess<N> 2xx as root within 2s
   |  2026-04-28T16:38:45Z  ! pattern E     ioc_pattern_e_websocket_shell_hits    45 external IP(s) reached /cpsess*/websocket/Shell with 2xx  (dim: 24x200:1,24x120:2,24x80:42)
   |  2026-04-29T08:41:22Z  ! pattern F     ioc_pattern_f_smark_envelope          __S_MARK__/__E_MARK__ harvester envelope in /root/.bash_history

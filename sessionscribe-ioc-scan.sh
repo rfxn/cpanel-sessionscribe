@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -5503,8 +5503,8 @@ aggregate_verdict() {
                         ((ioc_review++))
                         IOC_KEYS+=("$key")
                         # Surface review-tier IOCs in the verdict reasons line
-                        # so operators see "ioc_attacker_ip_in_access_log" even
-                        # when host_verdict is SUSPICIOUS not COMPROMISED.
+                        # so operators see e.g. "ioc_attacker_ip_in_access_log_probes_only"
+                        # even when host_verdict is SUSPICIOUS not COMPROMISED.
                         REASONS+=("$key")
                     fi
                     ;;
