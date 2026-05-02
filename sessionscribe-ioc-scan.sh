@@ -816,7 +816,6 @@ fi
 # All decorative output goes to stderr; stdout is reserved for JSONL.
 say() {  (( QUIET )) || printf '%s\n' "$*" >&2; }
 sayf() { (( QUIET )) || printf "$@" >&2; }
-section() { (( QUIET )) || printf '\n %s━━━ %s%s\n\n' "$BOLD" "$1" "$NC" >&2; }
 banner() {
     (( QUIET )) && return
     printf '\n %ssessionscribe-ioc-scan%s v%s - SessionScribe / CVE-2026-41940 local IR\n' "$BOLD" "$NC" "$VERSION" >&2
@@ -3163,7 +3162,7 @@ local_init() {
 
 # ---- version --------------------------------------------------------------
 check_version() {
-    section "Version"
+    hdr_section "version" "cpanel -V vs published patched-build cutoffs"
     local raw=""
     if [[ -n "$VERSION_OVERRIDE" ]]; then
         raw="$VERSION_OVERRIDE"
@@ -3297,7 +3296,7 @@ STATIC_EXPLAINS=(
 )
 
 check_static() {
-    section "Static patterns (ancillary; not primary CVE-2026-41940 verdict drivers)"
+    hdr_section "patterns" "static config-file patterns (ancillary; not CVE-driver)"
     local i id kind file vuln_pat fixed_pat explain fpath vhit fhit
     for i in "${!STATIC_IDS[@]}"; do
         id="${STATIC_IDS[$i]}"
@@ -3353,7 +3352,7 @@ check_static() {
 
 # ---- cpsrvd binary --------------------------------------------------------
 check_binary() {
-    section "cpsrvd binary"
+    hdr_section "cpsrvd" "cpsrvd binary patch markers"
     if [[ -z "$CPSRVD_BIN" || ! -f "$CPSRVD_BIN" ]]; then
         emit "binary" "cpsrvd_locate" "error" "cpsrvd_not_found" 0 \
              "note" "could not locate cpsrvd under ${CPANEL_ROOT}"
@@ -3406,7 +3405,7 @@ check_binary() {
 # ---- IOC log scan ---------------------------------------------------------
 check_logs() {
     (( NO_LOGS )) && return
-    section "IOC access-log scan"
+    hdr_section "iocscan" "access_log scan over ${SINCE_DAYS:-all}d window"
     local logdir=/usr/local/cpanel/logs
     if [[ ! -d "$logdir" ]]; then
         emit "logs" "logs_dir" "info" "no_log_dir" 0 \
@@ -4009,7 +4008,7 @@ check_token_used() {
 # the IOC ladder - they are known test collateral, not exploitation.
 check_sessions() {
     (( NO_SESSIONS )) && return
-    section "Session-store IOC scan"
+    hdr_section "sessions" "session-store IOC ladder"
     local d=/var/cpanel/sessions
     if [[ ! -d "$d" ]]; then
         emit "sessions" "sess_dir" "info" "no_session_dir" 0 "note" "no $d"
@@ -4304,12 +4303,12 @@ check_sessions() {
 check_destruction_iocs() {
     (( NO_DESTRUCTION_IOCS )) && return
     if [[ -n "$ROOT_OVERRIDE" ]]; then
-        section "Destruction IOC scan (Patterns A-I)"
+        hdr_section "destruct" "destruction IOC scan (Patterns A-I)"
         emit "destruction" "destruction_scan" "info" "skipped_snapshot_mode" 0 \
              "note" "destruction probes skip snapshot/--root mode (no host filesystem)"
         return
     fi
-    section "Destruction IOC scan (Patterns A-I)"
+    hdr_section "destruct" "destruction IOC scan (Patterns A-I)"
     local hits=0
 
     # History files swept by Pattern F harvester and Pattern H markers
@@ -5124,7 +5123,7 @@ check_destruction_iocs() {
 # ---- localhost marker probe ----------------------------------------------
 check_localhost_probe() {
     (( PROBE )) || return
-    section "Localhost marker probe (--probe)"
+    hdr_section "probe" "localhost marker probe"
     if ! command -v curl >/dev/null 2>&1; then
         emit "probe" "probe" "warning" "curl_missing" 0 "note" "curl required"
         return
@@ -5320,7 +5319,7 @@ aggregate_verdict() {
 
 print_verdict() {
     (( QUIET )) && return
-    section "Summary"
+    hdr_section "summary" "code state + host posture"
     sayf '   strong-vuln signals : %s%d%s\n' "$RED" "$STRONG_COUNT" "$NC"
     sayf '   patched signals     : %s%d%s\n' "$GREEN" "$FIXED_COUNT" "$NC"
     sayf '   inconclusive        : %s%d%s\n' "$YELLOW" "$INCONCLUSIVE_COUNT" "$NC"
@@ -5673,7 +5672,7 @@ if (( ! REPLAY_MODE )); then
 
     local_init
     if (( IOC_ONLY )); then
-        section "IOC-only mode (--ioc-only): code-state checks skipped"
+        hdr_section "ioc-only" "code-state checks skipped"
     else
         check_version
         check_static
@@ -5705,7 +5704,7 @@ else
     read_envelope_meta "$ENVELOPE_PATH"
     HOST_VERDICT="${ENV_HOST_VERDICT:-UNKNOWN}"
     SCORE="${ENV_SCORE:-0}"
-    section "Replay mode: detection skipped, forensic phases on $ENVELOPE_PATH"
+    hdr_section "replay" "forensic phases on $ENVELOPE_PATH"
 fi
 
 ###############################################################################
