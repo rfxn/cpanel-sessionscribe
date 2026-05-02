@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.10.1"
+VERSION="0.11.0"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -423,6 +423,13 @@ declare -a RECONCILED=()       # "verdict|delta_seconds|epoch|pattern|key"
 # Bundle TSV output uses real TABs - this is internal-only.
 PRIM_SEP=$'\x1f'
 declare -a IOC_PRIMITIVES=()
+
+# Per-row annotations indexed parallel to OFFENSE_EVENTS / RECONCILED.
+# Currently populated only for Pattern E websocket-shell rows: holds the
+# `dimensions` envelope field (e.g. "24x80:18,24x200:1") when present.
+# Empty string for any row without dimension data. Read by
+# render_offense_row to append "(dim: ...)" to the detail.
+declare -a IOC_ANNOTATIONS=()
 
 # Envelope-root metadata (populated by read_envelope_meta when chained from
 # ioc-scan via $SESSIONSCRIBE_IOC_JSON). These are the canonical IOC verdict
@@ -796,8 +803,9 @@ phase_defense() {
             say_def_miss "CSF still has cpsrvd ports in TCP_IN/TCP6_IN"
             emit_signal defense warn csf_dirty "cpsrvd ports present in TCP_IN/TCP6_IN"
         fi
-        # Verify actual iptables state (the host2.kyroslawgroup.net problem -
-        # csf.conf can be clean but iptables wasn't reloaded). cPanel/CSF
+        # Verify actual iptables state (cohort observation: csf.conf
+        # can be clean but iptables wasn't reloaded - false sense of
+        # defense). cPanel/CSF
         # posture is "explicit ACCEPT allowlist + default DROP via fall-
         # through", so the defense state is checked as the ABSENCE of an
         # ACCEPT 0.0.0.0/0 -> dpt:N rule for each cpsrvd port. We walk
@@ -1070,8 +1078,17 @@ read_iocs_from_envelope() {
         p_line=$(json_str_field "$line" line)
         p_row=$(ioc_primitive_row "$area" "$p_ip" "$p_path" "$p_log" "$p_count" "$p_h2xx" "$p_status" "$p_line")
 
+        # Per-row annotation: Pattern E websocket-shell rows carry a
+        # `dimensions` envelope field (rows×cols breakout). Captured
+        # parallel-indexed in IOC_ANNOTATIONS for the renderer.
+        local p_anno=""
+        if [[ "$key" == "ioc_pattern_e_websocket_shell_hits" ]]; then
+            p_anno=$(json_str_field "$line" dimensions)
+        fi
+
         OFFENSE_EVENTS+=("$ts|$pattern|$key|${note:-$key}|patch,modsec")
         IOC_PRIMITIVES+=("$p_row")
+        IOC_ANNOTATIONS+=("$p_anno")
         n_added=$((n_added+1))
         emit_signal offense fail "$key" "${note:-$key}" \
             epoch "$ts" pattern "$pattern" envelope "$(basename "$env")"
@@ -1113,6 +1130,7 @@ pattern_g_deep_checks() {
                 if [[ -n "$ctime_pre" ]]; then
                     OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_forged_mtime|backdated ssh key|patch,modsec")
                     IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "" "" "" "" "mtime forged to $PATTERN_G_FORGED_MTIME_WALL")")
+                    IOC_ANNOTATIONS+=("")
                 fi
             fi
         fi
@@ -1151,6 +1169,7 @@ pattern_g_deep_checks() {
             if [[ -n "$ctime_pre" ]]; then
                 OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|non-standard ssh key (ctime)|patch,modsec")
                 IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "" "$susp_count" "" "" "non-standard ssh key comments")")
+                IOC_ANNOTATIONS+=("")
             fi
         fi
     done
@@ -1188,6 +1207,7 @@ pattern_g_deep_checks() {
             if [[ -n "$c" ]]; then
                 OFFENSE_EVENTS+=("$c|G|pattern_g_offpath|ssh key in non-canonical path|patch,modsec")
                 IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$f" "" "" "" "" "ssh key out of ~/.ssh")")
+                IOC_ANNOTATIONS+=("")
             fi
         done <<< "$ssh_rsa_locations"
     fi
@@ -1498,7 +1518,7 @@ fmt_offense_detail() {
 # IOC_PRIMITIVES TSV row.
 # Layout: │ TS  ⚡ pattern X    key                       detail
 render_offense_row() {
-    local verdict="$1" delta="$2" ts_iso="$3" pattern="$4" key="$5" note="$6" prims="$7"
+    local verdict="$1" delta="$2" ts_iso="$3" pattern="$4" key="$5" note="$6" prims="$7" anno="${8:-}"
     local color
     case "$verdict" in
         PRE-DEFENSE|UNDEFENDED) color="$C_RED" ;;
@@ -1511,6 +1531,8 @@ render_offense_row() {
     IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
     local detail
     detail=$(fmt_offense_detail "$ip" "$path" "$count" "$status" "$note")
+    # Append per-row annotation when populated (e.g. Pattern E dimensions).
+    [[ -n "$anno" ]] && detail+="  (dim: $anno)"
 
     # Pattern column padded to 4 (covers "init"). Key column padded to 22.
     printf '  %s%s%s  %s  %s%s%s pattern %-4s  %s%-22s%s  %s\n' \
@@ -1817,12 +1839,13 @@ render_kill_chain() {
                     else
                         local _rec="${RECONCILED[$r_idx]}"
                         local _prims="${IOC_PRIMITIVES[$r_idx]:-}"
+                        local _anno="${IOC_ANNOTATIONS[$r_idx]:-}"
                         local r_verdict r_delta r_epoch r_stage r_key r_note
                         IFS=$'\t' read -r r_verdict r_delta r_epoch r_stage r_key r_note \
                             < <(decode_pipe_tail "$_rec" 6)
                         render_offense_row "$r_verdict" "$r_delta" \
                             "$(epoch_to_iso "$r_epoch")" "$r_stage" "$r_key" \
-                            "$r_note" "$_prims"
+                            "$r_note" "$_prims" "$_anno"
                     fi
                 done
             done
