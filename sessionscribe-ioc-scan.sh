@@ -668,6 +668,21 @@ N_OFF=0                 # offense-event count (informational, set at render time
 RECONCILED=()           # "verdict|delta|epoch|pattern|key|note" strings (phase_reconcile output)
 KILL_CHAIN_RENDERED=""  # ANSI-stripped kill-chain copy for bundle kill-chain.md
 
+# aggregate_verdict() output globals. Initialised here so --replay mode
+# (which skips aggregate_verdict) never sees "unbound variable" errors in
+# the summary / write_json / write_csv consumers at script end.
+SCORE=0
+STRONG_COUNT=0
+FIXED_COUNT=0
+INCONCLUSIVE_COUNT=0
+IOC_CRITICAL=0
+IOC_REVIEW=0
+ADVISORY_COUNT=0
+PROBE_ARTIFACT_COUNT=0
+HOST_VERDICT="UNKNOWN"
+CODE_VERDICT="UNKNOWN"
+VERDICT="UNKNOWN"
+
 # PATCHED_BUILDS_CPANEL / PATCHED_BUILD_WPSQUARED / CPANEL_NORM / PRIMARY_IP /
 # OS_PRETTY / LP_UID / INCIDENT_ID: referenced by write_kill_chain_primitives
 # and phase_defense. Set during main flow (check_version / banner / local_init);
