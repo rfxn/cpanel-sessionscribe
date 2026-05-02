@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.6
+# sessionscribe-ioc-scan.sh v1.6.7
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.6"
+VERSION="1.6.7"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -220,15 +220,29 @@ SSH_KEY_FILES=(
     "/root/.ssh/authorized_keys2"
 )
 
-# Attacker source IPs consolidated from the IC-5790 dossier (2026-05-01).
-# Roles: badpass exploit, JSON-API enum, websocket Shell, TLS/HTTP probes,
-# C2/dropper. Some are blackholed; we still want to count log hits as a
-# late-stage signal in case rotation didn't take. Operators with internal
-# scan boxes can suppress hits via --exclude-ip CIDR.
+# Attacker source IPs consolidated from the IC-5790 dossier (rev 3,
+# 2026-05-01). Roles annotated by row. Some are blackholed; we still want
+# to count log hits as a late-stage signal in case rotation didn't take.
+# Operators with internal scan boxes can suppress hits via --exclude-ip.
+#
+# 183.82.160.147 is notable: earliest websocket Shell (24x134) hit on
+# host.quickfix17.com is from DEC 2025 - approximately four months before
+# WebPros publicly disclosed CVE-2026-41940 on 2026-04-28. Pre-disclosure
+# silent exploitation; the --since default of "all retained logs" is what
+# surfaces these. Operators running --since 90 will miss them.
 ATTACKER_IPS=(
+    # badpass exploitation source IPs (initial-access wave)
     68.233.238.100   206.189.2.13     137.184.77.0     38.146.25.154
-    157.245.204.205  192.81.219.190   149.102.229.144  94.231.206.39
-    45.82.78.104     68.183.190.253   87.121.84.78     96.30.39.236
+    157.245.204.205  142.93.43.26     5.230.165.16     5.252.177.207
+    146.19.24.235
+    # JSON-API enum + websocket Shell operators (Pattern D/E)
+    192.81.219.190   149.102.229.144  183.82.160.147   45.82.78.104
+    # TLS/HTTP probes
+    94.231.206.39
+    # C2 / dropper / payload origin (Pattern A/C/D/H)
+    68.183.190.253   87.121.84.78     96.30.39.236     68.47.28.118
+    # Pattern Unknown - host.coprimemain.com (rev3 entry, not yet classified A or B)
+    89.34.18.59
 )
 
 ###############################################################################
