@@ -1706,7 +1706,7 @@ Update STATE.md with the v2.0.0 architecture; update CLAUDE.md with the merged-s
 - **Edge cases**: README.md may not exist or may be sparse — verify with `ls -la README.md` first; if it's a stub, expand it appropriately. README.md exists per repo dir listing
 - **Regression-case**: N/A — docs — STATE/CLAUDE/README updates only; CDN deploy is non-source side-effect; live behavior already verified in Phase 7
 
-- [ ] **Step 1: Update STATE.md shipped-versions table + architecture**
+- [x] **Step 1: Update STATE.md shipped-versions table + architecture**
 
   Read the current shipped-versions table and architecture section first, then rewrite. The post-merge state:
 
@@ -1748,7 +1748,7 @@ Update STATE.md with the v2.0.0 architecture; update CLAUDE.md with the merged-s
   --replay; it preserves the v1.x curl one-liner URL during the grace period.
   ```
 
-- [ ] **Step 2: Append `## Merged-script architecture` section to CLAUDE.md**
+- [x] **Step 2: Append `## Merged-script architecture` section to CLAUDE.md**
 
   Location: end of CLAUDE.md, before the verification gate section (or append at end if the verification gate is already last).
 
@@ -1812,7 +1812,7 @@ Update STATE.md with the v2.0.0 architecture; update CLAUDE.md with the merged-s
   on the v1.x curl one-liner. The shim will be removed in a future release.
   ```
 
-- [ ] **Step 3: Update README.md operator-facing usage**
+- [x] **Step 3: Update README.md operator-facing usage**
 
   Read README.md first to understand current structure, then rewrite the operator-usage section. Replace any `--chain-forensic`/`--chain-on-critical` examples with `--full`/`--replay`. Add an explicit `### Deprecation: sessionscribe-forensic.sh` subsection noting the shim and grace period.
 
@@ -1822,7 +1822,7 @@ Update STATE.md with the v2.0.0 architecture; update CLAUDE.md with the merged-s
   - Add a `--replay` example showing how to re-render a kill-chain from a saved envelope
   - Add a `### Deprecation: sessionscribe-forensic.sh` subsection at the end of the operator section
 
-- [ ] **Step 4: Commit docs**
+- [x] **Step 4: Commit docs**
 
   ```bash
   git add STATE.md CLAUDE.md README.md
@@ -1862,7 +1862,7 @@ Update STATE.md with the v2.0.0 architecture; update CLAUDE.md with the merged-s
   # expect: lines including the new commit hash pushed to main
   ```
 
-- [ ] **Step 5: CDN deploy + sha256 parity**
+- [x] **Step 5: CDN deploy + sha256 parity**
 
   Per the cdn-deploy reference memory:
 
@@ -1896,5 +1896,8 @@ Update STATE.md with the v2.0.0 architecture; update CLAUDE.md with the merged-s
   ```
 
   No additional commit — CDN deploy is a side-effect.
+
+  **Phase 8 result:** STATUS: DONE — All 5 steps complete. All accept criteria pass.
+  Commit: a754579. CDN sha256 parity verified. CDN smoke test confirms v2.0.0 + Pattern X.
 
 ---
