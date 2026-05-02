@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.11.0"
+VERSION="0.11.1"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -109,18 +109,21 @@ INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
 # Upload is opt-in via --upload (NEVER on by default).
 INTAKE_DEFAULT_TOKEN="cd88c9970c3176997c9671a2566fadc84904be0b73edd5e3b071452eade796e1"
 
-# Vendor-published patched builds.
+# Vendor-published patched builds. Tier 124 added per vendor advisory
+# (.35 in-place patch); previously listed in UNPATCHED_TIERS.
 PATCHED_BUILDS_CPANEL=(
-    "11.86.0.41"  "11.110.0.97"  "11.118.0.63"  "11.126.0.54"
-    "11.130.0.19" "11.132.0.29"  "11.134.0.20"  "11.136.0.5"
+    "11.86.0.41"  "11.110.0.97"  "11.118.0.63"  "11.124.0.35"
+    "11.126.0.54" "11.130.0.19"  "11.132.0.29"  "11.134.0.20"
+    "11.136.0.5"
 )
 PATCHED_BUILD_WPSQUARED="136.1.7"
 
 # Tiers explicitly excluded from the vendor patch list. Hosts on these tiers
 # have NO in-place fix and must be upgraded to a patched major series.
 # Operationally distinct from "patched build available but not applied" - the
-# response is upgrade/migrate, not upcp.
-UNPATCHED_TIERS=(112 114 116 120 122 124 128)
+# response is upgrade/migrate, not upcp. Tier 124 was here pre-advisory; it
+# was given a .35 in-place patch and now lives in PATCHED_BUILDS_CPANEL.
+UNPATCHED_TIERS=(112 114 116 120 122 128)
 
 # cpsrvd ports we expect to be closed on unpatched hosts.
 CPSRVD_PORTS=(2082 2083 2086 2087 2095 2096)
