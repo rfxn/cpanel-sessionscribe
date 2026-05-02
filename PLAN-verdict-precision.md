@@ -810,4 +810,24 @@ The sole remaining user of exit code 3 is now the SUSPICIOUS host-state assignme
 
 **Status:** COMPLETE — pre9 @ f8c219a
 
+### pre10 — MUST-FIX: awk split() arg order in Phase 2/Phase 5 emit-time path/status extraction (Phase 7 live-regression finding)
+
+**Problem:** Live regression on host2.ringithosting.com surfaced a real-data correctness bug: kill-chain.tsv showed `path=""`, `status=""`, `cpsess_token=""` for the new `ioc_attacker_ip_2xx_on_cpsess` strong emit AND for `ioc_pattern_e_websocket_shell_hits`, despite `ip` being correctly populated. Manual diagnosis on host2 reproduced the failure with `awk: fatal: split: second argument is not an array`.
+
+**Root cause:** Four awk one-liners in the emit-time bash extraction had `split($N, " ", p)` with arguments in wrong order. Standard awk signature is `split(string, array, fieldsep)` — the engineer's code passed the field-separator string `" "` as the second arg (where the array goes) and the array name `p` as the third arg (where the separator goes). gawk fails fatally on the malformed call; the bash command-substitution captures only stderr-less empty stdout, leaving `_c_path`, `_c_status`, `_e_path`, `_e_status` empty. This silently failed in pre2 and pre5/pre8 because shellcheck doesn't run awk regexes and bash -n doesn't execute the awk subshells. Sentinel passes 1+2 didn't catch it because they verified field-presence in JSON (the fields `"path":"",` ARE present in the emit; the empty value was indistinguishable from "no cpsess hits to populate them with").
+
+**Fix:** Swapped argument order at four call sites:
+- Line 3782 (Phase 2 `_c_path`)
+- Line 3783 (Phase 2 `_c_status`)
+- Line 5272 (Phase 5 Pattern E `_e_path`)
+- Line 5273 (Phase 5 Pattern E `_e_status`)
+
+All four now use `split($N, p, " ")` matching the canonical awk signature and the 9 other split() callsites elsewhere in the script.
+
+**Verification:**
+- `bash -n` + `shellcheck -S error` clean
+- Manual extraction on host2 against a real access_log line: `ip=80.75.212.14 path=/cpsess.../json-api/version status=200` (was `path=[] status=[]` pre-fix)
+- Live re-run on host2 (post-deploy) — kill-chain.tsv structured field check (gate 5)
+
+**Status:** COMPLETE — pre10 @ <commit-hash>
 
