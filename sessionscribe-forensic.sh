@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.9
+# sessionscribe-forensic.sh v0.10.0
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.9"
+VERSION="0.10.0"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -898,8 +898,10 @@ json_num_field() {
     printf '%s' "$v"
 }
 
-# Map ioc-scan emit key -> kill-chain stage letter for OFFENSE_EVENTS.
-ioc_key_to_stage() {
+# Map ioc-scan emit key -> IC-5790 Pattern letter for OFFENSE_EVENTS.
+# Vocabulary aligns with the dossier (Patterns A-I); init/X/? are pseudo-
+# patterns for recon, exploitation evidence, and unmapped keys respectively.
+ioc_key_to_pattern() {
     case "$1" in
         ioc_pattern_a_*)            echo A ;;
         ioc_pattern_b_*)            echo B ;;
@@ -908,6 +910,8 @@ ioc_key_to_stage() {
         ioc_pattern_e_*)            echo E ;;
         ioc_pattern_f_*)            echo F ;;
         ioc_pattern_g_*)            echo G ;;
+        ioc_pattern_h_*)            echo H ;;
+        ioc_pattern_i_*)            echo I ;;
         ioc_attacker_ip*|ioc_hits)  echo init ;;
         ioc_token_*|ioc_preauth_*|ioc_short_pass*|ioc_multiline_*|ioc_badpass*|ioc_cve_2026_41940*|ioc_hasroot*|ioc_malformed*|ioc_forged_*|ioc_tfa*|anomalous_root_sessions)
                                     echo X ;;
@@ -998,7 +1002,7 @@ ioc_primitive_row() {
 
 # Read kill-chain-relevant signals from $SESSIONSCRIBE_IOC_JSON and append
 # to OFFENSE_EVENTS in the shape phase_reconcile expects:
-#   "epoch|stage|key|note|defenses_required"
+#   "epoch|pattern|key|note|defenses_required"
 # Also captures envelope-root metadata + per-IOC primitives (ip / path /
 # log_file / count / hits_2xx / status / line excerpt) into IOC_PRIMITIVES,
 # parallel-indexed with OFFENSE_EVENTS, for the kill-chain renderer + bundle.
@@ -1018,7 +1022,7 @@ read_iocs_from_envelope() {
 
     read_envelope_meta
 
-    local line area severity key note ts stage n_added=0
+    local line area severity key note ts pattern n_added=0
     local p_ip p_path p_log p_count p_h2xx p_status p_line p_row
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
@@ -1038,7 +1042,7 @@ read_iocs_from_envelope() {
         esac
         note=$(json_str_field "$line" note)
         ts=$(ioc_signal_epoch "$line")
-        stage=$(ioc_key_to_stage "$key")
+        pattern=$(ioc_key_to_pattern "$key")
         # Forensic primitives - one of these is usually populated per signal,
         # depending on the area:
         #   logs       -> ip, log_file, line, status, count, hits_2xx
@@ -1055,11 +1059,11 @@ read_iocs_from_envelope() {
         p_line=$(json_str_field "$line" line)
         p_row=$(ioc_primitive_row "$area" "$p_ip" "$p_path" "$p_log" "$p_count" "$p_h2xx" "$p_status" "$p_line")
 
-        OFFENSE_EVENTS+=("$ts|$stage|$key|${note:-$key}|patch,modsec")
+        OFFENSE_EVENTS+=("$ts|$pattern|$key|${note:-$key}|patch,modsec")
         IOC_PRIMITIVES+=("$p_row")
         n_added=$((n_added+1))
         emit_signal offense fail "$key" "${note:-$key}" \
-            epoch "$ts" stage "$stage" envelope "$(basename "$env")"
+            epoch "$ts" pattern "$pattern" envelope "$(basename "$env")"
     done < "$env"
 
     say_info "envelope: imported $n_added IOC(s) from $(basename "$env")"
@@ -1422,12 +1426,12 @@ phase_reconcile() {
 # never contaminates --jsonl/--json on stdout. Suppressed under --quiet.
 ###############################################################################
 
-# Order stages canonically for the offense timeline. init is the recon
-# pre-cursor; A-G map to the IC-5790 pattern letters; X is forged-session
-# evidence that doesn't fit a destruction stage; ? is anything unmapped
-# (a v0.9.x ioc_key_to_stage gap caught at runtime).
-STAGE_ORDER=(init A B C D E F G X "?")
-declare -A STAGE_LABEL=(
+# Order patterns canonically for the offense timeline. init is the recon
+# pre-cursor; A-I map to the IC-5790 dossier Pattern letters; X is forged-
+# session evidence that doesn't fit a destruction pattern; ? is anything
+# unmapped (a runtime ioc_key_to_pattern gap).
+PATTERN_ORDER=(init A B C D E F G H I X "?")
+declare -A PATTERN_LABEL=(
     [init]="recon / harvest"
     [A]="ransom / encryptor"
     [B]="data destruction"
@@ -1436,6 +1440,8 @@ declare -A STAGE_LABEL=(
     [E]="websocket / fileman harvest"
     [F]="harvester shell"
     [G]="ssh key persistence"
+    [H]="seobot defacement / SEO spam"
+    [I]="system-service profile.d backdoor"
     [X]="forged session"
     ["?"]="unmapped"
 )
@@ -1479,9 +1485,9 @@ fmt_offense_detail() {
 # Render one offense row in compact single-line form for the chronological
 # tree. Caller passes the decomposed reconcile fields and the matching
 # IOC_PRIMITIVES TSV row.
-# Layout: │ TS  ⚡ stage X    key                       detail
+# Layout: │ TS  ⚡ pattern X    key                       detail
 render_offense_row() {
-    local verdict="$1" delta="$2" ts_iso="$3" stage="$4" key="$5" note="$6" prims="$7"
+    local verdict="$1" delta="$2" ts_iso="$3" pattern="$4" key="$5" note="$6" prims="$7"
     local color
     case "$verdict" in
         PRE-DEFENSE|UNDEFENDED) color="$C_RED" ;;
@@ -1495,12 +1501,12 @@ render_offense_row() {
     local detail
     detail=$(fmt_offense_detail "$ip" "$path" "$count" "$status" "$note")
 
-    # Stage column padded to 4 (covers "init"). Key column padded to 22.
-    printf '  %s%s%s  %s  %s%s%s stage %-4s  %s%-22s%s  %s\n' \
+    # Pattern column padded to 4 (covers "init"). Key column padded to 22.
+    printf '  %s%s%s  %s  %s%s%s pattern %-4s  %s%-22s%s  %s\n' \
         "$C_DIM" "$GLYPH_BOX_V" "$C_NC" \
         "$ts_iso" \
         "$color" "$GLYPH_OFFENSE" "$C_NC" \
-        "$stage" \
+        "$pattern" \
         "$C_CYN" "$key" "$C_NC" \
         "$detail"
 }
@@ -1935,7 +1941,7 @@ write_kill_chain_primitives() {
 
     # TSV header + DEF rows + IOC rows.
     {
-        printf 'kind\tts_epoch\tts_iso\tstage\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tline\n'
+        printf 'kind\tts_epoch\tts_iso\tpattern\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tline\n'
 
         # Defense rows.
         local de de_epoch de_key de_note _de_line
@@ -1953,23 +1959,23 @@ write_kill_chain_primitives() {
                 "$de_epoch" "$(epoch_to_iso "$de_epoch")" "$de_key" "$de_note"
         done <<< "$sorted_def"
 
-        # Offense rows. Iterate parallel arrays in canonical stage order.
-        local stage_iter idx
-        local -a stage_indices
-        for stage_iter in "${STAGE_ORDER[@]}"; do
-            stage_indices=()
+        # Offense rows. Iterate parallel arrays in canonical pattern order.
+        local pattern_iter idx
+        local -a pattern_indices
+        for pattern_iter in "${PATTERN_ORDER[@]}"; do
+            pattern_indices=()
             for (( idx=0; idx<${#RECONCILED[@]}; idx++ )); do
                 local r_pat
                 r_pat=$(echo "${RECONCILED[$idx]}" | cut -d'|' -f4)
-                [[ "$r_pat" == "$stage_iter" ]] || continue
-                stage_indices+=("$idx")
+                [[ "$r_pat" == "$pattern_iter" ]] || continue
+                pattern_indices+=("$idx")
             done
-            (( ${#stage_indices[@]} == 0 )) && continue
+            (( ${#pattern_indices[@]} == 0 )) && continue
 
             local i_sorted
             i_sorted=$(
                 local i ts
-                for i in "${stage_indices[@]}"; do
+                for i in "${pattern_indices[@]}"; do
                     ts=$(echo "${RECONCILED[$i]}" | cut -d'|' -f3)
                     printf '%s\t%s\n' "${ts:-0}" "$i"
                 done | sort -n -k1,1 | cut -f2
@@ -2024,8 +2030,15 @@ write_kill_chain_primitives() {
     # JSONL - same data, machine-parseable. Header row replaced by a single
     # "meta" object on line 1; each subsequent line is a kind=DEF or kind=IOC
     # record with envelope-root metadata embedded for self-attribution.
+    #
+    # Schema version tracking:
+    #   v1 (forensic <= 0.9.x): per-IOC field name was "stage"
+    #   v2 (forensic >= 0.10.0): per-IOC field renamed to "pattern" to align
+    #     with the IC-5790 dossier vocabulary. The _schema_changes hint in
+    #     the meta row makes the rename machine-discoverable for future
+    #     readers (operator tooling, LLM analyses).
     {
-        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
+        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":2,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
             "$HOSTNAME_J" "$PRIMARY_IP_J" "$LP_UID_J" "$OS_J" "$CPV_J" "$TS_ISO" \
             "$VERSION" "$INCIDENT_ID" "$RUN_ID" \
             "$(json_esc "$ENV_IOC_RUN_ID")" "$(json_esc "$ENV_IOC_TOOL_VERSION")" "$(json_esc "$ENV_IOC_TS")" \
@@ -2048,21 +2061,21 @@ write_kill_chain_primitives() {
                 "$(json_esc "$de_key")" "$(json_esc "$de_note")"
         done <<< "$sorted_def"
 
-        local stage_iter idx
-        local -a stage_indices
-        for stage_iter in "${STAGE_ORDER[@]}"; do
-            stage_indices=()
+        local pattern_iter idx
+        local -a pattern_indices
+        for pattern_iter in "${PATTERN_ORDER[@]}"; do
+            pattern_indices=()
             for (( idx=0; idx<${#RECONCILED[@]}; idx++ )); do
                 local r_pat
                 r_pat=$(echo "${RECONCILED[$idx]}" | cut -d'|' -f4)
-                [[ "$r_pat" == "$stage_iter" ]] || continue
-                stage_indices+=("$idx")
+                [[ "$r_pat" == "$pattern_iter" ]] || continue
+                pattern_indices+=("$idx")
             done
-            (( ${#stage_indices[@]} == 0 )) && continue
+            (( ${#pattern_indices[@]} == 0 )) && continue
             local i_sorted
             i_sorted=$(
                 local i ts
-                for i in "${stage_indices[@]}"; do
+                for i in "${pattern_indices[@]}"; do
                     ts=$(echo "${RECONCILED[$i]}" | cut -d'|' -f3)
                     printf '%s\t%s\n' "${ts:-0}" "$i"
                 done | sort -n -k1,1 | cut -f2
@@ -2083,7 +2096,12 @@ write_kill_chain_primitives() {
                 local area ip path log_file count h2xx status line
                 IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
 
-                printf '{"kind":"IOC","epoch":%s,"ts":"%s","stage":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","line":"%s"}\n' \
+                # JSONL schema v2 (forensic v0.10.0+): per-IOC field 'stage'
+                # renamed to 'pattern' to match the IC-5790 dossier vocabulary.
+                # Meta row carries schema_version=2 + a _schema_changes hint
+                # so future readers (operator tooling, LLM analyses) can
+                # auto-detect the rename and adapt.
+                printf '{"kind":"IOC","epoch":%s,"ts":"%s","pattern":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","line":"%s"}\n' \
                     "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
                     "$(json_esc "$r_pat")" "$(json_esc "$r_verdict")" \
                     "$(json_esc "$r_delta")" "$(json_esc "$dactive")" \
