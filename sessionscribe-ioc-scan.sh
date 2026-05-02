@@ -1150,20 +1150,29 @@ json_num_field() {
 }
 
 ioc_key_to_pattern() {
+    # New v2.2.0 keys (verdict-precision refactor):
+    #   ioc_attacker_ip_2xx_on_cpsess    pattern=X   strong  weight=8   real exploitation
+    #   ioc_attacker_ip_recon_only       pattern=init info   weight=0   probing only
+    #   ioc_failed_exploit_attempt       pattern=X   warning weight=3   cPanel IOC 5 analog
+    # Specific keys MUST appear before the ioc_attacker_ip* glob or the
+    # glob captures them first (case is first-match, not best-match).
     case "$1" in
-        (ioc_pattern_a_*)            echo A ;;
-        (ioc_pattern_b_*)            echo B ;;
-        (ioc_pattern_c_*)            echo C ;;
-        (ioc_pattern_d_*)            echo D ;;
-        (ioc_pattern_e_*)            echo E ;;
-        (ioc_pattern_f_*)            echo F ;;
-        (ioc_pattern_g_*)            echo G ;;
-        (ioc_pattern_h_*)            echo H ;;
-        (ioc_pattern_i_*)            echo I ;;
-        (ioc_attacker_ip*|ioc_hits)  echo init ;;
+        (ioc_pattern_a_*)                       echo A ;;
+        (ioc_pattern_b_*)                       echo B ;;
+        (ioc_pattern_c_*)                       echo C ;;
+        (ioc_pattern_d_*)                       echo D ;;
+        (ioc_pattern_e_*)                       echo E ;;
+        (ioc_pattern_f_*)                       echo F ;;
+        (ioc_pattern_g_*)                       echo G ;;
+        (ioc_pattern_h_*)                       echo H ;;
+        (ioc_pattern_i_*)                       echo I ;;
+        (ioc_attacker_ip_2xx_on_cpsess)         echo X ;;
+        (ioc_attacker_ip_recon_only)            echo init ;;
+        (ioc_failed_exploit_attempt)            echo X ;;
+        (ioc_attacker_ip*|ioc_hits)             echo init ;;
         (ioc_token_*|ioc_preauth_*|ioc_short_pass*|ioc_multiline_*|ioc_badpass*|ioc_cve_2026_41940*|ioc_hasroot*|ioc_malformed*|ioc_forged_*|ioc_tfa*|anomalous_root_sessions)
-                                     echo X ;;
-        (*)                          echo ? ;;
+                                                echo X ;;
+        (*)                                     echo ? ;;
     esac
 }
 
