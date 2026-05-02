@@ -1177,7 +1177,7 @@ ioc_key_to_pattern() {
 }
 
 ioc_signal_epoch() {
-    local line="$1" v iso k
+    local line="$1" v iso k key pattern
     for k in ts_epoch_first mtime_epoch ts_epoch; do
         v=$(json_num_field "$line" "$k")
         [[ -n "$v" && "$v" != "0" ]] && { printf '%s' "$v"; return; }
@@ -1189,6 +1189,18 @@ ioc_signal_epoch() {
             [[ -n "$v" ]] && { printf '%s' "$v"; return; }
         fi
     done
+
+    # Pattern-aware fallback: pattern=X events MUST have a real timestamp;
+    # synthesizing TS_EPOCH for them pollutes cluster-onset analysis
+    # (q5/q8 in summary.json - patient-zero anchor shifts to scan time).
+    # File-on-disk patterns (A/B/C/D/F/G/H/I) retain the TS_EPOCH fallback
+    # because they are authentic on-disk evidence even when the emit omits ts.
+    key=$(json_str_field "$line" "key")
+    pattern=$(ioc_key_to_pattern "$key")
+    if [[ "$pattern" == "X" ]]; then
+        printf '0'
+        return
+    fi
     printf '%s' "$TS_EPOCH"
 }
 
@@ -1285,6 +1297,19 @@ read_iocs_from_envelope() {
         esac
         note=$(json_str_field "$line" note)
         ts=$(ioc_signal_epoch "$line")
+        # Pattern X events with no resolvable timestamp are refused:
+        # ioc_signal_epoch() returns 0 for pattern=X when no real ts is found.
+        # Using TS_EPOCH for pattern=X would synthesize a scan-time anchor and
+        # corrupt cluster-onset (q8_patient_zero_x) analysis.
+        # The warning emitted here is a pattern=meta informational row
+        # recording the refused event for post-hoc review.
+        if [[ "$ts" == "0" ]]; then
+            key_for_warn=$(json_str_field "$line" key)
+            emit_signal offense warn ts_unresolvable_pattern_x \
+                "Pattern X event refused (no resolvable timestamp) - prevents synthetic scan-time anchor; pattern=meta informational only" \
+                key "${key_for_warn:-unknown}"
+            continue
+        fi
         pattern=$(ioc_key_to_pattern "$key")
         p_ip=$(json_str_field "$line" ip)
         [[ -z "$p_ip" ]] && p_ip=$(json_str_field "$line" src_ip)
