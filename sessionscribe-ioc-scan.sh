@@ -5509,7 +5509,7 @@ print_verdict() {
         local entry adv_id adv_key adv_note
         for entry in "${ADVISORIES[@]}"; do
             IFS='|' read -r adv_id adv_key adv_note <<< "$entry"
-            sayf '   %s⚐%s %s (%s)\n' "$CYAN" "$NC" "$adv_id" "$adv_key"
+            sayf '  %s%-10s%s %s (%s)\n' "$CYAN" "[ADVISORY]" "$NC" "$adv_id" "$adv_key"
             [[ -n "$adv_note" ]] && sayf '       %s%s%s\n' "$DIM" "$adv_note" "$NC"
         done
     fi
