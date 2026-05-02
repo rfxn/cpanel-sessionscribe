@@ -225,7 +225,7 @@ Establish the new key vocabulary and pattern-letter mappings without changing an
 ---
 
 ### Phase 2: cpsess-split for `ioc_attacker_ip_in_access_log` (THE HEADLINE)
-**Status:** COMPLETE — pre2 @ (pending commit)
+**Status:** COMPLETE — pre2 @ 778bd84
 
 Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on URLs containing `/cpsess<10digits>/` is **real exploitation evidence** (severity=strong, key=`ioc_attacker_ip_2xx_on_cpsess`, pattern=X); 2xx on any other path is **reconnaissance only** (severity=info, key=`ioc_attacker_ip_recon_only`, pattern=init). 4xx-only retains its warning-tier emit. The legacy key `ioc_attacker_ip_in_access_log` is kept as a parent rollup signal at info-tier so existing fleet aggregator queries continue to find a key for "T1 IPs were observed."
 
@@ -334,6 +334,7 @@ Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on U
 ---
 
 ### Phase 3: Add `ioc_failed_exploit_attempt` session signal (cPanel IOC 5 analog)
+**Status:** COMPLETE — pre3 @ (pending commit)
 
 Add a new warning-tier session-side signal that fires when a session has the failed-exploit footprint per cPanel's `ioc_checksessions_files.sh` IOC 5: `origin=badpass + token_denied + pass= line + no auth markers`. This becomes a SUSPICIOUS-tier signal in our model — it counts toward `ioc_review` (line 5311), exits 3 (post-Phase-6) or 2 (current behavior in `--ioc-only`), and surfaces in the verdict-reasons line.
 
@@ -357,11 +358,11 @@ Add a new warning-tier session-side signal that fires when a session has the fai
   - **Empty pass= line:** `^pass=$` (zero-length value) should NOT count — the cPanel script greps `^pass=` which matches even empty. Our `SF_PASS_PRESENT` should require a non-empty value to align with the cPanel semantics (saveSession only writes `pass=` when length > 0).
 - **Regression-case**: live test on host2 — host2 has confirmed compromised sessions (auth markers present). Expect: NO new `ioc_failed_exploit_attempt` emits on host2 (all session-side compromise paths fire IOC-E2/IOC-H/IOC-I instead). Negative-case validation only.
 
-- [ ] **Step 1: Add SF_PASS_PRESENT detection to the session awk pass**
+- [x] **Step 1: Add SF_PASS_PRESENT detection to the session awk pass**
 
   Location: `sessionscribe-ioc-scan.sh` ~line 3850 (the awk block in `analyze_session_file` or equivalent SF_* setter). Add awk var `pass_present=0; pass_present_nonempty=0` and a match for `/^pass=.+/` (non-empty pass line).
 
-- [ ] **Step 2: Add the new check after the existing IOC-G tfa emit**
+- [x] **Step 2: Add the new check after the existing IOC-G tfa emit**
 
   Location: insert after line 4232 (the `if (( SF_TFA && ! SF_LEGIT_LOGIN ))` block):
 
