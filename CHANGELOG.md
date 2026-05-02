@@ -4,6 +4,69 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.4.0 — 2026-05-02
+
+### Added
+- **Pre-compromise temporal gate** for two second-order signals that were
+  artificially skewing cluster-onset timeline metrics
+  (`ioc_pattern_e_websocket_shell_hits` and
+  `ioc_attacker_ip_2xx_on_cpsess`). Both are post-RCE / token-consumption
+  evidence — they require a first-order CVE-2026-41940 exploitation
+  primitive (`ioc_cve_2026_41940_crlf_access_chain`) as compromise
+  anchor. Without one, the hits are most likely shared-infra
+  coincidence, recycled-token noise, or pre-disclosure recon (the
+  testdev.halcyonplatinum.com pattern: Pattern E 2025-11-24,
+  2xx_on_cpsess 2026-03-26, both predating the actual CRLF chain at
+  2026-04-30 by months).
+- New advisory keys (weight=0; do NOT escalate `host_verdict`; surface
+  in ADVISORIES + signals[] for fleet-aggregator visibility):
+  - `ioc_attacker_ip_2xx_on_cpsess_pre_compromise` — fired when CRLF
+    chain is absent on the host, OR when 2xx_on_cpsess `ts_first`
+    PREDATES the first CRLF chain epoch.
+  - `ioc_pattern_e_websocket_shell_hits_pre_compromise` — same gate
+    against CRLF chain.
+  - `ioc_pattern_e_websocket_shell_hits_orphan` — fired when Pattern E
+    passes the CRLF gate but is more than `PATTERN_E_2XX_PROXIMITY_SEC`
+    (default 7 days) away from the nearest successful token-use event
+    (`ioc_attacker_ip_2xx_on_cpsess` first epoch). Operator opened
+    shell but never re-entered via cpsess token in the same session
+    window — exploitation-detached.
+- Each emit now carries `crlf_first_epoch` (and Pattern E adds
+  `twoxx_first_epoch` + `proximity_sec`) so downstream consumers
+  (ss-aggregate.py, kill-chain readers) have full provenance for the
+  gate decision without re-deriving it from the run.
+- New constant `PATTERN_E_2XX_PROXIMITY_SEC=604800` (7 days). New
+  globals `LOGS_CRLF_CHAIN_FIRST_EPOCH`, `LOGS_2XX_CPSESS_FIRST_EPOCH`
+  carry inter-check state (initialized to 0 so `--replay` mode and
+  empty-log paths cannot trip `set -u`).
+- `ioc_key_to_pattern()` explicit case clauses route the three new keys
+  to `init` (not part of the kill-chain pattern alphabet) before the
+  `ioc_pattern_e_*` and `ioc_attacker_ip*` globs would catch them.
+
+### Changed
+- `check_logs` now calls `check_crlf_access_primitive` BEFORE
+  `check_attacker_ips` (was the reverse). Both functions read the
+  access_log independently, so the reorder is observation-equivalent
+  for hosts where the CRLF chain does not fire; for hosts where it
+  does, the CRLF first epoch is now available as the temporal anchor
+  for the 2xx_on_cpsess gate at emit time. Pattern E's gate runs in
+  `check_destruction_iocs` which already executes after `check_logs`,
+  so no reorder is needed there.
+- VERSION 2.3.0 → 2.4.0.
+
+### Notes
+- The forensic kill-chain reconstruction filters by
+  `severity ∈ {strong, warning}` (per `read_iocs_from_envelope`), so
+  the new advisory entries are correctly EXCLUDED from
+  `kill-chain.jsonl` / `kill-chain.tsv` — pre-compromise events no
+  longer pollute the post-hoc attack timeline. They remain in the
+  envelope's `signals[]` array for ss-aggregate.py to compute
+  pre-compromise threat-intel stats.
+- Aggregator-side follow-up: `ss-aggregate.py` should treat
+  `_pre_compromise` and `_orphan` keys as their own buckets (not
+  collapsed into the strong-tier siblings) so cluster-onset / first-X
+  / threat-actor-bucketing analyses see clean post-compromise data.
+
 ## sessionscribe-ioc-scan.sh v2.3.0 — 2026-05-02
 
 ### Added
