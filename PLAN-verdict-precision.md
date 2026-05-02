@@ -467,7 +467,7 @@ Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to patt
 ---
 
 ### Phase 5: Structured kill-chain fields for Pattern E + new pattern=X (Gap 4)
-**Status:** COMPLETE — pre5 @ (pending commit)
+**Status:** COMPLETE — pre5 @ f903959
 
 Populate `ip`/`path`/`status`/`cpsess_token` structured fields at emit-time for Pattern E (`ioc_pattern_e_websocket_shell_hits`) and the new `ioc_attacker_ip_2xx_on_cpsess` (Phase 2). Today these fields are empty in `kill-chain.tsv` for these patterns because the upstream emit only writes `sample` (a free-form access_log line) and `dimensions`. Hand-investigation has to extract `access-logs.tgz` and re-grep — Phase 5 makes the kill-chain self-sufficient.
 
@@ -533,6 +533,7 @@ Populate `ip`/`path`/`status`/`cpsess_token` structured fields at emit-time for 
 ---
 
 ### Phase 6: Add exit code 3 = SUSPICIOUS
+**Status:** COMPLETE — pre6 @ (pending commit)
 
 Disambiguate host-state SUSPICIOUS from code-state INCONCLUSIVE on the exit code axis. Today both produce EXIT_CODE=2 — the collision is invisible to operators reading exit codes for fleet aggregation. Phase 6 splits them: code-state INCONCLUSIVE keeps exit 2; host-state SUSPICIOUS becomes exit 3.
 
@@ -553,7 +554,7 @@ Disambiguate host-state SUSPICIOUS from code-state INCONCLUSIVE on the exit code
   - **Combined code+host:** if VULNERABLE (exit 1) AND SUSPICIOUS (exit 3), today exit code is whichever was set last (host-state wins per the comment at line 5398). Phase 6: same precedence — host-state SUSPICIOUS overrides code-state VULNERABLE on exit code (both axes still report in the verdict block). COMPROMISED (exit 4) overrides everything.
 - **Regression-case**: live regression on host2 — expect EXIT_CODE=4 unchanged.
 
-- [ ] **Step 1: Update host-state axis logic**
+- [x] **Step 1: Update host-state axis logic**
 
   Location: `sessionscribe-ioc-scan.sh` lines 5400-5410.
 
@@ -585,7 +586,7 @@ Disambiguate host-state SUSPICIOUS from code-state INCONCLUSIVE on the exit code
 
   Note the IOC_ONLY-only conditional is removed — SUSPICIOUS exits 3 in all modes.
 
-- [ ] **Step 2: Update exit-code documentation block**
+- [x] **Step 2: Update exit-code documentation block**
 
   Location: script header comment around line 460-490 (the `--help` usage block).
 
