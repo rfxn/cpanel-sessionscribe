@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.8.2
+# sessionscribe-ioc-scan.sh v2.0.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.8.3"
+VERSION="2.0.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -5455,8 +5455,8 @@ ledger_write() {
     printf '%s\n' "$line" >> "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
     chmod 0600 "$LEDGER_DIR/runs.jsonl" 2>/dev/null || true
     # Per-run envelope. Skip if -o was given (operator captured their own).
-    # Path is exported on the global ENVELOPE_PATH so chain_forensic_dispatch
-    # can hand it to forensic via SESSIONSCRIBE_IOC_JSON.
+    # Path is exported on the global ENVELOPE_PATH for forensic phases and
+    # replay mode.
     local envelope=""
     if [[ -z "$OUTPUT_FILE" ]]; then
         envelope="$LEDGER_DIR/${RUN_ID}.json"
@@ -5501,185 +5501,76 @@ syslog_emit() {
 }
 
 ###############################################################################
-# --chain-forensic dispatch
+# resolve_replay_envelope
 #
-# When host_verdict != CLEAN and --chain-forensic is set, locate
-# sessionscribe-forensic.sh and exec it with --since/--no-color/--quiet
-# inherited and the same RUN_ID exported via SESSIONSCRIBE_RUN_ID.
-#
-# Resolution order (matches sessionscribe-mitigate.sh's modsec-config
-# resolution pattern):
-#   1. Sibling of this script on disk
-#   2. sessionscribe-forensic.sh on PATH
-#   3. https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh
-#
-# Remote fetches land in a mktemp file under /tmp with chmod 0700 so the
-# operator can re-use it without re-fetching. We do NOT verify a shasum
-# (no upstream-published hash to pin to yet); the caller is implicitly
-# trusting the same TLS pinning as `curl -fsSLO`.
-#
-# Forensic exit code is captured into a chain.forensic_exit signal (so
-# the JSON envelope and ledger record it) but does NOT override this
-# script's exit code - ioc-scan's exit code contract (0/1/2/3/4) is
-# what fleet wrappers consume.
+# Resolve a --replay PATH argument into a concrete envelope JSON file path.
+# Accepts:
+#   PATH.json                — used directly
+#   PATH/                    — looks for *.json (envelope.json or <run_id>.json)
+#   PATH.tgz, PATH.tar.gz    — extracts the envelope to /tmp/sessionscribe-replay-<RUN_ID>/
+# Sets RESOLVED_ENVELOPE_PATH on success; emits to stderr + exits 3 on
+# ambiguity or unreadability.
 ###############################################################################
-
-# Mirror sessionscribe-mitigate.sh's source-candidate convention.
-# Order: raw GitHub first (canonical, always-current); sh.rfxn.com as
-# a CDN-mirror fallback (occasionally returns 200+empty during sync,
-# which we detect via the shebang sanity-check below). Adding both
-# means a transient empty body or TLS hiccup on either origin doesn't
-# kill the chain.
-FORENSIC_SRC_CANDIDATES=(
-    "https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh"
-    "https://sh.rfxn.com/sessionscribe-forensic.sh"
-)
-
-# Last-attempt diagnostic state. Populated by fetch_forensic_remote on
-# failure so the warning emit can include the curl exit codes + URLs we
-# tried. Cleared on success.
-FORENSIC_FETCH_DIAG=""
-FORENSIC_FETCHED_PATH=""
-FORENSIC_FETCHED_URL=""
-
-# Fetch the forensic script from one of the canonical URLs into a tempfile.
-# On success: sets FORENSIC_FETCHED_PATH + FORENSIC_FETCHED_URL, returns 0.
-# On failure: sets FORENSIC_FETCH_DIAG with a per-URL "<url>:<rc>:<reason>"
-# trace, returns non-zero.
-#
-# Globals (not stdout) are used because the caller would otherwise have to
-# capture the result via $(...), which runs the function in a subshell -
-# any FORENSIC_FETCH_DIAG set on failure would be lost when $(...) exits,
-# defaulting the operator-visible diagnostic to "no_attempt" and hiding
-# whether curl was missing, the URL 404'd, the body was empty, etc.
-fetch_forensic_remote() {
-    FORENSIC_FETCH_DIAG=""
-    FORENSIC_FETCHED_PATH=""
-    FORENSIC_FETCHED_URL=""
-    if ! command -v curl >/dev/null 2>&1; then
-        FORENSIC_FETCH_DIAG="curl_missing"
-        return 1
+RESOLVED_ENVELOPE_PATH=""
+REPLAY_TMPDIR=""
+resolve_replay_envelope() {
+    local p="$1"
+    if [[ -z "$p" ]]; then
+        echo "Error: resolve_replay_envelope called with empty path" >&2
+        exit 3
     fi
-    local dest; dest=$(mktemp /tmp/sessionscribe-forensic.XXXXXX.sh) || {
-        FORENSIC_FETCH_DIAG="mktemp_failed"; return 1
-    }
-    chmod 0700 "$dest" 2>/dev/null
-    local url rc diag=""
-    for url in "${FORENSIC_SRC_CANDIDATES[@]}"; do
-        rc=0
-        curl -fsSL --max-time 30 -o "$dest" "$url" 2>/dev/null || rc=$?
-        if (( rc == 0 )); then
-            # Sanity-check: must be a bash script. Reject HTML/empty bodies
-            # (sh.rfxn.com served HTTP 200 + 0 bytes during a CDN sync window).
-            # Accept any reasonable bash shebang: #!/bin/bash, #!/usr/bin/bash,
-            # #!/usr/local/bin/bash, #!/usr/bin/env bash. The earlier regex
-            # `^#!/(usr/bin/env[[:space:]]+)?bash` only matched #!/bash and
-            # #!/usr/bin/env bash, so #!/bin/bash (canonical) failed the
-            # check and every fetched script was rejected.
-            if head -1 "$dest" 2>/dev/null | grep -qE '^#![[:space:]]*/[^[:space:]]*bash([[:space:]]|$)|^#![[:space:]]*/[^[:space:]]*env[[:space:]]+bash([[:space:]]|$)'; then
-                FORENSIC_FETCHED_PATH="$dest"
-                FORENSIC_FETCHED_URL="$url"
+    if [[ -f "$p" ]]; then
+        case "$p" in
+            (*.json)
+                RESOLVED_ENVELOPE_PATH="$p"
                 return 0
-            else
-                diag+="$url:200:bad_shebang_or_empty;"
-            fi
-        else
-            diag+="$url:curl_rc=$rc;"
+                ;;
+            (*.tgz|*.tar.gz)
+                REPLAY_TMPDIR=$(mktemp -d "/tmp/sessionscribe-replay-${RUN_ID}.XXXXXX") || {
+                    echo "Error: mktemp failed for replay extraction" >&2
+                    exit 3
+                }
+                if ! tar -xzf "$p" -C "$REPLAY_TMPDIR" 2>/dev/null; then
+                    echo "Error: failed to extract $p (not a valid gzip tarball?)" >&2
+                    exit 3
+                fi
+                # Bundle layout: <tmp>/<bundle-dir-name>/<run_id>.json (forensic
+                # bundle convention) OR <tmp>/envelope.json (legacy). Multi-match
+                # is an error — same rule as the directory case so an operator
+                # can't accidentally replay against a non-envelope JSON file.
+                local cand n_cand
+                n_cand=$(find "$REPLAY_TMPDIR" -maxdepth 3 -type f -name '*.json' 2>/dev/null | wc -l)
+                if (( n_cand == 0 )); then
+                    echo "Error: no .json envelope found inside $p" >&2
+                    exit 3
+                elif (( n_cand > 1 )); then
+                    echo "Error: $n_cand .json files found inside $p — ambiguous; extract manually and pass the envelope file directly with --replay" >&2
+                    find "$REPLAY_TMPDIR" -maxdepth 3 -type f -name '*.json' >&2
+                    exit 3
+                fi
+                cand=$(find "$REPLAY_TMPDIR" -maxdepth 3 -type f -name '*.json' 2>/dev/null | head -1)
+                RESOLVED_ENVELOPE_PATH="$cand"
+                return 0
+                ;;
+            (*)
+                echo "Error: --replay file must be .json, .tgz, or .tar.gz (got $p)" >&2
+                exit 3
+                ;;
+        esac
+    elif [[ -d "$p" ]]; then
+        # Directory — find the first envelope.json or numeric-prefixed .json
+        local cand
+        cand=$(find "$p" -maxdepth 1 -type f -name '*.json' 2>/dev/null | head -1)
+        if [[ -z "$cand" ]]; then
+            echo "Error: no .json envelope found in directory $p" >&2
+            exit 3
         fi
-    done
-    rm -f "$dest"
-    FORENSIC_FETCH_DIAG="$diag"
-    return 1
-}
-
-chain_forensic_dispatch() {
-    (( CHAIN_FORENSIC )) || return 0
-    if [[ "$HOST_VERDICT" == "CLEAN" ]]; then
-        emit "chain" "forensic_skip" "info" "chain_forensic_skipped_clean" 0 \
-             "note" "host_verdict=CLEAN; not chaining forensic."
+        RESOLVED_ENVELOPE_PATH="$cand"
         return 0
-    fi
-    # --chain-on-critical narrows the gate to COMPROMISED only. SUSPICIOUS
-    # hosts (review-severity IOCs without a critical hit) emit a distinct
-    # skip signal so fleet aggregations can still see the host needed
-    # forensic attention - just not auto-dispatched.
-    if (( CHAIN_ON_CRITICAL )) && [[ "$HOST_VERDICT" != "COMPROMISED" ]]; then
-        emit "chain" "forensic_skip" "info" "chain_forensic_skipped_below_critical" 0 \
-             "host_verdict" "$HOST_VERDICT" \
-             "note" "host_verdict=$HOST_VERDICT; --chain-on-critical limits chain to COMPROMISED."
-        return 0
-    fi
-    local self_dir; self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
-    local forensic_path="" forensic_origin="local"
-    if [[ -n "$self_dir" && -f "$self_dir/sessionscribe-forensic.sh" ]]; then
-        forensic_path="$self_dir/sessionscribe-forensic.sh"
-        forensic_origin="sibling"
-    elif command -v sessionscribe-forensic.sh >/dev/null 2>&1; then
-        forensic_path=$(command -v sessionscribe-forensic.sh)
-        forensic_origin="path"
     else
-        # Remote fetch fallback. Direct call (no $()) so the function's
-        # diagnostic globals reach this scope on failure.
-        if fetch_forensic_remote; then
-            forensic_path="$FORENSIC_FETCHED_PATH"
-            forensic_origin="remote:$FORENSIC_FETCHED_URL"
-            emit "chain" "forensic_fetch" "info" "chain_forensic_fetched_remote" 0 \
-                 "url" "$FORENSIC_FETCHED_URL" "path" "$FORENSIC_FETCHED_PATH" \
-                 "note" "forensic script not present locally; pulled from $FORENSIC_FETCHED_URL"
-        fi
+        echo "Error: --replay PATH does not exist: $p" >&2
+        exit 3
     fi
-    if [[ -z "$forensic_path" ]]; then
-        local diag="${FORENSIC_FETCH_DIAG:-no_attempt}"
-        emit "chain" "forensic_locate" "warning" "chain_forensic_not_found" 0 \
-             "note" "sessionscribe-forensic.sh not found locally and remote fetch failed; skipping chain. Diagnostic: $diag" \
-             "diag" "$diag"
-        return 0
-    fi
-    # Mirror ioc-scan's quiet state into forensic so a quiet ioc-scan run
-    # gives a quiet chain. Otherwise let forensic's human report flow
-    # through to stderr - that's the value-add of chaining (defense
-    # timeline, kill-chain reconcile, bundle status). --no-color always
-    # set because ioc-scan's output is often piped to logs.
-    local args=(--no-color)
-    (( QUIET )) && args+=(--quiet)
-    [[ -n "$SINCE_DAYS" ]] && args+=(--since "$SINCE_DAYS")
-    if (( CHAIN_UPLOAD )); then
-        args+=(--upload)
-        [[ -n "$CHAIN_UPLOAD_URL" ]]   && args+=(--upload-url   "$CHAIN_UPLOAD_URL")
-        [[ -n "$CHAIN_UPLOAD_TOKEN" ]] && args+=(--upload-token "$CHAIN_UPLOAD_TOKEN")
-    fi
-    # Write a preliminary envelope BEFORE forensic runs so it can read our
-    # IOCs via SESSIONSCRIBE_IOC_JSON (forensic v0.9+ uses this as its
-    # canonical IOC source). ledger_write rewrites the same path at the
-    # very end with the chain.forensic_* signals included.
-    local envelope_path=""
-    if [[ -z "$OUTPUT_FILE" && -n "${LEDGER_DIR:-}" ]]; then
-        envelope_path="$LEDGER_DIR/${RUN_ID}.json"
-        mkdir -p "$LEDGER_DIR" 2>/dev/null
-        write_json "$envelope_path" 2>/dev/null || envelope_path=""
-        [[ -n "$envelope_path" ]] && chmod 0600 "$envelope_path" 2>/dev/null
-    elif [[ -n "$OUTPUT_FILE" && "$OUTPUT_FILE" != "-" ]]; then
-        envelope_path="$OUTPUT_FILE"
-    fi
-    ENVELOPE_PATH="$envelope_path"
-
-    section "Chaining sessionscribe-forensic.sh (run_id=$RUN_ID, origin=$forensic_origin)"
-    local upload_note=""
-    (( CHAIN_UPLOAD )) && upload_note=" upload=on(${CHAIN_UPLOAD_URL:-default})"
-    emit "chain" "forensic_dispatch" "info" "chain_forensic_started" 0 \
-         "path" "$forensic_path" "origin" "$forensic_origin" "run_id" "$RUN_ID" \
-         "upload" "$CHAIN_UPLOAD" "envelope" "$ENVELOPE_PATH" \
-         "note" "dispatching forensic chain${upload_note}"
-    # Suppress forensic's stdout (its JSONL stream would interleave with
-    # ours and break a piping consumer); let stderr through so the
-    # operator sees the kill-chain reconstruction inline.
-    local fexit=0
-    SESSIONSCRIBE_RUN_ID="$RUN_ID" \
-    SESSIONSCRIBE_IOC_JSON="$ENVELOPE_PATH" \
-        bash "$forensic_path" "${args[@]}" >/dev/null || fexit=$?
-    emit "chain" "forensic_exit" "info" "chain_forensic_complete" 0 \
-         "exit_code" "$fexit" \
-         "note" "forensic chain exit=$fexit (does not override ioc exit_code)"
 }
 
 ###############################################################################
@@ -5690,27 +5581,97 @@ HOSTNAME_FQDN=$(hostname -f 2>/dev/null || hostname || echo unknown)
 HOSTNAME_JSON=$(json_esc "$HOSTNAME_FQDN")    # pre-escaped, used by emit/write_json
 TS_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-banner
+###############################################################################
+# Detection phase (skipped in --replay mode)
+###############################################################################
+if (( ! REPLAY_MODE )); then
+    banner
 
-local_init
-if (( IOC_ONLY )); then
-    section "IOC-only mode (--ioc-only): code-state checks skipped"
+    local_init
+    if (( IOC_ONLY )); then
+        section "IOC-only mode (--ioc-only): code-state checks skipped"
+    else
+        check_version
+        check_static
+        check_binary
+    fi
+    check_logs
+    check_sessions
+    check_destruction_iocs
+    check_localhost_probe
+
+    aggregate_verdict
+
+    # Write the envelope to disk BEFORE forensic phases run so the forensic
+    # path can read it from disk via the same code path used by --replay.
+    # This makes the envelope contract a same-script invariant rather than
+    # a cross-script handshake.
+    if [[ -z "$NO_LEDGER" || "$NO_LEDGER" -eq 0 ]]; then
+        mkdir -p "$LEDGER_DIR" 2>/dev/null
+        ENVELOPE_PATH="$LEDGER_DIR/${RUN_ID}.json"
+        write_json "$ENVELOPE_PATH" 2>/dev/null
+        [[ -f "$ENVELOPE_PATH" ]] && chmod 0600 "$ENVELOPE_PATH" 2>/dev/null
+    fi
 else
-    check_version
-    check_static
-    check_binary
+    # --replay PATH: skip detection, set ENVELOPE_PATH from resolved input.
+    resolve_replay_envelope "$REPLAY_PATH"
+    ENVELOPE_PATH="$RESOLVED_ENVELOPE_PATH"
+    # Read host_verdict / score / tool_version from the envelope so the
+    # forensic phases see consistent context.
+    read_envelope_meta "$ENVELOPE_PATH"
+    HOST_VERDICT="${ENV_HOST_VERDICT:-UNKNOWN}"
+    SCORE="${ENV_SCORE:-0}"
+    section "Replay mode: detection skipped, forensic phases on $ENVELOPE_PATH"
 fi
-check_logs
-check_sessions
-check_destruction_iocs
-check_localhost_probe
 
-aggregate_verdict
+###############################################################################
+# Forensic phases (--full or --replay)
+###############################################################################
+RUN_FORENSIC=0
+if (( REPLAY_MODE )); then
+    RUN_FORENSIC=1
+elif (( FULL_MODE )); then
+    # Apply legacy chain gates if set (--chain-on-critical etc.).
+    if (( CHAIN_ON_CRITICAL )) && [[ "$HOST_VERDICT" != "COMPROMISED" ]]; then
+        emit "summary" "forensic_skip" "info" "forensic_skipped_below_critical" 0 \
+             "host_verdict" "$HOST_VERDICT" \
+             "note" "host_verdict=$HOST_VERDICT; --chain-on-critical limits forensic to COMPROMISED."
+    elif [[ "$HOST_VERDICT" == "CLEAN" ]]; then
+        emit "summary" "forensic_skip" "info" "forensic_skipped_clean" 0 \
+             "note" "host_verdict=CLEAN; not running forensic phases."
+    else
+        RUN_FORENSIC=1
+    fi
+fi
 
-# Chain to forensic BEFORE printing the verdict / writing outputs so the
-# chain.forensic_* signals make it into the JSON envelope, CSV row, and
-# ledger entry. Forensic exit captured into signals; never overrides ours.
-chain_forensic_dispatch
+if (( RUN_FORENSIC )); then
+    phase_defense
+    phase_offense
+    phase_reconcile
+    render_kill_chain
+    if (( DO_BUNDLE )); then
+        phase_bundle
+        (( DO_UPLOAD )) && phase_upload
+    fi
+
+    # Forensic summary signal (mirrors the old standalone forensic exit
+    # logic, but now folded into the unified envelope + verdict). NO `local`
+    # keyword — this code runs at top level (outside any function); local
+    # would be a parse error. The names become globals; they're only read
+    # in the emit() call below so the namespace pollution is harmless.
+    n_off="${#OFFENSE_EVENTS[@]}"; n_def="${#DEFENSE_EVENTS[@]}"
+    f_verdict="CLEAN"; f_exit=0
+    if (( n_off > 0 )); then
+        if (( N_PRE > 0 )); then f_verdict="COMPROMISED_PRE_DEFENSE"; f_exit=2
+        else                     f_verdict="COMPROMISED_POST_DEFENSE"; f_exit=1
+        fi
+    fi
+    emit "summary" "forensic_summary" "info" "forensic_reconstruction" 0 \
+         "verdict" "$f_verdict" "iocs_total" "$n_off" \
+         "pre_defense" "$N_PRE" "post_defense" "$N_POST" \
+         "defenses_extracted" "$n_def" \
+         "note" "forensic reconstruction: $f_verdict (exit=$f_exit; does not override host_verdict exit code)"
+fi
 
 print_verdict
 
@@ -5718,9 +5679,7 @@ print_verdict
 # emit() so no end-of-run write is needed for that mode).
 (( CSV )) && write_csv /dev/stdout
 
-# File output (-o FILE). Format follows the streaming flag: CSV if --csv,
-# structured JSON otherwise (the JSON envelope is the natural file analog
-# of --jsonl too, since JSONL is signal-by-signal).
+# File output (-o FILE).
 if [[ -n "$OUTPUT_FILE" ]]; then
     if (( CSV )); then
         write_csv "$OUTPUT_FILE"
@@ -5729,9 +5688,20 @@ if [[ -n "$OUTPUT_FILE" ]]; then
     fi
 fi
 
-# Run ledger - write before exit so a failed exit code still records the
-# run. Soft-fails on permission issues; never alters the exit code.
+# Re-write the envelope at end-of-run so forensic-phase signals and the
+# forensic_summary land in the on-disk artifact (the early write above
+# had only the detection signals).
+if (( ! REPLAY_MODE )) && [[ -n "$ENVELOPE_PATH" && -f "$ENVELOPE_PATH" ]]; then
+    write_json "$ENVELOPE_PATH" 2>/dev/null
+    chmod 0600 "$ENVELOPE_PATH" 2>/dev/null
+fi
+
 ledger_write
 syslog_emit
+
+# Replay mode: clean up the tmpdir from tgz extraction.
+if (( REPLAY_MODE )) && [[ -n "$REPLAY_TMPDIR" && -d "$REPLAY_TMPDIR" ]]; then
+    rm -rf "$REPLAY_TMPDIR" 2>/dev/null
+fi
 
 exit "$EXIT_CODE"
