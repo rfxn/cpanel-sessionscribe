@@ -779,7 +779,7 @@ The sole remaining user of exit code 3 is now the SUSPICIOUS host-state assignme
 - **A:** Pattern E sample line filtered to attacker-known dimensions. Added `ext_known_sample` awk variable captured inside `if (d in known)` block; strong emit's `ip` / `path` / `status` / `cpsess_token` / `sample` fields now read from this dedicated sample (was: any external line, including 4xx probes and unknown-dim admin sessions). Defensive `${ext_known_sample:-$ext_sample}` fallback retained.
 - **B:** IOC-J `ioc_failed_exploit_attempt_*` (warning-tier) now requires `! SF_CP_TOKEN` to be strictly disjoint from IOC-E `ioc_token_attempt_*` (evidence-tier). Both share the parent key `ioc_failed_exploit_attempt`; without the new guard ss-aggregate.py double-counts when `cp_security_token` is present in a badpass+token_denied+pass-line session with no auth markers.
 - **C:** JSONL meta row bumped `schema_version` 2 → 3 with appended `_schema_changes` entry: `{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"}`. In-line printf comment also updated.
-- **D:** kill-chain.tsv `cpsess_token` column moved from position 17 (mid-row, between `status` and `line`) to position 18 (end-of-row), preserving column-index stability for external operator scripts that parse TSV by index. IOC printf args reordered correspondingly. (DEF row pre-existing 17-column shape unchanged — separate pre-existing schema mismatch, out of scope.)
+- **D:** kill-chain.tsv `cpsess_token` column moved from position 17 (mid-row, between `status` and `line`) to position 18 (end-of-row), preserving column-index stability for external operator scripts that parse TSV by index. IOC printf args reordered correspondingly. (DEF row 17-column shape left unchanged in pre8 — addressed in pre9 below; sentinel re-review correctly identified this as a Phase 5 / pre6 regression, not a pre-PR-existing issue as the engineer initially characterized it.)
 - **E:** `read_iocs_from_envelope` `local` declarations updated: added `key_for_warn` and `p_cpsess_token` to prevent function-global scope leak under `set -u`.
 
 **Verification:**
@@ -791,10 +791,23 @@ The sole remaining user of exit code 3 is now the SUSPICIOUS host-state assignme
 - `--bogus-flag` still returns exit 2; `--help` still returns exit 0
 
 **Judgment notes:**
-- DEF row at line 2523 has 17 columns vs the 18-column header (pre-existing — present in d848770). Not in scope for pre8.
+- DEF row at line 2524 has 17 columns vs the 18-column header. Engineer initially flagged as pre-existing and out of scope; sentinel re-review traced git history (9203a99 had aligned 17/17; pre6 introduced header→18 without updating DEF) and reclassified as a Phase 5 regression. Fixed in pre9.
 - `SF_CP_TOKEN` was already populated in `analyze_session()` (declared line 3928, set from cp_token field); no additional awk-pass changes needed.
 - Apostrophe-in-comment hazard: comments inside the awk single-quoted block must avoid apostrophes (would close the heredoc string). Caught locally during pre8 lint-fix; recorded here so future contributors avoid it.
 
-**Status:** COMPLETE — pre8 @ <commit-hash>
+**Status:** COMPLETE — pre8 @ 13aff7e
+
+### pre9 — SHOULD-FIX: kill-chain.tsv DEF row column-count alignment (sentinel re-review finding)
+
+**Problem:** Sentinel re-review of pre7+pre8 traced git history and confirmed the DEF row column mismatch was introduced by Phase 5 (pre6) when `cpsess_token` was added to header + IOC printf but the DEF printf at line 2524 was not updated. The engineer's pre8 plan-note characterized this as "pre-existing"; that was factually incorrect (baseline 9203a99 had aligned 17/17 columns).
+
+**Fix:** Added one trailing `\t` to DEF printf format string, taking the row from 16 tabs (17 columns) to 17 tabs (18 columns). The trailing field is empty — DEF rows don't have a cpsess_token by definition (they describe defense events, not exploitation events) — but column-index stability is now preserved for external `awk -F'\t'` parsers.
+
+**Verification:**
+- `awk 'NR==2524' sessionscribe-ioc-scan.sh | grep -oE '\\t' | wc -l` returns 17 (matches IOC and header)
+- `bash -n` + `shellcheck -S error` clean
+- Plan-doc text in pre8 entry updated to retract "pre-existing" claim
+
+**Status:** COMPLETE — pre9 @ <commit-hash>
 
 
