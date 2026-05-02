@@ -390,7 +390,7 @@ Add a new warning-tier session-side signal that fires when a session has the fai
 ---
 
 ### Phase 4: `ioc_signal_epoch` pattern=X timestamp guard (Gap 11)
-**Status:** COMPLETE — pre4 @ (pending commit)
+**Status:** COMPLETE — pre4 @ ade0036
 
 Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to pattern=X. Today `ioc_signal_epoch()` at line 1170 returns `TS_EPOCH` when no per-event timestamp can be resolved — for pattern=X events this synthesizes a kill-chain event at scan-time, polluting cluster-onset analysis (`q5/q8` in summary.json). The fix: when the resolved key maps to pattern=X AND no real timestamp exists, return 0 and let the caller emit a `pattern=meta` warning instead of fabricating an X event.
 
@@ -467,6 +467,7 @@ Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to patt
 ---
 
 ### Phase 5: Structured kill-chain fields for Pattern E + new pattern=X (Gap 4)
+**Status:** COMPLETE — pre5 @ (pending commit)
 
 Populate `ip`/`path`/`status`/`cpsess_token` structured fields at emit-time for Pattern E (`ioc_pattern_e_websocket_shell_hits`) and the new `ioc_attacker_ip_2xx_on_cpsess` (Phase 2). Today these fields are empty in `kill-chain.tsv` for these patterns because the upstream emit only writes `sample` (a free-form access_log line) and `dimensions`. Hand-investigation has to extract `access-logs.tgz` and re-grep — Phase 5 makes the kill-chain self-sufficient.
 
@@ -488,7 +489,7 @@ Populate `ip`/`path`/`status`/`cpsess_token` structured fields at emit-time for 
   - **Sample-line parsing:** the access_log sample is a single line in apache combined-log format. Parse via the same awk pattern used elsewhere in `check_attacker_ips`. Don't re-invent — reuse the proven extraction.
 - **Regression-case**: live test on host2 — diff `kill-chain.tsv` pre/post. Expected: Pattern E rows transition from empty `ip`/`path` to populated; everything else byte-identical.
 
-- [ ] **Step 1: Extract structured fields at Pattern E emit-time**
+- [x] **Step 1: Extract structured fields at Pattern E emit-time**
 
   Location: `sessionscribe-ioc-scan.sh` line ~5087.
 
@@ -521,11 +522,11 @@ Populate `ip`/`path`/`status`/`cpsess_token` structured fields at emit-time for 
        "note" "..."
   ```
 
-- [ ] **Step 2: Same treatment for Phase 2's `ioc_attacker_ip_2xx_on_cpsess` emit**
+- [x] **Step 2: Same treatment for Phase 2's `ioc_attacker_ip_2xx_on_cpsess` emit**
 
   Location: Phase 2 emit. The awk pass needs a "first 2xx-on-cpsess sample" output (parallel to today's `ext_sample`). Capture in awk END block, propagate through, parse into ip/path/status/cpsess_token at emit-time.
 
-- [ ] **Step 3: Extend kill-chain TSV header + writer to include `cpsess_token` column**
+- [x] **Step 3: Extend kill-chain TSV header + writer to include `cpsess_token` column**
 
   Location: `sessionscribe-ioc-scan.sh` line 2457 (header). Add `cpsess_token` after `status`. Update `printf` at line 2532 to add a column. Update JSONL printf at line 2617 similarly.
 
