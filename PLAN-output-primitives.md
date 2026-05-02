@@ -12,6 +12,8 @@
 
 **Plan Version:** 3.0.6
 
+**Status:** ALL PHASES COMPLETE — v2.1.0 live on `main` (commits `8011976` pre1 → `9203a99` pre7) as of 2026-05-02. Sentinel review (post-impl, 4-pass) found 1 MUST-FIX (matrix [OK] allow-list — fixed in pre7) + 1 INFORMATIONAL (Pattern E note interpolation — fixed in pre7). Live regression on host2.alps-supplies.com (COMPROMISED) confirmed: 7 sections, 61 bracketed tags, 0 Unicode glyphs, 7 matrix rows, exit=4 unchanged. Pattern E split-counter FP fix added in pre5 from operator interjection. Advisory glyph cleanup added in pre6 from live regression catch.
+
 ---
 
 ## Conventions
