@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -4011,24 +4011,58 @@ check_sessions() {
                 continue
             fi
 
-            # IOC-A: token_denied + cp_security_token co-occur. badpass-origin
-            # variant is the exploit fingerprint; otherwise may be an expired
-            # bookmark - downgrade to warning.
+            # IOC-A: token_denied + cp_security_token co-occur. Three-tier
+            # classification, mirroring cPanel's published reference
+            # (ioc_checksessions_files.sh):
+            #
+            #   1. badpass + auth markers (hasroot=1 / tfa_verified=1 /
+            #      successful_*_auth_with_timestamp) -> CRITICAL injection.
+            #      The badpass call site (Cpanel/Server.pm:1244-1252)
+            #      cannot legitimately set any of these.
+            #   2. badpass + no auth markers + pass= line present ->
+            #      ATTEMPT. A legitimate badpass session never carries
+            #      pass= (saveSession only writes pass when length>0;
+            #      Cpanel/Session.pm:181). Presence of pass= is anomalous
+            #      but, with no auth markers, the patch held -- the
+            #      injection didn't promote. Failed exploit attempt, NOT
+            #      a compromise. Encoded as `evidence` (records reason,
+            #      but does NOT escalate host_verdict to SUSPICIOUS or
+            #      COMPROMISED on its own).
+            #   3. badpass + no auth markers + no pass= -> INFO. Looks
+            #      like garden-variety failed login retries.
+            #   4. non-badpass + token_denied + cp_security_token ->
+            #      review (may be expired bookmark).
             if (( SF_TOKEN_DENIED && SF_CP_TOKEN )); then
                 if (( SF_BADPASS )); then
-                    emit_session "ioc_token_inject_$session_name" "strong" \
-                         "ioc_token_denied_with_badpass_origin" 10 \
-                         "path" "$f" "cp_security_token" "$SF_CP_VAL" \
-                         "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
-                         "note" "Pre-auth session with attacker-injected security token (CRITICAL)."
+                    if (( SF_HASROOT || SF_TFA || SF_EXT_AUTH || SF_INT_AUTH )); then
+                        emit_session "ioc_token_inject_$session_name" "strong" \
+                             "ioc_token_denied_with_badpass_origin" 10 \
+                             "path" "$f" "cp_security_token" "$SF_CP_VAL" \
+                             "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
+                             "note" "Pre-auth session with attacker-injected security token + auth markers (CRITICAL)."
+                        ((ioc_hits++))
+                    elif (( SF_PASS_COUNT > 0 )); then
+                        emit_session "ioc_token_attempt_$session_name" "evidence" \
+                             "ioc_failed_exploit_attempt" 0 \
+                             "path" "$f" "cp_security_token" "$SF_CP_VAL" \
+                             "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
+                             "pass_len" "$SF_PASS_LEN" \
+                             "note" "Failed exploit attempt: badpass origin + token_denied + pass= line, but no auth markers - patch held (ATTEMPT, not compromise)."
+                    else
+                        emit_session "ioc_token_info_$session_name" "info" \
+                             "ioc_badpass_token_denied_noauth_nopass" 0 \
+                             "path" "$f" "cp_security_token" "$SF_CP_VAL" \
+                             "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
+                             "note" "badpass origin + token_denied with no auth markers and no pass= line - likely failed login (INFO)."
+                    fi
                 else
                     emit_session "ioc_token_review_$session_name" "warning" \
                          "ioc_token_denied_with_cp_security_token" 0 \
                          "path" "$f" "cp_security_token" "$SF_CP_VAL" \
                          "token_denied" "$SF_TD_VAL" "origin" "$SF_ORIGIN" \
                          "note" "token_denied + cp_security_token co-exist - review (may be expired bookmark)."
+                    ((ioc_hits++))
                 fi
-                ((ioc_hits++))
             fi
 
             # IOC-B: pre-auth-paired session with successful_*_auth_with_timestamp.
