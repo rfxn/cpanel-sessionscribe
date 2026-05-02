@@ -808,6 +808,6 @@ The sole remaining user of exit code 3 is now the SUSPICIOUS host-state assignme
 - `bash -n` + `shellcheck -S error` clean
 - Plan-doc text in pre8 entry updated to retract "pre-existing" claim
 
-**Status:** COMPLETE — pre9 @ <commit-hash>
+**Status:** COMPLETE — pre9 @ f8c219a
 
 
