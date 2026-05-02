@@ -334,7 +334,7 @@ Replace the over-firing strong-on-any-2xx emit with a path-aware split: 2xx on U
 ---
 
 ### Phase 3: Add `ioc_failed_exploit_attempt` session signal (cPanel IOC 5 analog)
-**Status:** COMPLETE — pre3 @ (pending commit)
+**Status:** COMPLETE — pre3 @ 1bbbf66
 
 Add a new warning-tier session-side signal that fires when a session has the failed-exploit footprint per cPanel's `ioc_checksessions_files.sh` IOC 5: `origin=badpass + token_denied + pass= line + no auth markers`. This becomes a SUSPICIOUS-tier signal in our model — it counts toward `ioc_review` (line 5311), exits 3 (post-Phase-6) or 2 (current behavior in `--ioc-only`), and surfaces in the verdict-reasons line.
 
@@ -390,6 +390,7 @@ Add a new warning-tier session-side signal that fires when a session has the fai
 ---
 
 ### Phase 4: `ioc_signal_epoch` pattern=X timestamp guard (Gap 11)
+**Status:** COMPLETE — pre4 @ (pending commit)
 
 Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to pattern=X. Today `ioc_signal_epoch()` at line 1170 returns `TS_EPOCH` when no per-event timestamp can be resolved — for pattern=X events this synthesizes a kill-chain event at scan-time, polluting cluster-onset analysis (`q5/q8` in summary.json). The fix: when the resolved key maps to pattern=X AND no real timestamp exists, return 0 and let the caller emit a `pattern=meta` warning instead of fabricating an X event.
 
@@ -411,7 +412,7 @@ Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to patt
   - **Schema bump:** the new pattern=meta event needs a kill-chain.tsv handler — extend the IOC row writer at line 2532 to handle `kind=META` rows.
 - **Regression-case**: live test on host2 — host2's envelope has all-real timestamps. Expect: zero pattern=meta emits. Negative-case validation.
 
-- [ ] **Step 1: Add pattern-aware fallback in `ioc_signal_epoch()`**
+- [x] **Step 1: Add pattern-aware fallback in `ioc_signal_epoch()`**
 
   Location: `sessionscribe-ioc-scan.sh` lines 1170-1184. Replace today's:
   ```bash
@@ -444,7 +445,7 @@ Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to patt
   }
   ```
 
-- [ ] **Step 2: Handle ts=0 in `read_iocs_from_envelope()`**
+- [x] **Step 2: Handle ts=0 in `read_iocs_from_envelope()`**
 
   Location: `sessionscribe-ioc-scan.sh` line 1278 (the line `ts=$(ioc_signal_epoch "$line")`).
 
@@ -459,7 +460,7 @@ Refuse to fall back to `TS_EPOCH` (scan time) for signals whose key maps to patt
   fi
   ```
 
-- [ ] **Step 3: Extend kill-chain TSV/JSONL writers to handle pattern=meta rows (optional)**
+- [x] **Step 3: Extend kill-chain TSV/JSONL writers to handle pattern=meta rows (optional)**
 
   Location: `sessionscribe-ioc-scan.sh` lines 2456-2540. Currently writes DEF and IOC rows. Add a META row class for refused-pattern-X events. Defer if not needed by Phase 7 validation — meta events are warning-tier and don't drive the kill-chain narrative.
 
