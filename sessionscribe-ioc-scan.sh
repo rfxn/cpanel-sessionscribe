@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -183,7 +183,7 @@ PATTERN_C_SHA256="c04d526eb0f7c7660a19871d1675383c8eaf5336651b255c15f4da4708835e
 
 # Pattern D - WHM JSON-API recon + reseller-as-persistence. The sptadm
 # reseller, exploit.local contact, and 4ef72197.cpx.local domain are the
-# universal fingerprints across host.graceworkz.com and the cohort. The
+# universal fingerprints observed across the compromised cohort. The
 # WHM_FullRoot API token they create persists post-patch unless revoked,
 # so a clean host_verdict isn't enough - this string in accounting.log
 # means the attacker had root via API token at some point.
@@ -192,14 +192,14 @@ PATTERN_D_DOMAIN="4ef72197.cpx.local"
 PATTERN_D_EMAIL="a@exploit.local"
 PATTERN_D_TOKEN_NAME="WHM_FullRoot"
 
-# Pattern E - websocket/Shell access-log signature. Three operator
-# dimensions distinguish actor in the IC-5790 cohort (rev 3 dossier):
-#   24x80   - graceworkz / 192.81.219.190 (Pattern E original, automated)
-#   24x120  - graceworkz / 149.102.229.144 (secondary operator)
-#   24x134  - quickfix17 / 183.82.160.147 (DEC 2025, pre-disclosure)
-# Detection regex is dimension-agnostic so any rows=N&cols=M lands here;
-# operator attribution comes from dimension+IP+UA combination at triage.
+# Pattern E - websocket/Shell access-log signature. Operator-attribution
+# uses terminal dimensions (rows×cols in the URL); each distinct dimension
+# observed in the wild has been a distinct toolchain. Detection regex is
+# dimension-agnostic so any rows=N&cols=M lands here; the per-dimension
+# breakout below feeds the unknown-dimension warning that flags new
+# operators day-zero. Updated alongside PATTERNS.md (current rev 4).
 PATTERN_E_WS_RE='GET /cpsess[0-9]+/websocket/Shell'
+PATTERN_E_KNOWN_DIMS="24x80,24x120,24x134,24x200"
 
 # Pattern F - automated harvester wrap. The __S_MARK__/__E_MARK__ envelope
 # is a strong actor fingerprint; only a single grep needed across bash
@@ -214,11 +214,11 @@ PATTERN_F_E_MARK="__E_MARK__"
 # /etc/, /var/spool/cron/ is a candidate.
 PATTERN_G_FORGED_MTIME="2019-12-13"
 
-# Pattern H - seobot SEO defacement / per-site PHP webshell drop. Surfaced
-# 2026-05-01 14:59 CDT on host.quickfix17.com. Distinct actor from the
-# nuclear.x86 campaign - actively kills rival infections (xmrig, kswapd01)
-# before deploying. Four independent signals; H1/H2/H4 are dispositive,
-# H3 (ALLDONE marker) is corroborating only.
+# Pattern H - seobot SEO defacement / per-site PHP webshell drop.
+# Distinct actor from the nuclear.x86 campaign - actively kills rival
+# infections (xmrig, kswapd01) before deploying. Four independent
+# signals; H1/H2/H4 are dispositive, H3 (ALLDONE marker) is
+# corroborating only.
 PATTERN_H_DROPPER_FILE="seobot.php"
 PATTERN_H_END_MARKER="ALLDONE"
 PATTERN_H_KILL_PRELUDE='pkill -9 nuclear\.x86 kswapd01 xmrig'
@@ -227,12 +227,12 @@ PATTERN_H_ZIP_PATH="/tmp/seobot.zip"
 # self-cleans /tmp/seobot.zip on success; this catches interrupted runs.
 PATTERN_H_ZIP_MAGIC_B64="UEsDBBQACAAIAMhEkVw"
 
-# Pattern I - system-service profile.d backdoor (IC-5794 cohort, surfaced
-# 2026-05-01 on web01.guestreservations.com). Fires on every interactive
-# shell login - more discreet than cron. Likely Hyper Global-specific
-# (lateral from bastion, not direct CVE-2026-41940), but worth fleet-
-# wide hunting. Filename and binary path are unique to the dossier; no
-# benign system component creates these.
+# Pattern I - system-service profile.d backdoor. Fires on every
+# interactive shell login - more discreet than cron. Likely a
+# parallel-cohort secondary infection arriving via lateral movement
+# rather than direct CVE-2026-41940 exploitation, but worth fleet-
+# wide hunting. Filename and binary path are unique to the dossier;
+# no benign system component creates these.
 PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 PATTERN_I_BINARY="/root/.local/bin/system-service"
 PATTERN_I_PROCNAME="system-service"
@@ -254,11 +254,12 @@ SSH_KEY_FILES=(
 # to count log hits as a late-stage signal in case rotation didn't take.
 # Operators with internal scan boxes can suppress hits via --exclude-ip.
 #
-# 183.82.160.147 is notable: earliest websocket Shell (24x134) hit on
-# host.quickfix17.com is from DEC 2025 - approximately four months before
-# WebPros publicly disclosed CVE-2026-41940 on 2026-04-28. Pre-disclosure
-# silent exploitation; the --since default of "all retained logs" is what
-# surfaces these. Operators running --since 90 will miss them.
+# 183.82.160.147 is notable: earliest observed websocket Shell hit
+# (24x134 dimension) is from DEC 2025 - approximately four months
+# before WebPros publicly disclosed CVE-2026-41940 on 2026-04-28.
+# Pre-disclosure silent exploitation; the --since default of "all
+# retained logs" is what surfaces these. Operators running --since 90
+# will miss them.
 ATTACKER_IPS=(
     # badpass exploitation source IPs (initial-access wave)
     68.233.238.100   206.189.2.13     137.184.77.0     38.146.25.154
@@ -270,8 +271,14 @@ ATTACKER_IPS=(
     94.231.206.39
     # C2 / dropper / payload origin (Pattern A/C/D/H)
     68.183.190.253   87.121.84.78     96.30.39.236     68.47.28.118
-    # Pattern Unknown - host.coprimemain.com (rev3 entry, not yet classified A or B)
+    # Pattern Unknown (rev3 cohort entry, not yet classified A or B)
     89.34.18.59
+    # rev4 expansion (2026-05-02): four DigitalOcean operators chained
+    # the CRLF exploit over 8h on a single target then handed off to a
+    # destruction operator running 24x200 websocket Shell. 80.75.212.14
+    # is the early scout (mixed-UA recon hours before the exploit wave).
+    80.75.212.14     206.189.227.202  159.223.155.255  67.205.134.215
+    136.244.66.225
 )
 
 ###############################################################################
@@ -1091,6 +1098,13 @@ check_logs() {
     # successful exploitation (the IP may have been blackholed before
     # request landed) but does mean the attacker reached this host.
     check_attacker_ips "$logdir"
+
+    # ---- CRLF auth-bypass primitive (deterministic) ----------------------
+    # Direct fingerprint of the CVE-2026-41940 exploitation chain in the
+    # access log: 401 POST /login/?login_only=1 immediately followed by a
+    # 2xx GET /cpsess<N>/* as user "root" from the same IP within 2s.
+    # Independent of session-store evidence; survives mitigate purging.
+    check_crlf_access_primitive "$logdir"
 }
 
 # Cross-reference access_log against the dossier attacker-IP list. Pulled
@@ -1274,6 +1288,77 @@ check_attacker_ips() {
         done < "$tmp"
     fi
     rm -f "$tmp"
+}
+
+# Deterministic CRLF auth-bypass fingerprint in access_log.
+#
+# Primitive shape: a `POST /login/?login_only=1` returning 401 immediately
+# followed (≤2s, same source IP) by a `GET /cpsess<N>/<anything>` returning
+# 2xx with the user slot populated as `root`. This is what the CVE-2026-41940
+# CRLF chain looks like at the access-log layer: cpsrvd rejects the POST at
+# the HTTP level (401) but the saveSession() side-effect has already minted
+# the cpsess token, which the attacker then uses against any URL.
+#
+# Detection survives session-file purging by mitigate.sh - whereas the
+# session-store analyzer needs the forged session on disk, this primitive
+# only needs the access_log, which is what most hosts still have intact.
+# Probe-UA traffic is excluded; --since window honored.
+check_crlf_access_primitive() {
+    local logdir="$1"
+    local log="$logdir/access_log"
+    [[ -f "$log" ]] || return
+    local since_filter=0
+    [[ -n "$SINCE_EPOCH" ]] && since_filter="$SINCE_EPOCH"
+    local result
+    result=$(grep -E '^[^ ]+ - (root|-) \[' "$log" 2>/dev/null \
+            | grep -vE "$PROBE_UA_RE" \
+            | awk -v since="$since_filter" '
+        BEGIN { hits=0; sample=""; ts_first=0 }
+        function ts_of(s,    m, t) {
+            if (match(s, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
+                return mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
+            }
+            return 0
+        }
+        {
+            ip = $1
+            t = ts_of($0)
+            if (since > 0 && t > 0 && t < since) next
+            # 401 to POST /login/?login_only=1 - mints the cpsess token
+            # despite the surface-level rejection.
+            if (match($0, /"POST \/login\/\?login_only=1[^"]*" 401 /)) {
+                last_post[ip] = t
+                next
+            }
+            # 2xx to GET /cpsess<N>/* AS root within 2s of the matching POST.
+            # Identity slot ($3) is "root" only because cpsrvd has already
+            # bound the minted token to root by the time this request lands.
+            if (match($0, /"GET \/cpsess[0-9]+\/[^"]*" 2[0-9][0-9] /) \
+                && $3 == "root" \
+                && (ip in last_post) \
+                && t > 0 && last_post[ip] > 0 \
+                && (t - last_post[ip]) <= 2) {
+                hits++
+                if (sample == "") sample = $0
+                if (ts_first == 0 || t < ts_first) ts_first = t
+                # Consume the matched POST; next 401 starts a fresh window.
+                delete last_post[ip]
+            }
+        }
+        END { printf "%d\t%d\t%s\n", hits, ts_first, sample }')
+    local crlf_hits=0 crlf_ts_first=0 crlf_sample=""
+    IFS=$'\t' read -r crlf_hits crlf_ts_first crlf_sample <<< "$result"
+    crlf_hits="${crlf_hits:-0}"
+    crlf_ts_first="${crlf_ts_first:-0}"
+    if (( crlf_hits > 0 )); then
+        emit "logs" "ioc_cve_2026_41940_access_primitive" "strong" \
+             "ioc_cve_2026_41940_crlf_access_chain" 10 \
+             "count" "$crlf_hits" \
+             "ts_epoch_first" "$crlf_ts_first" \
+             "log_file" "$log" \
+             "line" "${crlf_sample:0:240}" \
+             "note" "$crlf_hits CRLF-bypass chain(s) in $log: POST /login → 401 then GET /cpsess<N>/* → 2xx as root within 2s. Deterministic CVE-2026-41940 exploitation evidence (CRITICAL)."
+    fi
 }
 
 # ---- session-store analyzer ----------------------------------------------
@@ -1872,6 +1957,40 @@ check_destruction_iocs() {
             ((hits++))
         fi
     fi
+    # Pattern A anti-forensic subroutine: in addition to encrypting /home
+    # data, the .sorry encryptor walks /var/log + /var/cpanel and encrypts
+    # forensic-evidence files (accounting.log, day-of cpanel-server-traffic
+    # apache log, imunify360 trail, apache2 archive logs, ConsoleKit
+    # history, system trace logs). Detection is bounded to maxdepth 6 with
+    # the cpanel imunify cache pruned (high churn, irrelevant). Threshold:
+    # >=10 .sorry files OR accounting.log encrypted = strong signal that
+    # forensic evidence was deliberately destroyed; fewer with accounting
+    # encrypted = warning. This signal holds even after the encryptor
+    # binary, README, and /home .sorry files have been cleaned by restore.
+    local fe_count=0 fe_acct=0 fe_sample=""
+    if [[ -d /var/log || -d /var/cpanel ]]; then
+        fe_count=$(find /var/log /var/cpanel -maxdepth 6 -name '*.sorry' \
+                       -not -path '*/imunify360/cache/*' 2>/dev/null | wc -l)
+        fe_count="${fe_count:-0}"
+        fe_count="${fe_count// /}"
+        fe_sample=$(find /var/log /var/cpanel -maxdepth 6 -name '*.sorry' \
+                        -not -path '*/imunify360/cache/*' 2>/dev/null | head -1)
+    fi
+    [[ -f /var/cpanel/accounting.log.sorry ]] && fe_acct=1
+    if (( fe_count >= 10 )) || (( fe_acct == 1 )); then
+        local fe_sev="strong" fe_weight=10 fe_mtime=0
+        if (( fe_count < 10 && fe_acct == 1 )); then
+            fe_sev="warning"; fe_weight=5
+        fi
+        [[ -n "$fe_sample" ]] && fe_mtime=$(stat -c %Y "$fe_sample" 2>/dev/null)
+        emit "destruction" "ioc_pattern_a_evidence_destruction" "$fe_sev" \
+             "ioc_pattern_a_evidence_targeted" "$fe_weight" \
+             "count" "$fe_count" "acct_log_encrypted" "$fe_acct" \
+             "sample_path" "${fe_sample:-(none)}" \
+             "mtime_epoch" "${fe_mtime:-0}" \
+             "note" "${fe_count} .sorry-encrypted file(s) under /var/log + /var/cpanel; accounting.log encrypted=${fe_acct}. Pattern A targeted forensic evidence - upstream Pattern D/E/F detection may silently miss."
+        ((hits++))
+    fi
 
     # ---- Pattern B: mysql wipe + BTC-note index drop ---------------------
     # Wipe heuristic: /var/lib/mysql/ exists, mysql/ subdir is gone, AND
@@ -1895,10 +2014,11 @@ check_destruction_iocs() {
             ((hits++))
         fi
     fi
-    # BTC index.html drops across /home users. IC-5790 rev3: graceworkz
-    # showed nested drops at /home/<user>/public_html/{banks,ois,sales,
-    # shop}/index.html. -maxdepth 4 bounds the walk; -name index.html
-    # filters before reading. -print0 + xargs -0 keeps a malicious user
+    # BTC index.html drops across /home users. Cohort observation:
+    # nested drops appear at /home/<user>/public_html/<subdir>/index.html
+    # (multiple sibling subdirs per user). -maxdepth 4 bounds the walk;
+    # -name index.html filters before reading. -print0 + xargs -0
+    # keeps a malicious user
     # dir name from breaking the pipeline. find errors quiet via 2>/dev/null
     # when /home/*/public_html glob is empty.
     local btc_hit=""
@@ -1996,7 +2116,15 @@ check_destruction_iocs() {
     # ---- Pattern D: sptadm reseller / WHM_FullRoot persistence ----------
     # accounting.log: any of sptadm/4ef72197.cpx.local/exploit.local/
     # WHM_FullRoot fingerprints. Bounded line-oriented file; single grep.
+    #
+    # Anti-forensic awareness (host2 deep-dig 2026-05-02): Pattern A's
+    # encryptor specifically targets /var/cpanel/accounting.log, leaving
+    # an .sorry-encrypted variant in place. If the live file is missing
+    # but the .sorry exists, emit an evidence-destroyed advisory and skip
+    # the grep (cannot read encrypted content). The /var/cpanel/users/
+    # and api-tokens.cache second-source checks below are unaffected.
     local acct_log=/var/cpanel/accounting.log
+    local acct_log_sorry=/var/cpanel/accounting.log.sorry
     if [[ -f "$acct_log" ]]; then
         local d_pat="${PATTERN_D_RESELLER}|${PATTERN_D_DOMAIN}|${PATTERN_D_EMAIL}|${PATTERN_D_TOKEN_NAME}"
         local d_count d_sample
@@ -2013,9 +2141,32 @@ check_destruction_iocs() {
                  "note" "Pattern D persistence fingerprint in $acct_log ($d_count hits) - reseller/API token created post-exploit; revoke before clearing."
             ((hits++))
         fi
+    elif [[ -f "$acct_log_sorry" ]]; then
+        local acct_sorry_mtime
+        acct_sorry_mtime=$(stat -c %Y "$acct_log_sorry" 2>/dev/null)
+        emit "destruction" "ioc_pattern_d_evidence_destroyed" "warning" \
+             "ioc_pattern_d_acctlog_encrypted" 5 \
+             "path" "$acct_log_sorry" \
+             "mtime_epoch" "${acct_sorry_mtime:-0}" \
+             "note" "Pattern D evidence file $acct_log_sorry encrypted by Pattern A; reseller-persistence cannot be ruled in/out from this file - rely on /var/cpanel/users/ second source."
+        ((hits++))
     fi
-    # Reseller account presence - the accounting.log row may have rotated.
-    if command -v getent >/dev/null 2>&1; then
+    # Reseller account presence - the accounting.log row may have rotated
+    # OR been encrypted by Pattern A. /var/cpanel/users/<name> is cpanel's
+    # canonical user record (written by createacct before any /etc/passwd
+    # row materializes; survives Pattern A which only walks logs). getent
+    # passwd is kept as a fallback for completeness.
+    local d_userfile="/var/cpanel/users/$PATTERN_D_RESELLER"
+    if [[ -f "$d_userfile" ]]; then
+        local d_userfile_mtime
+        d_userfile_mtime=$(stat -c %Y "$d_userfile" 2>/dev/null)
+        emit "destruction" "ioc_pattern_d_reseller" "strong" \
+             "ioc_pattern_d_reseller_user_present" 10 \
+             "user" "$PATTERN_D_RESELLER" "path" "$d_userfile" \
+             "mtime_epoch" "${d_userfile_mtime:-0}" \
+             "note" "cPanel user record '$d_userfile' present - attacker reseller (CRITICAL)."
+        ((hits++))
+    elif command -v getent >/dev/null 2>&1; then
         if getent passwd "$PATTERN_D_RESELLER" >/dev/null 2>&1; then
             local home_mtime=""
             [[ -d "/home/$PATTERN_D_RESELLER" ]] && home_mtime=$(stat -c %Y "/home/$PATTERN_D_RESELLER" 2>/dev/null)
@@ -2045,14 +2196,27 @@ check_destruction_iocs() {
     # ---- Pattern F: __S_MARK__ harvester envelope -----------------------
     # IC-5790 dossier rev3: harvester reads bash/zsh/sh/fish histories.
     # HISTORY_FILES_GLOB hoisted at the top of this function covers all four.
+    #
+    # Timestamp resolution: bash writes `#<epoch>\n<command>` markers when
+    # HISTTIMEFORMAT is set (CL6 default for root). Parse the first such
+    # marker preceding any __S_MARK__ line and emit it as ts_epoch_first;
+    # forensic's ioc_signal_epoch() prefers ts_epoch_first over mtime_epoch
+    # so the kill-chain reconciler classifies the harvester correctly even
+    # when subsequent shell sessions have bumped the file's mtime.
     local f_hit=""
     f_hit=$(grep -lF "$PATTERN_F_S_MARK" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
     if [[ -n "$f_hit" ]]; then
-        local f_mtime
+        local f_mtime f_smark_epoch
         f_mtime=$(stat -c %Y "$f_hit" 2>/dev/null)
+        f_smark_epoch=$(awk -v mark="$PATTERN_F_S_MARK" '
+            /^#[0-9]{9,11}$/ { last=substr($0,2); next }
+            index($0, mark) { if (last != "") { print last; exit } }
+        ' "$f_hit" 2>/dev/null)
+        f_smark_epoch="${f_smark_epoch:-0}"
         emit "destruction" "ioc_pattern_f_harvester" "strong" \
              "ioc_pattern_f_smark_envelope" 10 \
              "sample_path" "$f_hit" \
+             "ts_epoch_first" "$f_smark_epoch" \
              "mtime_epoch" "${f_mtime:-0}" \
              "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $f_hit - automated post-exploit recon (CRITICAL)."
         ((hits++))
@@ -2179,14 +2343,22 @@ check_destruction_iocs() {
 
     # H2: kill-prelude (`pkill -9 nuclear.x86 kswapd01 xmrig`) in any history
     # file. Reuses HISTORY_FILES_GLOB hoisted at the top of this function.
+    # Embedded #<epoch> markers parsed for ts_epoch_first (same fix as Pattern F).
     local h_kill_hit=""
     h_kill_hit=$(grep -lE "$PATTERN_H_KILL_PRELUDE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
     if [[ -n "$h_kill_hit" ]]; then
-        local h_kill_mtime
+        local h_kill_mtime h_kill_epoch
         h_kill_mtime=$(stat -c %Y "$h_kill_hit" 2>/dev/null)
+        h_kill_epoch=$(awk -v re="$PATTERN_H_KILL_PRELUDE" '
+            /^#[0-9]{9,11}$/ { last=substr($0,2); next }
+            $0 ~ re { if (last != "") { print last; exit } }
+        ' "$h_kill_hit" 2>/dev/null)
+        h_kill_epoch="${h_kill_epoch:-0}"
         emit "destruction" "ioc_pattern_h_kill_prelude" "strong" \
              "ioc_pattern_h_competitor_kill" 8 \
-             "sample_path" "$h_kill_hit" "mtime_epoch" "${h_kill_mtime:-0}" \
+             "sample_path" "$h_kill_hit" \
+             "ts_epoch_first" "$h_kill_epoch" \
+             "mtime_epoch" "${h_kill_mtime:-0}" \
              "note" "Pattern H competitor-kill prelude in $h_kill_hit (kills nuclear.x86/kswapd01/xmrig before drop)."
         ((hits++))
     fi
@@ -2267,9 +2439,10 @@ check_destruction_iocs() {
     fi
 
     # I4: failed-chmod log signature in /var/log/secure (or rotation).
-    # Eaton's discovery path - non-root user logs in via SSH, profile.d
-    # hook tries chmod, hits permission-denied, logs to secure. Confirms
-    # the hook is actively firing in the wild.
+    # Discovery path: when a non-root user logs in via SSH, the profile.d
+    # hook tries to chmod the binary, hits permission-denied, and logs
+    # the failure to /var/log/secure. Confirms the hook is actively
+    # firing in the wild.
     local i_log_hit=""
     i_log_hit=$(grep -lF "chmod: cannot access '$PATTERN_I_BINARY'" \
                     /var/log/secure /var/log/secure.[0-9]* /var/log/secure-* \
@@ -2305,16 +2478,31 @@ check_destruction_iocs() {
         if (( ${#EXCLUDE_IPS[@]} > 0 )); then
             excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
         fi
+        # Per-dimension breakout + handoff-burst detection: terminal
+        # dimensions (rows×cols in the websocket Shell URL) function as
+        # operator fingerprints across the dossier - distinct dimensions
+        # imply distinct toolchains. The known-good set is maintained in
+        # sync with PATTERNS.md; new dimensions are flagged warning-tier.
+        # Handoff burst: >=2 distinct external IPs each landing a 2xx in
+        # any 15-minute window indicates multi-operator exploit chaining.
         local ws_result
         ws_result=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
                        | grep -vE "$PROBE_UA_RE" \
-                       | EXCLUDES="$excludes_env" awk '
+                       | EXCLUDES="$excludes_env" \
+                         KNOWN_DIMS="$PATTERN_E_KNOWN_DIMS" \
+                         awk '
             BEGIN {
                 n = split(ENVIRON["EXCLUDES"], ex_arr, "\n")
                 for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
+                kn = split(ENVIRON["KNOWN_DIMS"], kd_arr, ",")
+                for (i = 1; i <= kn; i++) if (kd_arr[i] != "") known[kd_arr[i]] = 1
                 ext_total = 0; ext_2xx = 0; int_2xx = 0; int_other = 0
-                ext_sample = ""; int_sample = ""
-                ts_first_ext = 0
+                ext_sample = ""; int_sample = ""; unknown_dim_sample = ""
+                ts_first_ext = 0; burst_n = 0
+            }
+            function dim_of(s,    m) {
+                if (match(s, /rows=([0-9]+)&cols=([0-9]+)/, m)) return m[1] "x" m[2]
+                return ""
             }
             {
                 ip = $1
@@ -2329,6 +2517,7 @@ check_destruction_iocs() {
                 if (match($0, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
                     ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
                 }
+                d = dim_of($0)
                 is_internal = (ip ~ /^10\./ \
                                || ip ~ /^127\./ \
                                || ip ~ /^192\.168\./ \
@@ -2340,32 +2529,77 @@ check_destruction_iocs() {
                     } else int_other++
                 } else {
                     ext_total++
-                    if (st ~ /^2/) ext_2xx++
+                    if (st ~ /^2/) {
+                        ext_2xx++
+                        if (d != "") {
+                            dim_count[d]++
+                            if (!(d in known) && unknown_dim_sample == "") {
+                                unknown_dim_sample = $0
+                            }
+                            burst_n++
+                            burst_ts[burst_n] = ts
+                            burst_ip[burst_n] = ip
+                        }
+                    }
                     if (ext_sample == "") ext_sample = $0
                     if (ts > 0 && (ts_first_ext == 0 || ts < ts_first_ext)) ts_first_ext = ts
                 }
             }
             END {
-                printf "%d\t%d\t%d\t%d\t%d\n", ext_total, ext_2xx, int_2xx, int_other, ts_first_ext
+                # Per-dimension breakout - serialized "dim:count,dim:count,..."
+                dim_csv = ""
+                for (d in dim_count) {
+                    dim_csv = dim_csv (dim_csv == "" ? "" : ",") d ":" dim_count[d]
+                }
+                # Unknown dimensions - any d not in known set.
+                unknown_csv = ""
+                for (d in dim_count) {
+                    if (!(d in known)) {
+                        unknown_csv = unknown_csv (unknown_csv == "" ? "" : ",") d
+                    }
+                }
+                # Handoff burst: largest distinct-IP count within any 900s
+                # (15-min) window over the recorded 2xx events.
+                burst_max = 0
+                for (i = 1; i <= burst_n; i++) {
+                    delete window_ips
+                    win_n = 0
+                    for (j = 1; j <= burst_n; j++) {
+                        if (burst_ts[j] >= burst_ts[i] && burst_ts[j] - burst_ts[i] <= 900) {
+                            if (!(burst_ip[j] in window_ips)) {
+                                window_ips[burst_ip[j]] = 1
+                                win_n++
+                            }
+                        }
+                    }
+                    if (win_n > burst_max) burst_max = win_n
+                }
+                printf "%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n", \
+                       ext_total, ext_2xx, int_2xx, int_other, \
+                       ts_first_ext, burst_max, dim_csv, unknown_csv
                 print ext_sample
                 print int_sample
+                print unknown_dim_sample
             }')
         local ext_total=0 ext_2xx=0 int_2xx=0 int_other=0 ts_first_ext=0
-        local ext_sample="" int_sample=""
+        local burst_max=0 dim_csv="" unknown_csv=""
+        local ext_sample="" int_sample="" unknown_dim_sample=""
         {
-            IFS=$'\t' read -r ext_total ext_2xx int_2xx int_other ts_first_ext
+            IFS=$'\t' read -r ext_total ext_2xx int_2xx int_other ts_first_ext burst_max dim_csv unknown_csv
             IFS= read -r ext_sample
             IFS= read -r int_sample
+            IFS= read -r unknown_dim_sample
         } <<< "$ws_result"
         ext_total="${ext_total:-0}"; ext_2xx="${ext_2xx:-0}"
         int_2xx="${int_2xx:-0}"; int_other="${int_other:-0}"
-        ts_first_ext="${ts_first_ext:-0}"
+        ts_first_ext="${ts_first_ext:-0}"; burst_max="${burst_max:-0}"
 
         if (( ext_2xx > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "strong" \
                  "ioc_pattern_e_websocket_shell_hits" 10 \
                  "count" "$ext_2xx" "external_total" "$ext_total" \
                  "internal_2xx" "$int_2xx" \
+                 "dimensions" "${dim_csv:-(none)}" \
                  "ts_epoch_first" "$ts_first_ext" \
                  "sample" "${ext_sample:0:200}" \
                  "note" "$ext_2xx external IP(s) reached /cpsess*/websocket/Shell with 2xx - Pattern E interactive RCE (CRITICAL)."
@@ -2384,6 +2618,38 @@ check_destruction_iocs() {
                  "count" "$int_2xx" "internal_other" "$int_other" \
                  "sample" "${int_sample:0:200}" \
                  "note" "$int_2xx /cpsess*/websocket/Shell hit(s) from RFC1918/loopback - WHM Terminal admin sessions, benign."
+        fi
+
+        # Per-dimension breakout (info-level: triage context for the
+        # operator; consumed by forensic kill-chain renderer for
+        # annotation). Only emitted when 2xx hits exist - no signal
+        # otherwise.
+        if [[ -n "$dim_csv" ]]; then
+            emit "destruction" "ioc_pattern_e_dimensions" "info" \
+                 "ioc_pattern_e_dimension_breakout" 0 \
+                 "dimensions" "$dim_csv" \
+                 "note" "Pattern E websocket Shell dimensions seen: $dim_csv"
+        fi
+        # Unknown dimension warning - new operator fingerprint not yet in
+        # PATTERN_E_KNOWN_DIMS. Triage prompt: confirm and update dossier.
+        if [[ -n "$unknown_csv" ]]; then
+            emit "destruction" "ioc_pattern_e_unknown_dimension" "warning" \
+                 "ioc_pattern_e_dimension_unknown" 5 \
+                 "dimensions" "$unknown_csv" \
+                 "sample" "${unknown_dim_sample:0:200}" \
+                 "note" "Pattern E websocket Shell with dimension(s) $unknown_csv outside known operator set - possible new operator (REVIEW)."
+            ((hits++))
+        fi
+        # Handoff burst: >=2 distinct external IPs each minted cpsess +
+        # reached websocket Shell with 2xx within a 15-minute window.
+        # Strong signal of multi-operator exploit chaining (toolkit
+        # being shared/reused across operators on the same target).
+        if (( burst_max >= 2 )); then
+            emit "destruction" "ioc_pattern_e_handoff_burst" "strong" \
+                 "ioc_pattern_e_handoff_burst_present" 8 \
+                 "ip_count" "$burst_max" \
+                 "note" "Pattern E exploit-handoff burst: $burst_max distinct external IPs each minted cpsess + reached websocket Shell within a 15-minute window (multi-operator chain)."
+            ((hits++))
         fi
     fi
 
