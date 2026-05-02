@@ -631,7 +631,7 @@ Sample (sanitised, from a real lab host post-exploitation):
 +-- CVE-2026-41940 / IC-5790 --------------------------------------------
 | host         cpanel.example.com ()
 | cpanel       unknown   os unknown
-| verdict      COMPROMISED   score 315   ioc-scan v2.4.1
+| verdict      COMPROMISED   score 315   ioc-scan v2.5.0
 | defenses     patch x absent   modsec + up   csf + clean   mitigate + ran
 +------------------------------------------------------------------------
 
