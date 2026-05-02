@@ -3779,8 +3779,8 @@ check_attacker_ips() {
             # Parse structured fields from first cpsess-2xx sample line.
             local _c_ip _c_path _c_status _c_token=""
             _c_ip=$(printf '%s' "$cpsess_sample" | awk '{print $1}')
-            _c_path=$(printf '%s' "$cpsess_sample" | awk -F'"' 'NF>=2{n=split($2," ",p); if(n>=2)print p[2]; else print ""}')
-            _c_status=$(printf '%s' "$cpsess_sample" | awk -F'"' 'NF>=3{n=split($3," ",p); if(n>=1)print p[1]; else print ""}')
+            _c_path=$(printf '%s' "$cpsess_sample" | awk -F'"' 'NF>=2{n=split($2,p," "); if(n>=2)print p[2]; else print ""}')
+            _c_status=$(printf '%s' "$cpsess_sample" | awk -F'"' 'NF>=3{n=split($3,p," "); if(n>=1)print p[1]; else print ""}')
             if [[ "$_c_path" =~ /cpsess([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])/ ]]; then
                 _c_token="${BASH_REMATCH[1]}"
             fi
@@ -5269,8 +5269,8 @@ check_destruction_iocs() {
             local _e_src="${ext_known_sample:-$ext_sample}"
             local _e_ip _e_path _e_status _e_token=""
             _e_ip=$(printf '%s' "$_e_src" | awk '{print $1}')
-            _e_path=$(printf '%s' "$_e_src" | awk -F'"' 'NF>=2{n=split($2," ",p); if(n>=2)print p[2]; else print ""}')
-            _e_status=$(printf '%s' "$_e_src" | awk -F'"' 'NF>=3{n=split($3," ",p); if(n>=1)print p[1]; else print ""}')
+            _e_path=$(printf '%s' "$_e_src" | awk -F'"' 'NF>=2{n=split($2,p," "); if(n>=2)print p[2]; else print ""}')
+            _e_status=$(printf '%s' "$_e_src" | awk -F'"' 'NF>=3{n=split($3,p," "); if(n>=1)print p[1]; else print ""}')
             if [[ "$_e_path" =~ /cpsess([0-9]{10})/ ]]; then
                 _e_token="${BASH_REMATCH[1]}"
             fi
