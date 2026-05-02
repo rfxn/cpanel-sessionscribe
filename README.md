@@ -467,8 +467,19 @@ curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sess
 **Common patterns:**
 
 ```bash
-# default sectioned report
+# default triage (detection only — fast, fleet sweep)
 bash sessionscribe-ioc-scan.sh
+
+# full kill-chain reconstruction inline (detection + forensic phases)
+bash sessionscribe-ioc-scan.sh --full
+
+# full kill-chain + intake bundle submission
+bash sessionscribe-ioc-scan.sh --full --upload
+
+# replay forensic phases against a saved envelope (re-render without re-scanning)
+bash sessionscribe-ioc-scan.sh --replay /var/cpanel/sessionscribe-ioc/<run_id>.json
+bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle-dir>
+bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle>.tgz
 
 # JSONL for SIEM ingest
 bash sessionscribe-ioc-scan.sh --jsonl --quiet > host.jsonl
@@ -478,9 +489,6 @@ bash sessionscribe-ioc-scan.sh --csv --quiet > host.csv
 
 # host IOCs only - periodic post-patch sweep, last 7 days
 bash sessionscribe-ioc-scan.sh --ioc-only --since 7
-
-# auto-chain into forensic on dirty hosts (shared run_id)
-bash sessionscribe-ioc-scan.sh --chain-forensic --jsonl
 
 # offline forensics on an extracted snapshot tarball
 bash sessionscribe-ioc-scan.sh \
@@ -515,9 +523,9 @@ VULNERABLE, `2` = INCONCLUSIVE, `3` = tool error, `4` = COMPROMISED. A
 patched host can still exit `4` if prior exploitation left IOCs on disk.
 
 A run ledger is written to `/var/cpanel/sessionscribe-ioc/` by default
-(`--no-ledger` to disable). `--chain-forensic` auto-execs
-`sessionscribe-forensic.sh` with a shared `RUN_ID` when host_verdict is
-not CLEAN.
+(`--no-ledger` to disable). `--full` runs forensic phases inline in the
+same process. `--chain-forensic`, `--chain-on-critical`, `--chain-upload`
+are preserved as v1.x back-compat aliases (map to `--full` + gate flags).
 
 ```
 Usage: bash sessionscribe-ioc-scan.sh [OPTIONS]
@@ -581,16 +589,25 @@ Run ledger (default ON):
       --syslog               Emit a one-line summary via logger -t
                              sessionscribe-ioc -p auth.notice on completion.
 
-Forensic chaining:
-      --chain-forensic       After scan, if host_verdict != CLEAN, exec
-                             sessionscribe-forensic.sh with
-                             --since/--no-color/--quiet inherited and a
-                             shared RUN_ID. Resolution order: (1) sibling
-                             of this script, (2) PATH, (3) GitHub raw
-                             (rfxn/cpanel-sessionscribe@main). Forensic
-                             exit code is reported as a chain.forensic_exit
-                             signal but does not override this script's
-                             exit code.
+Forensic modes (v2.0.0+):
+      --full                 Run detection then forensic phases inline:
+                             defense / offense / reconcile / kill-chain /
+                             bundle. Writes envelope before forensic phases
+                             so --full and --replay share the same read path.
+      --replay PATH          Skip detection; replay forensic phases against
+                             a saved envelope (.json), bundle directory, or
+                             bundle tarball (.tgz). PATH resolution:
+                               1. .json file → read directly
+                               2. directory → scan for ioc-scan-envelope.json
+                               3. .tgz/.tar.gz → extract to tmpdir, scan
+      --no-bundle            Skip artifact tarball capture (use in --full or
+                             --replay mode on Pattern A hosts or for fast
+                             kill-chain re-render).
+      --chain-forensic       Back-compat alias for --full (no host-verdict gate).
+      --chain-on-critical    Back-compat alias for --full with
+                             CHAIN_ON_CRITICAL=1 (skips forensic if
+                             HOST_VERDICT != COMPROMISED).
+      --chain-upload         Back-compat alias for --full --upload.
 
 Misc:
       --timeout N            Probe timeout in seconds (default 8).
@@ -602,54 +619,40 @@ Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
 
 </details>
 
-### `sessionscribe-forensic.sh` - kill-chain reconstruction + evidence bundle
+### `sessionscribe-forensic.sh` - deprecation shim (v0.99.0)
+
+> [!WARNING]
+> **`sessionscribe-forensic.sh` has been merged into `sessionscribe-ioc-scan.sh` v2.0.0.**
+> The standalone forensic script is now a ~50-line deprecation shim. Use
+> `sessionscribe-ioc-scan.sh --full` or `--replay` for new deployments.
+> The shim will be removed in a future release.
+
+The shim is preserved at the `sh.rfxn.com` and `raw.githubusercontent.com`
+CDN URLs for operators still on the v1.x curl one-liner. It prints a one-line
+deprecation notice (suppressed by `--quiet` or `--jsonl`) and delegates to
+`sessionscribe-ioc-scan.sh --replay <envelope-path>`. The `--quiet` and
+`--jsonl` flags are forwarded to the underlying script.
 
 ```bash
+# Still works (shim delegates to ioc-scan --replay):
 curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh | bash
-```
 
-**Common patterns:**
+# Preferred v2.0.0 equivalent — full kill-chain in one script:
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --full
 
-```bash
-# default - sectioned report on stderr + JSONL on stdout + bundle capture
-bash sessionscribe-forensic.sh
-
-# JSONL only (SIEM ingest)
-bash sessionscribe-forensic.sh --jsonl > forensic-host.jsonl
-
-# correlate with ioc-scan via shared run_id
-SESSIONSCRIBE_RUN_ID=$(date +%s)-$$ \
-    bash sessionscribe-ioc-scan.sh --jsonl --quiet > ioc.jsonl
-SESSIONSCRIBE_RUN_ID=$(date +%s)-$$ \
-    bash sessionscribe-forensic.sh --jsonl > forensic.jsonl
-
-# Pattern A host - skip bundle (don't stat encryptor + don't bundle /root)
-bash sessionscribe-forensic.sh --no-bundle --jsonl
-
-# narrow IR window (default 90 days)
-bash sessionscribe-forensic.sh --since 14
-bash sessionscribe-forensic.sh --since all
-
-# scan archived rotations alongside live logs
-mkdir -p /tmp/cp-archive && \
-    tar -C /tmp/cp-archive -xzf /usr/local/cpanel/logs/archive/2026-02.tar.gz
-bash sessionscribe-forensic.sh --extra-logs /tmp/cp-archive
-
-# fleet - recommended: --no-bundle to avoid 20k tarballs; bundle on exit-2 hosts
-ansible -i hosts all -m script -a 'sessionscribe-forensic.sh --jsonl --no-bundle'
-
-# submit bundle to R-fx forensic intake (opt-in)
-bash sessionscribe-forensic.sh --upload
-RFXN_INTAKE_TOKEN=<hex-token> bash sessionscribe-forensic.sh --upload
+# Replay a saved envelope (re-render kill-chain without re-scanning):
+bash sessionscribe-ioc-scan.sh --replay /var/cpanel/sessionscribe-ioc/<run_id>.json
+bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle-dir>
+bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle>.tgz
 ```
 
 <details>
-<summary><b>Phases + verdicts + bundle layout + upload + full <code>--help</code></b> (click to expand)</summary>
+<summary><b>Phases + verdicts + bundle layout (now in ioc-scan --full / --replay)</b> (click to expand)</summary>
 
-Where `sessionscribe-ioc-scan.sh` answers *"is this host compromised?"*,
-`sessionscribe-forensic.sh` answers *"when was each indicator first
-present, and was the relevant defense in place at that time?"* - the
-read-only kill-chain reconstruction tool for the IC-5790 cohort.
+The forensic phases (previously in `sessionscribe-forensic.sh`) now run
+inline inside `sessionscribe-ioc-scan.sh` when `--full` or `--replay` is
+passed. Phase behavior is identical; see the `sessionscribe-ioc-scan.sh`
+section above for the `--full` / `--replay` flag reference.
 
 | Phase | What it does |
 |---|---|
@@ -660,17 +663,6 @@ read-only kill-chain reconstruction tool for the IC-5790 cohort.
 
 PRE-DEFENSE = host was open to the exploit when the indicator landed;
 POST-DEFENSE = the indicator is collateral or pre-mitigation noise.
-
-Exit codes: `0` = no IOCs found, `1` = IOCs found and all post-defense,
-`2` = IOCs found and at least one pre-defense (the high-attention case),
-`3` = tool error. Upload failure does **not** promote the exit code; it
-is recorded as an `upload fail` signal in the JSONL stream.
-
-**Bundle privacy.** Customer-domain web access logs (`domlogs`) are
-**not** bundled - only control-plane logs (cpsrvd, global Apache) and
-system auth logs. `/etc/shadow` is **not** bundled (no Pattern depends
-on hash material); `/etc/sudoers` + `/etc/sudoers.d/` are bundled
-instead, to catch attacker-planted `NOPASSWD:ALL` rules.
 
 **Bundle layout** (per host, under `/root/.ic5790-forensic/<TS>-<RUN_ID>/`,
 mode `0700`):
@@ -698,85 +690,27 @@ Typical bundle on a busy cPanel host with the 90-day window: ~250 MB –
 2 GB compressed. Per-tarball 2 GB cap (`--max-bundle-mb`) drops oversize
 candidates individually so the rest of the bundle still lands.
 
-**Bundle upload (`--upload`, opt-in).** Submits the bundle as a single
-PUT to `https://intake.rfxn.com/`. Server is upload-only - no GET/HEAD,
-no retrieval, no directory listing. On 201 returns JSON with stored
-filename, sha256, and remaining uses.
-
-Token resolution order: (1) `--upload-token TOKEN` CLI flag, (2)
-`RFXN_INTAKE_TOKEN` environment variable, (3) built-in convenience token
-(capped at 1000 PUTs server-side; request a private token from
-[proj@rfxn.com](mailto:proj@rfxn.com) for fleet use).
-
-Server enforces: `PUT` method (else 405), token present + valid + with
-remaining uses (else 401), body ≤ 2 GiB (else 413), gzip magic on first
-two bytes (else 415), non-empty body (else 400), disk free ≥ 5 GB (else
-507).
-
-```
-sessionscribe-forensic.sh v0.7.0
-
-Read-only kill-chain reconstruction for CVE-2026-41940 (IC-5790).
-
-USAGE
-  sessionscribe-forensic.sh [OUTPUT] [BUNDLE] [MISC]
-
-OUTPUT
-  (default)         ANSI report on stderr + JSONL on stdout
-  --jsonl           JSONL only on stdout
-  --json            Single JSON envelope on stdout
-  --quiet           Suppress sectioned report
-  -o, --output FILE Write final JSON envelope to FILE
-
-BUNDLE
-  --bundle             Capture artifact tarball (default)
-  --no-bundle          Skip artifact tarball (recommended on Pattern A hosts)
-  --bundle-dir DIR     Root for bundle output
-                       (default: /root/.ic5790-forensic)
-  --max-bundle-mb N    Cap bundle size in MB. Pre-flight `du` runs per
-                       candidate set; oversize sets are skipped with a
-                       warning. (default: 2048 MB / 2 GB).
-                       Use 0 for no cap.
-  --no-history         Skip /home/*/.bash_history capture (privacy)
-
-LOGS / TIME WINDOW
-  --extra-logs DIR     Additional access-log directory to scan (e.g. point
-                       at an expanded /usr/local/cpanel/logs/archive/*.tar.gz
-                       to include rotated logs from older incident windows).
-  --since DAYS         Limit log + session-file scans + bundle to last N
-                       days. Default: 90 days (covers any pre-disclosure
-                       exploitation since CVE-2026-41940 was released).
-  --since all          Disable the time window - scan every retained
-                       session and access-log, no upper bound on bundle.
-
-UPLOAD (off by default - explicit opt-in)
-  --upload             Submit the bundle to the R-fx forensic intake after
-                       capture. Off by default. Requires --bundle (the
-                       default). Single PUT of an outer .tgz archive of
-                       the bundle dir; server returns 201 + JSON with the
-                       stored filename, sha256, and remaining_uses.
-  --upload-url URL     Override intake URL.
-                       (default: https://intake.rfxn.com/)
-  --upload-token TOKEN Override token. Resolution order:
-                         1. --upload-token TOKEN (CLI flag)
-                         2. $RFXN_INTAKE_TOKEN (environment)
-                         3. built-in convenience token (limited use:
-                            server enforces a 1000-PUT cap per token;
-                            for ongoing fleet use, request your own
-                            token from R-fx Networks <proj@rfxn.com>).
-
-MISC
-  --no-color        Disable ANSI color (NO_COLOR=1 also honored)
-  -h, --help        Show this help
-
-EXIT CODES
-  0  no IOCs found
-  1  IOCs found, all post-defense
-  2  IOCs found, at least one pre-defense (defense was missing)
-  3  tool error
-```
-
 </details>
+
+### Deprecation: sessionscribe-forensic.sh
+
+As of v2.0.0, all forensic phases (defense timeline, kill-chain, bundle,
+upload) are built into `sessionscribe-ioc-scan.sh`. The migration path:
+
+| v1.x one-liner | v2.0.0 equivalent |
+|---|---|
+| `bash sessionscribe-forensic.sh` | `bash sessionscribe-ioc-scan.sh --full` |
+| `bash sessionscribe-forensic.sh --no-bundle` | `bash sessionscribe-ioc-scan.sh --full --no-bundle` |
+| `bash sessionscribe-forensic.sh --upload` | `bash sessionscribe-ioc-scan.sh --full --upload` |
+| `SESSIONSCRIBE_IOC_JSON=<path> bash sessionscribe-forensic.sh` | `bash sessionscribe-ioc-scan.sh --replay <path>` |
+| `bash sessionscribe-ioc-scan.sh --chain-forensic` | `bash sessionscribe-ioc-scan.sh --full` |
+| `bash sessionscribe-ioc-scan.sh --chain-on-critical` | `bash sessionscribe-ioc-scan.sh --full` (CHAIN_ON_CRITICAL=1) |
+| `bash sessionscribe-ioc-scan.sh --chain-upload` | `bash sessionscribe-ioc-scan.sh --full --upload` |
+
+The `sessionscribe-forensic.sh` v0.99.0 shim is retained at both CDN URLs
+(`sh.rfxn.com` and `raw.githubusercontent.com`) to avoid breaking deployed
+one-liners during the grace period. The shim prints a deprecation notice
+and execs into `ioc-scan --replay`. It will be removed in a future release.
 
 ### `sessionscribe-revsnap.sh` - RE snapshot collector
 
@@ -870,16 +804,16 @@ ansible -i hosts cpanel -m script -a 'sessionscribe-mitigate.sh --csv --quiet' \
     > fleet-mitigate.csv
 
 # kill-chain reconciliation across fleet - --no-bundle on the broad sweep,
-# then collect bundles only on the high-attention hosts that exit 2
+# then collect bundles only on the high-attention hosts (v2.0.0+: use --full)
 ansible -i hosts cpanel -m script \
-    -a 'sessionscribe-forensic.sh --jsonl --no-bundle' > fleet-forensic.jsonl
+    -a 'sessionscribe-ioc-scan.sh --full --no-bundle --jsonl' > fleet-forensic.jsonl
 jq -r 'select(.phase=="summary" and .key=="verdict"
               and .note=="COMPROMISED_PRE_DEFENSE") | .host' \
     fleet-forensic.jsonl > pre-defense-hosts.txt
 
 # bundle collection on the pre-defense subset
 ansible -i pre-defense-hosts.txt all -m script \
-    -a 'sessionscribe-forensic.sh --jsonl --bundle-dir /root/.ic5790-forensic'
+    -a 'sessionscribe-ioc-scan.sh --full --jsonl --bundle-dir /root/.ic5790-forensic'
 ```
 
 The probe is independently fleet-safe (canary-tagged sessions, active
