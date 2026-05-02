@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-forensic.sh v0.9.5
+# sessionscribe-forensic.sh v0.9.9
 # (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -74,7 +74,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 3
 fi
 
-VERSION="0.9.8"
+VERSION="0.9.9"
 INCIDENT_ID="IC-5790"
 
 # Default capture window. CVE-2026-41940 was disclosed 2026-04-28; 90d covers
@@ -2222,6 +2222,25 @@ phase_bundle() {
         echo "since_epoch=${SINCE_EPOCH:-}"
         echo "max_bundle_mb=$MAX_BUNDLE_MB"
     } > "$bdir/manifest.txt"
+
+    # Stash the upstream ioc-scan JSON envelope. Only the canonical structured
+    # record is preserved (operator-facing stdout is not captured); without
+    # this, an offline analyst can see the kill-chain reconciliation but not
+    # the source per-signal evidence ioc-scan emitted. KB-sized, always safe
+    # to bundle. Only present when chained from ioc-scan.
+    if [[ -n "${SESSIONSCRIBE_IOC_JSON:-}" && -f "$SESSIONSCRIBE_IOC_JSON" ]]; then
+        if cp "$SESSIONSCRIBE_IOC_JSON" "$bdir/ioc-scan-envelope.json" 2>/dev/null; then
+            chmod 0600 "$bdir/ioc-scan-envelope.json" 2>/dev/null
+            local env_size
+            env_size=$(stat -c %s "$bdir/ioc-scan-envelope.json" 2>/dev/null)
+            emit_signal bundle info ioc_envelope_captured \
+                "ioc-scan envelope copied to bundle (${env_size:-?} bytes)" \
+                src "$SESSIONSCRIBE_IOC_JSON" dest "ioc-scan-envelope.json" bytes "${env_size:-0}"
+        else
+            emit_signal bundle warn ioc_envelope_copy_failed \
+                "could not copy ioc-scan envelope into bundle" src "$SESSIONSCRIBE_IOC_JSON"
+        fi
+    fi
 
     # Kill-chain primitives next to the manifest. These are tiny (KB-scale)
     # so they're always written - independent of any per-tarball size cap.
