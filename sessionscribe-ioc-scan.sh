@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.7.0
+# sessionscribe-ioc-scan.sh v1.8.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -1043,8 +1043,12 @@ check_logs() {
             ts = 0
             # cpanel timestamp [MM/DD/YYYY:HH:MM:SS ...] (NOT Apache CLF
             # DD/Mon/YYYY). gawk mktime needs "YYYY MM DD HH MM SS".
-            if (match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
-                ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
+            # 2-arg match() + substr/split for gawk 3.1.x (CL6 floor) - the
+            # 3-arg match(s, /re/, arr) form is gawk 4.0+ only.
+            if (match(line, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                _d = substr(line, RSTART+1, RLENGTH-1)
+                split(_d, _p, /[\/:]/)
+                ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
                 if (floor > 0 && ts > 0 && ts < floor) next
             }
             print user "\t" status "\t" t[1] "\t" port "\t" src "\t" ts "\t" line
@@ -1198,8 +1202,11 @@ check_attacker_ips() {
             }
 
             ts = 0
-            if (match(line, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
-                ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
+            # 2-arg match() + substr/split for gawk 3.1.x (CL6 floor).
+            if (match(line, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                _d = substr(line, RSTART+1, RLENGTH-1)
+                split(_d, _p, /[\/:]/)
+                ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
             }
 
             # --since gate: when SINCE_EPOCH is set (floor > 0), drop hits
@@ -1314,9 +1321,13 @@ check_crlf_access_primitive() {
             | grep -vE "$PROBE_UA_RE" \
             | awk -v since="$since_filter" '
         BEGIN { hits=0; sample=""; ts_first=0 }
-        function ts_of(s,    m, t) {
-            if (match(s, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
-                return mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
+        # gawk 3.1.x (CL6 floor) lacks 3-arg match(s, /re/, arr); use the
+        # 2-arg form with RSTART/RLENGTH + substr/split to extract groups.
+        function ts_of(s,    d, n, p) {
+            if (match(s, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                d = substr(s, RSTART+1, RLENGTH-1)
+                n = split(d, p, /[\/:]/)
+                return mktime(p[3]" "p[1]" "p[2]" "p[4]" "p[5]" "p[6])
             }
             return 0
         }
@@ -2500,8 +2511,14 @@ check_destruction_iocs() {
                 ext_sample = ""; int_sample = ""; unknown_dim_sample = ""
                 ts_first_ext = 0; burst_n = 0
             }
-            function dim_of(s,    m) {
-                if (match(s, /rows=([0-9]+)&cols=([0-9]+)/, m)) return m[1] "x" m[2]
+            # gawk 3.1.x (CL6 floor) lacks 3-arg match(s, /re/, arr); the
+            # 2-arg form with substr+split extracts the captured groups.
+            function dim_of(s,    seg, n, kv) {
+                if (match(s, /rows=[0-9]+&cols=[0-9]+/)) {
+                    seg = substr(s, RSTART, RLENGTH)
+                    n = split(seg, kv, /[=&]/)
+                    return kv[2] "x" kv[4]
+                }
                 return ""
             }
             {
@@ -2514,8 +2531,11 @@ check_destruction_iocs() {
                     st = ss[1]
                 }
                 ts = 0
-                if (match($0, /\[([0-9]{2})\/([0-9]{2})\/([0-9]{4}):([0-9]{2}):([0-9]{2}):([0-9]{2})/, m)) {
-                    ts = mktime(m[3]" "m[1]" "m[2]" "m[4]" "m[5]" "m[6])
+                # gawk 3.1.x: 2-arg match() + substr/split (no 3-arg form).
+                if (match($0, /\[[0-9]{2}\/[0-9]{2}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                    _d = substr($0, RSTART+1, RLENGTH-1)
+                    split(_d, _p, /[\/:]/)
+                    ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
                 }
                 d = dim_of($0)
                 is_internal = (ip ~ /^10\./ \
