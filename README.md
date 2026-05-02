@@ -20,7 +20,7 @@ Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr
 </div>
 
 <p align="center">
-<strong><em>Four requests forge a root session. Half the supported tiers got no patch.<br/>
+<strong><em>Four requests forge a root session. Six tiers still have no in-place patch.<br/>
 The architectural fix isn't in the binary - it's at the proxy endpoint.</em></strong>
 </p>
 
@@ -45,7 +45,7 @@ bash sessionscribe-mitigate.sh --csv
 ```
 
 > [!IMPORTANT]
-> **Tiers 112, 114, 116, 120, 122, 124, 128 have no vendor patch.** Every
+> **Tiers 112, 114, 116, 120, 122, 128 have no vendor patch.** Every
 > build on those tiers is vulnerable, and upgrade-or-migrate is the only
 > durable fix. Until then: firewall TCP/2082, 2083, 2086, 2087, 2095, 2096
 > to management CIDRs (the orchestrator's `csf`/`apf`/`runfw` phases do this
@@ -90,7 +90,7 @@ in between.
 
 | Capability | Vendor advisory | watchTowr PoC | This toolkit |
 |---|---|---|---|
-| Patched-build list | yes | no | yes - incl. EL6 11.86.0.41 + WP² 136.1.7 + EOL handling |
+| Patched-build list | yes | no | yes - incl. EL6 11.86.0.41, EL6/CL6 110.0.103, tier 124 + WP² 136.1.7 + EOL handling |
 | Remote detection | no | partial - stage 1+2 only, false-positives on patched hosts | full 4-stage chain, deterministic verdict |
 | On-host IOC scan | partial | no | vendor patterns + co-occurrence + forged-timestamp heuristic |
 | Active mitigation | "patch + reboot" | n/a | mitigation orchestrator + ModSec rules + port lockdown |
@@ -231,7 +231,7 @@ bash sessionscribe-mitigate.sh --csv   > host.csv
 
 | Phase | What it does |
 |---|---|
-| `patch` | `cpanel -V` vs the published patched-build list (incl. EL6 11.86.0.41 and WP² 136.1.7) |
+| `patch` | `cpanel -V` vs the published patched-build list (incl. EL6 11.86.0.41, EL6/CL6 110.0.103, tier 124, and WP² 136.1.7) |
 | `preflight` | Removes `/etc/yum.repos.d/threatdown.repo`; ensures `epel-release`; disables broken non-base repos so `upcp` doesn't die mid-flight |
 | `upcp` | If unpatched, kicks off `/scripts/upcp --force --bg` |
 | `proxysub` | Enables `proxysubdomains` + new-account variant; rebuilds httpd conf |
@@ -896,7 +896,7 @@ Explicit non-goals:
   `Cpanel/Session/*.pm`. The cpanel-issued back-port for your tier is the
   real fix; the toolkit closes the practical attack window in the meantime
   and stays useful as detection + posture validation after the patch lands.
-- **Not a fix for tiers 112, 114, 116, 120, 122, 124, 128.** Those tiers
+- **Not a fix for tiers 112, 114, 116, 120, 122, 128.** Those tiers
   have no vendor patch. The orchestrator's `proxysub` + firewall phases
   plus the ModSec rule pack reduce blast radius, but the only durable
   answer is upgrade or migration.
@@ -964,19 +964,23 @@ preceding `/login/` 200 in the same session window.
 ## Affected builds
 
 ```
-11.86.0.41 (EL6)   11.110.0.97   11.118.0.63   11.126.0.54
-11.130.0.19        11.132.0.29   11.134.0.20   11.136.0.5
+11.86.0.41 (EL6/CL7)   11.110.0.97        11.118.0.63        11.124.0.35
+11.126.0.54            11.130.0.19        11.132.0.29        11.134.0.20
+11.136.0.5             110.0.103 (EL6/CL6 from .50)
 
-WP Squared:        136.1.7
+WP Squared:            136.1.7
 ```
 
 Tiers excluded from the vendor patch list have **no in-place fix**: 112,
-114, 116, 120, 122, 124, 128. Hosts on those tiers must be upgraded to a
+114, 116, 120, 122, 128. Hosts on those tiers must be upgraded to a
 patched major series, migrated, or have their cpsrvd listeners firewalled
 until they are.
 
-The 11.86.0.41 build for EL6 was added in the 04/29 advisory revision; 11.130
-was bumped from `.18` to `.19` in the same revision.
+The 11.86.0.41 build for EL6/CL7 was added in the 04/29 advisory revision;
+11.130 was bumped from `.18` to `.19` in the same revision. A subsequent
+revision added **11.124.0.35** (closing the prior gap on tier 124) and
+**110.0.103** as a direct upgrade target for EL6/CL6 hosts still on
+v110.0.50, so they don't have to cross-tier jump to 11.86.
 
 ---
 
