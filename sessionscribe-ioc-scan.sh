@@ -1296,6 +1296,7 @@ read_iocs_from_envelope() {
 
     local line area severity key note ts pattern n_added=0
     local p_ip p_path p_log p_count p_h2xx p_status p_line p_row p_anno
+    local p_cpsess_token key_for_warn
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
         area=$(json_str_field "$line" area)
@@ -2506,7 +2507,7 @@ write_kill_chain_primitives() {
 
     # TSV header + DEF rows + IOC rows.
     {
-        printf 'kind\tts_epoch\tts_iso\tpattern\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tcpsess_token\tline\n'
+        printf 'kind\tts_epoch\tts_iso\tpattern\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tline\tcpsess_token\n'
 
         # Defense rows.
         local de de_epoch de_key de_note _de_line
@@ -2586,7 +2587,7 @@ write_kill_chain_primitives() {
                     "$r_pat" "$r_verdict" "$r_delta" "$dactive" \
                     "$r_key" "$nclean" \
                     "${area:-}" "${ip:-}" "${path:-}" "${log_file:-}" \
-                    "${count:-}" "${h2xx:-}" "${status:-}" "${cpsess_token:-}" "${line:-}"
+                    "${count:-}" "${h2xx:-}" "${status:-}" "${line:-}" "${cpsess_token:-}"
             done <<< "$i_sorted"
         done
     } > "$tsv"
@@ -2599,11 +2600,15 @@ write_kill_chain_primitives() {
     # Schema version tracking:
     #   v1 (forensic <= 0.9.x): per-IOC field name was "stage"
     #   v2 (forensic >= 0.10.0): per-IOC field renamed to "pattern" to align
-    #     with the IC-5790 dossier vocabulary. The _schema_changes hint in
-    #     the meta row makes the rename machine-discoverable for future
-    #     readers (operator tooling, LLM analyses).
+    #     with the IC-5790 dossier vocabulary.
+    #   v3 (ioc-scan >= 2.2.0): added per-IOC field "cpsess_token" (10-digit
+    #     prefix extracted from /cpsess<10>/ paths at emit-time; populated by
+    #     Pattern E + ioc_attacker_ip_2xx_on_cpsess and any future emits that
+    #     pass the 9th positional arg to ioc_primitive_row()).
+    # The _schema_changes hint in the meta row makes the rename + addition
+    # machine-discoverable for future readers (operator tooling, LLM analyses).
     {
-        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":2,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
+        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":3,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
             "${HOSTNAME_J:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
             "$VERSION" "${INCIDENT_ID:-}" "$RUN_ID" \
             "$(json_esc "${ENV_IOC_RUN_ID:-}")" "$(json_esc "${ENV_IOC_TOOL_VERSION:-}")" "$(json_esc "${ENV_IOC_TS:-}")" \
@@ -2661,11 +2666,12 @@ write_kill_chain_primitives() {
                 local area ip path log_file count h2xx status line cpsess_token
                 IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line cpsess_token <<< "$prims"
 
-                # JSONL schema v2 (forensic v0.10.0+): per-IOC field 'stage'
-                # renamed to 'pattern' to match the IC-5790 dossier vocabulary.
-                # Meta row carries schema_version=2 + a _schema_changes hint
+                # JSONL schema v3 (ioc-scan v2.2.0+): per-IOC field 'stage'
+                # was renamed to 'pattern' in v2 (forensic v0.10.0+) to match
+                # the IC-5790 dossier vocabulary; v3 added 'cpsess_token'.
+                # Meta row carries schema_version=3 + a _schema_changes hint
                 # so future readers (operator tooling, LLM analyses) can
-                # auto-detect the rename and adapt.
+                # auto-detect the rename and addition and adapt.
                 printf '{"kind":"IOC","epoch":%s,"ts":"%s","pattern":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","cpsess_token":"%s","line":"%s"}\n' \
                     "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
                     "$(json_esc "$r_pat")" "$(json_esc "$r_verdict")" \
@@ -4363,11 +4369,16 @@ check_sessions() {
             # success.
             #
             # Severity=warning so this counts toward ioc_review (SUSPICIOUS) but
-            # NOT ioc_critical (COMPROMISED). Distinct from IOC-E2 which fires
-            # CRITICAL when auth markers ARE present (real compromise). Mutually
-            # exclusive with IOC-E2: the auth-marker guards below prevent double-
-            # firing on the same session.
+            # NOT ioc_critical (COMPROMISED). Mutually exclusive with IOC-E
+            # (`ioc_token_attempt_*`, also parent key ioc_failed_exploit_attempt)
+            # via `! SF_CP_TOKEN` -- when cp_security_token IS in the session
+            # IOC-E fires (evidence-tier); when ABSENT IOC-J fires (warning-tier).
+            # Without this guard both would emit on the same session against
+            # the same parent key, which double-counts in ss-aggregate.py.
+            # Also mutually exclusive with IOC-E2 (CRITICAL when auth markers
+            # ARE present): the auth-marker guards below prevent that.
             if (( SF_BADPASS && SF_TOKEN_DENIED && SF_PASS_PRESENT_NONEMPTY \
+                  && ! SF_CP_TOKEN \
                   && ! SF_INT_AUTH && ! SF_EXT_AUTH \
                   && ! SF_HASROOT && ! SF_TFA )); then
                 emit_session "ioc_failed_exploit_attempt_$session_name" "warning" \
@@ -5103,6 +5114,15 @@ check_destruction_iocs() {
                 #              trips Pattern E STRONG as "RCE landed".
                 ext_2xx_known = 0; ext_2xx_unknown = 0
                 ext_sample = ""; int_sample = ""; unknown_dim_sample = ""
+                # ext_known_sample is the FIRST 2xx external line whose
+                # terminal dim is in the attacker-fingerprint set; the
+                # strong-emit ip / path / status / cpsess_token fields
+                # are parsed from THIS line, not from any external line
+                # (4xx probes, unknown-dim admin sessions). Without it,
+                # a host with a 4xx probe at 09:00 plus a known-dim 2xx
+                # at 10:00 would surface the 4xx probe as the strong
+                # emit sample -- contradicting ext_2xx_known > 0.
+                ext_known_sample = ""
                 ts_first_ext = 0; burst_n = 0
             }
             # gawk 3.1.x (CL6 floor) lacks 3-arg match(s, /re/, arr); the
@@ -5150,6 +5170,12 @@ check_destruction_iocs() {
                             if (d in known) {
                                 # Attacker-fingerprint dim — strong-tier signal.
                                 ext_2xx_known++
+                                # Capture the FIRST attacker-dim 2xx line as
+                                # the canonical sample for the strong-emit
+                                # structured fields. ext_sample (any external
+                                # line) is preserved for fallback / lower-tier
+                                # emits.
+                                if (ext_known_sample == "") ext_known_sample = $0
                                 # Handoff-burst tracking only counts attacker-
                                 # dimension hits; legitimate admin teams from
                                 # multiple IPs in 15min should not trip the
@@ -5207,16 +5233,18 @@ check_destruction_iocs() {
                 print ext_sample
                 print int_sample
                 print unknown_dim_sample
+                print ext_known_sample
             }')
         local ext_total=0 ext_2xx=0 ext_2xx_known=0 ext_2xx_unknown=0
         local int_2xx=0 int_other=0 ts_first_ext=0
         local burst_max=0 dim_csv="" unknown_csv=""
-        local ext_sample="" int_sample="" unknown_dim_sample=""
+        local ext_sample="" int_sample="" unknown_dim_sample="" ext_known_sample=""
         {
             IFS=$'\t' read -r ext_total ext_2xx ext_2xx_known ext_2xx_unknown int_2xx int_other ts_first_ext burst_max dim_csv unknown_csv
             IFS= read -r ext_sample
             IFS= read -r int_sample
             IFS= read -r unknown_dim_sample
+            IFS= read -r ext_known_sample
         } <<< "$ws_result"
         ext_total="${ext_total:-0}"; ext_2xx="${ext_2xx:-0}"
         ext_2xx_known="${ext_2xx_known:-0}"; ext_2xx_unknown="${ext_2xx_unknown:-0}"
@@ -5228,13 +5256,21 @@ check_destruction_iocs() {
         #   ext_2xx_unknown> 0 → warning (admin session most likely; review)
         #   ext_total      > 0 → warning (probes only, host repelled)
         if (( ext_2xx_known > 0 )); then
-            # Parse structured fields from the first attacker-dimension sample line.
+            # Parse structured fields from the first ATTACKER-DIM 2xx line
+            # (ext_known_sample). ext_sample is any external line, including
+            # 4xx probes and unknown-dim admin sessions, so it could surface
+            # mismatched ip/path/status/cpsess_token relative to the
+            # ext_2xx_known > 0 condition. ext_known_sample is captured
+            # inside `if (d in known)` so it is always representative.
+            # Defensive fallback to ext_sample shouldn't be reached when
+            # ext_2xx_known > 0.
             # Apache combined-log format: IP - USER [DATE] "METHOD PATH PROTO" STATUS SIZE ...
             # bash =~ uses libc POSIX ERE (supports {n}) -- only awk regex needs gawk floor.
+            local _e_src="${ext_known_sample:-$ext_sample}"
             local _e_ip _e_path _e_status _e_token=""
-            _e_ip=$(printf '%s' "$ext_sample" | awk '{print $1}')
-            _e_path=$(printf '%s' "$ext_sample" | awk -F'"' 'NF>=2{n=split($2," ",p); if(n>=2)print p[2]; else print ""}')
-            _e_status=$(printf '%s' "$ext_sample" | awk -F'"' 'NF>=3{n=split($3," ",p); if(n>=1)print p[1]; else print ""}')
+            _e_ip=$(printf '%s' "$_e_src" | awk '{print $1}')
+            _e_path=$(printf '%s' "$_e_src" | awk -F'"' 'NF>=2{n=split($2," ",p); if(n>=2)print p[2]; else print ""}')
+            _e_status=$(printf '%s' "$_e_src" | awk -F'"' 'NF>=3{n=split($3," ",p); if(n>=1)print p[1]; else print ""}')
             if [[ "$_e_path" =~ /cpsess([0-9]{10})/ ]]; then
                 _e_token="${BASH_REMATCH[1]}"
             fi
@@ -5248,7 +5284,7 @@ check_destruction_iocs() {
                  "ts_epoch_first" "$ts_first_ext" \
                  "ip" "$_e_ip" "path" "$_e_path" "status" "$_e_status" \
                  "cpsess_token" "${_e_token:-}" \
-                 "sample" "${ext_sample:0:200}" \
+                 "sample" "${_e_src:0:200}" \
                  "note" "$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
             ((hits++))
         elif (( ext_2xx_unknown > 0 )); then
