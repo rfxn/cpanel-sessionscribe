@@ -32,18 +32,44 @@ if [[ -z "$ENVELOPE_PATH" ]]; then
     echo "         sessionscribe-ioc-scan.sh --replay <envelope.json|bundle.tgz|bundle-dir>" >&2
     exit 3
 fi
-# Locate ioc-scan: sibling > PATH > current dir.
-SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
+# Locate ioc-scan: sibling (version-checked) > CDN fetch > PATH > current dir.
+# SELF_DIR resolution: BASH_SOURCE[0] is /dev/stdin or /dev/fd/N when run via
+# curl | bash, so the sibling check falls through to the CDN fetch path.
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
 IOC_PATH=""
+# Check sibling — only accept it if it understands --replay (v2.0.0+).
 if [[ -n "$SELF_DIR" && -f "$SELF_DIR/sessionscribe-ioc-scan.sh" ]]; then
-    IOC_PATH="$SELF_DIR/sessionscribe-ioc-scan.sh"
-elif command -v sessionscribe-ioc-scan.sh >/dev/null 2>&1; then
-    IOC_PATH=$(command -v sessionscribe-ioc-scan.sh)
-elif [[ -f "./sessionscribe-ioc-scan.sh" ]]; then
-    IOC_PATH="./sessionscribe-ioc-scan.sh"
-else
-    echo "Error: sessionscribe-ioc-scan.sh not found (sibling, PATH, or .)." >&2
-    echo "       Fetch from https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh" >&2
-    exit 3
+    if grep -q -- '--replay' "$SELF_DIR/sessionscribe-ioc-scan.sh" 2>/dev/null; then
+        IOC_PATH="$SELF_DIR/sessionscribe-ioc-scan.sh"
+    fi
+fi
+# Check current dir (same version guard).
+if [[ -z "$IOC_PATH" && -f "./sessionscribe-ioc-scan.sh" ]]; then
+    if grep -q -- '--replay' "./sessionscribe-ioc-scan.sh" 2>/dev/null; then
+        IOC_PATH="./sessionscribe-ioc-scan.sh"
+    fi
+fi
+# Check PATH.
+if [[ -z "$IOC_PATH" ]] && command -v sessionscribe-ioc-scan.sh >/dev/null 2>&1; then
+    _p=$(command -v sessionscribe-ioc-scan.sh)
+    if grep -q -- '--replay' "$_p" 2>/dev/null; then
+        IOC_PATH="$_p"
+    fi
+fi
+# CDN fetch fallback: when no local v2.0.0+ copy is available (e.g. curl | bash
+# deploy of the shim where only the shim was fetched).
+# SESSIONSCRIBE_IOC_SCAN_URL overrides the CDN URL (useful for pre-release testing).
+if [[ -z "$IOC_PATH" ]]; then
+    _tmpdir=$(mktemp -d 2>/dev/null || { echo "Error: mktemp failed" >&2; exit 3; })
+    _fetched="$_tmpdir/sessionscribe-ioc-scan.sh"
+    _cdn_url="${SESSIONSCRIBE_IOC_SCAN_URL:-https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh}"
+    if curl -fsSL "$_cdn_url" -o "$_fetched" 2>/dev/null && [[ -s "$_fetched" ]]; then
+        IOC_PATH="$_fetched"
+    else
+        rm -rf "$_tmpdir" 2>/dev/null
+        echo "Error: sessionscribe-ioc-scan.sh not found (sibling, PATH, ., CDN)." >&2
+        echo "       Fetch from https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh" >&2
+        exit 3
+    fi
 fi
 exec bash "$IOC_PATH" "$@" --replay "$ENVELOPE_PATH"  # delegates to sessionscribe-ioc-scan.sh
