@@ -15,7 +15,7 @@ Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr
 [![Disclosed](https://img.shields.io/badge/disclosed-2026--04--28-22d3ee?labelColor=09090b)](https://support.cpanel.net/hc/en-us/articles/40073787579671)
 [![License](https://img.shields.io/badge/license-GPL--2.0-22d3ee?labelColor=09090b)](LICENSE)
 
-[Tools](#tools) · [The chain](#the-chain) · [Verify](#verify-yourself) · [Each tool](#each-tool) · [Fleet usage](#fleet-usage) · [Affected builds](#affected-builds) · [Priority order](#priority-order) · [Reporting](#reporting) · [References](#references)
+[Tools](#tools) · [The chain](#the-chain) · [Verify](#verify-yourself) · [Each tool](#each-tool) · [Kill-chain output](#kill-chain-output-ioc-scan---full) · [Fleet usage](#fleet-usage) · [Affected builds](#affected-builds) · [Priority order](#priority-order) · [Reporting](#reporting) · [References](#references)
 
 </div>
 
@@ -67,34 +67,17 @@ bash sessionscribe-mitigate.sh --csv
 
 ## Tools
 
-Six artifacts in the kit. Click a name to jump to its quickstart + reference.
+Five artifacts in the kit. Click a name to jump to its quickstart + reference.
 
 - **[`sessionscribe-mitigate.sh`](#sessionscribe-mitigatesh---mitigation-orchestrator)** - mitigation orchestrator *(on the cPanel host)*
 - **[`modsec-sessionscribe.conf`](#modsec-sessionscribeconf---modsecurity-rule-pack)** - ModSecurity rule pack *(Apache + mod_security2, in front of cpsrvd)*
 - **[`sessionscribe-remote-probe.sh`](#sessionscribe-remote-probesh---non-destructive-verdict-per-host)** - non-destructive remote probe *(anywhere with `curl`)*
-- **[`sessionscribe-ioc-scan.sh`](#sessionscribe-ioc-scansh---on-host-ioc-ladder)** - on-host IOC ladder *(on the cPanel host)*
-- **[`sessionscribe-forensic.sh`](#sessionscribe-forensicsh---kill-chain-reconstruction--evidence-bundle)** - kill-chain reconstruction + evidence bundle *(on the cPanel host)*
+- **[`sessionscribe-ioc-scan.sh`](#sessionscribe-ioc-scansh---on-host-ioc-ladder--kill-chain)** - on-host IOC ladder + kill-chain *(on the cPanel host; `--full` runs detection + forensic phases inline)*
 - **[`sessionscribe-revsnap.sh`](#sessionscribe-revsnapsh---re-snapshot-collector)** - per-tier RE snapshot collector *(on the cPanel host, around `upcp`)*
 
 All artifacts live in this repo on
 [GitHub](https://github.com/rfxn/cpanel-sessionscribe) and are
 `curl`-ready via the raw URLs shown in each section's quickstart. GPL v2.
-
----
-
-## How this compares to public material
-
-The vendor advisory documents the patch boundary; the watchTowr PoC
-demonstrates the primitive. This toolkit fills the operator-side gaps
-in between.
-
-| Capability | Vendor advisory | watchTowr PoC | This toolkit |
-|---|---|---|---|
-| Patched-build list | yes | no | yes - incl. EL6 11.86.0.41, EL6/CL6 110.0.103, tier 124 + WP² 136.1.7 + EOL handling |
-| Remote detection | no | partial - stage 1+2 only, false-positives on patched hosts | full 4-stage chain, deterministic verdict |
-| On-host IOC scan | partial | no | vendor patterns + co-occurrence + forged-timestamp heuristic |
-| Active mitigation | "patch + reboot" | n/a | mitigation orchestrator + ModSec rules + port lockdown |
-| Patch-dissection collateral | no | no | per-tier RE snapshot collector |
 
 ---
 
@@ -458,7 +441,7 @@ Detection mechanism (full chain - default):
 
 </details>
 
-### `sessionscribe-ioc-scan.sh` - on-host IOC ladder
+### `sessionscribe-ioc-scan.sh` - on-host IOC ladder + kill-chain
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash
@@ -619,40 +602,58 @@ Exit codes: 0=PATCHED+CLEAN, 1=VULNERABLE, 2=INCONCLUSIVE, 3=tool error,
 
 </details>
 
-### `sessionscribe-forensic.sh` - deprecation shim (v0.99.0)
+### Kill-chain output (`ioc-scan --full`)
 
-> [!WARNING]
-> **`sessionscribe-forensic.sh` has been merged into `sessionscribe-ioc-scan.sh` v2.0.0.**
-> The standalone forensic script is now a ~50-line deprecation shim. Use
-> `sessionscribe-ioc-scan.sh --full` or `--replay` for new deployments.
-> The shim will be removed in a future release.
+`--full` runs detection then the forensic phases inline (defense timeline,
+offense ingest, reconcile, kill-chain renderer, bundle). On a known-bad
+host the renderer collates every IOC against the defense activations and
+classifies each as **PRE-DEFENSE**, **POST-DEFENSE**, **POST-PARTIAL**, or
+**UNDEFENDED**, then summarises with a verdict + defense-lag headline.
 
-The shim is preserved at the `sh.rfxn.com` and `raw.githubusercontent.com`
-CDN URLs for operators still on the v1.x curl one-liner. It prints a one-line
-deprecation notice (suppressed by `--quiet` or `--jsonl`) and delegates to
-`sessionscribe-ioc-scan.sh --replay <envelope-path>`. The `--quiet` and
-`--jsonl` flags are forwarded to the underlying script.
+Sample (sanitised, from a real lab host post-exploitation):
 
-```bash
-# Still works (shim delegates to ioc-scan --replay):
-curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-forensic.sh | bash
+```
++-- CVE-2026-41940 / IC-5790 --------------------------------------------
+| host         cpanel.example.com ()
+| cpanel       unknown   os unknown
+| verdict      COMPROMISED   score 315   ioc-scan v2.0.0
+| defenses     patch x absent   modsec + up   csf + clean   mitigate + ran
++------------------------------------------------------------------------
 
-# Preferred v2.0.0 equivalent — full kill-chain in one script:
-curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --full
+  |  -- PRE-DEFENSE (32 events) --
+  |  2026-03-25T09:43:19Z  ! pattern init  ioc_attacker_ip_in_access_log         219 hit(s) (last 90d) from IC-5790 IPs - 160 returned 2xx
+  |  2026-04-28T14:35:56Z  ! pattern X     ioc_cve_2026_41940_crlf_access_chain  15 CRLF-bypass chain(s) — POST /login 401 then GET /cpsess<N> 2xx as root within 2s
+  |  2026-04-28T16:38:45Z  ! pattern E     ioc_pattern_e_websocket_shell_hits    45 external IP(s) reached /cpsess*/websocket/Shell with 2xx  (dim: 24x200:1,24x120:2,24x80:42)
+  |  2026-04-29T08:41:22Z  ! pattern F     ioc_pattern_f_smark_envelope          __S_MARK__/__E_MARK__ harvester envelope in /root/.bash_history
+  |  2026-04-29T16:41:24Z  ! pattern A     ioc_pattern_a_ransom_readme           /home/user1/README.md
+  |  2026-04-29T16:41:38Z  ! pattern A     ioc_pattern_a_ransom_readme           /home/user2/README.md
+  |  2026-04-29T16:41:55Z  ! pattern A     ioc_pattern_a_ransom_readme           /home/user3/README.md
+  |  2026-04-29T16:41:56Z  ! pattern A     ioc_pattern_a_ransom_readme           /home/user4/README.md
+  |  …  (22 more Pattern A ransom_readme events across customer homedirs)
+  |  2026-04-29T16:42:09Z  ! pattern A     ioc_pattern_a_sorry_files_present     608 .sorry-encrypted files present
+  |  2026-04-29T17:52:58Z  ! pattern D     ioc_pattern_d_acctlog_encrypted       /var/cpanel/accounting.log.sorry
+  |  2026-04-29T17:53:37Z  ! pattern A     ioc_pattern_a_evidence_targeted       608 .sorry files under /var/log + /var/cpanel
 
-# Replay a saved envelope (re-render kill-chain without re-scanning):
-bash sessionscribe-ioc-scan.sh --replay /var/cpanel/sessionscribe-ioc/<run_id>.json
-bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle-dir>
-bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle>.tgz
+  |  -- DEFENSES --
+  |  2026-04-29T23:48:21Z  + DEFENSE     mitigate_first          sessionscribe-mitigate.sh first run
+  |  2026-04-29T23:48:21Z  + DEFENSE     csf                     csf.conf cpsrvd ports stripped
+  |  2026-04-29T23:48:46Z  + DEFENSE     modsec                  modsec rule 1500030 installed
+  |  2026-04-30T19:12:56Z  + DEFENSE     mitigate_last           sessionscribe-mitigate.sh last run
+
+  |  -- POST-PARTIAL (1 event) --
+  |  2026-04-30T12:23:42Z  ! pattern E     ioc_pattern_e_handoff_burst_present   3 distinct external IPs each minted cpsess + reached websocket Shell within 15-min window
+
+  | HEADLINE
+  |   verdict       COMPROMISED  (score 315)
+  |   defense lag   37d 9h LATE  (first IOC 2026-03-25T09:43:19Z, defense up 37d 9h later)
+  |   attackers     —  (filesystem-only IOCs)
+
+  counters defenses=4  iocs=33  pre=32  undef=0  post=1  attackers=0
+   · forensic_summary                             forensic reconstruction: COMPROMISED_PRE_DEFENSE
 ```
 
 <details>
-<summary><b>Phases + verdicts + bundle layout (now in ioc-scan --full / --replay)</b> (click to expand)</summary>
-
-The forensic phases (previously in `sessionscribe-forensic.sh`) now run
-inline inside `sessionscribe-ioc-scan.sh` when `--full` or `--replay` is
-passed. Phase behavior is identical; see the `sessionscribe-ioc-scan.sh`
-section above for the `--full` / `--replay` flag reference.
+<summary><b>Phases + verdicts + bundle layout</b> (click to expand)</summary>
 
 | Phase | What it does |
 |---|---|
@@ -691,26 +692,6 @@ Typical bundle on a busy cPanel host with the 90-day window: ~250 MB –
 candidates individually so the rest of the bundle still lands.
 
 </details>
-
-### Deprecation: sessionscribe-forensic.sh
-
-As of v2.0.0, all forensic phases (defense timeline, kill-chain, bundle,
-upload) are built into `sessionscribe-ioc-scan.sh`. The migration path:
-
-| v1.x one-liner | v2.0.0 equivalent |
-|---|---|
-| `bash sessionscribe-forensic.sh` | `bash sessionscribe-ioc-scan.sh --full` |
-| `bash sessionscribe-forensic.sh --no-bundle` | `bash sessionscribe-ioc-scan.sh --full --no-bundle` |
-| `bash sessionscribe-forensic.sh --upload` | `bash sessionscribe-ioc-scan.sh --full --upload` |
-| `SESSIONSCRIBE_IOC_JSON=<path> bash sessionscribe-forensic.sh` | `bash sessionscribe-ioc-scan.sh --replay <path>` |
-| `bash sessionscribe-ioc-scan.sh --chain-forensic` | `bash sessionscribe-ioc-scan.sh --full` |
-| `bash sessionscribe-ioc-scan.sh --chain-on-critical` | `bash sessionscribe-ioc-scan.sh --full` (CHAIN_ON_CRITICAL=1) |
-| `bash sessionscribe-ioc-scan.sh --chain-upload` | `bash sessionscribe-ioc-scan.sh --full --upload` |
-
-The `sessionscribe-forensic.sh` v0.99.0 shim is retained at both CDN URLs
-(`sh.rfxn.com` and `raw.githubusercontent.com`) to avoid breaking deployed
-one-liners during the grace period. The shim prints a deprecation notice
-and execs into `ioc-scan --replay`. It will be removed in a future release.
 
 ### `sessionscribe-revsnap.sh` - RE snapshot collector
 

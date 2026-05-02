@@ -6,6 +6,11 @@
 # Pre-codename internal probe variant (superseded by sessionscribe-remote-probe.sh)
 nxesec-whmscribe-b-probe.sh
 
+# Removed in v2.0.0: forensic phases now live inline in
+# sessionscribe-ioc-scan.sh under --full / --replay. The shim is gone;
+# block accidental re-adds.
+sessionscribe-forensic.sh
+
 # Original watchTowr public PoC (saved locally for reference; upstream
 # lives at github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE)
 watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py
