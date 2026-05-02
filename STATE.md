@@ -4,9 +4,9 @@
 
 | Script | Version | Notes |
 |---|---|---|
-| sessionscribe-ioc-scan.sh | **1.8.2** | gawk-3.x compat fixes for the v1.8.0 awk additions: 2-arg `match()` + substr/split (3-arg form is gawk 4.0+) at 5 sites in v1.8.1; explicit char-class repetition replacing `{n}` interval expressions (gawk 3.x default mode disables them) at 6 sites in v1.8.2. Verified end-to-end on host2 (lab host A) — Pattern X `ioc_cve_2026_41940_crlf_access_chain` now emits 15 chains, lands in PRE-DEFENSE under the actual exploit time. Earlier v1.8.0 (uncommitted shape): Pattern A anti-forensic detection, Pattern D `.sorry` fallback + `/var/cpanel/users/$reseller` second-source, Pattern E per-dimension breakout + 15-min handoff-burst signal, deterministic CRLF auth-bypass primitive in access_log, Pattern F embedded `#<epoch>` parsing, ATTACKER_IPS rev4. Prior shipped: v1.7.0 (Pattern H + Pattern I), v1.6.8, v1.6.7. |
-| sessionscribe-forensic.sh | **0.11.0** | `IOC_ANNOTATIONS[]` parallel array; renderer appends `(dim: …)` to Pattern E websocket-shell rows from envelope dimensions field; index alignment maintained at all IOC_PRIMITIVES append sites. Prior shipped: v0.10.1 (Pattern H/I bundle capture), v0.10.0 (stage→pattern vocab refactor + JSONL schema_version=2) |
-| sessionscribe-mitigate.sh | **0.4.0** | anti-forensic awareness in `phase_preflight`: detects `accounting.log.sorry` and warns operator that Pattern D detection is lossy; suggests `/var/cpanel/users/$reseller` direct verification |
+| sessionscribe-ioc-scan.sh | **2.0.0** | (architectural break) Merged sessionscribe-forensic.sh inline. Detection runs in default --triage mode (envelope-only); --full adds forensic phases (defense / offense / reconcile / kill-chain / bundle); --replay PATH replays forensic phases against a saved envelope (.json), bundle directory, or tarball (.tgz). Removed: chain_forensic_dispatch, fetch_forensic_remote (no remote fetch needed). --chain-forensic, --chain-upload, --chain-on-critical preserved as back-compat aliases. Envelope written-then-read on every --full run (same code path as --replay) — envelope contract is now a same-script invariant rather than cross-script handshake. Prior shipped: v1.8.2 (gawk-3.x compat at 6 sites + 5 sites), v1.8.0 (CRLF entry primitive + Pattern A anti-forensic), v1.7.0 (Pattern H + Pattern I). |
+| sessionscribe-forensic.sh | **0.99.0 (deprecation shim)** | ~50-line shim that prints a one-line deprecation notice and execs `sessionscribe-ioc-scan.sh --replay <path>`. Preserves the CDN URL for grace-period clients on the v1.x curl one-liner. --quiet and --jsonl suppress the banner. Will be removed in a future release. |
+| sessionscribe-mitigate.sh | **0.4.0** | (unchanged) anti-forensic awareness in `phase_preflight`. |
 
 CDN sha256 / LOC columns will be re-stamped on next CDN sync. Repo:
 `https://github.com/rfxn/cpanel-sessionscribe`. CDN:
@@ -14,18 +14,31 @@ CDN sha256 / LOC columns will be re-stamped on next CDN sync. Repo:
 
 ## Architecture
 
-Single-source IOC + envelope-driven kill-chain:
+Single-script unified detection + forensic + replay (post-merge v2.0.0):
 
 ```
-sessionscribe-ioc-scan.sh ──► /var/cpanel/sessionscribe-ioc/<run_id>.json
-                                            │
-                                            ▼  SESSIONSCRIBE_IOC_JSON env
-sessionscribe-forensic.sh  ──► defense timeline + reconcile + bundle + intake
+                     ┌──────────── sessionscribe-ioc-scan.sh ───────────┐
+                     │                                                   │
+--triage (default) ──┤  detection ──► /var/cpanel/sessionscribe-ioc/    │
+                     │                <run_id>.json (envelope)           │
+                     │                                                   │
+--full              ─┤  detection ──► envelope ──► forensic phases:    │
+                     │                                defense + offense │
+                     │                                + reconcile +     │
+                     │                                kill-chain +      │
+                     │                                bundle + upload   │
+                     │                                                   │
+--replay PATH       ─┤  envelope (from PATH) ──► forensic phases       │
+                     │                                                   │
+                     └───────────────────────────────────────────────────┘
 ```
 
-ioc-scan is the canonical IOC detector. forensic consumes the envelope
-to construct the kill-chain — it does not re-detect IOCs. Verdict
-divergence between the two is structurally impossible.
+Envelope is written to disk BEFORE forensic phases run (in --full mode) so
+`read_iocs_from_envelope` reads from disk — the same code path used by
+--replay. This makes the envelope contract a same-script invariant.
+
+sessionscribe-forensic.sh is a v0.99.0 deprecation shim that delegates to
+--replay; it preserves the v1.x curl one-liner URL during the grace period.
 
 ## Operator-facing usage
 
@@ -33,15 +46,21 @@ divergence between the two is structurally impossible.
 # triage only (fast, fleet sweep)
 curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash
 
-# triage + kill-chain reconstruction
-curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash /dev/stdin --chain-forensic
+# triage + full kill-chain reconstruction
+curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash /dev/stdin --full
 
 # triage + kill-chain + intake submission
-curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash /dev/stdin --chain-upload
+curl -fsSL https://sh.rfxn.com/sessionscribe-ioc-scan.sh | bash /dev/stdin --full --upload
+
+# replay forensic phases against a saved envelope (re-render kill-chain without re-scanning)
+bash sessionscribe-ioc-scan.sh --replay /var/cpanel/sessionscribe-ioc/<run_id>.json
+bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle-dir>
+bash sessionscribe-ioc-scan.sh --replay /root/.ic5790-forensic/<bundle>.tgz
 ```
 
-When `--chain-forensic` is set, forensic's defense / offense / reconcile
-output now flows inline to the operator (suppressed in v0.8.x and earlier).
+In `--full` mode, detection and forensic phases run in a single process.
+The envelope is written before forensic phases run so `--replay` and `--full`
+use the same read path — envelope contract is a same-script invariant.
 
 ## Envelope contract
 
@@ -73,12 +92,12 @@ priority chain: `ts_epoch_first` → `mtime_epoch` → `ts_epoch` →
 
 ## Pending
 
-- **Phase 4 verification:** re-run on lab hosts (see INTERNAL-NOTES.md
-  for the active roster). Forensic should reproduce ioc-scan's
-  host_verdict exactly. Any divergence is an envelope-contract bug.
 - **schema_version field at envelope root:** future-proofing per the
-  v0.9 risk register. Not yet pinned. forensic v0.10.x+ reads any v1.6.x or v1.7.x or v1.8.x
-  envelope.
+  v0.9 risk register. Not yet pinned. ioc-scan v2.0.0 reads any v1.6.x, v1.7.x, or v1.8.x
+  envelope in --replay mode.
+- **sessionscribe-forensic.sh removal:** the v0.99.0 deprecation shim will be
+  removed in a future release once grace-period operators have migrated to
+  `ioc-scan --replay`.
 
 ## Bash floor
 

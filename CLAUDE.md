@@ -301,3 +301,60 @@ grep -nE 'match\([^,]+,[^,]+,[^)]+\)' sessionscribe-ioc-scan.sh
 Run on a real CL6/EL6 box (cpanel_client tmux session in operator
 memory). gawk version on the lab can be confirmed with `awk --version`
 — must be `3.1.x` for floor validation.
+
+---
+
+## Merged-script architecture (v2.0.0+)
+
+As of v2.0.0, `sessionscribe-forensic.sh` is merged into
+`sessionscribe-ioc-scan.sh`. The two-script chain (with envelope-as-IPC)
+is replaced by a single script with three operator-facing modes:
+
+| Mode | Flag | What it does |
+|---|---|---|
+| Triage (default) | (none) or `--triage` | Detection only; writes envelope to `/var/cpanel/sessionscribe-ioc/<run_id>.json`. No defense timeline, kill-chain, or bundle. |
+| Full | `--full` | Detection + forensic phases (defense / offense / reconcile / kill-chain / bundle / upload). |
+| Replay | `--replay PATH` | Skip detection; replay forensic against a saved envelope (`.json`), bundle directory, or `.tgz`. |
+
+### Envelope read-after-write contract
+
+In `--full` mode the envelope is written to disk BEFORE forensic phases
+run, then `phase_offense` reads it back via the same code path used by
+`--replay`. This makes the envelope contract a same-script invariant —
+any divergence between detection's signals and forensic's view of them
+is impossible by construction (single source, single read path).
+
+### Back-compat aliases
+
+The v1.x chain flags continue to work — they map to `--full` plus the
+matching gate flag:
+
+| v1.x flag | v2.0.0 equivalent |
+|---|---|
+| `--chain-forensic` | `--full` (no host-verdict gate) |
+| `--chain-on-critical` | `--full` + `CHAIN_ON_CRITICAL=1` (skip if HOST_VERDICT != COMPROMISED) |
+| `--chain-upload` | `--full --upload` |
+
+### Forensic-area signals
+
+Forensic phases emit signals via `emit_signal()` (a thin wrapper around
+the canonical `emit()`) under these new `area` values: `defense`,
+`offense`, `reconcile`, `bundle`, `upload`, `summary`. The severity
+vocabulary maps:
+
+| forensic severity | emit() severity | weight |
+|---|---|---|
+| `pass`, `info` | `info` | 0 |
+| `warn` | `warning` | 4 |
+| `fail` | `strong` | 10 |
+
+All forensic findings flow into the unified `SIGNALS[]` stream and
+appear in the same envelope as detection signals.
+
+### Deprecation shim
+
+`sessionscribe-forensic.sh` is now a ~50-line v0.99.0 shim that prints
+a one-line deprecation notice and `exec`s
+`sessionscribe-ioc-scan.sh --replay <path>`. It preserves the
+`sh.rfxn.com` and `raw.githubusercontent.com` URLs for operators still
+on the v1.x curl one-liner. The shim will be removed in a future release.
