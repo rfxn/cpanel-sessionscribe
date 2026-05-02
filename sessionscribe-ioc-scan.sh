@@ -3597,9 +3597,11 @@ check_attacker_ips() {
             probe_re = ENVIRON["PROBE_RE"]
             n = split(ENVIRON["EXCLUDES"], ex_arr, "\n")
             for (i = 1; i <= n; i++) if (ex_arr[i] != "") ex[ex_arr[i]] = 1
-            total = 0; h2xx = 0; h3xx = 0; h4xx = 0; hother = 0
+            total = 0; h2xx = 0; h2xx_cpsess = 0; h2xx_recon = 0
+            h3xx = 0; h4xx = 0; hother = 0
             nsamp = 0; ts_first = 0
             historical_drops = 0
+            cpsess_sample = ""
         }
         {
             src  = $1
@@ -3615,6 +3617,18 @@ check_attacker_ips() {
                 s = substr(line, RSTART + 2)
                 split(s, ss, " ")
                 st = ss[1]
+            }
+
+            # Extract path from Apache combined log quoted request field.
+            # Format: IP - USER [DATE] "METHOD PATH PROTO" STATUS ...
+            # gawk 3.1.x (CL6 floor): 2-arg match() + substr only.
+            path = ""
+            if (match(line, /"[A-Z]+ /)) {
+                _req = substr(line, RSTART + 1)
+                _qend = index(_req, "\"")
+                if (_qend > 0) _req = substr(_req, 1, _qend - 1)
+                _n = split(_req, _rp, " ")
+                if (_n >= 2) path = _rp[2]
             }
 
             ts = 0
@@ -3639,10 +3653,23 @@ check_attacker_ips() {
             if (ts > 0 && (ts_first == 0 || ts < ts_first)) ts_first = ts
 
             total++
-            if      (st ~ /^2/) h2xx++
-            else if (st ~ /^3/) h3xx++
-            else if (st ~ /^4/) h4xx++
-            else                hother++
+            if (st ~ /^2/) {
+                h2xx++
+                # cpsess-split: exactly 10 digits after /cpsess followed by /.
+                # gawk 3.x floor: no {10} interval - use explicit repetition.
+                if (match(path, /\/cpsess[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]\//)) {
+                    h2xx_cpsess++
+                    if (cpsess_sample == "") cpsess_sample = line
+                } else {
+                    h2xx_recon++
+                }
+            } else if (st ~ /^3/) {
+                h3xx++
+            } else if (st ~ /^4/) {
+                h4xx++
+            } else {
+                hother++
+            }
 
             if (nsamp < 5) {
                 nsamp++
@@ -3650,17 +3677,30 @@ check_attacker_ips() {
             }
         }
         END {
-            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
-                total, h2xx, h3xx, h4xx, hother, ts_first, historical_drops
+            printf "TOTALS\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n", \
+                total, h2xx, h2xx_cpsess, h2xx_recon, h3xx, h4xx, hother, ts_first
+            printf "DROPS\t%d\n", historical_drops
+            printf "CPSESS_SAMPLE\t%s\n", cpsess_sample
         }' > "$tmp" 2>/dev/null
 
-    local total=0 h2xx=0 h3xx=0 h4xx=0 hother=0 ts_first=0 historical_drops=0
+    local total=0 h2xx=0 h2xx_cpsess=0 h2xx_recon=0
+    local h3xx=0 h4xx=0 hother=0 ts_first=0 historical_drops=0
+    local cpsess_sample=""
     local totals_line; totals_line=$(grep '^TOTALS' "$tmp" 2>/dev/null | head -1)
     if [[ -n "$totals_line" ]]; then
-        IFS=$'\t' read -r _ total h2xx h3xx h4xx hother ts_first historical_drops \
+        IFS=$'\t' read -r _ total h2xx h2xx_cpsess h2xx_recon h3xx h4xx hother ts_first \
             <<< "$totals_line"
     fi
+    local drops_line; drops_line=$(grep '^DROPS' "$tmp" 2>/dev/null | head -1)
+    if [[ -n "$drops_line" ]]; then
+        IFS=$'\t' read -r _ historical_drops <<< "$drops_line"
+    fi
+    local cpsess_line; cpsess_line=$(grep '^CPSESS_SAMPLE' "$tmp" 2>/dev/null | head -1)
+    if [[ -n "$cpsess_line" ]]; then
+        cpsess_sample="${cpsess_line#CPSESS_SAMPLE	}"
+    fi
     total="${total:-0}"; h2xx="${h2xx:-0}"
+    h2xx_cpsess="${h2xx_cpsess:-0}"; h2xx_recon="${h2xx_recon:-0}"
     h3xx="${h3xx:-0}"; h4xx="${h4xx:-0}"; hother="${hother:-0}"; ts_first="${ts_first:-0}"
     historical_drops="${historical_drops:-0}"
 
@@ -3679,26 +3719,48 @@ check_attacker_ips() {
     fi
 
     if (( total > 0 )); then
-        # Only 2xx is exploitation. 4xx/3xx is probing - SUSPICIOUS, not
-        # COMPROMISED.
-        local sev parent_note window_note=""
-        [[ -n "${SINCE_DAYS:-}" ]] && window_note=" (last ${SINCE_DAYS}d"
-        (( historical_drops > 0 )) && window_note="${window_note}; $historical_drops older hit(s) excluded by --since"
-        [[ -n "$window_note" ]] && window_note="${window_note})"
-        if (( h2xx > 0 )); then
-            sev="strong"
-            parent_note="$total hit(s)${window_note} from IC-5790 IPs - $h2xx returned 2xx (EXPLOITATION EVIDENCE - CRITICAL)"
-        else
-            sev="warning"
-            parent_note="$total hit(s)${window_note} from IC-5790 IPs - all rejected ($h4xx 4xx, $h3xx 3xx, $hother other) - probing only, no successful response (REVIEW)"
+        # cpsess-split: three-way emit depending on where the 2xx hits landed.
+        #   h2xx_cpsess > 0 → strong  (2xx on /cpsess<10digits>/ = real exploitation)
+        #   h2xx_recon  > 0 → info    (2xx on other paths = reconnaissance only)
+        #   total > 0, 4xx only → warning (probing, all rejected)
+        # The legacy ioc_attacker_ip_in_access_log strong emit is REPLACED by
+        # this chain; it no longer fires at strong severity for any path.
+        if (( h2xx_cpsess > 0 )); then
+            # Parse structured fields from first cpsess-2xx sample line.
+            local _c_ip _c_path _c_status _c_token=""
+            _c_ip=$(printf '%s' "$cpsess_sample" | awk '{print $1}')
+            _c_path=$(printf '%s' "$cpsess_sample" | awk -F'"' 'NF>=2{n=split($2," ",p); if(n>=2)print p[2]; else print ""}')
+            _c_status=$(printf '%s' "$cpsess_sample" | awk -F'"' 'NF>=3{n=split($3," ",p); if(n>=1)print p[1]; else print ""}')
+            if [[ "$_c_path" =~ /cpsess([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])/ ]]; then
+                _c_token="${BASH_REMATCH[1]}"
+            fi
+            emit "logs" "ioc_attacker_ip_2xx_on_cpsess" "strong" \
+                 "ioc_attacker_ip_2xx_on_cpsess" 8 \
+                 "count" "$total" "hits_2xx_cpsess" "$h2xx_cpsess" \
+                 "hits_2xx_recon" "$h2xx_recon" "hits_3xx" "$h3xx" \
+                 "hits_4xx" "$h4xx" "hits_other" "$hother" \
+                 "historical_drops" "$historical_drops" \
+                 "ts_epoch_first" "$ts_first" \
+                 "ip" "$_c_ip" "path" "$_c_path" "status" "$_c_status" \
+                 "cpsess_token" "${_c_token:-}" \
+                 "note" "$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
+        elif (( h2xx_recon > 0 )); then
+            emit "logs" "ioc_attacker_ip_recon_only" "info" \
+                 "ioc_attacker_ip_recon_only" 0 \
+                 "count" "$total" "hits_2xx_recon" "$h2xx_recon" \
+                 "hits_3xx" "$h3xx" "hits_4xx" "$h4xx" "hits_other" "$hother" \
+                 "historical_drops" "$historical_drops" \
+                 "ts_epoch_first" "$ts_first" \
+                 "note" "$h2xx_recon hit(s) from IC-5790 IPs returned 2xx on non-cpsess paths - reconnaissance only (REVIEW)."
+        elif (( total > 0 )); then
+            emit "logs" "ioc_attacker_ip_probes_only" "warning" \
+                 "ioc_attacker_ip_in_access_log_probes_only" 3 \
+                 "count" "$total" "hits_4xx" "$h4xx" "hits_3xx" "$h3xx" \
+                 "hits_other" "$hother" \
+                 "historical_drops" "$historical_drops" \
+                 "ts_epoch_first" "$ts_first" \
+                 "note" "$total hit(s) from IC-5790 IPs - all rejected (probing only, no successful response)."
         fi
-        emit "logs" "ioc_attacker_ip" "$sev" \
-             "ioc_attacker_ip_in_access_log" 8 \
-             "count" "$total" "hits_2xx" "$h2xx" "hits_3xx" "$h3xx" \
-             "hits_4xx" "$h4xx" "hits_other" "$hother" \
-             "historical_drops" "$historical_drops" \
-             "ts_epoch_first" "$ts_first" \
-             "note" "$parent_note"
 
         local tag src ip st ts line trim
         while IFS=$'\t' read -r tag src ip st ts line; do
@@ -3707,7 +3769,7 @@ check_attacker_ips() {
             emit "logs" "ioc_attacker_ip_sample" "info" "ioc_attacker_ip_sample" 0 \
                  "ip" "$ip" "status" "$st" "log_file" "$logdir/$src" \
                  "ts_epoch" "${ts:-0}" "line" "$trim" \
-                 "note" "$ip → $st  ($src)"
+                 "note" "$ip $st  ($src)"
         done < "$tmp"
     fi
     rm -f "$tmp"
