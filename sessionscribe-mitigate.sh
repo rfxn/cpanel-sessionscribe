@@ -84,7 +84,7 @@
 
 set -u
 
-VERSION="0.3.1"
+VERSION="0.4.0"
 
 ###############################################################################
 # Constants
@@ -656,6 +656,30 @@ phase_preflight() {
     phase_begin preflight
 
     local actions=0 warns=0
+
+    # Anti-forensic awareness: Pattern A's encryptor specifically targets
+    # forensic-evidence files in /var/log + /var/cpanel. The most load-
+    # bearing of these for our detection chain is /var/cpanel/accounting.log
+    # (Pattern D persistence evidence: createacct/setupreseller/setacls
+    # rows for the attacker reseller). If the live file is missing but the
+    # .sorry-encrypted variant exists, surface a strong operator advisory
+    # so they don't trust a clean Pattern D verdict; ioc-scan v1.8.0+
+    # emits ioc_pattern_d_acctlog_encrypted as a parallel signal.
+    sk evidence_destruction
+    local acct_live=/var/cpanel/accounting.log
+    local acct_sorry=/var/cpanel/accounting.log.sorry
+    if [[ ! -f "$acct_live" && -f "$acct_sorry" ]]; then
+        local sorry_count=0
+        sorry_count=$(find /var/log /var/cpanel -maxdepth 6 -name '*.sorry' \
+                          -not -path '*/imunify360/cache/*' 2>/dev/null | wc -l)
+        sorry_count="${sorry_count// /}"
+        say_warn "Pattern A evidence destruction: $acct_sorry exists (${sorry_count} .sorry files in /var/log+/var/cpanel) - Pattern D detection lossy on this host; verify reseller via /var/cpanel/users/sptadm directly."
+        warns=$((warns+1))
+    elif [[ -f "$acct_live" ]]; then
+        say_pass "$acct_live present (no Pattern A evidence destruction detected)"
+    else
+        say_info "$acct_live not present (host may not have run reseller-creating WHM operations)"
+    fi
 
     # 2a: threatdown.repo (and similar) removal.
     local f
