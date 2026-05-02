@@ -2730,18 +2730,20 @@ phase_bundle() {
     # record is preserved (operator-facing stdout is not captured); without
     # this, an offline analyst can see the kill-chain reconciliation but not
     # the source per-signal evidence ioc-scan emitted. KB-sized, always safe
-    # to bundle. Only present when chained from ioc-scan.
-    if [[ -n "${SESSIONSCRIBE_IOC_JSON:-}" && -f "$SESSIONSCRIBE_IOC_JSON" ]]; then
-        if cp "$SESSIONSCRIBE_IOC_JSON" "$bdir/ioc-scan-envelope.json" 2>/dev/null; then
+    # to bundle. In --full mode ENVELOPE_PATH is the authoritative source;
+    # SESSIONSCRIBE_IOC_JSON is the legacy shim path (kept for back-compat).
+    local _env_src="${ENVELOPE_PATH:-${SESSIONSCRIBE_IOC_JSON:-}}"
+    if [[ -n "$_env_src" && -f "$_env_src" ]]; then
+        if cp "$_env_src" "$bdir/ioc-scan-envelope.json" 2>/dev/null; then
             chmod 0600 "$bdir/ioc-scan-envelope.json" 2>/dev/null
             local env_size
             env_size=$(stat -c %s "$bdir/ioc-scan-envelope.json" 2>/dev/null)
             emit_signal bundle info ioc_envelope_captured \
                 "ioc-scan envelope copied to bundle (${env_size:-?} bytes)" \
-                src "$SESSIONSCRIBE_IOC_JSON" dest "ioc-scan-envelope.json" bytes "${env_size:-0}"
+                src "$_env_src" dest "ioc-scan-envelope.json" bytes "${env_size:-0}"
         else
             emit_signal bundle warn ioc_envelope_copy_failed \
-                "could not copy ioc-scan envelope into bundle" src "$SESSIONSCRIBE_IOC_JSON"
+                "could not copy ioc-scan envelope into bundle" src "$_env_src"
         fi
     fi
 
