@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v1.6.7
+# sessionscribe-ioc-scan.sh v1.6.8
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -103,7 +103,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="1.6.7"
+VERSION="1.6.8"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Tier 130
 # moved from "no in-place patch" to patched (11.130.0.18) in the post-disclosure
@@ -120,8 +120,10 @@ UNPATCHED_TIERS="112 114 116 120 122 124 128"
 ACL_STRINGS_PATTERN='init_acls|checkacl|clear_acls|filter_acls|_dynamic_acl_update|acls_are_initialized|load_dynamic_acl_cache_if_current|_get_dynamic_acl_lists|get_default_acls|Whostmgr::ACLS'
 
 # Automated user-agent pattern for the IOC log scan. Loose-match any of these
-# on /json-api/* against cpsrvd ports.
-IOC_AUTOMATED_UA='python-requests|^curl/|Go-http-client|libwww-perl|aiohttp|okhttp|httpx'
+# on /json-api/* against cpsrvd ports. l9scan catches LeakIX-flavored
+# Mozilla UAs (full UA: "Mozilla/5.0 (l9scan/...; +https://leakix.net)") -
+# the substring is unique enough to not FP on real-browser Mozilla rows.
+IOC_AUTOMATED_UA='python-requests|^curl/|Go-http-client|libwww-perl|aiohttp|okhttp|httpx|l9scan'
 
 # cpsrvd ports that the WebPros-published IOC pattern landed on.
 CPSRVD_PORT_RE='^(2082|2083|2086|2087|2095|2096)$'
@@ -190,9 +192,13 @@ PATTERN_D_DOMAIN="4ef72197.cpx.local"
 PATTERN_D_EMAIL="a@exploit.local"
 PATTERN_D_TOKEN_NAME="WHM_FullRoot"
 
-# Pattern E - websocket/Shell access-log signature. The 24x80 dimension is
-# the script-kiddie automated default; 24x120 has been seen too. The path
-# pattern (cpsess token + /websocket/Shell) is what matters.
+# Pattern E - websocket/Shell access-log signature. Three operator
+# dimensions distinguish actor in the IC-5790 cohort (rev 3 dossier):
+#   24x80   - graceworkz / 192.81.219.190 (Pattern E original, automated)
+#   24x120  - graceworkz / 149.102.229.144 (secondary operator)
+#   24x134  - quickfix17 / 183.82.160.147 (DEC 2025, pre-disclosure)
+# Detection regex is dimension-agnostic so any rows=N&cols=M lands here;
+# operator attribution comes from dimension+IP+UA combination at triage.
 PATTERN_E_WS_RE='GET /cpsess[0-9]+/websocket/Shell'
 
 # Pattern F - automated harvester wrap. The __S_MARK__/__E_MARK__ envelope
@@ -1744,6 +1750,18 @@ check_destruction_iocs() {
     section "Destruction IOC scan (Patterns A-G)"
     local hits=0
 
+    # History files swept by Pattern F harvester and Pattern H markers
+    # (kill-prelude, ALLDONE). Bash + zsh + sh + fish, root + every cPanel
+    # user. Empty globs expand to literal pattern; grep handles missing
+    # paths via 2>/dev/null. Hoisted once so both pattern blocks share
+    # a single source of truth.
+    local HISTORY_FILES_GLOB=(
+        /root/.bash_history /root/.zsh_history /root/.sh_history
+        /root/.local/share/fish/fish_history
+        /home/*/.bash_history /home/*/.zsh_history /home/*/.sh_history
+        /home/*/.local/share/fish/fish_history
+    )
+
     # ---- Pattern A: /root/sshd encryptor + .sorry + ransom README + C2 ---
     if [[ -f "$PATTERN_A_BINARY" ]]; then
         local actual_sha="" bin_mtime
@@ -1853,9 +1871,15 @@ check_destruction_iocs() {
             ((hits++))
         fi
     fi
-    # BTC index.html drops across /home users. One glob, one grep.
+    # BTC index.html drops across /home users. IC-5790 rev3: graceworkz
+    # showed nested drops at /home/<user>/public_html/{banks,ois,sales,
+    # shop}/index.html. -maxdepth 4 bounds the walk; -name index.html
+    # filters before reading. -print0 + xargs -0 keeps a malicious user
+    # dir name from breaking the pipeline. find errors quiet via 2>/dev/null
+    # when /home/*/public_html glob is empty.
     local btc_hit=""
-    btc_hit=$(grep -lF "$PATTERN_B_BTC_ADDR" /home/*/public_html/index.html 2>/dev/null | head -1)
+    btc_hit=$(find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
+                | xargs -0 grep -lF "$PATTERN_B_BTC_ADDR" 2>/dev/null | head -1)
     if [[ -n "$btc_hit" ]]; then
         local btc_mtime
         btc_mtime=$(stat -c %Y "$btc_hit" 2>/dev/null)
@@ -1995,9 +2019,10 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern F: __S_MARK__ harvester envelope -----------------------
+    # IC-5790 dossier rev3: harvester reads bash/zsh/sh/fish histories.
+    # HISTORY_FILES_GLOB hoisted at the top of this function covers all four.
     local f_hit=""
-    f_hit=$(grep -lF "$PATTERN_F_S_MARK" \
-                /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
+    f_hit=$(grep -lF "$PATTERN_F_S_MARK" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
     if [[ -n "$f_hit" ]]; then
         local f_mtime
         f_mtime=$(stat -c %Y "$f_hit" 2>/dev/null)
