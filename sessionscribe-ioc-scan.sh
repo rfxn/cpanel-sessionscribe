@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -152,6 +152,19 @@ PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
 # Forgery cleartext like `pass=x` is single-digit. Anything below this floor
 # combined with successful_*_auth_with_timestamp is treated as forgery evidence.
 PASS_FORGERY_MAX_LEN=12
+
+# Session-file mtime/ctime divergence threshold (seconds). cpsrvd's
+# write-session path sets both timestamps atomically, so a legitimate
+# session has mtime == ctime to the second. Divergence of this magnitude
+# means something modified the file's mtime separately - typically
+# `touch -d <past>` to backdate (the testdev.halcyonplatinum.com pattern:
+# mtime 5 months in the past, ctime current) or `touch -d <future>` to
+# forward-date. 600s gives generous margin for any normal write/sync
+# anomaly while still catching minutes-to-months backdating. Used as an
+# advisory-tier flag (no verdict escalation) so backup-restore artifacts
+# (cp -p / tar xp / rsync -t) on a clean host don't false-positive
+# COMPROMISED. See v3/v4 ioc-scan recommendations Gap 10.
+SESSION_MTIME_CTIME_THRESHOLD_SEC=600
 
 # Probe-traffic exclusion. Both the local-marker probe (this script) and the
 # remote probe (sessionscribe-remote-probe.sh) emit distinctive UAs so their
@@ -3914,8 +3927,15 @@ check_crlf_access_primitive() {
 #   src_ip       peer IP (address= or remote_addr=, first occurrence)
 #   login_time   login_time= as ISO-8601 UTC (CAN be forged via injection;
 #                compare against file_mtime to detect)
-#   file_mtime   session file mtime as ISO-8601 UTC (NOT forgeable in
-#                this exploit class - reflects actual cpsrvd write)
+#   file_mtime   session file mtime as ISO-8601 UTC (CAN be backdated by
+#                `touch -d` post-write; compare against file_ctime to detect)
+#   file_ctime   session file ctime as ISO-8601 UTC (NOT backdateable by
+#                user-space tools - touch updates ctime to wall-clock).
+#                Legitimate cpsrvd writes have file_mtime == file_ctime.
+#   mtime_ctime_delta_sec   signed seconds (mtime - ctime). Empty when
+#                stat could not provide both; non-zero magnitude means
+#                the mtime was modified separately from the file content
+#                (touch -d forgery, cp -p / tar xp restore artifact).
 #
 # Args identical to emit() minus the area (always "sessions"):
 #   emit_session <key> <severity> <signal> <weight> [k v ...]
@@ -3927,6 +3947,8 @@ emit_session() {
         "src_ip"     "${SF_REMOTE_ADDR:-}" \
         "login_time" "${SF_LOGIN_ISO:-}" \
         "file_mtime" "${SF_FILE_MTIME_ISO:-}" \
+        "file_ctime" "${SF_FILE_CTIME_ISO:-}" \
+        "mtime_ctime_delta_sec" "${SF_MTIME_CTIME_DELTA:-}" \
         "$@"
 }
 
@@ -3947,18 +3969,42 @@ analyze_session() {
     #   SF_LOGIN_ISO    login_time formatted as ISO-8601 UTC (operator-friendly)
     #   SF_FILE_MTIME   file mtime epoch (last write to disk)
     #   SF_FILE_MTIME_ISO   file mtime as ISO-8601 UTC
+    #   SF_FILE_CTIME   file ctime epoch (last inode metadata change; cannot
+    #                   be backdated by user-space tools - touch updates
+    #                   mtime + atime but ctime tracks the touch itself)
+    #   SF_FILE_CTIME_ISO   file ctime as ISO-8601 UTC
+    #   SF_MTIME_CTIME_DELTA   signed (mtime - ctime) seconds; "" if either
+    #                   timestamp is missing or non-numeric. Used downstream
+    #                   to detect mtime-forgery (Gap 10 IOC).
     SF_USER="";        SF_REMOTE_ADDR=""
     SF_LOGIN_TIME="";  SF_LOGIN_ISO=""
     SF_FILE_MTIME="";  SF_FILE_MTIME_ISO=""
+    SF_FILE_CTIME="";  SF_FILE_CTIME_ISO=""
+    SF_MTIME_CTIME_DELTA=""
 
-    # Capture file mtime BEFORE reading the file content (stat is read-only
-    # so atime is unaffected, but pull both file timestamps now so they're
-    # available for every emit downstream).
+    # Capture file mtime + ctime BEFORE reading the file content (stat is
+    # read-only so atime is unaffected). Single stat call avoids a second
+    # subprocess per session. `%Y %Z` returns "<mtime_epoch> <ctime_epoch>"
+    # space-separated. Parameter-expansion split (no read needed).
     local _sf_path="$1"
     if [[ -e "$_sf_path" ]]; then
-        SF_FILE_MTIME=$(stat -c %Y "$_sf_path" 2>/dev/null)
-        if [[ -n "$SF_FILE_MTIME" ]]; then
-            SF_FILE_MTIME_ISO=$(date -u -d "@$SF_FILE_MTIME" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+        local _times
+        _times=$(stat -c '%Y %Z' "$_sf_path" 2>/dev/null)
+        if [[ -n "$_times" ]]; then
+            SF_FILE_MTIME="${_times%% *}"
+            SF_FILE_CTIME="${_times##* }"
+            if [[ "$SF_FILE_MTIME" =~ ^[0-9]+$ ]]; then
+                SF_FILE_MTIME_ISO=$(date -u -d "@$SF_FILE_MTIME" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+            fi
+            if [[ "$SF_FILE_CTIME" =~ ^[0-9]+$ ]]; then
+                SF_FILE_CTIME_ISO=$(date -u -d "@$SF_FILE_CTIME" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+            fi
+            # Compute signed delta only when both timestamps parsed cleanly.
+            # Empty SF_MTIME_CTIME_DELTA means "delta unknown" (vs. "delta = 0"
+            # which would falsely imply known-equal); downstream uses "" guard.
+            if [[ "$SF_FILE_MTIME" =~ ^[0-9]+$ && "$SF_FILE_CTIME" =~ ^[0-9]+$ ]]; then
+                SF_MTIME_CTIME_DELTA=$((SF_FILE_MTIME - SF_FILE_CTIME))
+            fi
         fi
     fi
 
@@ -4143,6 +4189,11 @@ check_sessions() {
     fi
     local raw_dir="$d/raw" preauth_dir="$d/preauth"
     local scanned=0 ioc_hits=0 anomalous=0 probe_artifacts=0
+    # Gap 10: count of sessions whose mtime diverges from ctime by
+    # >= SESSION_MTIME_CTIME_THRESHOLD_SEC (touch-d forgery candidates,
+    # cp -p / tar xp restore artifacts). Surfaced as advisory both
+    # per-session and as a section-level summary.
+    local mtime_anomalies=0
     local f session_name preauth_file
     local now_epoch; now_epoch=$(date -u +%s 2>/dev/null || echo 0)
 
@@ -4387,6 +4438,39 @@ check_sessions() {
                      "note" "Failed CVE-2026-41940 attempt: badpass origin + token_denied + pass= line + no auth markers - injection did not promote (REVIEW)."
                 ((ioc_hits++))
             fi
+
+            # Gap 10: session_mtime_vs_ctime_anomaly (forensic enrichment).
+            # cpsrvd's session writer sets mtime and ctime atomically via a
+            # single write(2)+fsync(2) - legitimate sessions have mtime ==
+            # ctime to the second. A delta of THRESHOLD seconds means the
+            # mtime was modified separately from the file content - the
+            # signature pattern is `touch -d <past>` to backdate (testdev.
+            # halcyonplatinum.com case: mtime 5 months before ctime, which
+            # falsely anchored cluster-onset analysis 4.5 months before the
+            # real campaign start). Severity is `advisory` (weight 0): does
+            # NOT escalate host_verdict. False positives include cp -p /
+            # tar xp / rsync -t backup-restore (which preserve mtime but
+            # reset ctime to NOW); the section-level summary count helps
+            # operators distinguish single-session forgery from fleet-wide
+            # restore artifacts.
+            if [[ -n "$SF_MTIME_CTIME_DELTA" ]]; then
+                local _abs_delta="${SF_MTIME_CTIME_DELTA#-}"
+                if [[ "$_abs_delta" =~ ^[0-9]+$ ]] \
+                   && (( _abs_delta >= SESSION_MTIME_CTIME_THRESHOLD_SEC )); then
+                    local _direction="backdated"
+                    (( SF_MTIME_CTIME_DELTA > 0 )) && _direction="future"
+                    emit_session "session_mtime_anomaly_$session_name" "advisory" \
+                         "session_mtime_vs_ctime_anomaly" 0 \
+                         "path" "$f" \
+                         "mtime_epoch" "${SF_FILE_MTIME:-}" \
+                         "ctime_epoch" "${SF_FILE_CTIME:-}" \
+                         "delta_sec" "$SF_MTIME_CTIME_DELTA" \
+                         "abs_delta_sec" "$_abs_delta" \
+                         "direction" "$_direction" \
+                         "note" "Session file mtime $_direction ${_abs_delta}s vs ctime - timestamp not trustworthy for cluster-onset analysis (touch -d backdating, or cp -p / tar xp restore artifact). Hand-investigate."
+                    ((mtime_anomalies++))
+                fi
+            fi
         done
     fi
 
@@ -4442,7 +4526,23 @@ check_sessions() {
              "note" "$probe_artifacts session(s) tagged with sessionscribe-remote-probe canary - clear with: sessionscribe-remote-probe.sh --cleanup | ssh root@host"
     fi
 
-    if (( ioc_hits == 0 && anomalous == 0 )); then
+    # Gap 10: section-level mtime-anomaly summary. Surfaced even when no
+    # other IOCs fired so a host with quietly-backdated sessions doesn't
+    # get a "no_session_iocs" all-clear. The count lets fleet aggregators
+    # distinguish single-session forgery (likely real) from fleet-wide
+    # restore artifacts (mass cp -p / tar xp - many sessions affected).
+    if (( mtime_anomalies > 0 )); then
+        emit "sessions" "session_mtime_anomaly_summary" "advisory" \
+             "session_mtime_vs_ctime_anomaly_count" 0 \
+             "count" "$mtime_anomalies" "scanned" "$scanned" \
+             "threshold_sec" "$SESSION_MTIME_CTIME_THRESHOLD_SEC" \
+             "note" "$mtime_anomalies of $scanned session(s) had mtime/ctime divergence >= ${SESSION_MTIME_CTIME_THRESHOLD_SEC}s - mtime is untrustworthy for cluster-onset analysis on these sessions (could be touch-d injection or cp -p / tar xp restore artifact)."
+    fi
+
+    # The all-clear emit covers IOC-ladder + anomalous-shape + mtime-anomaly
+    # cohorts. mtime_anomalies is included in the gate so a host with quietly-
+    # backdated sessions but no other signals does not falsely assert no_session_iocs.
+    if (( ioc_hits == 0 && anomalous == 0 && mtime_anomalies == 0 )); then
         emit "sessions" "session_scan" "info" "no_session_iocs" 0 \
              "scanned" "$scanned" "probe_artifacts" "$probe_artifacts" \
              "note" "no IOCs or anomalous-shape sessions found"
