@@ -1243,18 +1243,20 @@ read_envelope_meta() {
 
 ioc_primitive_row() {
     local area="$1" ip="$2" path="$3" log_file="$4" count="$5" h2xx="$6" status="$7" line="$8"
+    local cpsess_token="${9:-}"
     local clean="${line//$'\t'/ }"
     clean="${clean//$'\n'/ }"
     clean="${clean//$'\r'/ }"
-    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s' \
-        "${area:-}"     "$PRIM_SEP" \
-        "${ip:-}"       "$PRIM_SEP" \
-        "${path:-}"     "$PRIM_SEP" \
-        "${log_file:-}" "$PRIM_SEP" \
-        "${count:-}"    "$PRIM_SEP" \
-        "${h2xx:-}"     "$PRIM_SEP" \
-        "${status:-}"   "$PRIM_SEP" \
-        "$clean"
+    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s' \
+        "${area:-}"         "$PRIM_SEP" \
+        "${ip:-}"           "$PRIM_SEP" \
+        "${path:-}"         "$PRIM_SEP" \
+        "${log_file:-}"     "$PRIM_SEP" \
+        "${count:-}"        "$PRIM_SEP" \
+        "${h2xx:-}"         "$PRIM_SEP" \
+        "${status:-}"       "$PRIM_SEP" \
+        "$clean"            "$PRIM_SEP" \
+        "${cpsess_token:-}"
 }
 
 # Modified from forensic: takes envelope path as $1 with
@@ -1320,7 +1322,8 @@ read_iocs_from_envelope() {
         p_h2xx=$(json_num_field "$line" hits_2xx)
         p_status=$(json_str_field "$line" status)
         p_line=$(json_str_field "$line" line)
-        p_row=$(ioc_primitive_row "$area" "$p_ip" "$p_path" "$p_log" "$p_count" "$p_h2xx" "$p_status" "$p_line")
+        p_cpsess_token=$(json_str_field "$line" cpsess_token)
+        p_row=$(ioc_primitive_row "$area" "$p_ip" "$p_path" "$p_log" "$p_count" "$p_h2xx" "$p_status" "$p_line" "$p_cpsess_token")
         p_anno=""
         if [[ "$key" == "ioc_pattern_e_websocket_shell_hits" ]]; then
             p_anno=$(json_str_field "$line" dimensions)
@@ -2488,7 +2491,7 @@ write_kill_chain_primitives() {
 
     # TSV header + DEF rows + IOC rows.
     {
-        printf 'kind\tts_epoch\tts_iso\tpattern\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tline\n'
+        printf 'kind\tts_epoch\tts_iso\tpattern\tverdict\tdelta\tdefenses_at_ioc\tkey\tnote\tarea\tip\tpath\tlog_file\tcount\thits_2xx\tstatus\tcpsess_token\tline\n'
 
         # Defense rows.
         local de de_epoch de_key de_note _de_line
@@ -2554,8 +2557,8 @@ write_kill_chain_primitives() {
                 local clean="${prims//$'\n'/ }"
                 clean="${clean//$'\r'/ }"
 
-                local area ip path log_file count h2xx status line
-                IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$clean"
+                local area ip path log_file count h2xx status line cpsess_token
+                IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line cpsess_token <<< "$clean"
                 # Embedded literal tabs (rare) would collide with the bundle
                 # TSV column separator; flatten to spaces.
                 line="${line//$'\t'/ }"
@@ -2563,12 +2566,12 @@ write_kill_chain_primitives() {
                 local nclean="${r_note//$'\t'/ }"
                 nclean="${nclean//$'\n'/ }"
 
-                printf 'IOC\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                printf 'IOC\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                     "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
                     "$r_pat" "$r_verdict" "$r_delta" "$dactive" \
                     "$r_key" "$nclean" \
                     "${area:-}" "${ip:-}" "${path:-}" "${log_file:-}" \
-                    "${count:-}" "${h2xx:-}" "${status:-}" "${line:-}"
+                    "${count:-}" "${h2xx:-}" "${status:-}" "${cpsess_token:-}" "${line:-}"
             done <<< "$i_sorted"
         done
     } > "$tsv"
@@ -2640,15 +2643,15 @@ write_kill_chain_primitives() {
                 [[ -n "$eff_patch"  ]] && (( r_epoch >= eff_patch  )) && dactive+="patch,"
                 [[ -n "$eff_modsec" ]] && (( r_epoch >= eff_modsec )) && dactive+="modsec,"
                 dactive="${dactive%,}"
-                local area ip path log_file count h2xx status line
-                IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line <<< "$prims"
+                local area ip path log_file count h2xx status line cpsess_token
+                IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line cpsess_token <<< "$prims"
 
                 # JSONL schema v2 (forensic v0.10.0+): per-IOC field 'stage'
                 # renamed to 'pattern' to match the IC-5790 dossier vocabulary.
                 # Meta row carries schema_version=2 + a _schema_changes hint
                 # so future readers (operator tooling, LLM analyses) can
                 # auto-detect the rename and adapt.
-                printf '{"kind":"IOC","epoch":%s,"ts":"%s","pattern":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","line":"%s"}\n' \
+                printf '{"kind":"IOC","epoch":%s,"ts":"%s","pattern":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","cpsess_token":"%s","line":"%s"}\n' \
                     "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
                     "$(json_esc "$r_pat")" "$(json_esc "$r_verdict")" \
                     "$(json_esc "$r_delta")" "$(json_esc "$dactive")" \
@@ -2656,7 +2659,8 @@ write_kill_chain_primitives() {
                     "$(json_esc "$area")" "$(json_esc "$ip")" \
                     "$(json_esc "$path")" "$(json_esc "$log_file")" \
                     "$(json_esc "$count")" "$(json_esc "$h2xx")" \
-                    "$(json_esc "$status")" "$(json_esc "$line")"
+                    "$(json_esc "$status")" "$(json_esc "${cpsess_token:-}")" \
+                    "$(json_esc "$line")"
             done <<< "$i_sorted"
         done
     } > "$jsonl"
@@ -5209,6 +5213,16 @@ check_destruction_iocs() {
         #   ext_2xx_unknown> 0 → warning (admin session most likely; review)
         #   ext_total      > 0 → warning (probes only, host repelled)
         if (( ext_2xx_known > 0 )); then
+            # Parse structured fields from the first attacker-dimension sample line.
+            # Apache combined-log format: IP - USER [DATE] "METHOD PATH PROTO" STATUS SIZE ...
+            # bash =~ uses libc POSIX ERE (supports {n}) -- only awk regex needs gawk floor.
+            local _e_ip _e_path _e_status _e_token=""
+            _e_ip=$(printf '%s' "$ext_sample" | awk '{print $1}')
+            _e_path=$(printf '%s' "$ext_sample" | awk -F'"' 'NF>=2{n=split($2," ",p); if(n>=2)print p[2]; else print ""}')
+            _e_status=$(printf '%s' "$ext_sample" | awk -F'"' 'NF>=3{n=split($3," ",p); if(n>=1)print p[1]; else print ""}')
+            if [[ "$_e_path" =~ /cpsess([0-9]{10})/ ]]; then
+                _e_token="${BASH_REMATCH[1]}"
+            fi
             emit "destruction" "ioc_pattern_e_websocket" "strong" \
                  "ioc_pattern_e_websocket_shell_hits" 10 \
                  "count" "$ext_2xx_known" "external_total" "$ext_total" \
@@ -5217,6 +5231,8 @@ check_destruction_iocs() {
                  "internal_2xx" "$int_2xx" \
                  "dimensions" "${dim_csv:-(none)}" \
                  "ts_epoch_first" "$ts_first_ext" \
+                 "ip" "$_e_ip" "path" "$_e_path" "status" "$_e_status" \
+                 "cpsess_token" "${_e_token:-}" \
                  "sample" "${ext_sample:0:200}" \
                  "note" "$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
             ((hits++))
