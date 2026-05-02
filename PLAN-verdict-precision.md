@@ -152,7 +152,7 @@ These v4 gaps are NOT in this plan, with reasons:
 ---
 
 ### Phase 1: Scaffold — pattern-letter map updates, new keys defined, no behavior change
-**Status:** COMPLETE — pre1 @ (pending commit)
+**Status:** COMPLETE — pre1 @ 32cc0fe
 
 Establish the new key vocabulary and pattern-letter mappings without changing any emit-site behavior. Adds three new entries to `ioc_key_to_pattern()` and documents them in the script header severity table. No new emits in this phase — Phases 2/3 wire the actual emits. Phase 1 is pure scaffolding; running ioc-scan in this phase produces byte-identical output to v2.1.0-pre7.
 
