@@ -2521,7 +2521,7 @@ write_kill_chain_primitives() {
             [[ -z "$_de_line" ]] && continue
             IFS=$'\t' read -r de_epoch de_key de_note < <(decode_pipe_tail "$_de_line" 3)
             [[ -z "$de_epoch" ]] && continue
-            printf 'DEF\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t-\t\t\t\t\t\t\t\n' \
+            printf 'DEF\t%s\t%s\t-\t-\t-\t-\t%s\t%s\t-\t\t\t\t\t\t\t\t\n' \
                 "$de_epoch" "$(epoch_to_iso "$de_epoch")" "$de_key" "$de_note"
         done <<< "$sorted_def"
 
