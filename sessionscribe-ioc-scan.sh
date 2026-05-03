@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.5.0
+# sessionscribe-ioc-scan.sh v2.7.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -62,45 +62,48 @@
 # co-occurrence fingerprint. Companion remote detection probe ships as
 # sessionscribe-remote-probe.sh.
 #
-# Output styles:
-#   default     ANSI sectioned report on stderr; stdout empty
-#   --output    write structured JSON to FILE (also prints sectioned report)
-#   --jsonl     stream one JSON signal per line on stdout (suppresses sectioned)
-#   --csv       one summary row per host on stdout (suppresses sectioned)
-#   --quiet     suppress sectioned report
-#   --verbose   expand matrix detail; future-proof escape for elided info
+# Modes (v2.0.0+ - forensic phases live inline; --replay supersedes the
+# v1.x two-script chain):
+#   --triage      detection only (default); writes envelope to run-ledger
+#   --full        detection + forensic (defense, offense, reconcile,
+#                 kill-chain, bundle, upload). Bundle on by default.
+#   --replay PATH replay forensic against a saved envelope (.json), bundle
+#                 directory, or .tgz - re-render or re-submit without rescan.
+#
+# Output streams (any mode):
+#   default       ANSI sectioned report on stderr
+#   -o, --output  structured output to FILE (JSON, or CSV with --csv)
+#   --jsonl       one JSON signal per line on stdout (suppresses sectioned)
+#   --csv         one per-host summary row on stdout (suppresses sectioned)
+#   --quiet       suppress sectioned report
+#   --verbose     expand matrix detail
 #
 # Verdict axes (independent):
-#   code_verdict  PATCHED / VULNERABLE / INCONCLUSIVE   - derived from version,
-#                 Perl patterns, cpsrvd binary fingerprint
-#   host_verdict  CLEAN / SUSPICIOUS / COMPROMISED      - derived from session
-#                 IOC scan (vendor + CVE-2026-41940 ladder) and access-log scan.
+#   code_verdict  PATCHED / VULNERABLE / INCONCLUSIVE - from version, Perl
+#                 patterns, cpsrvd binary fingerprint
+#   host_verdict  CLEAN / SUSPICIOUS / COMPROMISED - from session IOC scan
+#                 (vendor + CVE-2026-41940 ladder) and access-log scan.
 #                 Sessions tagged with the companion probe's canary attribute
-#                 are bucketed as PROBE_ARTIFACT and do NOT escalate to
-#                 COMPROMISED.
+#                 bucket as PROBE_ARTIFACT (do NOT escalate).
 #
 # Exit codes (highest priority wins):
-#   0  PATCHED  + CLEAN
-#   1  VULNERABLE                       (code-state vulnerable)
-#   2  INCONCLUSIVE                     (code-state ambiguous; also tool error
-#                                        for bad args / missing deps)
-#   3  SUSPICIOUS                       (host-state: ioc_review > 0 — warning-
-#                                        tier IOC hits, includes
-#                                        ioc_failed_exploit_attempt, recon-only
-#                                        attacker-IP traffic, anomalous root
-#                                        sessions)
-#   4  COMPROMISED                      (host-state IOC hit; overrides 0/1/2/3 -
-#                                        a patched host can still be compromised
-#                                        from prior exploitation)
+#   0  PATCHED+CLEAN
+#   1  VULNERABLE      code-state: cpsrvd binary unpatched
+#   2  INCONCLUSIVE    code-state ambiguous; also tool error (bad args/deps)
+#   3  SUSPICIOUS      host-state: ioc_review > 0 (warning-tier IOC hits)
+#   4  COMPROMISED     host-state: ioc_critical > 0 (overrides 0/1/2/3 -
+#                      a patched host can still be compromised from prior
+#                      exploitation)
 #
 # Usage:
-#   bash sessionscribe-ioc-scan.sh                                       # report only (default)
-#   bash sessionscribe-ioc-scan.sh --probe                               # + localhost marker GET
-#   bash sessionscribe-ioc-scan.sh --since 90                            # narrow log/heuristic to 90d
-#   bash sessionscribe-ioc-scan.sh -o /root/sessionscribe-scan.json --jsonl  # JSON file + JSONL stream
+#   bash sessionscribe-ioc-scan.sh                       # triage (default)
+#   bash sessionscribe-ioc-scan.sh --full                # + forensic + bundle
+#   bash sessionscribe-ioc-scan.sh --full --upload       # + ship to intake
+#   bash sessionscribe-ioc-scan.sh --replay PATH         # re-render saved bundle
+#   bash sessionscribe-ioc-scan.sh --since 90 --jsonl    # 90d window, JSONL stream
 #
 # Fleet (Ansible/Salt/SSH wrap of local mode):
-#   ansible -i hosts all -m script -a 'sessionscribe-ioc-scan.sh --jsonl --quiet'
+#   ansible -i hosts all -m script -a 'sessionscribe-ioc-scan.sh --full --jsonl --quiet'
 #   pdsh -w cpanel-fleet 'bash -s' < sessionscribe-ioc-scan.sh
 
 set -u
