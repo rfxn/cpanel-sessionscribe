@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.1
+# sessionscribe-ioc-scan.sh v2.7.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.1"
+VERSION="2.7.2"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -357,6 +357,14 @@ LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
 DEFAULT_BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
 DEFAULT_MAX_BUNDLE_MB=2048      # per-tarball cap (NOT bundle-wide)
 DEFAULT_FORENSIC_SINCE_DAYS=90  # forensic-mode default --since when unspecified
+# Bundle retention: keep the N newest bundles in $BUNDLE_DIR_ROOT (current
+# run + the N-1 most-recent prior runs); older bundle dirs and any sibling
+# .upload.tgz are pruned at the end of phase_bundle. Bundle uploads ride
+# off-host to intake, so the local copy is operator-recovery scratch -
+# 3 is enough to keep "this run + last two" without unbounded growth on
+# busy fleet hosts. Override via $BUNDLE_RETENTION env var; set 0 to
+# disable pruning entirely.
+DEFAULT_BUNDLE_RETENTION=3
 INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
 # Convenience token for ad-hoc intake submissions; server enforces 1000-PUT
 # cap per token. For fleet use, supply --upload-token or RFXN_INTAKE_TOKEN.
@@ -509,7 +517,10 @@ Mode (post-merge v2.0.0):
 
 Bundle (active in full or replay mode):
       --bundle               Capture artifact tarball to $BUNDLE_DIR_ROOT/
-                             <ts>-<run_id>/ (default ON in full mode)
+                             <ts>-<run_id>/ (default ON in full mode).
+                             Retains the 3 newest bundles; older ones are
+                             pruned at end of phase_bundle. Override via
+                             $BUNDLE_RETENTION env (0 = disable pruning).
       --no-bundle            Skip bundle capture (recommended on Pattern A
                              hosts where du+tar would compete with the
                              encryptor for IO)
@@ -2948,6 +2959,61 @@ bundle_tar() {
     fi
 }
 
+# Bundle retention sweep. Keeps the $keep newest bundles in $BUNDLE_DIR_ROOT
+# (sorted lexically by name; TS_ISO prefix is sortable) and removes older
+# ones plus any sibling .upload.tgz. Operator-renamed entries that don't
+# match the TS_ISO-Z- prefix are left alone so a manually-staged bundle is
+# never silently deleted.
+#
+# bash 4.1 floor: char-class repetition only (no {n} quantifiers); case-
+# pattern dedupe instead of associative arrays; C-style for over an array
+# index range so set -u + empty-array iteration doesn't trip the floor.
+prune_old_bundles() {
+    local keep="${BUNDLE_RETENTION:-$DEFAULT_BUNDLE_RETENTION}"
+    local root="$BUNDLE_DIR_ROOT"
+    [[ -d "$root" && "$keep" -gt 0 ]] || return 0
+
+    # TS_ISO prefix: YYYY-MM-DDThh:mm:ssZ-...
+    local prefix='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z-'
+
+    local bases=()
+    local seen="|"
+    local name base
+    while IFS= read -r name; do
+        base="${name%.upload.tgz}"
+        [[ "$base" =~ $prefix ]] || continue
+        case "$seen" in *"|${base}|"*) continue ;; esac
+        seen="${seen}${base}|"
+        bases+=("$base")
+    done < <(find "$root" -maxdepth 1 -mindepth 1 \
+              \( -type d -o -name '*.upload.tgz' \) \
+              -printf '%f\n' 2>/dev/null | sort -r)
+
+    local n=${#bases[@]}
+    (( n > keep )) || return 0
+
+    local pruned=0 freed_kb=0 i b entry sz
+    for (( i = keep; i < n; i++ )); do
+        b="${bases[$i]}"
+        for entry in "$root/$b" "$root/${b}.upload.tgz"; do
+            [[ -e "$entry" ]] || continue
+            sz=$(du -sk -- "$entry" 2>/dev/null | awk '{print $1}')
+            if rm -rf -- "$entry" 2>/dev/null; then
+                freed_kb=$((freed_kb + ${sz:-0}))
+            fi
+        done
+        pruned=$((pruned+1))
+    done
+
+    if (( pruned > 0 )); then
+        local freed_mb=$(( freed_kb / 1024 ))
+        say_info "pruned $pruned old bundle(s); freed ~${freed_mb}MiB (kept $keep newest)"
+        emit_signal bundle info bundle_pruned \
+            "retention=$keep pruned=$pruned freed_mib=$freed_mb" \
+            retention "$keep" pruned "$pruned" freed_mib "$freed_mb"
+    fi
+}
+
 phase_bundle() {
     hdr_section "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
 
@@ -3283,6 +3349,11 @@ phase_bundle() {
         done < <(find /home -maxdepth 3 -name '.bash_history' -type f -print0 2>/dev/null)
         say_info "captured $found user bash histories"
     fi
+
+    # Retention sweep: keep current run + DEFAULT_BUNDLE_RETENTION-1 prior
+    # runs, prune the rest. Runs after capture so the just-built bundle is
+    # always in the keep set. No-op if $BUNDLE_RETENTION is set to 0.
+    prune_old_bundles
 
     # Final sweep: signal what we built.
     local total_size

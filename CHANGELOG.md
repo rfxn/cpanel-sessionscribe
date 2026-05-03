@@ -4,6 +4,24 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.2 — 2026-05-03
+
+### Added
+- **Bundle retention sweep in `phase_bundle`.** New `prune_old_bundles()`
+  helper keeps the 3 newest bundles in `$BUNDLE_DIR_ROOT` (current run +
+  the 2 prior) and removes older bundle dirs plus their sibling
+  `.upload.tgz`. Operator-renamed entries that don't carry the TS_ISO-Z
+  prefix are left alone. Retention configurable via `$BUNDLE_RETENTION`
+  env (0 = disable). Default 3 chosen because uploads ride off-host to
+  intake and the on-host copy is operator-recovery scratch — unbounded
+  accumulation has been the dominant disk-pressure signal on busy fleet
+  hosts that run `--full` regularly. Pruned-bundle count and MiB freed
+  emit as `bundle_pruned` info signal.
+
+### Fixed
+- Top-of-file v-header drift (carried over from v2.7.1 doc fix): header
+  comment now matches `VERSION` at parse time.
+
 ## sessionscribe-ioc-scan.sh v2.7.1 — 2026-05-03
 
 ### Added
