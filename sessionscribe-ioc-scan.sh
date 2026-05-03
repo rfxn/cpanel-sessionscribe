@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.6.1"
+VERSION="2.7.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -237,6 +237,34 @@ PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 PATTERN_I_BINARY="/root/.local/bin/system-service"
 PATTERN_I_PROCNAME="system-service"
 
+# Pattern J - persistence via Linux init facilities (udev rule + systemd
+# unit). Shape-based detection (filenames vary per host); both observed
+# attacker shapes pull a payload binary. Two sub-detectors:
+#   J1: udev rule with `RUN+=...sh -c '...'` body that backgrounds via
+#       `at now` (the dossier-observed shape). Strong tier requires the
+#       pipe-to-`at now` form; nohup/setsid/disown demote to warning.
+#   J2: systemd unit with ExecStart pointing OUTSIDE legit binary roots
+#       (allowlist below) + unit not RPM-owned + Description shadows
+#       a known systemd/cPanel service name. /usr/share/<x>/<y> ExecStart
+#       is the strongest discriminator: legit systemd units never live in
+#       /usr/share/ per FHS (data, not executables).
+PATTERN_J_UDEV_DIRS=(/etc/udev/rules.d /run/udev/rules.d)
+PATTERN_J_SYSTEMD_UNIT_DIRS=(/etc/systemd/system)
+# ExecStart-allowed binary roots. Legit cPanel/LSWS/Plesk extras included
+# so a stock control-panel host doesn't FP. /usr/lib/systemd/ covers
+# upstream systemd's own service binaries.
+PATTERN_J_EXECSTART_ALLOWED_RE='^(/usr/(bin|sbin|lib/systemd|lib(64)?/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|local/(bin|sbin|cpanel|lsws|directadmin))|/opt/|/var/(cpanel|lib/dovecot|lib/mysql)|/bin/|/sbin/)'
+# Description shadow list - legit systemd/cPanel service names an attacker
+# might mimic with a `<name>-helper` / `<name>-cleanup` / `<name>2` suffix.
+PATTERN_J_DESC_SHADOW_RE='\b(dbus-broker|systemd-(resolved|networkd|timesyncd|logind|udevd)|cpsrvd|cphulkd|queueprocd|exim-altport|chkservd|tailwatchd|cpanel-dovecot)\b'
+# Pattern J incident-window cutoff (90 days) for promoting from warning to
+# strong on the soft-shape branch. Files older than this are still emitted
+# at warning weight=4 but don't reach strong unless an extra signal hits.
+PATTERN_J_RECENT_DAYS=90
+# Cap on systemd units walked per scan (perf bound). EL7+ stock fleet has
+# ~30-50 units in /etc/systemd/system/ - 200 is a generous cap.
+PATTERN_J_MAX_UNITS=200
+
 # Attacker-planted jumphost-mimic SSH key labels (per IC-5790 dossier).
 PATTERN_G_BAD_KEY_LABELS=(
     "209.59.141.49"
@@ -277,6 +305,12 @@ ATTACKER_IPS=(
     # is the early scout (mixed-UA recon hours before the exploit wave).
     80.75.212.14     206.189.227.202  159.223.155.255  67.205.134.215
     136.244.66.225
+    # rev5 (2026-05-03): Pattern J operator - drops udev/systemd-unit
+    # persistence that fetches an out-of-band payload binary. Detection
+    # is by the Pattern J shape gates (J1/J2) plus this operator IP; no
+    # payload-binary fingerprint shipped yet (sha256 will land in the
+    # dossier when the binary is fully analyzed).
+    45.92.1.188
 )
 
 ###############################################################################
@@ -1142,6 +1176,84 @@ emit_signal() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# Package-ownership probe for Pattern J FP gating. Prefer rpm; fall back
+# to dpkg for debian-ish hosts; if neither tool exists, return 2 ("no
+# probe available") so callers can downgrade severity rather than guess.
+# Returns: 0 = file is owned by an installed package
+#          1 = file is NOT owned by any installed package
+#          2 = no ownership probe available (rpm AND dpkg both missing)
+# Always returns text on stdout for diagnostic logging:
+#   "owned:<pkg>" | "not_owned" | "no_probe"
+# Set -u safe: every branch initializes _own and uses `|| true` to swallow
+# rpm/dpkg non-zero exit codes (rpm -qf rc=1 on not-owned is normal).
+is_rpm_owned() {
+    local _file="$1" _own=""
+    if have_cmd rpm; then
+        _own=$(rpm -qf -- "$_file" 2>/dev/null || true)
+        if [[ -z "$_own" || "$_own" == *"not owned by any package"* \
+              || "$_own" == *"No such file"* ]]; then
+            printf 'not_owned'
+            return 1
+        fi
+        printf 'owned:%s' "$_own"
+        return 0
+    fi
+    if have_cmd dpkg; then
+        # dpkg -S returns "<pkg>: <path>" on owned, exit non-zero on not-owned.
+        _own=$(dpkg -S -- "$_file" 2>/dev/null || true)
+        if [[ -z "$_own" ]]; then
+            printf 'not_owned'
+            return 1
+        fi
+        printf 'owned:%s' "${_own%%:*}"
+        return 0
+    fi
+    printf 'no_probe'
+    return 2
+}
+
+# Bulk variant: pass an array of paths, get back tab-separated lines
+# of "<rc>\t<path>" where rc is 0/1/2 per is_rpm_owned semantics. Uses
+# one rpm process for all paths (rpmdb opens once instead of N times).
+# Performance: ~200ms once vs ~50-80ms × N for the per-path form.
+bulk_rpm_owned_filter() {
+    (( $# > 0 )) || return 0
+    local _f
+    if have_cmd rpm; then
+        # rpm -qf <p1> <p2> ... emits one line per input, in input order.
+        # Owned lines: "<package-NVR>". Not-owned: "file <p> is not owned...".
+        # Pair input order with output via paste-style awk.
+        local _out
+        _out=$(rpm -qf -- "$@" 2>&1 || true)
+        local _i=0
+        while IFS= read -r _line; do
+            _f="${@:$((_i+1)):1}"
+            if [[ "$_line" == *"not owned by any package"* \
+                  || "$_line" == *"No such file"* ]]; then
+                printf '1\t%s\n' "$_f"
+            else
+                printf '0\t%s\n' "$_f"
+            fi
+            _i=$((_i+1))
+        done <<< "$_out"
+        return
+    fi
+    # dpkg has no bulk equivalent; loop. Set -u safe.
+    if have_cmd dpkg; then
+        for _f in "$@"; do
+            if dpkg -S -- "$_f" >/dev/null 2>&1; then
+                printf '0\t%s\n' "$_f"
+            else
+                printf '1\t%s\n' "$_f"
+            fi
+        done
+        return
+    fi
+    for _f in "$@"; do
+        printf '2\t%s\n' "$_f"
+    done
+}
+
 mtime_of() {
     local f="$1"
     [[ -e "$f" ]] || { echo ""; return; }
@@ -1218,6 +1330,12 @@ ioc_key_to_pattern() {
         (ioc_pattern_g_*)                       echo G ;;
         (ioc_pattern_h_*)                       echo H ;;
         (ioc_pattern_i_*)                       echo I ;;
+        (ioc_pattern_j_*)                       echo J ;;
+        # Mitigate-quarantine secondary-read replay signals - synthetic
+        # emits derived from sidecar fields, NOT from re-running the live
+        # IOC ladder. Routed to X (forged-session evidence) since that's
+        # what the source data is.
+        (ioc_quarantined_session_*)             echo X ;;
         (ioc_attacker_ip_2xx_on_cpsess)         echo X ;;
         (ioc_attacker_ip_recon_only)            echo init ;;
         (ioc_failed_exploit_attempt)            echo X ;;
@@ -2047,7 +2165,7 @@ phase_reconcile() {
 # pre-cursor; A-I map to the IC-5790 dossier Pattern letters; X is forged-
 # session evidence that doesn't fit a destruction pattern; ? is anything
 # unmapped (a runtime ioc_key_to_pattern gap).
-PATTERN_ORDER=(init A B C D E F G H I X "?")
+PATTERN_ORDER=(init A B C D E F G H I J X "?")
 declare -A PATTERN_LABEL=(
     [init]="recon / harvest"
     [A]="ransom / encryptor"
@@ -2056,9 +2174,10 @@ declare -A PATTERN_LABEL=(
     [D]="persistence (reseller token)"
     [E]="websocket / fileman harvest"
     [F]="harvester shell"
-    [G]="ssh key persistence"
+    [G]="persistence (ssh key)"
     [H]="seobot defacement / SEO spam"
-    [I]="system-service profile.d backdoor"
+    [I]="persistence (profile.d backdoor)"
+    [J]="persistence (udev / systemd unit)"
     [X]="forged session"
     ["?"]="unmapped"
 )
@@ -2657,7 +2776,7 @@ write_kill_chain_primitives() {
     # Schema v3: 'stage' renamed to 'pattern' (v2); 'cpsess_token' added
     # (v3). _schema_changes in meta lets consumers auto-detect the rename.
     {
-        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":3,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
+        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":4,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"},{"v":4,"since_tool":"2.7.0","added":["pattern_j","quarantined_session_emit","quarantine_run_dir","original_path","reasons_ioc","low_confidence_no_sidecar","degraded_confidence_snapshot"],"note":"Pattern J (udev/systemd-unit init-facility persistence) + mitigate-quarantine secondary read (synthetic emits from .info sidecar fields)"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
             "${HOSTNAME_JSON:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
             "$VERSION" "${INCIDENT_ID:-}" "$RUN_ID" \
             "$(json_esc "${ENV_IOC_RUN_ID:-}")" "$(json_esc "${ENV_IOC_TOOL_VERSION:-}")" "$(json_esc "${ENV_IOC_TS:-}")" \
@@ -4159,9 +4278,16 @@ check_token_used() {
 check_sessions() {
     (( NO_SESSIONS )) && return
     hdr_section "sessions" "session-store IOC ladder"
-    local d=/var/cpanel/sessions
+    # Snapshot-aware path roots. Live mode prefix is empty.
+    local _root_prefix="${ROOT_OVERRIDE:-}"
+    local d="${_root_prefix}/var/cpanel/sessions"
+    # On a host where mitigate already quarantined every forged session,
+    # /var/cpanel/sessions may still exist but raw/ is empty. The walk
+    # below produces 0 hits live - run the quarantine secondary regardless
+    # so previously-compromised hosts don't scan CLEAN.
     if [[ ! -d "$d" ]]; then
         emit "sessions" "sess_dir" "info" "no_session_dir" 0 "note" "no $d"
+        check_quarantined_sessions
         return
     fi
     local raw_dir="$d/raw" preauth_dir="$d/preauth"
@@ -4472,6 +4598,21 @@ check_sessions() {
              "note" "$mtime_anomalies of $scanned session(s) had mtime/ctime divergence >= ${SESSION_MTIME_CTIME_THRESHOLD_SEC}s - mtime is untrustworthy for cluster-onset analysis on these sessions (could be touch-d injection or cp -p / tar xp restore artifact)."
     fi
 
+    # ---- (b) Mitigate-quarantine secondary read --------------------------
+    # On hosts where sessionscribe-mitigate.sh ran, forged sessions have
+    # been moved out of /var/cpanel/sessions/raw/ and into the quarantine
+    # tree at $MITIGATE_BACKUP_ROOT/<RUN>/quarantined-sessions/raw/. The
+    # live walk above sees an empty raw/ on those hosts, so without this
+    # secondary path a previously-compromised host scans CLEAN. Sidecars
+    # next to each quarantined file (`<sname>.info`) carry the original
+    # mtime + IOC pattern letters that fired the quarantine - emit
+    # synthetic signals from those fields so the kill-chain timeline
+    # reflects when the attacker forged the session, not when we
+    # quarantined it. Direct call (not `$( … )`) - subshell would discard
+    # SIGNALS[] mutations from emit().
+    check_quarantined_sessions
+    ioc_hits=$((ioc_hits + QUARANTINED_HITS))
+
     # The all-clear emit covers IOC-ladder + anomalous-shape + mtime-anomaly
     # cohorts. mtime_anomalies is included in the gate so a host with quietly-
     # backdated sessions but no other signals does not falsely assert no_session_iocs.
@@ -4482,21 +4623,295 @@ check_sessions() {
     fi
 }
 
-# ---- destruction-stage IOC scan (Patterns A-I) ---------------------------
+# Walk $MITIGATE_BACKUP_ROOT/*/quarantined-sessions/raw/ and emit one
+# synthetic signal per quarantined session, derived from the .info sidecar
+# (no re-run of the live IOC ladder, which is coupled to current host
+# state). Writes hit count to global QUARANTINED_HITS - emit() mutates
+# SIGNALS[] which would be lost in a `$( … )` subshell. Honors snapshot
+# mode by reading from $ROOT_OVERRIDE when set. Capped at
+# PATTERN_J_MAX_QUARANTINE total sessions to bound runtime on hosts with
+# bulk-quarantine history.
+check_quarantined_sessions() {
+    QUARANTINED_HITS=0
+    local hits=0
+    local prefix="${ROOT_OVERRIDE:-}"
+    local root="${prefix}${MITIGATE_BACKUP_ROOT}"
+    [[ -d "$root" ]] || return
+
+    # Walk most-recent run-dirs first; cap total sessions analyzed.
+    local _max="${PATTERN_J_MAX_QUARANTINE:-200}"
+    local _seen=0
+    local run_dir f
+    while IFS= read -r run_dir; do
+        local qraw="$run_dir/quarantined-sessions/raw"
+        [[ -d "$qraw" ]] || continue
+        for f in "$qraw"/*; do
+            [[ -f "$f" ]] || continue
+            # Skip the .info sidecars themselves.
+            [[ "$f" == *.info ]] && continue
+            (( _seen >= _max )) && break 2
+            ((_seen++))
+
+            local sidecar="${f}.info"
+            local q_mtime="" q_reasons="" q_orig="" q_sha="" q_run_ts=""
+            local _has_sidecar=0
+            if [[ -f "$sidecar" ]]; then
+                _has_sidecar=1
+                local _k _v
+                while IFS='=' read -r _k _v; do
+                    case "$_k" in
+                        (mtime_epoch)     q_mtime="$_v" ;;
+                        (reasons_ioc)     q_reasons="$_v" ;;
+                        (original_path)   q_orig="$_v" ;;
+                        (sha256)          q_sha="$_v" ;;
+                        (quarantine_ts)   q_run_ts="$_v" ;;
+                    esac
+                done < "$sidecar"
+            else
+                # Fallback: file mtime (the cp -a from mitigate preserves
+                # the original mtime, so this is still meaningful). Flag
+                # as low confidence so consumers can distinguish.
+                q_mtime=$(stat -c %Y "$f" 2>/dev/null)
+            fi
+
+            local sname _key
+            sname=$(basename -- "$f")
+            _key="ioc_quarantined_session_${sname}"
+            emit "sessions" "$_key" "warning" \
+                 "ioc_quarantined_session_present" 4 \
+                 "path" "$f" \
+                 "original_path" "${q_orig:-}" \
+                 "quarantine_run_dir" "$run_dir" \
+                 "quarantine_ts" "${q_run_ts:-}" \
+                 "mtime_epoch" "${q_mtime:-0}" \
+                 "reasons_ioc" "${q_reasons:-unknown}" \
+                 "sha256" "${q_sha:-}" \
+                 "low_confidence_no_sidecar" "$([[ $_has_sidecar -eq 0 ]] && echo 1 || echo 0)" \
+                 "note" "Forged session in mitigate quarantine (reasons=${q_reasons:-unknown}); host had IOC-positive sessions before mitigation purged them - past compromise (REVIEW)."
+            ((hits++))
+        done
+    done < <(find "$root" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | awk '{print $2}')
+
+    QUARANTINED_HITS="$hits"
+}
+
+# Pattern J detection - init-facility persistence (udev + systemd unit).
+# Writes hit count to global PATTERN_J_HITS (not stdout) - emit() mutates
+# the SIGNALS[] array, which would be lost in a `$( … )` subshell.
+# Snapshot-aware: when ROOT_OVERRIDE is set, walks $ROOT_OVERRIDE-prefixed
+# paths and demotes severity to info+degraded_confidence_snapshot=1 (no
+# live rpmdb to cross-check). FP gates documented inline.
+check_pattern_j_persistence() {
+    PATTERN_J_HITS=0
+    local hits=0
+    local prefix=""
+    [[ -n "${ROOT_OVERRIDE:-}" ]] && prefix="$ROOT_OVERRIDE"
+    local snapshot_mode=0
+    [[ -n "$prefix" ]] && snapshot_mode=1
+
+    # ---- J1: udev rules with backgrounded RUN ----------------------------
+    # Strong tier requires the pipe-to-`at now` shape (dossier-observed,
+    # vanishingly rare in benign automation). nohup/setsid/disown forms
+    # demote to warning - those are common in legit ad-hoc tooling.
+    local d _udev_files=()
+    for d in "${PATTERN_J_UDEV_DIRS[@]}"; do
+        local _d="${prefix}${d}"
+        [[ -d "$_d" ]] || continue
+        # Find rule files modified in the last PATTERN_J_RECENT_DAYS days OR
+        # all rule files (we want full coverage here - the FP gate is the
+        # shape match below, not file age).
+        while IFS= read -r f; do
+            _udev_files+=("$f")
+        done < <(find "$_d" -maxdepth 1 -type f -name '*.rules' 2>/dev/null)
+    done
+
+    if (( ${#_udev_files[@]} > 0 )); then
+        # Shape probe: scan bodies once with grep, then RPM-filter only the hits.
+        local _hit_shape_strong=()  _hit_shape_warn=()
+        local f
+        for f in "${_udev_files[@]}"; do
+            # Strong: `| at now` (or `| at[[:space:]]+now`) inside a RUN value.
+            if grep -qE 'RUN[+=]+=.*sh -c.*\|[[:space:]]*at[[:space:]]+now\b' "$f" 2>/dev/null; then
+                _hit_shape_strong+=("$f")
+            elif grep -qE 'RUN[+=]+=.*sh -c.*\b(nohup|setsid|disown)\b' "$f" 2>/dev/null; then
+                _hit_shape_warn+=("$f")
+            fi
+        done
+
+        # FP gate: not RPM-owned. In snapshot mode skip ownership check
+        # (no rpmdb) and always demote tier by one notch.
+        local _strong_unowned=() _warn_unowned=()
+        if (( snapshot_mode )); then
+            _strong_unowned=("${_hit_shape_strong[@]}")
+            _warn_unowned=("${_hit_shape_warn[@]}")
+        else
+            local _all=("${_hit_shape_strong[@]}" "${_hit_shape_warn[@]}")
+            local _own_lines=""
+            if (( ${#_all[@]} > 0 )); then
+                _own_lines=$(bulk_rpm_owned_filter "${_all[@]}")
+            fi
+            local _rc _path
+            while IFS=$'\t' read -r _rc _path; do
+                [[ -z "$_path" ]] && continue
+                # rc=0 owned, rc=1 not_owned, rc=2 no_probe (treat as warn)
+                if [[ "$_rc" == "1" || "$_rc" == "2" ]]; then
+                    if printf '%s\n' "${_hit_shape_strong[@]}" | grep -qxF "$_path"; then
+                        _strong_unowned+=("$_path")
+                    else
+                        _warn_unowned+=("$_path")
+                    fi
+                fi
+            done <<< "$_own_lines"
+        fi
+
+        for f in "${_strong_unowned[@]}"; do
+            local _mtime _run_line
+            _mtime=$(stat -c %Y "$f" 2>/dev/null)
+            _run_line=$(grep -m1 -E 'RUN[+=]+=.*sh -c.*\|[[:space:]]*at[[:space:]]+now\b' "$f" 2>/dev/null)
+            local _sev=strong _wt=10 _conf=""
+            if (( snapshot_mode )); then
+                _sev=info; _wt=2; _conf="degraded_confidence_snapshot=1; "
+            fi
+            emit "destruction" "ioc_pattern_j_udev_run" "$_sev" \
+                 "ioc_pattern_j_udev_run_at_now" "$_wt" \
+                 "path" "$f" "mtime_epoch" "${_mtime:-0}" \
+                 "sample" "${_run_line:0:300}" \
+                 "note" "${_conf}Pattern J1 udev rule at $f backgrounds shell via 'at now' and is not package-owned (CRITICAL)."
+            ((hits++))
+        done
+        for f in "${_warn_unowned[@]}"; do
+            local _mtime
+            _mtime=$(stat -c %Y "$f" 2>/dev/null)
+            emit "destruction" "ioc_pattern_j_udev_async" "warning" \
+                 "ioc_pattern_j_udev_async_run" 4 \
+                 "path" "$f" "mtime_epoch" "${_mtime:-0}" \
+                 "note" "Pattern J1 candidate: udev rule at $f backgrounds shell (nohup/setsid/disown) and is not package-owned (REVIEW)."
+            ((hits++))
+        done
+    fi
+
+    # ---- J2: systemd units with non-allowlisted ExecStart ----------------
+    # Walk /etc/systemd/system only (operator-customizable tree). Cap at
+    # PATTERN_J_MAX_UNITS to bound walk-time on hosts with many units.
+    local _unit_files=()
+    for d in "${PATTERN_J_SYSTEMD_UNIT_DIRS[@]}"; do
+        local _d="${prefix}${d}"
+        [[ -d "$_d" ]] || continue
+        while IFS= read -r f; do
+            _unit_files+=("$f")
+            (( ${#_unit_files[@]} >= PATTERN_J_MAX_UNITS )) && break
+        done < <(find "$_d" -maxdepth 1 -type f -name '*.service' 2>/dev/null)
+    done
+
+    if (( ${#_unit_files[@]} > 0 )); then
+        # Shape probe: extract ExecStart and Description per unit.
+        local _suspicious_units=()
+        local f
+        for f in "${_unit_files[@]}"; do
+            local _exec _desc _exec_path
+            _exec=$(grep -m1 -E '^[[:space:]]*ExecStart[[:space:]]*=' "$f" 2>/dev/null \
+                | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[+!@-]*//' \
+                | awk '{print $1}')
+            [[ -z "$_exec" ]] && continue
+            _exec_path="$_exec"
+            # ExecStart shape: outside allowlist OR /usr/share/ root.
+            if [[ "$_exec_path" =~ ^/usr/share/ ]] \
+               || ! [[ "$_exec_path" =~ $PATTERN_J_EXECSTART_ALLOWED_RE ]]; then
+                _suspicious_units+=("$f")
+            fi
+        done
+
+        # RPM-filter both unit files AND their ExecStart binaries; both
+        # must be not-RPM-owned to qualify as Pattern J (an unowned unit
+        # pointing at an RPM-owned binary is a sysadmin custom unit;
+        # an owned unit with an unowned binary is broken-but-benign).
+        if (( ${#_suspicious_units[@]} > 0 )); then
+            local _unit_unowned=()
+            if (( snapshot_mode )); then
+                _unit_unowned=("${_suspicious_units[@]}")
+            else
+                local _own_lines _rc _path
+                _own_lines=$(bulk_rpm_owned_filter "${_suspicious_units[@]}")
+                while IFS=$'\t' read -r _rc _path; do
+                    [[ -z "$_path" ]] && continue
+                    if [[ "$_rc" == "1" || "$_rc" == "2" ]]; then
+                        _unit_unowned+=("$_path")
+                    fi
+                done <<< "$_own_lines"
+            fi
+
+            local f
+            for f in "${_unit_unowned[@]}"; do
+                local _mtime _exec_path _desc _now _age _is_recent=0
+                _mtime=$(stat -c %Y "$f" 2>/dev/null)
+                _now=$(date -u +%s 2>/dev/null || echo 0)
+                _age=$(( _now - ${_mtime:-0} ))
+                (( _age < PATTERN_J_RECENT_DAYS * 86400 )) && _is_recent=1
+                _exec_path=$(grep -m1 -E '^[[:space:]]*ExecStart[[:space:]]*=' "$f" 2>/dev/null \
+                    | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[+!@-]*//' \
+                    | awk '{print $1}')
+                _desc=$(grep -m1 -E '^[[:space:]]*Description[[:space:]]*=' "$f" 2>/dev/null \
+                    | sed -E 's/^[[:space:]]*Description[[:space:]]*=//')
+
+                # Strong-tier conjunction: /usr/share/ ExecStart AND Description
+                # shadows known service AND mtime recent. Otherwise warning/4.
+                local _strong_match=0
+                if [[ "$_exec_path" =~ ^/usr/share/ ]] \
+                   && [[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] \
+                   && (( _is_recent )); then
+                    _strong_match=1
+                fi
+
+                local _sev _wt _key
+                if (( snapshot_mode )); then
+                    _sev=info; _wt=2
+                    _key="ioc_pattern_j_systemd_unit_snapshot"
+                elif (( _strong_match )); then
+                    _sev=strong; _wt=10
+                    _key="ioc_pattern_j_systemd_unit_present"
+                else
+                    _sev=warning; _wt=4
+                    _key="ioc_pattern_j_systemd_unit_candidate"
+                fi
+                emit "destruction" "ioc_pattern_j_systemd_unit" "$_sev" \
+                     "$_key" "$_wt" \
+                     "path" "$f" "mtime_epoch" "${_mtime:-0}" \
+                     "exec_start" "${_exec_path:-}" \
+                     "description" "${_desc:0:120}" \
+                     "shadow_match" "$([[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] && echo 1 || echo 0)" \
+                     "is_recent" "$_is_recent" \
+                     "snapshot" "$snapshot_mode" \
+                     "note" "Pattern J2 systemd unit at $f - non-allowlist ExecStart=$_exec_path and not package-owned."
+                ((hits++))
+            done
+        fi
+    fi
+
+    PATTERN_J_HITS="$hits"
+}
+
+# ---- destruction-stage IOC scan (Patterns A-J) ---------------------------
 # Cheap, bounded host-state probes for late-stage compromise residue.
 # Scoped to /home, /var/www, /root, /etc, /var/spool/cron, /tmp, /var/tmp -
 # operator-overrideable via $CPANEL_ROOT? No: these paths are filesystem
-# constants, not cpanel-prefixed. Snapshot mode (--root) skips this whole
-# block (we don't have meaningful destruction traces in a snapshot).
+# constants, not cpanel-prefixed. Snapshot mode (--root) skips most patterns
+# but Pattern J does honor --root with degraded confidence (the udev/systemd
+# trees ARE present in a snapshot).
 check_destruction_iocs() {
     (( NO_DESTRUCTION_IOCS )) && return
     if [[ -n "$ROOT_OVERRIDE" ]]; then
-        hdr_section "destruct" "destruction IOC scan (Patterns A-I)"
-        emit "destruction" "destruction_scan" "info" "skipped_snapshot_mode" 0 \
-             "note" "destruction probes skip snapshot/--root mode (no host filesystem)"
+        hdr_section "destruct" "destruction IOC scan (Pattern J only - snapshot mode)"
+        emit "destruction" "destruction_scan" "info" "snapshot_mode_partial" 0 \
+             "note" "Patterns A-I skip snapshot/--root mode (no host filesystem). Pattern J (udev/systemd persistence) walks the snapshot tree with degraded confidence (no live rpmdb)."
+        # Pattern J is snapshot-aware - the trees it walks (udev rules + systemd
+        # units) ARE present in a typical snapshot. Severity is auto-demoted
+        # inside the function when ROOT_OVERRIDE is set. Direct call (not
+        # `$( … )`) so emit()'s SIGNALS[] writes survive.
+        check_pattern_j_persistence
         return
     fi
-    hdr_section "destruct" "destruction IOC scan (Patterns A-I)"
+    hdr_section "destruct" "destruction IOC scan (Patterns A-J)"
     local hits=0
 
     # History files swept by Pattern F harvester and Pattern H markers
@@ -5079,6 +5494,18 @@ check_destruction_iocs() {
              "note" "Pattern I hook fire signature in $i_log_hit (failed chmod from non-root login) - corroborating evidence."
         ((hits++))
     fi
+
+    # ---- Pattern J: init-facility persistence (udev + systemd) ----------
+    # Co-stage with Patterns G/I (post-RCE persistence). Walks udev rules
+    # and /etc/systemd/system/ (operator-customizable tree only - skip
+    # /usr/lib/systemd/ which is RPM territory). FP gates: (1) RPM ownership
+    # via bulk_rpm_owned_filter (one rpmdb open per scan), (2) attacker-
+    # specific shape match (`| at now` for J1; /usr/share/ ExecStart +
+    # description-shadow for J2), (3) mtime within incident window for the
+    # soft-shape branch. Direct call (not `$( … )`) - subshell would discard
+    # SIGNALS[] mutations from emit().
+    check_pattern_j_persistence
+    hits=$((hits + PATTERN_J_HITS))
 
     # ---- Pattern E: websocket/Shell access-log signature ---------------
     # /cpsess<id>/websocket/Shell is WHM Terminal. Categorize per

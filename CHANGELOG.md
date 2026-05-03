@@ -4,6 +4,82 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.1 — 2026-05-03
+
+### Added
+- **Pattern J — init-facility persistence detection.** New IOC class
+  alongside the existing A-I dossier patterns. Two sub-detectors inside
+  `check_destruction_iocs`:
+  - **J1 (udev)** — walks `/etc/udev/rules.d/` and `/run/udev/rules.d/`.
+    Strong tier requires the `RUN+="...sh -c '... | at now'"` shape
+    (dossier-observed; the pipe-to-`at now` form is vanishingly rare in
+    benign udev automation). Warning tier covers `nohup`/`setsid`/`disown`
+    backgrounded shell-outs. Both gates AND with non-RPM-ownership.
+  - **J2 (systemd)** — walks `/etc/systemd/system/*.service` only
+    (operator-customizable tree; `/usr/lib/systemd/system/` is RPM
+    territory and is intentionally skipped). Strong tier requires the
+    conjunction: ExecStart inside `/usr/share/` + Description shadows a
+    known systemd/cPanel service name + unit and binary not RPM-owned +
+    mtime within 90 days. Otherwise warning. Allowlist for legit
+    ExecStart roots includes `/usr/local/cpanel/`, `/usr/local/lsws/`,
+    `/opt/`, `/var/cpanel/`, `/var/lib/dovecot/`, `/var/lib/mysql/` so
+    a stock control-panel host doesn't FP.
+  - Snapshot-aware: when `--root DIR` is set, walks `${DIR}/etc/...`
+    and demotes severity to `info` with `degraded_confidence_snapshot=1`
+    (no live rpmdb to cross-check ownership).
+  - RPM ownership probe via new helper `is_rpm_owned()` and bulk-mode
+    `bulk_rpm_owned_filter()` (one rpmdb open for N paths instead of N
+    individual rpm calls). Falls back to `dpkg -S` on debian-ish hosts;
+    if neither tool is present, severity downgrades automatically.
+  - Pattern letter `J` wired into `ioc_key_to_pattern()`, `PATTERN_ORDER`,
+    and `PATTERN_LABEL`. `[I]` and `[G]` labels relabeled to
+    `persistence (...)` for symmetry with `[J]` and `[D]`.
+- **Mitigate-quarantine secondary read** in `check_sessions`. On hosts
+  where `sessionscribe-mitigate.sh` ran, forged sessions are moved out
+  of `/var/cpanel/sessions/raw/` and into the quarantine tree at
+  `$MITIGATE_BACKUP_ROOT/<RUN>/quarantined-sessions/raw/`. The live walk
+  saw an empty raw/ on those hosts and produced `host_verdict=CLEAN` on
+  demonstrably compromised systems. New `check_quarantined_sessions()`
+  function walks the quarantine, reads each `<sname>.info` sidecar with
+  a data-only key=value parser (no eval), and emits one synthetic
+  `ioc_quarantined_session_<sname>` warning-tier signal per file with:
+  `original_path`, `quarantine_run_dir`, `quarantine_ts`, original
+  `mtime_epoch` (from sidecar — attacker write-time, not our cp time),
+  `reasons_ioc` (the IOC pattern letters that fired the quarantine),
+  `sha256`. Quarantined emits route to Pattern X via dedicated
+  `(ioc_quarantined_session_*) echo X` branch in `ioc_key_to_pattern`.
+  Cap of 200 sessions analyzed per scan, oldest-skip beyond. Sidecar
+  fallback when missing (mitigate v0.4.x predates sidecars): use file
+  mtime + `low_confidence_no_sidecar=1` flag, never crash.
+- **`45.92.1.188` added to `ATTACKER_IPS`** (rev5; Pattern J operator).
+
+### Changed
+- VERSION 2.6.1 → 2.7.1 (additive features, new IOC class, schema bump).
+- `_schema_changes` meta record bumped to `schema_version=4` with a v4
+  entry describing the new emit fields (`pattern_j`,
+  `quarantined_session_emit`, `quarantine_run_dir`, `original_path`,
+  `reasons_ioc`, `low_confidence_no_sidecar`,
+  `degraded_confidence_snapshot`).
+- `check_destruction_iocs` snapshot-mode early-return now runs Pattern J
+  (degraded confidence) before returning, instead of skipping
+  destruction probes wholesale. Matches the user expectation that
+  `--root` against an offline snapshot can still surface persistence.
+- `check_sessions` early-return path (when `/var/cpanel/sessions` is
+  missing) now runs the quarantine secondary first — previously, hosts
+  without a live sessions dir reported `CLEAN` even when the quarantine
+  contained evidence of past compromise.
+
+### Notes
+- Pattern J detection is RPM-ownership-anchored to bound FP rate. Hosts
+  running heavy site-tooling that drops non-RPM-owned udev rules or
+  systemd units may emit `warning`-tier J signals; the `strong` tier
+  requires the attacker-specific shape conjunction so should be
+  near-zero-FP on typical fleet hosts.
+- For fleet aggregation: query `signals[].id == "ioc_pattern_j_*"` for
+  J emits and `signals[].id ^= "ioc_quarantined_session_"` for the
+  quarantine secondary's contribution. The kill-chain renderer slots J
+  alongside G/I as co-stage persistence (post-RCE).
+
 ## sessionscribe-ioc-scan.sh v2.6.1 — 2026-05-02
 
 ### Fixed
