@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.5.1
+# sessionscribe-mitigate.sh v0.6.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -55,6 +55,19 @@
 #               backup dir w/ .info (ctime); rm originals
 #   probe       (opt-in via --probe) self-test via remote-probe against
 #               127.0.0.1; expect SAFE/blocked verdict
+#   kill        (opt-in via --kill) targeted quarantine + IP block from
+#               an IOC envelope (sessionscribe-ioc-scan output). Reads
+#               the latest /var/cpanel/sessionscribe-ioc/*.json (or
+#               --envelope PATH), builds a manifest of file quarantines
+#               + attacker IP blocks, and (with --apply) executes them:
+#               files moved to <BACKUP_DIR>/quarantine/<mirrored-path>
+#               with sha256 chain-of-custody; per-incident IPs added via
+#               csf -d; rfxn fleet blocklist registered in
+#               /etc/csf/csf.blocklists with LF_IPSET=1. Path allowlist
+#               refuses anything outside /root/, /home/*/, /etc/profile.d/,
+#               /etc/systemd/system/, /etc/udev/rules.d/, /etc/cron.{d,*}/,
+#               /var/spool/cron/, /usr/local/cpanel/var/. Gated on
+#               host_verdict == COMPROMISED (override: --kill-anyway).
 #
 # Output:
 #   default     ANSI sectioned report on stderr
@@ -79,7 +92,7 @@
 
 set -u
 
-VERSION="0.5.1"
+VERSION="0.6.0"
 
 ###############################################################################
 # Constants

@@ -4,6 +4,73 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.6.0 — 2026-05-03
+
+### Added
+- **`phase_kill`: targeted quarantine + IP block from an IOC envelope.**
+  New opt-in phase consuming `sessionscribe-ioc-scan` envelope JSON to
+  perform manifest-driven cleanup of bad-actor access on a host.
+  Default-off; opt-in via `--kill`. Gated on `host_verdict == COMPROMISED`
+  (override: `--kill-anyway`).
+- **CLI flags:** `--kill`, `--envelope PATH`, `--kill-anyway`,
+  `--no-kill`. `--envelope PATH` and `--kill-anyway` imply `--kill`.
+- **Manifest-driven actions** at `$BACKUP_DIR/kill-manifest.json`
+  (audit-trail source of truth):
+  - **File quarantine:** Pattern A/C/D/F/G/H/I/J on-disk evidence is
+    *moved* (never deleted) to `$BACKUP_DIR/quarantine/<mirrored-path>`
+    with sha256 chain-of-custody (`sha256_pre`, `sha256_post`, `size`,
+    `dest`). Cross-filesystem moves fall back to cp -a + rm. Result
+    vocabulary: `ok | gone | refused_special_file | mv_failed |
+    rm_failed_after_copy | corrupt_during_move`.
+  - **Per-incident IP blocks** via `csf -d <ip> "sessionscribe ioc=<key>
+    run=<run_id>"`. RFC1918 / loopback / link-local / multicast / shape-
+    malformed IPs refused (envelope-injection guard). IPv4 + IPv6
+    supported. Idempotent vs `/etc/csf/csf.deny` (gawk-3.x literal-
+    equality check, no regex-escape).
+  - **rfxn fleet blocklist registration** via `/etc/csf/csf.blocklists`
+    (verified against aetherinox/csf-firewall docs since ConfigServer
+    shut down). Idempotent insert of
+    `RFXN_FH_L2L3|86400|0|https://cdn.rfxn.com/downloads/rfxn_fh-l2_l3_webserver.netset`.
+    Probes `LF_IPSET` and flips 0->1 in `--apply` (with `backup_file`).
+    CSF handles fetch + cache + ipset binding on its own schedule.
+- **Path allowlist + envelope-injection guards** (`kill_path_in_allowlist`):
+  Refuses any path outside documented mutable roots (/root/, /home/*/,
+  /etc/profile.d/, /etc/systemd/system/, /etc/udev/rules.d/,
+  /etc/cron.d/, /etc/cron.{hourly,daily,weekly,monthly}/,
+  /var/spool/cron/, /usr/local/cpanel/var/). Pre-resolution shape
+  probes: absolute path required; no control chars (NUL/newline/tab/
+  ESC); `realpath -m` resolves symlinks + .. components (readlink -f
+  fallback). Refused items recorded in manifest as `action:"refused"`,
+  never reach the K3 quarantine logic.
+- **Sidecar action stream** at `$BACKUP_DIR/kill-manifest.actions.jsonl`
+  (one JSON record per action). `finalize_manifest` merges the sidecar
+  into the manifest at K6, populating `ts_applied`, the `csf{}` block,
+  and the `summary{}` counters (`files_quarantined`, `files_failed`,
+  `files_gone`, `files_special`, `ips_blocked`, `ips_skipped`,
+  `ips_failed`).
+- **`--list-phases`** now lists `kill   no   (opt-in) targeted
+  quarantine + IP block from IOC envelope (--kill)`.
+
+### Compatibility
+- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 floor (CL6/EL6) preserved.
+  Zero `mapfile`/`readarray`/`${var: -1}`/`declare -g`/`local -n`/
+  `wait -n`/`coproc` in kill-chain helpers. Zero 3-arg `match()` and
+  zero `{n}` interval expressions in awk regex blocks. All array
+  iterations stream via `while-read` (no unguarded for-in under
+  `set -u` + bash 4.1).
+- `jq` opportunistic, never required: K1 manifest builder + K6
+  finalizer use bash + awk only. `jq` is convenient for inspecting
+  the output but is not a runtime dependency.
+- CSF version floor: any version supporting `/etc/csf/csf.blocklists`
+  + `LF_IPSET=1` (universal across the fleet's CSF versions).
+
+### Operator runbook
+- `.rdf/work-output/k8-lab-runbook.md` — seven-scenario lab E2E with
+  the CL6 floor verification gate. Walks through opt-in confirmation,
+  gate firing, dry-run, full apply, idempotent re-apply, allowlist
+  refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
+  malformed IP, traversal).
+
 ## sessionscribe-ioc-scan.sh v2.7.4 — 2026-05-03
 
 ### Added
