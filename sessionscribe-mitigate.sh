@@ -538,6 +538,281 @@ epoch_to_iso() {
 }
 
 ###############################################################################
+# Kill-chain (phase_kill) helpers - read IOC envelope, build manifest of
+# intended quarantine + IP-block actions. Manifest is the audit-trail source
+# of truth. K1 deliverable: read-only manifest construction. Mutating actions
+# land in K3 (file quarantine), K4 (CSF deny), K5 (rfxn blocklist register).
+# Field-extraction helpers mirror sessionscribe-ioc-scan.sh primitives so
+# producer/consumer parsing is a single shared contract.
+###############################################################################
+
+KILL_ENVELOPE_DIR="/var/cpanel/sessionscribe-ioc"
+
+# Newest envelope JSON by mtime; empty if dir absent or no JSON files.
+kill_find_envelope() {
+    [[ -d "$KILL_ENVELOPE_DIR" ]] || return 0
+    ls -1t "$KILL_ENVELOPE_DIR"/*.json 2>/dev/null | head -1
+}
+
+# Extract a top-level scalar (host_verdict, run_id, ts, tool_version, score).
+# Skips signal-array lines (those start with {"host":). Mirrors ioc-scan's
+# envelope_root_field exactly.
+kill_envelope_root_field() {
+    local env="$1" key="$2" raw v
+    raw=$(grep -vE '^[[:space:]]*\{\"host\":' "$env" 2>/dev/null \
+          | grep -oE "\"${key}\":[[:space:]]*(\"[^\"]*\"|-?[0-9]+(\.[0-9]+)?)" \
+          | head -1)
+    [[ -z "$raw" ]] && return 0
+    v="${raw#*:}"
+    v="${v# }"
+    v="${v#\"}"
+    v="${v%\"}"
+    printf '%s' "$v"
+}
+
+# String-field extraction from a single signal line. Mirrors ioc-scan's
+# json_str_field. Handles \\ and \" via parameter expansion.
+kill_json_str_field() {
+    local line="$1" key="$2" v
+    v=$(printf '%s\n' "$line" | grep -oE "\"$key\":\"([^\"\\\\]|\\\\.)*\"" | head -1)
+    [[ -z "$v" ]] && return 0
+    v="${v#*\":\"}"
+    v="${v%\"}"
+    v="${v//\\\"/\"}"
+    v="${v//\\\\/\\}"
+    printf '%s' "$v"
+}
+
+# Numeric-or-stringified-numeric field from a signal line.
+kill_json_num_field() {
+    local line="$1" key="$2" v
+    v=$(printf '%s\n' "$line" | grep -oE "\"$key\":(\"[0-9.+-]*\"|-?[0-9]+(\.[0-9]+)?)" | head -1)
+    [[ -z "$v" ]] && return 0
+    v="${v#*\":}"
+    v="${v#\"}"
+    v="${v%\"}"
+    printf '%s' "$v"
+}
+
+# Pattern-letter mapping. Patterns A/C/D/F/G/H/I/J emit on-disk evidence
+# (eligible for quarantine). B is structural (mysql wipe = absent dir, no
+# fs target). E is log/session-resident (handled by phase_sessions). The
+# pre-compromise advisory keys map to "skip" so they never enter the manifest.
+kill_pattern_for_key() {
+    case "$1" in
+        (ioc_pattern_e_websocket_shell_hits_pre_compromise) echo skip ;;
+        (ioc_pattern_e_websocket_shell_hits_orphan)         echo skip ;;
+        (ioc_attacker_ip_2xx_on_cpsess_pre_compromise)      echo skip ;;
+        (ioc_pattern_a_*)              echo A ;;
+        (ioc_pattern_b_*)              echo B ;;
+        (ioc_pattern_c_*)              echo C ;;
+        (ioc_pattern_d_*)              echo D ;;
+        (ioc_pattern_e_*)              echo E ;;
+        (ioc_pattern_f_*)              echo F ;;
+        (ioc_pattern_g_*)              echo G ;;
+        (ioc_pattern_h_*)              echo H ;;
+        (ioc_pattern_i_*)              echo I ;;
+        (ioc_pattern_j_*)              echo J ;;
+        (ioc_attacker_ip_2xx_on_cpsess) echo ip ;;
+        (ioc_attacker_ip_in_access_log_probes_only) echo ip ;;
+        (ioc_attacker_ip*)             echo skip ;;
+        (*)                            echo skip ;;
+    esac
+}
+
+# Per-pattern action policy. Returns "quarantine" for patterns that emit
+# on-disk evidence we should move to BACKUP_DIR/quarantine/, "skip" otherwise.
+kill_action_for_pattern() {
+    case "$1" in
+        (A|C|D|F|G|H|I|J) echo quarantine ;;
+        (*) echo skip ;;
+    esac
+}
+
+# Path-allowlist gate. K1 stub - returns 0 unconditionally if path is
+# non-empty. K2 hardens with a real allowlist + envelope-injection guards.
+kill_path_in_allowlist() {
+    local path="$1"
+    [[ -n "$path" ]] || return 1
+    return 0
+}
+
+# Build the manifest. Walks signals, applies pattern->action policy,
+# aggregates attacker IPs, writes JSON to OUT_FILE. Returns 0 on success,
+# 1 if envelope is missing/unreadable. K3/K4/K5/K6 patch the manifest
+# in place to record results.
+kill_build_manifest() {
+    local env="$1" out="$2"
+    [[ -n "$env" && -f "$env" ]] || return 1
+    [[ -n "$out" ]] || return 1
+
+    local hv run_id ioc_tv host
+    hv=$(kill_envelope_root_field "$env" host_verdict)
+    run_id=$(kill_envelope_root_field "$env" run_id)
+    ioc_tv=$(kill_envelope_root_field "$env" tool_version)
+    host=$(kill_envelope_root_field "$env" host)
+
+    local ts_planned
+    ts_planned=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    local files_tmp ips_tmp refused_tmp
+    files_tmp=$(mktemp /tmp/sessionscribe-kill-files-XXXXXX) || return 1
+    ips_tmp=$(mktemp /tmp/sessionscribe-kill-ips-XXXXXX) || { rm -f "$files_tmp"; return 1; }
+    refused_tmp=$(mktemp /tmp/sessionscribe-kill-refused-XXXXXX) || { rm -f "$files_tmp" "$ips_tmp"; return 1; }
+
+    local line area severity key pattern path ip ts_first count action
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
+        area=$(kill_json_str_field "$line" area)
+        case "$area" in
+            (logs|destruction) ;;
+            (*) continue ;;
+        esac
+        severity=$(kill_json_str_field "$line" severity)
+        case "$severity" in
+            (strong|warning) ;;
+            (*) continue ;;
+        esac
+        key=$(kill_json_str_field "$line" key)
+        case "$key" in
+            (ioc_sample|ioc_attacker_ip_sample|session_shape_sample) continue ;;
+        esac
+        pattern=$(kill_pattern_for_key "$key")
+        [[ "$pattern" == "skip" ]] && continue
+
+        if [[ "$pattern" == "ip" ]]; then
+            ip=$(kill_json_str_field "$line" ip)
+            [[ -z "$ip" ]] && continue
+            ts_first=$(kill_json_num_field "$line" ts_epoch_first)
+            [[ -z "$ts_first" ]] && ts_first=0
+            count=$(kill_json_num_field "$line" count)
+            [[ -z "$count" ]] && count=1
+            printf '%s\t%s\t%s\t%s\n' "$ip" "$ts_first" "$count" "$key" >> "$ips_tmp"
+            continue
+        fi
+
+        action=$(kill_action_for_pattern "$pattern")
+        [[ "$action" == "skip" ]] && continue
+
+        path=$(kill_json_str_field "$line" path)
+        [[ -z "$path" ]] && path=$(kill_json_str_field "$line" sample_path)
+        # "(none)" is a documented placeholder some emits use when no real
+        # evidence path was captured (pattern_a_evidence_destruction etc).
+        [[ "$path" == "(none)" || -z "$path" ]] && continue
+
+        if ! kill_path_in_allowlist "$path"; then
+            printf '%s\t%s\t%s\t%s\n' "$pattern" "$key" "$path" "path_outside_allowlist" >> "$refused_tmp"
+            continue
+        fi
+
+        printf '%s\t%s\t%s\t%s\n' "$pattern" "$key" "$path" "$action" >> "$files_tmp"
+    done < "$env"
+
+    # IP aggregation: group by IP, sum hits, take min(ts_first), keep first
+    # observed source_signal. gawk-3.x compatible (assoc array, no 3-arg
+    # match, no {n} intervals).
+    local ips_agg
+    ips_agg=$(awk -F'\t' '
+        {
+            ip=$1; ts=$2+0; hits=$3+0; key=$4
+            if (!(ip in seen)) {
+                seen[ip]=1; first_ts[ip]=ts; first_key[ip]=key; tot_hits[ip]=hits
+            } else {
+                if (ts > 0 && (first_ts[ip] == 0 || ts < first_ts[ip])) first_ts[ip]=ts
+                tot_hits[ip] += hits
+            }
+        }
+        END {
+            for (ip in seen) {
+                printf "%s\t%d\t%d\t%s\n", ip, first_ts[ip], tot_hits[ip], first_key[ip]
+            }
+        }
+    ' "$ips_tmp" | sort -t$'\t' -k2,2n -k1,1)
+
+    local files_planned ips_planned refused_count
+    files_planned=$(wc -l < "$files_tmp" | tr -d ' ')
+    if [[ -z "$ips_agg" ]]; then
+        ips_planned=0
+    else
+        ips_planned=$(printf '%s\n' "$ips_agg" | grep -c .)
+    fi
+    refused_count=$(wc -l < "$refused_tmp" | tr -d ' ')
+
+    # Hand-formatted JSON. jq is opportunistic later for in-place patching
+    # during K3/K4/K6; K1 itself emits valid JSON without depending on jq.
+    local first
+    {
+        printf '{\n'
+        printf '  "tool":"sessionscribe-mitigate",\n'
+        printf '  "tool_version":"%s",\n' "$VERSION"
+        printf '  "envelope":"%s",\n' "$(json_esc "$env")"
+        printf '  "envelope_run_id":"%s",\n' "$(json_esc "$run_id")"
+        printf '  "envelope_tool_version":"%s",\n' "$(json_esc "$ioc_tv")"
+        printf '  "host":"%s",\n' "$(json_esc "$host")"
+        printf '  "host_verdict":"%s",\n' "$(json_esc "$hv")"
+        printf '  "run_id":"%s",\n' "$RUN_ID"
+        printf '  "ts_planned":"%s",\n' "$ts_planned"
+        printf '  "ts_applied":null,\n'
+        printf '  "items":[\n'
+
+        first=1
+        local p k pp aa
+        while IFS=$'\t' read -r p k pp aa; do
+            [[ -z "$p" ]] && continue
+            (( first )) || printf ',\n'
+            first=0
+            printf '    {"kind":"file","pattern":"%s","ioc_key":"%s","path":"%s","action":"%s","sha256_pre":null,"sha256_post":null,"size":null,"dest":null,"result":null}' \
+                "$(json_esc "$p")" "$(json_esc "$k")" "$(json_esc "$pp")" "$(json_esc "$aa")"
+        done < "$files_tmp"
+
+        local rp rk rpath rres
+        while IFS=$'\t' read -r rp rk rpath rres; do
+            [[ -z "$rp" ]] && continue
+            (( first )) || printf ',\n'
+            first=0
+            printf '    {"kind":"file","pattern":"%s","ioc_key":"%s","path":"%s","action":"refused","result":"%s"}' \
+                "$(json_esc "$rp")" "$(json_esc "$rk")" "$(json_esc "$rpath")" "$(json_esc "$rres")"
+        done < "$refused_tmp"
+
+        if [[ -n "$ips_agg" ]]; then
+            local ip_a ts_a hits_a key_a
+            while IFS=$'\t' read -r ip_a ts_a hits_a key_a; do
+                [[ -z "$ip_a" ]] && continue
+                (( first )) || printf ',\n'
+                first=0
+                printf '    {"kind":"ip","ip":"%s","first_seen_epoch":%s,"hits":%s,"source_signal":"%s","action":"csf-deny","result":null}' \
+                    "$(json_esc "$ip_a")" "${ts_a:-0}" "${hits_a:-0}" "$(json_esc "$key_a")"
+            done <<< "$ips_agg"
+        fi
+
+        printf '\n  ],\n'
+        printf '  "csf":{\n'
+        printf '    "blocklist_url":"https://cdn.rfxn.com/downloads/rfxn_fh-l2_l3_webserver.netset",\n'
+        printf '    "blocklist_name":"RFXN_FH_L2L3",\n'
+        printf '    "registered":null,\n'
+        printf '    "lf_ipset":null,\n'
+        printf '    "lf_ipset_maxelem":null,\n'
+        printf '    "config_changed":null\n'
+        printf '  },\n'
+        printf '  "summary":{\n'
+        printf '    "files_planned":%d,\n' "$files_planned"
+        printf '    "ips_planned":%d,\n' "$ips_planned"
+        printf '    "files_refused":%d,\n' "$refused_count"
+        printf '    "files_quarantined":null,\n'
+        printf '    "files_failed":null,\n'
+        printf '    "files_gone":null,\n'
+        printf '    "ips_blocked":null,\n'
+        printf '    "ips_skipped":null,\n'
+        printf '    "ips_failed":null\n'
+        printf '  }\n'
+        printf '}\n'
+    } > "$out"
+
+    rm -f "$files_tmp" "$ips_tmp" "$refused_tmp"
+    return 0
+}
+
+###############################################################################
 # Backup root
 ###############################################################################
 
@@ -2054,6 +2329,14 @@ run_phase() {
         probe)      phase_probe ;;
     esac
 }
+
+# Library-only mode for unit-testing kill-chain helpers without running the
+# phase chain. When MITIGATE_LIBRARY_ONLY=1, all globals are initialized and
+# every helper function is in scope, but the banner, phases, and exit logic
+# below are skipped. Used by K1+ test harnesses; never set in production.
+if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 if (( QUIET == 0 )); then
     printf '\n%ssessionscribe-mitigate%s v%s - CVE-2026-41940 defense-in-depth\n' \
