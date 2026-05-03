@@ -267,6 +267,34 @@ PHASE SELECTION
     --kill-anyway          Run the kill chain even if host_verdict is not
                            COMPROMISED (operator-confirmed override).
                            Implies --kill.
+    --ssh-prune            Sweep canonical SSH key paths (~root/.ssh/
+                           authorized_keys{,2} + every /home/*/.ssh/
+                           authorized_keys{,2}) and surgically remove
+                           any key whose comment does not match the
+                           LW-trusted regex. Implies --kill. Per-line
+                           prune; original whole file preserved in
+                           BACKUP_DIR/quarantine/. Empty-comment keys
+                           are KEPT by default with WARN; pass
+                           --ssh-prune-unlabeled to also remove them.
+                           NOTE: respects host_verdict==COMPROMISED
+                           gate; for fleet-wide hygiene runs use
+                           --ssh-prune --kill-anyway.
+    --ssh-prune-unlabeled  Also prune keys with no comment (default
+                           policy keeps them with WARN). Implies
+                           --ssh-prune.
+    --ssh-allow REGEX      Append a site-specific trust-regex
+                           extension (POSIX ERE; matched against the
+                           comment field). Repeatable; values
+                           concatenated via '|'. Validated at parse
+                           time. Implies --ssh-prune.
+    --ssh-allow-lockout    Allow files where every key would be
+                           pruned (would-lock-out gate). Off by
+                           default. Implies --ssh-prune.
+    --ssh-allow-drift      Bypass the trust-regex sync gate (allow
+                           --ssh-prune even when mitigate's
+                           KILL_SSH_TRUST_RE has drifted from
+                           ioc-scan's SSH_KNOWN_GOOD_RE). Loud WARN.
+                           Off by default. Implies --ssh-prune.
     --list-phases          Print phase IDs + descriptions, then exit.
 
 OUTPUT (mutually exclusive on stdout - last flag wins)
@@ -348,6 +376,44 @@ while [[ $# -gt 0 ]]; do
         --kill)             RUN_KILL=1; shift ;;
         --envelope)         KILL_ENVELOPE="$2"; RUN_KILL=1; shift 2 ;;
         --kill-anyway)      KILL_ANYWAY=1; RUN_KILL=1; shift ;;
+        --ssh-prune)        RUN_KILL=1; KILL_SSH_PRUNE=1; shift ;;
+        --ssh-prune-unlabeled)
+                            RUN_KILL=1; KILL_SSH_PRUNE=1; KILL_SSH_PRUNE_UNLABELED=1; shift ;;
+        --ssh-allow)
+            # say_fail / say_warn are not yet defined at arg-parse time
+            # (definitions land after this loop); use plain stderr +
+            # the same exit-3 convention as the unknown-option branch.
+            [[ -z "${2:-}" ]] && { echo "Error: --ssh-allow requires REGEX" >&2; exit 3; }
+            # Validate as ERE: probe with empty + non-empty input. bash =~
+            # returns 0 (match), 1 (no match), 2 (regex error). rc=2 from
+            # EITHER probe = bad regex. The (...) subshell is INTENTIONAL
+            # — it isolates the [[ regex-error ]] from the parent shell so
+            # the script doesn't trip set-e / set-u behavior on a syntax
+            # error in operator-supplied input.
+            # shellcheck disable=SC2234  # subshell intentional (regex isolation)
+            ( [[ "" =~ $2 ]] ) 2>/dev/null
+            rc_empty=$?
+            # shellcheck disable=SC2234  # subshell intentional (regex isolation)
+            ( [[ "x" =~ $2 ]] ) 2>/dev/null
+            rc_nonempty=$?
+            if (( rc_empty > 1 || rc_nonempty > 1 )); then
+                echo "Error: --ssh-allow value is not a valid POSIX ERE: $2" >&2
+                exit 3
+            fi
+            # Round-2 M-5: warn on overly broad patterns that would silently
+            # neutralize the prune action. Operator policy permits them but
+            # we surface the breadth (plain stderr — say_warn not yet defined).
+            case "$2" in
+                (.\*|.\+|''|.) echo "Warning: --ssh-allow value '$2' is overly broad; effective regex matches everything → prune is neutralized for trust-check purposes." >&2 ;;
+            esac
+            KILL_SSH_ALLOW_EXTRAS+=("$2")
+            RUN_KILL=1; KILL_SSH_PRUNE=1
+            shift 2
+            ;;
+        --ssh-allow-lockout)
+                            RUN_KILL=1; KILL_SSH_PRUNE=1; KILL_SSH_ALLOW_LOCKOUT=1; shift ;;
+        --ssh-allow-drift)
+                            RUN_KILL=1; KILL_SSH_PRUNE=1; KILL_SSH_ALLOW_DRIFT=1; shift ;;
         --no-kill)          PHASE_DISABLED[kill]=1; shift ;;
         --no-snapshot)      PHASE_DISABLED[snapshot]=1; shift ;;
         --no-upcp)          PHASE_DISABLED[upcp]=1; shift ;;
@@ -2010,6 +2076,23 @@ kill_sidecar_to_lookup() {
                 printf 'csf\t%s\tresult\t%s\n' "$csf_key" "$result"
                 printf 'csf\t%s\tvalue\t%s\n'  "$csf_key" "$value"
                 ;;
+            sshkey)
+                # v0.7.0: per-file sshkey actions. Apply path emits BARE
+                # primaries (pruned_ok, forced_full_prune, ...). Path is
+                # the lookup key. keys_pruned + keys_kept feed the
+                # finalize_manifest summary aggregates.
+                path=$(kill_json_str_field "$line" path)
+                local kp_v kk_v sha_pre_v sha_post_v
+                kp_v=$(kill_json_num_field "$line" keys_pruned)
+                kk_v=$(kill_json_num_field "$line" keys_kept)
+                sha_pre_v=$(kill_json_str_field "$line" sha256_pre)
+                sha_post_v=$(kill_json_str_field "$line" sha256_post)
+                printf 'sshkey\t%s\tresult\t%s\n'      "$path" "$result"
+                printf 'sshkey\t%s\tkeys_pruned\t%s\n' "$path" "${kp_v:-0}"
+                printf 'sshkey\t%s\tkeys_kept\t%s\n'   "$path" "${kk_v:-0}"
+                printf 'sshkey\t%s\tsha256_pre\t%s\n'  "$path" "$sha_pre_v"
+                printf 'sshkey\t%s\tsha256_post\t%s\n' "$path" "$sha_post_v"
+                ;;
         esac
     done < "$sidecar"
 }
@@ -2035,6 +2118,11 @@ kill_compute_verdict() {
     local files_q=0 files_f=0 files_g=0 files_special=0 files_refused=0
     local ips_ok=0 ips_skip=0 ips_fail=0
     local csf_failed=0 csf_changed=0 csf_pending=0
+    # v0.7.0: kind:sshkey accumulators. Read from sidecar (apply mode) and
+    # from manifest "result":"planned_<primary>" (check mode, since sidecar
+    # is empty until prune_ssh_keys_from_manifest runs).
+    local sshkeys_ok=0 sshkeys_skip=0 sshkeys_fail=0 sshkeys_pending=0
+    local sshkeys_warn_promote=0
 
     # grep -c always emits a number (0 when no match) but rc=1 when zero -
     # do NOT chain `|| echo 0` here, that would append a second "0\n".
@@ -2075,13 +2163,75 @@ kill_compute_verdict() {
                                                    csf_pending=$((csf_pending+1)) ;;
                     esac
                     ;;
+                sshkey)
+                    # Sidecar carries BARE primary results (no `planned_` prefix);
+                    # apply-mode contributions land here. Result vocabulary +
+                    # contribution table per PLAN-sshkey-prune.md lines 47-61.
+                    case "$r" in
+                        (pruned_ok)
+                            sshkeys_ok=$((sshkeys_ok+1)) ;;
+                        (forced_full_prune)
+                            sshkeys_ok=$((sshkeys_ok+1))
+                            sshkeys_warn_promote=1 ;;
+                        (nothing_to_prune|gone|refused_symlink)
+                            sshkeys_skip=$((sshkeys_skip+1)) ;;
+                        (kept_unlabeled_warned)
+                            sshkeys_skip=$((sshkeys_skip+1))
+                            sshkeys_warn_promote=1 ;;
+                        (would_lock_out)
+                            sshkeys_skip=$((sshkeys_skip+1))
+                            sshkeys_warn_promote=1 ;;
+                        (lock_contended|concurrent_modification)
+                            sshkeys_skip=$((sshkeys_skip+1))
+                            sshkeys_warn_promote=1 ;;
+                        (prune_failed|refused_unparseable|clobbered_post_mv)
+                            sshkeys_fail=$((sshkeys_fail+1)) ;;
+                    esac
+                    ;;
             esac
         done < "$sidecar"
     fi
 
-    local total_fail=$(( files_f + ips_fail + csf_failed ))
-    local total_ok=$(( files_q + ips_ok + csf_changed ))
-    local total_pending=$(( csf_pending ))
+    # --check mode: sidecar is empty (or only K5-pending). Read sshkey
+    # plan-of-record straight from the manifest's "result":"planned_*" rows.
+    # Apply mode also reads the manifest as a fallback for items that
+    # appear in the manifest but produced no sidecar record (e.g., emitter
+    # short-circuited at gone/refused_symlink before a sidecar write).
+    if [[ "$MODE" != "apply" ]]; then
+        local pl ml
+        while IFS= read -r ml; do
+            [[ "$ml" =~ \"kind\":\"sshkey\" ]] || continue
+            # Pull "result":"planned_<primary>" — manifest value in --check.
+            pl=$(printf '%s' "$ml" | grep -oE '"result":"planned_[a-z_]+"' \
+                | head -1 | sed -E 's|^"result":"planned_||; s|"$||')
+            case "$pl" in
+                (pruned_ok)
+                    sshkeys_ok=$((sshkeys_ok+1)) ;;
+                (forced_full_prune)
+                    sshkeys_ok=$((sshkeys_ok+1))
+                    sshkeys_warn_promote=1 ;;
+                (nothing_to_prune|gone|refused_symlink)
+                    sshkeys_skip=$((sshkeys_skip+1)) ;;
+                (kept_unlabeled_warned)
+                    sshkeys_skip=$((sshkeys_skip+1))
+                    sshkeys_warn_promote=1 ;;
+                (would_lock_out)
+                    # --check semantics: would_lock_out is total_pending in
+                    # check mode (still surfaces as needs-apply work).
+                    sshkeys_pending=$((sshkeys_pending+1))
+                    sshkeys_warn_promote=1 ;;
+                (lock_contended|concurrent_modification)
+                    sshkeys_skip=$((sshkeys_skip+1))
+                    sshkeys_warn_promote=1 ;;
+                (prune_failed|refused_unparseable|clobbered_post_mv)
+                    sshkeys_fail=$((sshkeys_fail+1)) ;;
+            esac
+        done < "$manifest"
+    fi
+
+    local total_fail=$(( files_f + ips_fail + csf_failed + sshkeys_fail ))
+    local total_ok=$(( files_q + ips_ok + csf_changed + sshkeys_ok ))
+    local total_pending=$(( csf_pending + sshkeys_pending ))
 
     # Read planned counts from the manifest - K1 wrote them. In --check
     # mode the manifest is the only source of truth; sidecar records are
@@ -2094,16 +2244,27 @@ kill_compute_verdict() {
 
     if (( total_fail > 0 )); then
         LAST_KILL_VERDICT="FAIL"
-        LAST_KILL_DETAIL="${files_f} file fail(s), ${ips_fail} csf-deny fail(s), ${csf_failed} csf-conf fail(s)"
+        LAST_KILL_DETAIL="${files_f} file fail(s), ${ips_fail} csf-deny fail(s), ${csf_failed} csf-conf fail(s), ${sshkeys_fail} sshkey fail(s)"
     elif (( total_ok > 0 )); then
-        LAST_KILL_VERDICT="ACTION"
-        LAST_KILL_DETAIL="${files_q} quarantined, ${ips_ok} blocked, ${csf_changed} csf change(s); skips=${files_g}+${files_special}+${ips_skip}+${files_refused}"
-    elif [[ "$MODE" != "apply" ]] && (( files_planned + ips_planned > 0 || total_pending > 0 )); then
+        # WARN-promotion: forced_full_prune / kept_unlabeled_warned /
+        # would_lock_out / concurrent_modification / lock_contended on
+        # any sshkey item escalates the verdict from ACTION to WARN.
+        if (( sshkeys_warn_promote )); then
+            LAST_KILL_VERDICT="WARN"
+            LAST_KILL_DETAIL="${files_q} quarantined, ${ips_ok} blocked, ${csf_changed} csf change(s), ${sshkeys_ok} sshkey prune(s); WARN-promoted by sshkey result"
+        else
+            LAST_KILL_VERDICT="ACTION"
+            LAST_KILL_DETAIL="${files_q} quarantined, ${ips_ok} blocked, ${csf_changed} csf change(s), ${sshkeys_ok} sshkey prune(s); skips=${files_g}+${files_special}+${ips_skip}+${files_refused}"
+        fi
+    elif [[ "$MODE" != "apply" ]] && (( files_planned + ips_planned > 0 || total_pending > 0 || sshkeys_skip > 0 )); then
         LAST_KILL_VERDICT="WARN"
-        LAST_KILL_DETAIL="${files_planned} file(s) + ${ips_planned} ip(s) planned; ${total_pending} csf change(s) pending; needs --apply"
+        LAST_KILL_DETAIL="${files_planned} file(s) + ${ips_planned} ip(s) planned; ${total_pending} csf/sshkey change(s) pending; needs --apply"
     elif (( total_pending > 0 )); then
         LAST_KILL_VERDICT="WARN"
         LAST_KILL_DETAIL="${total_pending} csf change(s) need --apply; ${files_refused} path(s) refused"
+    elif (( sshkeys_warn_promote )); then
+        LAST_KILL_VERDICT="WARN"
+        LAST_KILL_DETAIL="sshkey result requires WARN promotion (kept-unlabeled / lock-out / concurrent-modification / lock-contended)"
     elif (( files_refused > 0 || files_g > 0 || files_special > 0 || ips_skip > 0 )); then
         LAST_KILL_VERDICT="WARN"
         LAST_KILL_DETAIL="all skips/refused; ${files_refused} refused, ${files_g} gone, ${files_special} special, ${ips_skip} ip skips"
@@ -2147,6 +2308,12 @@ finalize_manifest() {
             # Aggregate counters from the lookup map for the summary block.
             files_q = 0; files_f = 0; files_g = 0; files_special = 0
             ips_ok = 0; ips_skip = 0; ips_fail = 0
+            # v0.7.0 sshkey counters. Apply-path sidecar emits BARE primaries.
+            sshkeys_files_pruned = 0; sshkeys_files_clean = 0
+            sshkeys_files_kept_unlabeled = 0; sshkeys_files_lock_out = 0
+            sshkeys_files_failed = 0; sshkeys_files_concurrent_mod = 0
+            sshkeys_files_lock_contended = 0
+            sshkeys_keys_pruned_apply = 0; sshkeys_keys_kept_apply = 0
             for (k in store) {
                 split(k, p, SUBSEP)
                 if (p[3] != "result") continue
@@ -2160,6 +2327,20 @@ finalize_manifest() {
                     if (v == "ok") ips_ok++
                     else if (v == "already_blocked" || v == "private_skipped" || v == "csf_not_installed") ips_skip++
                     else if (v == "csf_failed") ips_fail++
+                } else if (p[1] == "sshkey") {
+                    if (v == "pruned_ok" || v == "forced_full_prune") sshkeys_files_pruned++
+                    else if (v == "nothing_to_prune" || v == "gone" || v == "refused_symlink") sshkeys_files_clean++
+                    else if (v == "kept_unlabeled_warned") sshkeys_files_kept_unlabeled++
+                    else if (v == "would_lock_out") sshkeys_files_lock_out++
+                    else if (v == "concurrent_modification") sshkeys_files_concurrent_mod++
+                    else if (v == "lock_contended") sshkeys_files_lock_contended++
+                    else if (v == "prune_failed" || v == "refused_unparseable" || v == "clobbered_post_mv") sshkeys_files_failed++
+                    # Roll keys_pruned / keys_kept from this sshkey item
+                    # into the apply-mode totals.
+                    pkey = store["sshkey", p[2], "keys_pruned"]
+                    if (pkey ~ /^[0-9]+$/) sshkeys_keys_pruned_apply += pkey
+                    kkey = store["sshkey", p[2], "keys_kept"]
+                    if (kkey ~ /^[0-9]+$/) sshkeys_keys_kept_apply += kkey
                 }
             }
             in_items = 0; in_csf = 0; in_summary = 0; depth = 0
@@ -2181,11 +2362,12 @@ finalize_manifest() {
         /^  "summary":\{$/                { in_summary = 1
                                             print
                                             # files_planned / ips_planned / files_refused
-                                            # are emitted as "0" placeholders here; the
-                                            # sed pass after awk re-extracts the real K1
+                                            # and the sshkey planned/keep totals are emitted
+                                            # as "0" placeholders here; the sed pass after
+                                            # awk re-extracts the real K1 / kind:sshkey
                                             # values from the source manifest and patches
                                             # them in. Source of truth = the original
-                                            # summary block on disk.
+                                            # summary block + on-disk kind:sshkey items.
                                             printf "    \"files_planned\":0,\n"
                                             printf "    \"ips_planned\":0,\n"
                                             printf "    \"files_refused\":0,\n"
@@ -2195,7 +2377,22 @@ finalize_manifest() {
                                             printf "    \"files_special\":%d,\n",     files_special
                                             printf "    \"ips_blocked\":%d,\n",       ips_ok
                                             printf "    \"ips_skipped\":%d,\n",       ips_skip
-                                            printf "    \"ips_failed\":%d\n",         ips_fail
+                                            printf "    \"ips_failed\":%d,\n",        ips_fail
+                                            # v0.7.0 sshkey block. files_planned / keys_*
+                                            # are placeholders (see sed pass below); the
+                                            # remaining counters come from sidecar
+                                            # aggregates above (BARE primaries).
+                                            printf "    \"sshkeys_files_planned\":0,\n"
+                                            printf "    \"sshkeys_files_pruned\":%d,\n",         sshkeys_files_pruned
+                                            printf "    \"sshkeys_files_clean\":%d,\n",          sshkeys_files_clean
+                                            printf "    \"sshkeys_files_kept_unlabeled\":%d,\n", sshkeys_files_kept_unlabeled
+                                            printf "    \"sshkeys_files_lock_out\":%d,\n",       sshkeys_files_lock_out
+                                            printf "    \"sshkeys_files_failed\":%d,\n",         sshkeys_files_failed
+                                            printf "    \"sshkeys_files_concurrent_mod\":%d,\n", sshkeys_files_concurrent_mod
+                                            printf "    \"sshkeys_files_lock_contended\":%d,\n", sshkeys_files_lock_contended
+                                            printf "    \"sshkeys_keys_pruned\":0,\n"
+                                            printf "    \"sshkeys_keys_kept\":0,\n"
+                                            printf "    \"sshkeys_keys_kept_unlabeled\":0\n"
                                             next }
         /^  \}$/ && in_summary            { in_summary = 0; print; next }
 
@@ -2239,6 +2436,21 @@ finalize_manifest() {
             ip = json_str(line, "ip")
             r = store["ip", ip, "result"]
             if (r == "") { print; next }
+            line = patch_field(line, "result", quoted(r))
+            print line
+            next
+        }
+        # v0.7.0: kind:sshkey item patcher. Apply path writes a sidecar
+        # record with BARE primary results; the K1 manifest "result" field
+        # is null and gets patched here (or stays null in --check, where
+        # the K1 emit already wrote "planned_<primary>").
+        in_items == 1 && /\{"kind":"sshkey"/ {
+            line = $0
+            path = json_str(line, "path")
+            r = store["sshkey", path, "result"]
+            if (r == "") { print; next }
+            sha_post = store["sshkey", path, "sha256_post"]
+            line = patch_field(line, "sha256_post", quoted(sha_post))
             line = patch_field(line, "result", quoted(r))
             print line
             next
@@ -2301,10 +2513,35 @@ finalize_manifest() {
     ip_p=$(grep -oE '"ips_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
     fr=$(grep -oE '"files_refused":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
     fp="${fp:-0}"; ip_p="${ip_p:-0}"; fr="${fr:-0}"
+
+    # v0.7.0 sshkey planned counts: derived from the manifest's kind:sshkey
+    # items themselves (K1 wrote them). Sum keys_pruned, keys_kept,
+    # keys_kept_unlabeled across every kind:sshkey row; total file count is
+    # the row count. In --check the per-key totals come from the planned
+    # classifier output; in --apply they reflect the original plan-of-record
+    # (sidecar BARE primaries handle post-mutation result reconciliation in
+    # the awk pass above).
+    local sk_files_planned sk_keys_pruned sk_keys_kept sk_keys_kept_unl
+    sk_files_planned=$(grep -cE '"kind":"sshkey"' "$manifest" 2>/dev/null)
+    sk_files_planned="${sk_files_planned:-0}"
+    sk_keys_pruned=$(grep -oE '"keys_pruned":[0-9]+' "$manifest" \
+        | grep -oE '[0-9]+' | awk '{n+=$1} END{print n+0}')
+    sk_keys_kept=$(grep -oE '"keys_kept":[0-9]+' "$manifest" \
+        | grep -oE '[0-9]+' | awk '{n+=$1} END{print n+0}')
+    sk_keys_kept_unl=$(grep -oE '"keys_kept_unlabeled":[0-9]+' "$manifest" \
+        | grep -oE '[0-9]+' | awk '{n+=$1} END{print n+0}')
+    sk_keys_pruned="${sk_keys_pruned:-0}"
+    sk_keys_kept="${sk_keys_kept:-0}"
+    sk_keys_kept_unl="${sk_keys_kept_unl:-0}"
+
     sed -i -E \
         -e "s|\"files_planned\":[0-9]+,|\"files_planned\":${fp},|" \
         -e "s|\"ips_planned\":[0-9]+,|\"ips_planned\":${ip_p},|" \
         -e "s|\"files_refused\":[0-9]+,|\"files_refused\":${fr},|" \
+        -e "s|\"sshkeys_files_planned\":[0-9]+,|\"sshkeys_files_planned\":${sk_files_planned},|" \
+        -e "s|\"sshkeys_keys_pruned\":[0-9]+,|\"sshkeys_keys_pruned\":${sk_keys_pruned},|" \
+        -e "s|\"sshkeys_keys_kept\":[0-9]+,|\"sshkeys_keys_kept\":${sk_keys_kept},|" \
+        -e "s|\"sshkeys_keys_kept_unlabeled\":[0-9]+|\"sshkeys_keys_kept_unlabeled\":${sk_keys_kept_unl}|" \
         "$tmp"
 
     mv "$tmp" "$manifest"
@@ -3978,6 +4215,30 @@ phase_kill() {
         mkdir -p "$BACKUP_DIR" 2>/dev/null || true
     fi
 
+    # v0.7.0 ssh-key-prune setup. Runs ONCE per phase_kill invocation,
+    # ahead of manifest build so kill_build_manifest's per-signal
+    # supersede check sees the populated KILL_SSHKEY_CANONICAL_CACHE.
+    if (( KILL_SSH_PRUNE )); then
+        # F-01: trust-drift sync gate.
+        if ! kill_sshkey_check_trust_drift; then
+            phase_set kill FAIL "trust-regex drift; --ssh-allow-drift to override"
+            return
+        fi
+        # Effective trust regex = base regex + |-joined --ssh-allow extras.
+        KILL_SSH_TRUST_RE_EFFECTIVE="$KILL_SSH_TRUST_RE"
+        if (( ${#KILL_SSH_ALLOW_EXTRAS[@]} > 0 )); then
+            local _extra
+            for _extra in "${KILL_SSH_ALLOW_EXTRAS[@]}"; do
+                KILL_SSH_TRUST_RE_EFFECTIVE+="|${_extra}"
+            done
+        fi
+        # F-06: orphan-tmp sweep at startup.
+        kill_sshkey_orphan_tmp_sweep
+        # M-2: populate canonical-paths cache ONCE so the supersede
+        # check is O(1) per signal.
+        kill_sshkey_populate_canonical_cache
+    fi
+
     local manifest="$BACKUP_DIR/kill-manifest.json"
 
     # K1: build manifest.
@@ -4000,6 +4261,12 @@ phase_kill() {
         apply_csf_blocks "$manifest" || true
         # K5: rfxn blocklist register (mutates csf.conf + csf.blocklists).
         register_rfxn_blocklist "$manifest" || true
+        # K-sshkey: surgical SSH-key prune (per-line). Runs only when
+        # --ssh-prune is active. Uses the manifest's pre-baked
+        # original_backup_path so recovery_hint stays accurate.
+        if (( KILL_SSH_PRUNE )); then
+            prune_ssh_keys_from_manifest "$manifest" || true
+        fi
 
         # csf -ra reload if anything csf-related changed.
         local sidecar="${manifest%.json}.actions.jsonl"
@@ -4190,8 +4457,29 @@ run_phase() {
 # every helper function is in scope, but the banner, phases, and exit logic
 # below are skipped. Used by K1+ test harnesses; never set in production.
 if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
+    # MITIGATE_DUMP_FLAGS=1 — P3 test seam. Dumps the post-parse state of
+    # the --ssh-* flag globals so the test harness can spawn a subprocess
+    # to verify arg-parse side effects. Not a documented flag; never set
+    # in production.
+    if [[ "${MITIGATE_DUMP_FLAGS:-0}" == "1" ]]; then
+        printf 'KILL_SSH_PRUNE=%s\n'           "$KILL_SSH_PRUNE"
+        printf 'KILL_SSH_PRUNE_UNLABELED=%s\n' "$KILL_SSH_PRUNE_UNLABELED"
+        printf 'KILL_SSH_ALLOW_LOCKOUT=%s\n'   "$KILL_SSH_ALLOW_LOCKOUT"
+        printf 'KILL_SSH_ALLOW_DRIFT=%s\n'     "$KILL_SSH_ALLOW_DRIFT"
+        printf 'RUN_KILL=%s\n'                 "$RUN_KILL"
+        printf 'KILL_SSH_ALLOW_EXTRAS_COUNT=%s\n' "${#KILL_SSH_ALLOW_EXTRAS[@]}"
+        if (( ${#KILL_SSH_ALLOW_EXTRAS[@]} > 0 )); then
+            for _i_extra in "${!KILL_SSH_ALLOW_EXTRAS[@]}"; do
+                printf 'KILL_SSH_ALLOW_EXTRAS[%s]=%s\n' \
+                    "$_i_extra" "${KILL_SSH_ALLOW_EXTRAS[$_i_extra]}"
+            done
+        fi
+        exit 0
+    fi
     if [[ "${MITIGATE_RUN_P1_TESTS:-0}" == "1" ]]; then
-        # P1 test harness — 29 cases from PLAN-sshkey-prune.md lines 488-525.
+        # P1+P2+P3 test harness — 44 cases from PLAN-sshkey-prune.md.
+        # P1 = 29 (helpers + drift gate), P2 = 6 (manifest sweep + apply
+        # consumer), P3 = 9 (CLI flags + phase_kill drift gate).
         # Each test prints OK(<n> <description>) or FAIL(<n> <description>:
         # <diagnostic>) on stdout. Exits 0 on all-OK, 1 on any FAIL.
         _t_pass=0
@@ -4816,9 +5104,179 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         KILL_SSHKEY_CANONICAL_CACHE=()
         unset MITIGATE_FORCE_SSH_PRUNE
 
+        # ===================================================================
+        # P3 tests (36-44). CLI flags + phase_kill drift gate.
+        # Tests 36-43 spawn subprocesses that re-invoke this script with
+        # MITIGATE_LIBRARY_ONLY=1 + MITIGATE_DUMP_FLAGS=1 so the arg-parse
+        # loop runs once and the post-parse global state is dumped to
+        # stdout for inspection. Test 44 drives phase_kill in-process via
+        # a synthetic envelope + fake ioc-scan companion path.
+        # ===================================================================
+        _self_path="${BASH_SOURCE[0]}"
+
+        # Test 36: --ssh-allow with a valid regex is accepted (exit 0).
+        _o36=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-allow 'contractor@bigco\.example' 2>/dev/null)
+        _rc36=$?
+        if (( _rc36 == 0 )) && [[ "$_o36" == *"KILL_SSH_ALLOW_EXTRAS[0]=contractor@bigco\\.example"* ]]; then
+            _t_ok 36 "--ssh-allow valid regex accepted"
+        else
+            _t_fail 36 "--ssh-allow valid regex accepted" "rc=$_rc36 out=$_o36"
+        fi
+
+        # Test 37: --ssh-allow with `[` is rejected (exit 3, "not a valid POSIX ERE").
+        _o37=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-allow '[' 2>&1 >/dev/null)
+        _rc37=$?
+        if (( _rc37 == 3 )) && [[ "$_o37" == *"not a valid POSIX ERE"* ]]; then
+            _t_ok 37 "--ssh-allow invalid regex -> exit 3 + ERE message"
+        else
+            _t_fail 37 "--ssh-allow invalid regex -> exit 3 + ERE message" \
+                "rc=$_rc37 stderr=$_o37"
+        fi
+
+        # Test 38: --ssh-allow with .* accepted, broad-regex WARN to stderr.
+        _o38_err=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-allow '.*' 2>&1 >/dev/null)
+        _rc38=$?
+        if (( _rc38 == 0 )) && [[ "$_o38_err" == *"overly broad"* ]]; then
+            _t_ok 38 "--ssh-allow .* -> accepted + broad WARN to stderr"
+        else
+            _t_fail 38 "--ssh-allow .* -> accepted + broad WARN" \
+                "rc=$_rc38 stderr=$_o38_err"
+        fi
+
+        # Test 39: --ssh-allow X --ssh-allow Y -> both accumulated.
+        _o39=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-allow 'foo' --ssh-allow 'bar' 2>/dev/null)
+        _rc39=$?
+        if (( _rc39 == 0 )) \
+           && [[ "$_o39" == *"KILL_SSH_ALLOW_EXTRAS_COUNT=2"* ]] \
+           && [[ "$_o39" == *"KILL_SSH_ALLOW_EXTRAS[0]=foo"* ]] \
+           && [[ "$_o39" == *"KILL_SSH_ALLOW_EXTRAS[1]=bar"* ]]; then
+            _t_ok 39 "--ssh-allow X --ssh-allow Y -> both accumulated"
+        else
+            _t_fail 39 "--ssh-allow X --ssh-allow Y -> both accumulated" \
+                "rc=$_rc39 out=$_o39"
+        fi
+
+        # Test 40: --ssh-prune sets KILL_SSH_PRUNE=1 and RUN_KILL=1.
+        _o40=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-prune 2>/dev/null)
+        if [[ "$_o40" == *"KILL_SSH_PRUNE=1"* ]] \
+           && [[ "$_o40" == *"RUN_KILL=1"* ]]; then
+            _t_ok 40 "--ssh-prune sets KILL_SSH_PRUNE=1 + RUN_KILL=1"
+        else
+            _t_fail 40 "--ssh-prune sets KILL_SSH_PRUNE=1 + RUN_KILL=1" "out=$_o40"
+        fi
+
+        # Test 41: --ssh-prune-unlabeled sets all three.
+        _o41=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-prune-unlabeled 2>/dev/null)
+        if [[ "$_o41" == *"RUN_KILL=1"* ]] \
+           && [[ "$_o41" == *"KILL_SSH_PRUNE=1"* ]] \
+           && [[ "$_o41" == *"KILL_SSH_PRUNE_UNLABELED=1"* ]]; then
+            _t_ok 41 "--ssh-prune-unlabeled sets RUN_KILL+KILL_SSH_PRUNE+KILL_SSH_PRUNE_UNLABELED"
+        else
+            _t_fail 41 "--ssh-prune-unlabeled" "out=$_o41"
+        fi
+
+        # Test 42: --ssh-allow-lockout sets the lockout flag (and implies
+        # --ssh-prune + --kill).
+        _o42=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-allow-lockout 2>/dev/null)
+        if [[ "$_o42" == *"RUN_KILL=1"* ]] \
+           && [[ "$_o42" == *"KILL_SSH_PRUNE=1"* ]] \
+           && [[ "$_o42" == *"KILL_SSH_ALLOW_LOCKOUT=1"* ]]; then
+            _t_ok 42 "--ssh-allow-lockout sets the lockout flag (implies prune+kill)"
+        else
+            _t_fail 42 "--ssh-allow-lockout" "out=$_o42"
+        fi
+
+        # Test 43: --ssh-allow-drift sets the drift flag (and implies
+        # --ssh-prune + --kill).
+        _o43=$(MITIGATE_LIBRARY_ONLY=1 MITIGATE_DUMP_FLAGS=1 \
+            bash "$_self_path" --ssh-allow-drift 2>/dev/null)
+        if [[ "$_o43" == *"RUN_KILL=1"* ]] \
+           && [[ "$_o43" == *"KILL_SSH_PRUNE=1"* ]] \
+           && [[ "$_o43" == *"KILL_SSH_ALLOW_DRIFT=1"* ]]; then
+            _t_ok 43 "--ssh-allow-drift sets the drift flag (implies prune+kill)"
+        else
+            _t_fail 43 "--ssh-allow-drift" "out=$_o43"
+        fi
+
+        # Test 44: phase_kill with synthesized trust-regex drift —
+        # default flags fail with phase_set kill FAIL detail mentioning
+        # "drift"; KILL_SSH_ALLOW_DRIFT=1 proceeds with WARN.
+        # Set up a fake ioc-scan companion at a non-default path with a
+        # divergent SSH_KNOWN_GOOD_RE so kill_sshkey_check_trust_drift
+        # returns rc=1.
+        _fake_ioc44="$_t_dir/44-iocscan.sh"
+        {
+            printf '#!/bin/bash\n'
+            printf "SSH_KNOWN_GOOD_RE='(bogus_drift_test)'\n"
+        } > "$_fake_ioc44"
+        # Synthetic envelope (compromised host so the gate is met).
+        _env44="$_t_dir/44-envelope.json"
+        {
+            printf '{\n'
+            printf '  "host":"test","host_verdict":"COMPROMISED","run_id":"test","tool_version":"test",\n'
+            printf '  "signals":[]\n}\n'
+        } > "$_env44"
+        # Drive phase_kill in-process. Save / restore the relevant globals.
+        _save_run_kill="$RUN_KILL"
+        _save_mode="$MODE"
+        _save_envelope="$KILL_ENVELOPE"
+        _save_backup_dir="$BACKUP_DIR"
+        _save_drift="$KILL_SSH_ALLOW_DRIFT"
+        RUN_KILL=1; KILL_SSH_PRUNE=1
+        MODE="check"
+        KILL_ENVELOPE="$_env44"
+        BACKUP_DIR="$_t_dir/44-bdir"
+        mkdir -p "$BACKUP_DIR"
+        KILL_SSH_TRUST_DRIFT_TEST_PATH="$_fake_ioc44"
+
+        # Run #1: drift, no override → phase FAIL with detail mentioning "drift".
+        KILL_SSH_ALLOW_DRIFT=0
+        # phase_kill writes to P_VERDICT[kill] / P_DETAIL[kill] via phase_set.
+        # Suppress all stderr/stdout banners.
+        QUIET=1
+        phase_kill >/dev/null 2>&1
+        _v44a="${P_VERDICT[kill]:-?}"
+        _d44a="${P_DETAIL[kill]:-}"
+
+        # Run #2: drift, override → proceeds. Verdict is whatever finalize
+        # produces; the assertion is "did NOT FAIL with drift message".
+        KILL_SSH_ALLOW_DRIFT=1
+        # Reset phase state so phase_set can reassign.
+        unset 'P_VERDICT[kill]' 'P_DETAIL[kill]'
+        phase_kill >/dev/null 2>&1
+        _v44b="${P_VERDICT[kill]:-?}"
+        _d44b="${P_DETAIL[kill]:-}"
+
+        # Restore globals.
+        unset KILL_SSH_TRUST_DRIFT_TEST_PATH
+        RUN_KILL="$_save_run_kill"
+        MODE="$_save_mode"
+        KILL_ENVELOPE="$_save_envelope"
+        BACKUP_DIR="$_save_backup_dir"
+        KILL_SSH_ALLOW_DRIFT="$_save_drift"
+        KILL_SSH_PRUNE=0
+        KILL_SSH_TRUST_RE_EFFECTIVE=""
+        KILL_SSHKEY_CANONICAL_CACHE=()
+
+        # Assert: run #1 = FAIL with "drift" in detail; run #2 != FAIL with drift.
+        if [[ "$_v44a" == "FAIL" && "$_d44a" == *"drift"* \
+              && "$_v44b" != "FAIL" ]]; then
+            _t_ok 44 "phase_kill drift gate fails without override; proceeds with KILL_SSH_ALLOW_DRIFT=1"
+        else
+            _t_fail 44 "phase_kill drift gate" \
+                "no_override_v=$_v44a no_override_d='$_d44a' override_v=$_v44b override_d='$_d44b'"
+        fi
+
         rm -rf "$_t_dir"
         printf '\n'
-        printf 'P1 tests: %d/%d passed\n' "$_t_pass" $(( _t_pass + _t_fail ))
+        printf 'P1+P2+P3 tests: %d/%d passed\n' "$_t_pass" $(( _t_pass + _t_fail ))
         if (( _t_fail > 0 )); then
             exit 1
         fi
