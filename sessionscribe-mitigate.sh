@@ -629,12 +629,54 @@ kill_action_for_pattern() {
     esac
 }
 
-# Path-allowlist gate. K1 stub - returns 0 unconditionally if path is
-# non-empty. K2 hardens with a real allowlist + envelope-injection guards.
+# Path-allowlist gate. Refuses any path outside the documented allowlist
+# of mutable roots; protects against (a) malformed envelopes, (b) path
+# traversal from a compromised ioc-scan, (c) operator misconfiguration.
+#
+# Allowlist:
+#   /root/                              user home (root operator)
+#   /home/*/                            cPanel user homes (incl. .ssh, public_html)
+#   /etc/profile.d/                     login-time hooks (Pattern I)
+#   /etc/systemd/system/                unit files (Pattern J)
+#   /etc/udev/rules.d/                  udev rules (Pattern J)
+#   /etc/cron.d/, cron.{hourly,daily,weekly,monthly}/  scheduled tasks
+#   /var/spool/cron/                    user crontabs
+#   /usr/local/cpanel/var/              cPanel reseller token files (Pattern D)
+#
+# Shape probes:
+#   - Path must be absolute (envelope contract; relative is operator error)
+#   - No control chars (NUL, newline, tab, etc.) - envelope-injection guard
+#   - realpath -m resolves symlinks + .. components; falls back to readlink -f
+#     on hosts where realpath is absent (EL6 coreutils 8.4 has both, but
+#     keep the fallback for cross-distro defensiveness).
 kill_path_in_allowlist() {
-    local path="$1"
+    local path="$1" resolved
     [[ -n "$path" ]] || return 1
-    return 0
+    [[ "$path" == /* ]] || return 1
+    [[ "$path" =~ [[:cntrl:]] ]] && return 1
+
+    if have_cmd realpath; then
+        resolved=$(realpath -m "$path" 2>/dev/null) || return 1
+    elif have_cmd readlink; then
+        resolved=$(readlink -f "$path" 2>/dev/null)
+        [[ -z "$resolved" ]] && resolved="$path"
+    else
+        resolved="$path"
+    fi
+    [[ -n "$resolved" ]] || return 1
+    [[ "$resolved" == /* ]] || return 1
+
+    case "$resolved" in
+        (/root|/root/*)                                                                                  return 0 ;;
+        (/home/*)                                                                                        return 0 ;;
+        (/etc/profile.d/*)                                                                               return 0 ;;
+        (/etc/systemd/system/*)                                                                          return 0 ;;
+        (/etc/udev/rules.d/*)                                                                            return 0 ;;
+        (/etc/cron.d/*|/etc/cron.hourly/*|/etc/cron.daily/*|/etc/cron.weekly/*|/etc/cron.monthly/*)      return 0 ;;
+        (/var/spool/cron/*)                                                                              return 0 ;;
+        (/usr/local/cpanel/var/*)                                                                        return 0 ;;
+        (*)                                                                                              return 1 ;;
+    esac
 }
 
 # Build the manifest. Walks signals, applies pattern->action policy,
