@@ -1017,6 +1017,343 @@ quarantine_from_manifest() {
     return $fails
 }
 
+# Build a sidecar lookup. Streams the *.actions.jsonl into stdout as
+# tab-delimited rows: lookup_kind <TAB> lookup_key <TAB> field <TAB> value.
+# Consumed by finalize_manifest's awk merger.
+kill_sidecar_to_lookup() {
+    local sidecar="$1"
+    [[ -f "$sidecar" ]] || return 0
+
+    local line kind key
+    local path sha_pre sha_post size dest result
+    local ip src comment
+    local csf_key value
+    while IFS= read -r line; do
+        kind=$(kill_json_str_field "$line" kind)
+        result=$(kill_json_str_field "$line" result)
+        case "$kind" in
+            file)
+                path=$(kill_json_str_field "$line" path)
+                sha_pre=$(kill_json_str_field "$line" sha256_pre)
+                sha_post=$(kill_json_str_field "$line" sha256_post)
+                size=$(kill_json_num_field "$line" size)
+                dest=$(kill_json_str_field "$line" dest)
+                printf 'file\t%s\tresult\t%s\n'     "$path" "$result"
+                printf 'file\t%s\tsha256_pre\t%s\n' "$path" "$sha_pre"
+                printf 'file\t%s\tsha256_post\t%s\n' "$path" "$sha_post"
+                printf 'file\t%s\tsize\t%s\n'       "$path" "${size:-}"
+                printf 'file\t%s\tdest\t%s\n'       "$path" "$dest"
+                ;;
+            ip)
+                ip=$(kill_json_str_field "$line" ip)
+                src=$(kill_json_str_field "$line" source_signal)
+                comment=$(kill_json_str_field "$line" comment)
+                printf 'ip\t%s\tresult\t%s\n'         "$ip" "$result"
+                printf 'ip\t%s\tsource_signal\t%s\n'  "$ip" "$src"
+                printf 'ip\t%s\tcomment\t%s\n'        "$ip" "$comment"
+                ;;
+            csf)
+                csf_key=$(kill_json_str_field "$line" key)
+                value=$(kill_json_str_field "$line" value)
+                printf 'csf\t%s\tresult\t%s\n' "$csf_key" "$result"
+                printf 'csf\t%s\tvalue\t%s\n'  "$csf_key" "$value"
+                ;;
+        esac
+    done < "$sidecar"
+}
+
+# Compute the phase_kill verdict from sidecar action results + manifest
+# refused items. Sets the global LAST_KILL_VERDICT and LAST_KILL_DETAIL
+# so the caller can phase_set kill ${verdict} "${detail}".
+#
+# Verdict logic:
+#   FAIL    - any mv_failed / corrupt_during_move / rm_failed_after_copy
+#             / csf_failed / config_set_failed
+#   ACTION  - at least one ok action and no failures
+#   WARN    - --check mode finds work, OR --apply with non-fatal skips
+#             (private_skipped, already_blocked, gone, needs_apply_*)
+#   OK      - nothing planned, nothing done
+#   SKIPPED - set by caller before this fn (gate-not-met)
+LAST_KILL_VERDICT=""
+LAST_KILL_DETAIL=""
+kill_compute_verdict() {
+    local manifest="$1"
+    local sidecar="${manifest%.json}.actions.jsonl"
+
+    local files_q=0 files_f=0 files_g=0 files_special=0 files_refused=0
+    local ips_ok=0 ips_skip=0 ips_fail=0
+    local csf_failed=0 csf_changed=0 csf_pending=0
+
+    # grep -c always emits a number (0 when no match) but rc=1 when zero -
+    # do NOT chain `|| echo 0` here, that would append a second "0\n".
+    files_refused=$(grep -cE '"action":"refused"' "$manifest" 2>/dev/null)
+    files_refused="${files_refused:-0}"
+
+    if [[ -f "$sidecar" ]]; then
+        local line k r kc
+        while IFS= read -r line; do
+            k=$(kill_json_str_field "$line" kind)
+            r=$(kill_json_str_field "$line" result)
+            case "$k" in
+                file)
+                    case "$r" in
+                        (ok)                                                          files_q=$((files_q+1)) ;;
+                        (gone)                                                        files_g=$((files_g+1)) ;;
+                        (refused_special_file)                                        files_special=$((files_special+1)) ;;
+                        (mv_failed|corrupt_during_move|rm_failed_after_copy)          files_f=$((files_f+1)) ;;
+                    esac
+                    ;;
+                ip)
+                    case "$r" in
+                        (ok)                                                          ips_ok=$((ips_ok+1)) ;;
+                        (already_blocked|private_skipped|csf_not_installed)           ips_skip=$((ips_skip+1)) ;;
+                        (csf_failed)                                                  ips_fail=$((ips_fail+1)) ;;
+                    esac
+                    ;;
+                csf)
+                    kc=$(kill_json_str_field "$line" key)
+                    case "$r" in
+                        (ok|created_new_file)
+                            case "$kc" in
+                                (LF_IPSET|blocklist_register) csf_changed=$((csf_changed+1)) ;;
+                            esac
+                            ;;
+                        (config_set_failed)        csf_failed=$((csf_failed+1)) ;;
+                        (needs_apply_to_flip|needs_apply_to_register|needs_apply_to_create)
+                                                   csf_pending=$((csf_pending+1)) ;;
+                    esac
+                    ;;
+            esac
+        done < "$sidecar"
+    fi
+
+    local total_fail=$(( files_f + ips_fail + csf_failed ))
+    local total_ok=$(( files_q + ips_ok + csf_changed ))
+    local total_pending=$(( csf_pending ))
+
+    if (( total_fail > 0 )); then
+        LAST_KILL_VERDICT="FAIL"
+        LAST_KILL_DETAIL="${files_f} file fail(s), ${ips_fail} csf-deny fail(s), ${csf_failed} csf-conf fail(s)"
+    elif (( total_ok > 0 )); then
+        LAST_KILL_VERDICT="ACTION"
+        LAST_KILL_DETAIL="${files_q} quarantined, ${ips_ok} blocked, ${csf_changed} csf change(s); skips=${files_g}+${files_special}+${ips_skip}+${files_refused}"
+    elif (( total_pending > 0 )); then
+        LAST_KILL_VERDICT="WARN"
+        LAST_KILL_DETAIL="${total_pending} csf change(s) need --apply; ${files_refused} path(s) refused"
+    elif (( files_refused > 0 || files_g > 0 || files_special > 0 || ips_skip > 0 )); then
+        LAST_KILL_VERDICT="WARN"
+        LAST_KILL_DETAIL="all skips/refused; ${files_refused} refused, ${files_g} gone, ${files_special} special, ${ips_skip} ip skips"
+    else
+        LAST_KILL_VERDICT="OK"
+        LAST_KILL_DETAIL="nothing to do"
+    fi
+}
+
+# Merge sidecar action results into the manifest, populate ts_applied,
+# csf{} block, and summary{} counters. Output replaces the manifest in
+# place via temp + mv. Pure bash/awk - no jq dependency.
+finalize_manifest() {
+    local manifest="$1"
+    [[ -n "$manifest" && -f "$manifest" ]] || return 1
+    local sidecar="${manifest%.json}.actions.jsonl"
+    local lookup tmp
+    lookup=$(mktemp /tmp/sessionscribe-kill-lookup-XXXXXX) || return 1
+    tmp="${manifest}.tmp.$$"
+
+    kill_sidecar_to_lookup "$sidecar" > "$lookup"
+
+    local ts_applied
+    ts_applied=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # awk merger: streams the manifest, looking up file/ip patches by path/ip
+    # from the lookup file. CSF block and summary are emitted from scratch
+    # using sidecar aggregates. gawk-3.x compatible (no 3-arg match, no {n},
+    # split on tab is portable).
+    awk -v lookup="$lookup" -v ts_applied="$ts_applied" '
+        BEGIN {
+            # Load lookup: lookup_kind<TAB>lookup_key<TAB>field<TAB>value
+            while ((getline ll < lookup) > 0) {
+                n = split(ll, a, "\t")
+                if (n < 4) continue
+                lkind = a[1]; lkey = a[2]; field = a[3]; value = a[4]
+                store[lkind, lkey, field] = value
+                if (lkind == "csf") csf_keys[lkey] = 1
+            }
+            close(lookup)
+
+            # Aggregate counters from the lookup map for the summary block.
+            files_q = 0; files_f = 0; files_g = 0; files_special = 0
+            ips_ok = 0; ips_skip = 0; ips_fail = 0
+            for (k in store) {
+                split(k, p, SUBSEP)
+                if (p[3] != "result") continue
+                v = store[k]
+                if (p[1] == "file") {
+                    if (v == "ok") files_q++
+                    else if (v == "gone") files_g++
+                    else if (v == "refused_special_file") files_special++
+                    else if (v == "mv_failed" || v == "corrupt_during_move" || v == "rm_failed_after_copy") files_f++
+                } else if (p[1] == "ip") {
+                    if (v == "ok") ips_ok++
+                    else if (v == "already_blocked" || v == "private_skipped" || v == "csf_not_installed") ips_skip++
+                    else if (v == "csf_failed") ips_fail++
+                }
+            }
+            in_items = 0; in_csf = 0; in_summary = 0; depth = 0
+        }
+
+        # Detect block boundaries by line content.
+        /^  "items":\[$/                  { in_items = 1; print; next }
+        /^  \],$/ && in_items             { in_items = 0; print; next }
+        /^  "csf":\{$/                    { in_csf = 1
+                                            print
+                                            print "    \"blocklist_url\":\"https://cdn.rfxn.com/downloads/rfxn_fh-l2_l3_webserver.netset\","
+                                            print "    \"blocklist_name\":\"RFXN_FH_L2L3\","
+                                            printf "    \"registered\":%s,\n", csf_registered_value()
+                                            printf "    \"lf_ipset\":\"%s\",\n", store["csf","LF_IPSET","value"] != "" ? store["csf","LF_IPSET","value"] : "unknown"
+                                            printf "    \"lf_ipset_maxelem\":\"%s\",\n", store["csf","LF_IPSET_MAXELEM","value"] != "" ? store["csf","LF_IPSET_MAXELEM","value"] : "unknown"
+                                            printf "    \"config_changed\":%s\n", csf_changed_value()
+                                            next }
+        /^  \},$/ && in_csf               { in_csf = 0; print; next }
+        /^  "summary":\{$/                { in_summary = 1
+                                            files_planned_str = lookup_summary_orig("files_planned")
+                                            ips_planned_str = lookup_summary_orig("ips_planned")
+                                            files_refused_str = lookup_summary_orig("files_refused")
+                                            print
+                                            printf "    \"files_planned\":%s,\n",  files_planned_str
+                                            printf "    \"ips_planned\":%s,\n",    ips_planned_str
+                                            printf "    \"files_refused\":%s,\n",  files_refused_str
+                                            printf "    \"files_quarantined\":%d,\n", files_q
+                                            printf "    \"files_failed\":%d,\n",      files_f
+                                            printf "    \"files_gone\":%d,\n",        files_g
+                                            printf "    \"files_special\":%d,\n",     files_special
+                                            printf "    \"ips_blocked\":%d,\n",       ips_ok
+                                            printf "    \"ips_skipped\":%d,\n",       ips_skip
+                                            printf "    \"ips_failed\":%d\n",         ips_fail
+                                            next }
+        /^  \}$/ && in_summary            { in_summary = 0; print; next }
+
+        # Inside csf block / summary block: skip the original lines (we re-emit).
+        in_csf == 1                        { next }
+        in_summary == 1                    { next }
+
+        # ts_applied patch.
+        /^  "ts_applied":null,$/           { printf "  \"ts_applied\":\"%s\",\n", ts_applied; next }
+
+        # Inside items: patch file/ip lines based on lookup. The lines are
+        # the ones K1 wrote ({"kind":"file",...} or {"kind":"ip",...}).
+        in_items == 1 && /\{"kind":"file","pattern"/ {
+            line = $0
+            # Skip refused items - K2 already set their result; do not patch.
+            if (line ~ /"action":"refused"/) { print; next }
+            # Extract path and look up.
+            path = json_str(line, "path")
+            r = store["file", path, "result"]
+            if (r == "") {
+                # No sidecar record (action ran in --check or path was
+                # somehow missed). Leave nulls.
+                print
+                next
+            }
+            sha_pre  = store["file", path, "sha256_pre"]
+            sha_post = store["file", path, "sha256_post"]
+            sz       = store["file", path, "size"]
+            dst      = store["file", path, "dest"]
+            # Replace the trailing nulls with the populated values.
+            line = patch_field(line, "sha256_pre", quoted(sha_pre))
+            line = patch_field(line, "sha256_post", quoted(sha_post))
+            line = patch_field_raw(line, "size", (sz == "" ? "null" : sz))
+            line = patch_field(line, "dest", quoted(dst))
+            line = patch_field(line, "result", quoted(r))
+            print line
+            next
+        }
+        in_items == 1 && /\{"kind":"ip"/ {
+            line = $0
+            ip = json_str(line, "ip")
+            r = store["ip", ip, "result"]
+            if (r == "") { print; next }
+            line = patch_field(line, "result", quoted(r))
+            print line
+            next
+        }
+
+        # Default: passthrough.
+        { print }
+
+        # Helpers.
+        function quoted(s) {
+            if (s == "" || s == "null") return "null"
+            gsub(/\\/, "\\\\", s)
+            gsub(/"/, "\\\"", s)
+            return "\"" s "\""
+        }
+        function patch_field(line, key, val,    pat) {
+            pat = "\"" key "\":null"
+            sub(pat, "\"" key "\":" val, line)
+            # Also patch when an existing string is present (legacy nulls).
+            return line
+        }
+        function patch_field_raw(line, key, val,    pat) {
+            pat = "\"" key "\":null"
+            sub(pat, "\"" key "\":" val, line)
+            return line
+        }
+        function json_str(line, key,    re, m) {
+            re = "\"" key "\":\""
+            i = index(line, re)
+            if (i == 0) return ""
+            rest = substr(line, i + length(re))
+            j = index(rest, "\"")
+            if (j == 0) return ""
+            return substr(rest, 1, j - 1)
+        }
+        function lookup_summary_orig(field) {
+            # Read the existing summary value from the manifest (passed via
+            # global ORIG_SUMMARY[]). Fallback "0" when absent.
+            v = ORIG_SUMMARY[field]
+            if (v == "") return "0"
+            return v
+        }
+        function csf_registered_value() {
+            br = store["csf", "blocklist_register", "result"]
+            if (br == "ok" || br == "created_new_file" || br == "already_registered") return "true"
+            if (br == "") return "null"
+            return "false"
+        }
+        function csf_changed_value() {
+            n = 0
+            v1 = store["csf", "LF_IPSET", "value"]
+            if (v1 == "0->1") n = 1
+            v2 = store["csf", "blocklist_register", "result"]
+            if (v2 == "ok" || v2 == "created_new_file") n = 1
+            return (n ? "true" : "false")
+        }
+    ' "$manifest" > "$tmp" || { rm -f "$tmp" "$lookup"; return 1; }
+
+    # Preserve the original summary file_planned/ips_planned/files_refused
+    # values from the source manifest (K1 wrote them; K6 re-emits them).
+    # awk handled it via the in_summary block above by reading them via
+    # json_str() before re-emitting - but we need a pre-pass to seed
+    # ORIG_SUMMARY[]. Simpler: re-extract here and patch.
+    local fp ip_p fr
+    fp=$(grep -oE '"files_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
+    ip_p=$(grep -oE '"ips_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
+    fr=$(grep -oE '"files_refused":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
+    fp="${fp:-0}"; ip_p="${ip_p:-0}"; fr="${fr:-0}"
+    sed -i -E \
+        -e "s|\"files_planned\":[0-9]+,|\"files_planned\":${fp},|" \
+        -e "s|\"ips_planned\":[0-9]+,|\"ips_planned\":${ip_p},|" \
+        -e "s|\"files_refused\":[0-9]+,|\"files_refused\":${fr},|" \
+        "$tmp"
+
+    mv "$tmp" "$manifest"
+    rm -f "$lookup"
+
+    kill_compute_verdict "$manifest"
+    return 0
+}
+
 # Build the manifest. Walks signals, applies pattern->action policy,
 # aggregates attacker IPs, writes JSON to OUT_FILE. Returns 0 on success,
 # 1 if envelope is missing/unreadable. K3/K4/K5/K6 patch the manifest
