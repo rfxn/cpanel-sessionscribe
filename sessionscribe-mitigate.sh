@@ -773,6 +773,118 @@ kill_quarantine_one() {
     return 0
 }
 
+# IP routability gate. Refuses private (RFC1918), loopback, link-local,
+# multicast, reserved, and shape-malformed IPs. Bash =~ uses libc ERE
+# which supports {n} per CLAUDE.md note. Returns 0 if the IP is a
+# globally routable unicast address worth blocking, 1 otherwise.
+kill_ip_is_routable() {
+    local ip="$1" ip_lc a b c d n
+    [[ -n "$ip" ]] || return 1
+
+    # IPv4: four 1-3 digit octets.
+    if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+        c="${BASH_REMATCH[3]}"; d="${BASH_REMATCH[4]}"
+        for n in "$a" "$b" "$c" "$d"; do
+            (( n >= 0 && n <= 255 )) || return 1
+        done
+        # 0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16, 224/4+
+        case "$a" in
+            (0|10|127) return 1 ;;
+        esac
+        if [[ "$a" == "169" && "$b" == "254" ]]; then return 1; fi
+        if [[ "$a" == "172" ]] && (( b >= 16 && b <= 31 )); then return 1; fi
+        if [[ "$a" == "192" && "$b" == "168" ]]; then return 1; fi
+        if (( a >= 224 )); then return 1; fi
+        return 0
+    fi
+
+    # IPv6: at least one colon, hex digits + colons only. Coarse-grained;
+    # CSF will reject malformed shapes itself, but we filter the obvious
+    # private/reserved blocks here so we don't push them into csf.deny.
+    if [[ "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" == *:* ]]; then
+        ip_lc=$(printf '%s' "$ip" | tr '[:upper:]' '[:lower:]')
+        case "$ip_lc" in
+            (::1|::) return 1 ;;
+            (fe8?:*|fe9?:*|fea?:*|feb?:*) return 1 ;;     # fe80::/10 link-local
+            (fc??:*|fd??:*) return 1 ;;                    # fc00::/7 unique-local
+            (ff*) return 1 ;;                              # ff00::/8 multicast
+        esac
+        return 0
+    fi
+
+    return 1
+}
+
+# Append one IP-action record to the sidecar JSONL.
+kill_ip_action_record() {
+    local sidecar="$1" ip="$2" src="$3" comment="$4" result="$5"
+    {
+        printf '{"kind":"ip","ip":"%s","source_signal":"%s","comment":"%s","result":"%s","ts":"%s"}\n' \
+            "$(json_esc "$ip")" "$(json_esc "$src")" \
+            "$(json_esc "$comment")" "$(json_esc "$result")" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "$sidecar"
+}
+
+# Walk a manifest, csf -d every kind=ip action=csf-deny item. Skips
+# private/loopback/link-local/multicast IPs (envelope-injection guard).
+# Skips IPs already present in /etc/csf/csf.deny (idempotent re-runs).
+# Returns 0 if all ok or all benign skips, non-zero on csf_failed.
+#
+# Result vocabulary:
+#   ok                  csf -d succeeded
+#   already_blocked     IP already on first whitespace-delimited field of csf.deny
+#   private_skipped     RFC1918 / loopback / link-local / multicast / malformed
+#   csf_failed          csf binary returned non-zero
+#   csf_not_installed   csf binary absent (skipped, not failed)
+apply_csf_blocks() {
+    local manifest="$1"
+    [[ -n "$manifest" && -f "$manifest" ]] || return 1
+    local sidecar="${manifest%.json}.actions.jsonl"
+    local deny_file=/etc/csf/csf.deny
+
+    if ! have_cmd csf; then
+        kill_ip_action_record "$sidecar" "" "" "" "csf_not_installed"
+        return 0
+    fi
+
+    local line ip src_signal hits comment fails=0
+    while IFS= read -r line; do
+        [[ "$line" =~ \"kind\":\"ip\" ]] || continue
+        [[ "$line" =~ \"action\":\"csf-deny\" ]] || continue
+
+        ip=$(kill_json_str_field "$line" ip)
+        src_signal=$(kill_json_str_field "$line" source_signal)
+        hits=$(kill_json_num_field "$line" hits)
+        [[ -z "$ip" ]] && continue
+
+        if ! kill_ip_is_routable "$ip"; then
+            kill_ip_action_record "$sidecar" "$ip" "$src_signal" "" "private_skipped"
+            continue
+        fi
+
+        # Idempotency: csf.deny is one IP per line, optionally with
+        # whitespace/# comment. awk handles this without regex-escaping
+        # the IP (gawk-3.x safe; literal first-field equality).
+        if [[ -f "$deny_file" ]] && \
+           awk -v ip="$ip" '$1==ip {found=1} END{exit !found}' "$deny_file" 2>/dev/null; then
+            kill_ip_action_record "$sidecar" "$ip" "$src_signal" "" "already_blocked"
+            continue
+        fi
+
+        comment="sessionscribe run=$RUN_ID src=$src_signal hits=${hits:-0}"
+        if csf -d "$ip" "$comment" >/dev/null 2>&1; then
+            kill_ip_action_record "$sidecar" "$ip" "$src_signal" "$comment" "ok"
+        else
+            kill_ip_action_record "$sidecar" "$ip" "$src_signal" "$comment" "csf_failed"
+            fails=$((fails+1))
+        fi
+    done < "$manifest"
+
+    return $fails
+}
+
 # Walk a manifest, quarantine every kind=file action=quarantine item.
 # Refused items (action=refused) are skipped. Returns the number of
 # failures (0 = all ok or all benign skips).
