@@ -679,6 +679,125 @@ kill_path_in_allowlist() {
     esac
 }
 
+# Append one action-result record to the kill-actions sidecar JSONL.
+# Args: sidecar kind path ioc_key pattern sha256_pre sha256_post size dest result
+# All values are json-escaped via json_esc; size is a numeric or empty string.
+# K6 reads this sidecar to merge results into the final manifest.
+kill_action_record() {
+    local sidecar="$1" kind="$2" path="$3" key="$4" pattern="$5"
+    local sha_pre="$6" sha_post="$7" size="$8" dest="$9" result="${10}"
+    {
+        printf '{"kind":"%s","path":"%s","ioc_key":"%s","pattern":"%s",' \
+            "$(json_esc "$kind")" "$(json_esc "$path")" \
+            "$(json_esc "$key")" "$(json_esc "$pattern")"
+        printf '"sha256_pre":"%s","sha256_post":"%s",' \
+            "$(json_esc "$sha_pre")" "$(json_esc "$sha_post")"
+        if [[ -n "$size" && "$size" =~ ^[0-9]+$ ]]; then
+            printf '"size":%s,' "$size"
+        else
+            printf '"size":null,'
+        fi
+        printf '"dest":"%s","result":"%s","ts":"%s"}\n' \
+            "$(json_esc "$dest")" "$(json_esc "$result")" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "$sidecar"
+}
+
+# Quarantine one file: stat -> sha256 -> mv (with cp+rm cross-fs fallback)
+# -> sha256 verify. Records action via kill_action_record. Returns 0 on
+# success or benign skip (gone / refused_special_file), 1 on failure.
+# Result vocabulary:
+#   ok                      moved + sha256 verified
+#   gone                    file already absent (no action needed)
+#   refused_special_file    not a regular file (block/char/fifo/socket)
+#   mv_failed               both mv and cp+rm failed
+#   rm_failed_after_copy    cp succeeded but rm failed (incomplete quarantine)
+#   corrupt_during_move     sha256 mismatch between source and dest
+kill_quarantine_one() {
+    local path="$1" key="$2" pattern="$3" sidecar="$4"
+    local sha_pre="" sha_post="" size="" dest="" result=""
+    local mv_rc cp_rc rm_rc
+
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "" "" "" "" "gone"
+        return 0
+    fi
+
+    if [[ ! -f "$path" || -L "$path" ]]; then
+        # Symlinks are "special" in this context: even though backdoor
+        # symlinks (eg /home/x/.ssh -> /etc) are interesting, quarantining
+        # the link without resolving the target leaves the target intact;
+        # quarantining via realpath would cross the allowlist boundary.
+        # Refuse and surface to operator for hand-handling.
+        kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "" "" "" "" "refused_special_file"
+        return 0
+    fi
+
+    sha_pre=$(sha256sum "$path" 2>/dev/null | awk '{print $1}')
+    size=$(stat -c '%s' "$path" 2>/dev/null)
+    dest="$BACKUP_DIR/quarantine/${path#/}"
+
+    if ! mkdir -p "$(dirname "$dest")" 2>/dev/null; then
+        kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "$sha_pre" "" "$size" "$dest" "mv_failed"
+        return 1
+    fi
+
+    mv "$path" "$dest" 2>/dev/null
+    mv_rc=$?
+
+    if (( mv_rc != 0 )); then
+        # Cross-filesystem mv fails with EXDEV; fall back to cp+rm. Same
+        # pattern phase_sessions uses for the session-quarantine path.
+        cp -a "$path" "$dest" 2>/dev/null
+        cp_rc=$?
+        if (( cp_rc != 0 )); then
+            kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "$sha_pre" "" "$size" "$dest" "mv_failed"
+            return 1
+        fi
+        rm -f "$path" 2>/dev/null
+        rm_rc=$?
+        if (( rm_rc != 0 )); then
+            sha_post=$(sha256sum "$dest" 2>/dev/null | awk '{print $1}')
+            kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "$sha_pre" "$sha_post" "$size" "$dest" "rm_failed_after_copy"
+            return 1
+        fi
+    fi
+
+    sha_post=$(sha256sum "$dest" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$sha_pre" && -n "$sha_post" && "$sha_pre" != "$sha_post" ]]; then
+        result="corrupt_during_move"
+    else
+        result="ok"
+    fi
+    kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "$sha_pre" "$sha_post" "$size" "$dest" "$result"
+    return 0
+}
+
+# Walk a manifest, quarantine every kind=file action=quarantine item.
+# Refused items (action=refused) are skipped. Returns the number of
+# failures (0 = all ok or all benign skips).
+quarantine_from_manifest() {
+    local manifest="$1"
+    [[ -n "$manifest" && -f "$manifest" ]] || return 1
+    local sidecar="${manifest%.json}.actions.jsonl"
+    : > "$sidecar"
+
+    local line path key pattern fails=0
+    while IFS= read -r line; do
+        [[ "$line" =~ \"kind\":\"file\" ]] || continue
+        [[ "$line" =~ \"action\":\"quarantine\" ]] || continue
+        path=$(kill_json_str_field "$line" path)
+        key=$(kill_json_str_field "$line" ioc_key)
+        pattern=$(kill_json_str_field "$line" pattern)
+        [[ -z "$path" ]] && continue
+        if ! kill_quarantine_one "$path" "$key" "$pattern" "$sidecar"; then
+            fails=$((fails+1))
+        fi
+    done < "$manifest"
+
+    return $fails
+}
+
 # Build the manifest. Walks signals, applies pattern->action policy,
 # aggregates attacker IPs, writes JSON to OUT_FILE. Returns 0 on success,
 # 1 if envelope is missing/unreadable. K3/K4/K5/K6 patch the manifest
