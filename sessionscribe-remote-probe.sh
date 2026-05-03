@@ -6,8 +6,6 @@
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
 #
-# sessionscribe-remote-probe.sh   v1.2.0
-#
 # Detection probe for CVE-2026-41940 (SessionScribe - disclosed 2026-04-28,
 # cPanel KB 40073787579671). Unauthenticated session forgery in cPanel/WHM
 # via CRLF injection into the password field of a preauth session.
@@ -39,55 +37,27 @@
 # Vulnerability primitive
 # ============================================================================
 #
-# The whostmgrsession cookie has the canonical form `:NAME,OBHEX` where:
-#     NAME    random alphanumeric - the session-file basename
-#     OBHEX   1-64 lowercase hex chars - the secret used to construct
-#             Cpanel::Session::Encoder for the password field
-#
-# Cpanel/Session/Load.pm get_ob_part() (line 122) extracts OBHEX:
-#     if ( $$session_name_ref =~ s/,([0-9a-f]{1,64})$// ) { $ob = $1; }
-#
-# Any cookie shape that fails this regex leaves $ob undef, which on line 93
-# short-circuits the encoder construction:
-#     my $encoder = $ob && Cpanel::Session::Encoder->new('secret' => $ob);
-#
-# With $encoder unset, saveSession() writes the password field VERBATIM into
-# the on-disk session file. An attacker controls the password via:
-#     Authorization: Basic <base64(user:VALUE)>
-# Embedding CR/LF inside VALUE causes the single `pass=` line to split into
-# multiple `key=value` lines that become canonical session attributes:
-#     pass=x
-#     successful_internal_auth_with_timestamp=<now>
-#     user=root
-#     hasroot=1
-#
-# Five vulnerable cookie shapes (each failing the OBHEX regex):
-#     :NAME                       no comma
-#     :NAME,                      trailing comma, empty OBHEX
-#     :NAME,GHIJ                  non-hex tail
-#     :NAME,ABCDEF                uppercase hex
-#     :NAME,<65-char hex tail>    OBHEX too long
-#
-# Combined with successful_internal_auth_with_timestamp=<now>, cpsrvd treats
-# the next request as logged-in. Outcome: full session forgery to root.
+# whostmgrsession cookie shape `:NAME,OBHEX`. Five shapes fail
+# Cpanel/Session/Load.pm get_ob_part()'s `,([0-9a-f]{1,64})$` regex:
+#   :NAME (no comma) | :NAME, (empty) | :NAME,GHIJ (non-hex)
+#   :NAME,ABCDEF (uppercase) | :NAME,<65-char> (too long)
+# When ob is unset, the encoder short-circuits and saveSession() writes
+# the password verbatim. Authorization: Basic <b64(user:VALUE)> with
+# CR/LF in VALUE splits `pass=` into canonical session keys including
+# successful_internal_auth_with_timestamp + hasroot=1 → root forgery.
 #
 # ============================================================================
 # Patch mechanism (vendor advisory KB 40073787579671)
 # ============================================================================
 #
-# Fixed cpsrvd writes `pass=no-ob:<hex>` via hex_encode_only when ob_part is
-# missing - every byte (including CR/LF) becomes ASCII hex, never standalone
-# session attributes. Patched Cpanel/Session/Load.pm has a companion `no-ob:`
-# branch on the load side. Patched-boundary builds (anything below on the
-# same tier is vulnerable):
+# Patched cpsrvd hex-encodes the password when ob is missing
+# (`pass=no-ob:<hex>`); CR/LF can no longer become standalone keys.
+# Patched-boundary builds (anything below on the same tier is vulnerable):
 #     11.86.0.41    11.110.0.97   11.118.0.63   11.126.0.54
 #     11.130.0.19   11.132.0.29   11.134.0.20   11.136.0.5
-# Tier 86 received a back-port patch as a courtesy from cPanel but remains
-# EOL for general support - patch_status reports `patched_eol` so triage
-# tooling can tell "safe + supported" from "safe + unsupported tier".
-# Tiers 112/114/116/120/122/124/128 have NO patch - operators must upgrade
-# the major series, migrate, or firewall direct cpsrvd ports
-# (2082/2083/2086/2087/2095/2096).
+# Tier 86 is patched as a courtesy but remains EOL → patch_status
+# `patched_eol`. Tiers 112/114/116/120/122/124/128 have NO patch —
+# upgrade or firewall cpsrvd ports (2082/2083/2086/2087/2095/2096).
 #
 # ============================================================================
 # Detection chain
@@ -132,48 +102,24 @@
 # Safety boundary
 # ============================================================================
 #
-# Stage 3's listaccts handler writes user=root into the session as an
-# unconditional side effect; this is intrinsic to the gadget, not a probe
-# choice. The forged session is therefore root-equivalent for the window
-# between stage 3 and stage 5 logout (typ. 1-3s). The probe deliberately:
-#   - injects NO user= override (cpsrvd's user= dedup is first-wins on
-#     some versions and last-wins on others; omitting it avoids
-#     inconsistent cross-version behavior in the session file)
-#   - injects hasroot=0 explicitly (defense-in-depth; honored where
-#     last-write wins on hasroot)
-#   - performs NO state-changing API calls (no /scripts/passwd, no
-#     /json-api/createacct, no /Shell, no /CommandStream, no UAPI mutators)
-#   - reads only /json-api/version (the lowest-information JSON-API endpoint)
-#   - actively invalidates via /cpsess<token>/logout + /logout
-#   - tags every forged session with `nxesec_canary_<nonce>=1` for forensic
-#     correlation
+# Stage 3's listaccts handler writes user=root unconditionally — gadget,
+# not probe choice. Forged session is root-equivalent between stages 3 and
+# 5 (~1-3s). The probe: omits user= (cross-version dedup inconsistency),
+# injects hasroot=0 (defense-in-depth), reads only /json-api/version, no
+# mutating endpoints, invalidates via /cpsess<token>/logout + /logout,
+# and tags every session with `nxesec_canary_<nonce>=1`.
 #
-# For read-only audits where no privileged session window is tolerable, use
-# --no-verify (stage 1+2 only). NOTE: --no-verify reverts to the pre-v2
-# stage-2 heuristic, which produces FALSE POSITIVES on patched hosts -
-# every cookie-bearing request returns 307 + /cpsess<token>/ regardless of
-# patch state because the redirect is normal URL canonicalization.
+# --no-verify (stage 1+2) avoids the privileged window but reverts to a
+# stage-2 heuristic that FALSE-POSITIVES on patched hosts (307 to
+# /cpsess<token>/ is normal URL canonicalization).
 #
 # ============================================================================
 # Cleanup
 # ============================================================================
 #
-# Stage 5 logout invalidates the forged session on cpsrvd; if it fails,
-# sessions expire on the natural cpsrvd idle timeout (~30 min). To remove
-# session files immediately, run `--cleanup` to emit the wildcard remover
-# (matches `nxesec_canary_*`) and execute it as root on each formerly-VULN
-# target. The cleanup operation is:
-#
-#     grep -l "nxesec_canary_" \
-#          /var/cpanel/sessions/raw/* \
-#          /var/cpanel/sessions/cache/* \
-#          /var/cpanel/sessions/preauth/* 2>/dev/null \
-#       | while read f; do
-#           n=$(basename "$f")
-#           rm -f "/var/cpanel/sessions/raw/$n" \
-#                 "/var/cpanel/sessions/cache/$n" \
-#                 "/var/cpanel/sessions/preauth/$n"
-#         done
+# Stage 5 logout invalidates the forged session; failure → sessions expire
+# at cpsrvd idle (~30 min). For immediate removal, `--cleanup` prints a
+# canary-matching rm command to run as root on each formerly-VULN target.
 #
 # ============================================================================
 # Output modes
@@ -185,11 +131,8 @@
 #   --json      structured JSON with probe-level results + per-target rollup
 #   --cleanup   print the local cleanup command and exit (no probing)
 #
-# --fingerprint-only runs stage 0 only - no preauth session created, no CRLF
-# injection, no propagation, no logout. Verdict is derived purely from build
-# vs. patch-boundary table. Banner-only verdicts are LOWER CONFIDENCE than
-# the full chain (a host can lie about its build, or be misconfigured), so
-# this mode is for fast scoping, not authoritative confirmation.
+# --fingerprint-only runs stage 0 only — no session created, verdict from
+# build banner alone. Banners can lie; use the full chain for confirmation.
 #
 # ============================================================================
 # Exit codes
@@ -602,16 +545,9 @@ patch_status_phrase() {
 }
 
 # === Stage 0: passive fingerprint ===
-# Single GET against /login/?login_only=1 - no body, no cookie, no auth.
-# Harvests:
-#   - Server: response header (cpsrvd/<MAJ.MIN.REL.BUILD> on most builds;
-#     some hardened/proxied configurations strip the version)
-#   - cPanel_magic_revision_<digits> in HTML body (1:1 with build,
-#     survives even when Server: is sanitized)
-#
-# Emits "<status>|<build>|<magic_rev>|<server_hdr>" on stdout.
-#   status = ok          - got a response (build/magic may still be empty)
-#   status = transport_N - curl exit code N (DNS / TCP / TLS failure)
+# Single GET /login/?login_only=1 (no body/cookie/auth). Harvests Server:
+# `cpsrvd/<build>` and cPanel_magic_revision_<digits> in HTML (survives
+# Server: stripping). Emits "<status>|<build>|<magic_rev>|<server_hdr>".
 fingerprint_target() {
   local url=$1 host_hdr=$2 resolve_pin=${3:-}
   local hdr_file body_file
@@ -647,19 +583,11 @@ fingerprint_target() {
 }
 
 # === Stage 1: mint preauth session ===
-# resolve_pin (optional) is passed to curl --resolve as HOSTNAME:PORT:IP so
-# proxy-domain probes get SNI right under HTTP/2's strict-Host enforcement
-# (Apache 2.4 returns 421 Misdirected Request if SNI != Host header).
-#
-# Emits "<reason>|<cookie>" on stdout. On success: "ok|<cookie-value>".
-# On failure: reason is one of:
-#   dns_failed         - couldn't resolve host (curl exit 6)
-#   connect_refused    - TCP refused (curl exit 7, fast)
-#   connect_timeout    - TCP timed out (curl exit 7/28; port firewalled)
-#   tls_failed         - SSL/TLS handshake failed (curl exits 35/52/56/60)
-#   http_421           - Apache HTTP/2 SNI≠Host (Misdirected Request)
-#   http_<code>_no_cookie  - got a status, but no whostmgrsession cookie
-#   transport_<code>   - other curl exit code
+# resolve_pin → curl --resolve so proxy-domain probes get SNI right under
+# HTTP/2 strict-Host (Apache 2.4 returns 421 if SNI != Host).
+# Emits "<reason>|<cookie>": ok | dns_failed | connect_refused |
+# connect_timeout | tls_failed | http_421 | http_<code>_no_cookie |
+# transport_<code>.
 mint_preauth() {
   local url=$1 host_hdr=$2 resolve_pin=${3:-}
   local hdr_file
@@ -708,13 +636,9 @@ mint_preauth() {
 }
 
 # === Stage 2: CRLF injection probe ===
-# Payload deliberately omits user= and hasroot=1. cpsrvd's session parser
-# is first-wins on 11.122 and last-wins on 11.134 for user=, so injecting
-# it produces inconsistent cross-version behavior. Stage 3 propagation
-# (next handler) will write user=root regardless. We inject only:
-#   successful_internal_auth_with_timestamp  - gates the bypass
-#   hasroot=0                                - defense-in-depth (newer respects)
-#   nxesec_canary_<nonce>=1                  - forensic signature
+# Payload omits user= (cross-version dedup inconsistency) and hasroot=1.
+# Stage 3 propagation will write user=root regardless. Inject only
+# successful_internal_auth_with_timestamp + hasroot=0 + nxesec_canary.
 inject_probe() {
   local url=$1 host_hdr=$2 session_base=$3 resolve_pin=${4:-}
   local now; now=$(date +%s)

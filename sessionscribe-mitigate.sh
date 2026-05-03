@@ -10,11 +10,9 @@
 # sessionscribe-mitigate.sh
 #
 # DISCLAIMER / USE AT YOUR OWN RISK
-#   Active mitigation tool. Modifies firewall configuration, repo files,
-#   tweak settings, Apache config, and may launch /scripts/upcp. Provided
-#   as-is, without warranty of any kind. Default mode is --check (read-only);
-#   --apply is required to mutate state. Validate against your own
-#   change-control before running --apply on production.
+#   Active mitigation. Modifies firewall, repos, tweaksettings, Apache
+#   config; may launch /scripts/upcp. Default --check is read-only;
+#   --apply mutates. Validate against change-control first.
 ###############################################################################
 #
 # ============================================================================
@@ -40,14 +38,8 @@
 #
 # Phases (in order; selectable via --only, --no-PHASE, or --list-phases):
 #
-#   snapshot    pre-mitigation evidence capture: tarball /var/cpanel/users/,
-#               accounting.log/audit.log, sessions/{raw,preauth,cache}/,
-#               cpanel.config, and `whmapi1 get_tweaksetting` output for
-#               proxysub keys to <BACKUP_DIR>/pre-mitigate-state.tgz BEFORE
-#               any mutating phase runs. Captures rogue artifacts (WHM API
-#               tokens, attacker accounts, accounting-log persistence) that
-#               later mitigation steps + cpsrvd state churn would otherwise
-#               destroy by the time a forensic bundle is taken.
+#   snapshot    pre-mitigation evidence capture (users/, accounting.log,
+#               sessions/, cpanel.config, tweaksettings) BEFORE mutation.
 #   patch       cpanel -V vs published patched-build cutoffs
 #   preflight   epel-release present; threatdown.repo absent; broken
 #               non-base repos disabled (centos/alma/rocky baseos/appstream/
@@ -59,21 +51,16 @@
 #   runfw       running iptables/ip6tables INPUT chain inspection
 #   apache      httpd active + security2_module loaded
 #   modsec      modsec2.user.conf contains 1500030 + 1500031
-#   sessions    /var/cpanel/sessions/raw IOC ladder; quarantine forged
-#               sessions to backup dir w/ .info metadata (preserves ctime
-#               that cp -a cannot carry); rm originals so leaked
-#               cp_security_token cannot be reused
+#   sessions    sessions/raw IOC ladder; quarantine forged sessions to
+#               backup dir w/ .info (ctime); rm originals
 #   probe       (opt-in via --probe) self-test via remote-probe against
 #               127.0.0.1; expect SAFE/blocked verdict
 #
 # Output:
 #   default     ANSI sectioned report on stderr
 #   --json      single JSON envelope on stdout (per-host)
-#   --jsonl     stream one JSON signal per line on stdout (per-phase
-#               signals + final summary). Each line carries host, os,
-#               cpanel_version for fleet aggregation.
-#   --csv       single CSV summary row on stdout (header + one row).
-#               Same host-context columns. Designed for fleet roll-up.
+#   --jsonl     stream one JSON signal per line on stdout
+#   --csv       single CSV summary row on stdout (header + one row)
 #   --quiet     suppress sectioned report
 #
 # Exit codes (highest priority wins):
@@ -471,15 +458,8 @@ declare -a SIGNALS_JSON=()     # JSONL strings (already escaped + assembled)
 
 N_OK=0; N_WARN=0; N_FAIL=0; N_ACTION=0; N_SKIPPED=0
 
-# Emit a structured signal. Streaming JSONL writes immediately; otherwise
-# accumulated for end-of-run summary.
-#
-# Args: phase severity key kvargs...
-#   phase    short id (patch/preflight/etc)
-#   severity info|action|warn|fail|skip (lowercase, plus 'pass' for success)
-#   key      machine-readable specifier (e.g. "cpsrvd_port_clean")
-#   note     human note (one positional after key, optional)
-#   extra k=v pairs (optional, after note)
+# Emit a structured signal. JSONL streams immediately; else buffered.
+# Args: phase severity key [note] [k v ...]
 emit_signal() {
     local phase="$1" sev="$2" key="$3" note="${4:-}"
     shift 4 || shift $#
@@ -582,46 +562,12 @@ backup_file() {
 }
 
 ###############################################################################
-# 0. snapshot - pre-mitigation evidence capture
+# 0. snapshot - pre-mitigation evidence capture. Runs FIRST so state is
+# frozen before mutating phases. tier1: users/, accounting.log[.*],
+# audit.log[.*], cpanel.config, pre-mitigate-tweaksettings.txt (proxysub
+# mutation has no per-file backup). tier2 (capped): sessions/{raw,preauth,
+# cache}/. Output rides into forensic bundles via defense-state.tgz.
 ###############################################################################
-#
-# Runs FIRST in the phase order so attacker-touchable state is preserved
-# before any mutating phase (csf/apf/modsec edits, sessions quarantine,
-# proxysub whmapi1 mutation) perturbs it. Three drivers:
-#
-#   1. Mitigation-driven evidence destruction. Operator timeline:
-#      attack at T -> mitigate.sh at T+1d -> forensic bundle at T+2d.
-#      Between mitigate-time and bundle-time, cpsrvd state churn +
-#      session quarantine narrow the live snapshot. Pre-mitigation
-#      capture freezes the state at mitigate-time so the bundle can
-#      ship two snapshots (pre + post mitigation).
-#
-#   2. proxysub whmapi1 mutation has no per-file backup target. Capture
-#      `whmapi1 get_tweaksetting` output for proxysubdomains and
-#      proxysubdomainsfornewaccounts BEFORE phase_proxysub runs so undo
-#      info is preserved.
-#
-#   3. /var/cpanel/users/ holds rogue WHM API tokens (.api files) that
-#      can't be reconstructed from access_log alone if the system or
-#      operator purges them later.
-#
-# Capture tiers (size-bounded):
-#
-#   tier1 (always captured):
-#       /var/cpanel/users/                   - WHM accounts + .api tokens
-#       /var/cpanel/accounting.log[.*]       - createacct/setupreseller/setacls
-#       /var/cpanel/audit.log[.*]            - audit trail (if present)
-#       /var/cpanel/cpanel.config            - pre-proxysub state
-#       pre-mitigate-tweaksettings.txt       - whmapi1 get_tweaksetting output
-#
-#   tier2 (capped via --max-snapshot-mb):
-#       /var/cpanel/sessions/raw/            - full session corpus
-#       /var/cpanel/sessions/preauth/        - pre-promotion markers
-#       /var/cpanel/sessions/cache/          - propagated session store
-#
-# Output: <BACKUP_DIR>/pre-mitigate-state.tgz + .info sidecar with sha256.
-# ioc-scan's phase_bundle already includes the entire BACKUP_ROOT in
-# defense-state.tgz so this artifact rides into forensic bundles for free.
 
 phase_snapshot() {
     P_CUR=snapshot
@@ -755,18 +701,10 @@ phase_snapshot() {
         printf '%s\0' "$tweak_file" >> "$list_file"
     fi
 
-    # tar rc=1 ("file changed as we read it" / "file removed before reading"
-    # under /var/cpanel/sessions/) is non-fatal - sessions churn during the
-    # capture window and that is expected. rc>=2 is real failure.
-    #
-    # Symlink handling: GNU tar's default is to STORE symlinks as symlinks
-    # for files encountered during recursive directory traversal; only
-    # top-level command-line arguments are dereferenced (and even those
-    # only with -h/--dereference, which we do NOT pass). Our top-level
-    # entries are directories (/var/cpanel/sessions/{raw,preauth,cache})
-    # and tier-1 regular files - so an attacker-planted symlink inside
-    # /var/cpanel/sessions/raw/ archives as a symlink, NOT its target.
-    # Do not add -h/--dereference here.
+    # tar rc=1 ("file changed/removed during read") is expected — sessions
+    # churn during capture. rc>=2 is real failure.
+    # No -h/--dereference: attacker-planted symlinks in sessions/ must
+    # archive as symlinks, not their targets.
     local tar_rc=0
     tar --null -czf "$snap_tgz" -T "$list_file" 2>/dev/null || tar_rc=$?
     rm -f "$list_file" 2>/dev/null
@@ -926,14 +864,8 @@ phase_preflight() {
 
     local actions=0 warns=0
 
-    # Anti-forensic awareness: Pattern A's encryptor specifically targets
-    # forensic-evidence files in /var/log + /var/cpanel. The most load-
-    # bearing of these for our detection chain is /var/cpanel/accounting.log
-    # (Pattern D persistence evidence: createacct/setupreseller/setacls
-    # rows for the attacker reseller). If the live file is missing but the
-    # .sorry-encrypted variant exists, surface a strong operator advisory
-    # so they don't trust a clean Pattern D verdict; ioc-scan v1.8.0+
-    # emits ioc_pattern_d_acctlog_encrypted as a parallel signal.
+    # Pattern A's encryptor targets accounting.log → .sorry. Without the
+    # live file, Pattern D detection is lossy — surface an advisory.
     sk evidence_destruction
     local acct_live=/var/cpanel/accounting.log
     local acct_sorry=/var/cpanel/accounting.log.sorry
@@ -1582,42 +1514,13 @@ phase_modsec() {
 }
 
 ###############################################################################
-# 10. sessions - forged-session IOC ladder + quarantine
+# 10. sessions - forged-session IOC ladder + quarantine. Mirrors
+# ioc-scan.sh's ladder. Patch closes the vector; leaked tokens survive
+# until session expiry, so quarantine is still required. --apply moves
+# raw + preauth + cache copies (listaccts propagates raw → cache, so
+# removing only raw leaves the token live). Probe-canary sessions
+# (^nxesec_canary_<nonce>=) skipped + counted separately.
 ###############################################################################
-#
-# Symmetric with sessionscribe-ioc-scan.sh's session-store IOC ladder. Walks
-# /var/cpanel/sessions/raw/* and identifies forged sessions left behind by
-# CRLF injection (CVE-2026-41940). The patch closes the *vector* for new
-# forgeries, but a leaked cp_security_token survives until the session
-# expires - so a host that was exploited pre-patch may still be reachable
-# via the previously-forged token. This phase:
-#
-#   1. Detects forged sessions via the strong-IOC ladder
-#      (A/B/C/D/E/E2/F/H/I; matches ioc-scan.sh strong signals).
-#   2. In --apply mode: copies each forged session AND its sibling
-#      companions (preauth/<sname>, cache/<sname>) into the run's backup
-#      dir under `quarantined-sessions/{raw,preauth,cache}/`, writes a
-#      sibling .info file preserving every metadata field that `cp -a`
-#      cannot carry (most importantly ctime), then removes the originals
-#      so the attacker cannot reuse the leaked token.
-#
-#      Why all three subdirs: cpsrvd's stage-3 listaccts handler in the
-#      exploit chain propagates raw -> cache; subsequent token-bearing
-#      requests read from cache. Removing raw alone leaves the cache copy
-#      live and the cp_security_token still useful. preauth holds the
-#      pre-promotion marker (IOC-B). The remote-probe --cleanup helper
-#      already cleans all three for canary collateral; mitigation does
-#      the same for actual forgeries.
-#   3. In --check mode: reports what would be quarantined, no mutation.
-#
-# Probe-canary sessions (sessionscribe-remote-probe collateral, line
-# matching ^nxesec_canary_<nonce>=) are skipped and counted separately so
-# probe runs do not trigger mitigation.
-#
-# Bash floor: 4.1 (CentOS 6 ships bash-4.1.2). Avoids `[[ -v ]]` (4.2+),
-# `declare -g` (4.2+), `printf '%(...)T'` (4.2+), `mapfile -d` (4.4+).
-# Relies on GNU coreutils 8.4+ (`stat -c %Y/%X/%Z`, `date -d @<epoch>`)
-# and findutils 4.4+ - both shipped with EL6.
 
 phase_sessions() {
     P_CUR=sessions
@@ -1645,47 +1548,14 @@ phase_sessions() {
         [[ -f "$f" ]] || continue
         scanned=$((scanned+1))
 
-        # Single awk pass extracts the session shape and emits one of:
-        #   PROBE_ARTIFACT          - skip (probe collateral)
-        #   FORGED:<reason-list>    - forged; reasons is CSV of A/B-cand/C/D/E/E2/F/H/I/D2/2
-        #   OK                      - clean
-        # B-cand is "candidate IOC-B" - confirmed in bash by checking for
-        # a paired preauth companion file (cpsrvd's write_session removes
-        # the preauth marker on auth promotion, so paired existence is
-        # structurally impossible in benign flow).
-        #
-        # IOC-D2: single-line pass= on a badpass session with no auth
-        # markers. saveSession (Cpanel/Session.pm:181) writes pass= only
-        # when length($session_ref->{pass}) > 0. The badpass call site
-        # (Cpanel/Server.pm:1244-1252) does not pass `pass` to newsession.
-        # A legitimate badpass session therefore has no pass= line. Any
-        # pass= line on a badpass session is the footprint of an injection
-        # that tampered with a user-controlled field on the badpass-bound
-        # request. IOC-D catches the multi-line / stranded variant
-        # (watchTowr CRLF chain); IOC-D2 catches the residual single-line
-        # well-formed case. ATTEMPT-class.
-        #
-        # IOC-2 (standalone): tfa_verified=1 outside known-good origins.
-        # tfa_verified=1 is written by exactly two paths
-        # (Cpanel/Security/Authn/TwoFactorAuth/Verify.pm:122 and
-        # Cpanel/Server.pm:2295). Both produce one of three legitimate
-        # origin methods (handle_form_login, create_user_session,
-        # handle_auth_transfer). The badpass+tfa case is covered by IOC-E.
-        # This check catches the residual: a fabricated origin carrying
-        # tfa_verified=1. ATTEMPT-class.
-        #
-        # SOURCE-OF-TRUTH for the known-good list: re-audit on each
-        # cpsrvd patch tier bump. Files to diff:
-        #   Cpanel/Security/Authn/TwoFactorAuth/Verify.pm
-        #   Cpanel/Server.pm
-        # Specifically, every callsite that writes tfa_verified=1 must
-        # route through one of {handle_form_login, create_user_session,
-        # handle_auth_transfer}. If a future patched-tier introduces a
-        # new origin method that legitimately mints tfa_verified=1,
-        # extend has_kg below to include it (else FP IOC-2 will fire).
-        # Floor patched tiers as of v0.5.0: 11.86.0.41, 11.110.0.97,
-        # 11.118.0.63, 11.126.0.54, 11.130.0.19, 11.132.0.29,
-        # 11.134.0.20, 11.136.0.5.
+        # awk emits PROBE_ARTIFACT / FORGED:<csv> / OK. B-cand confirmed in
+        # bash via paired preauth companion (cpsrvd removes preauth on
+        # promotion). IOC-D2: single-line pass= on a badpass session is
+        # injection footprint (saveSession writes pass= only length>0;
+        # badpass call site doesn't pass `pass`). IOC-2: re-audit
+        # Cpanel/Security/Authn/TwoFactorAuth/Verify.pm + Cpanel/Server.pm
+        # on patch tier bump — extend has_kg if a new legitimate origin
+        # appears, else FP.
         session_shape=$(awk -v now="$now_epoch" -v floor="$PASS_FORGERY_MAX_LEN" \
                             -v canary_re="$PROBE_CANARY_PAT" '
             BEGIN { line_idx=0; pass_count=0; pass_at=0 }
@@ -1695,8 +1565,6 @@ phase_sessions() {
             /^origin_as_string=/ {
                 origin=substr($0, index($0,"=")+1)
                 if (origin ~ /method=badpass/)              has_bp=1
-                # Known-good origin methods - the only legitimate cpsrvd
-                # tfa_verified=1 producers (see IOC-2 comment block above).
                 if (origin ~ /method=handle_form_login/)    has_kg=1
                 if (origin ~ /method=create_user_session/)  has_kg=1
                 if (origin ~ /method=handle_auth_transfer/) has_kg=1
@@ -1813,12 +1681,8 @@ phase_sessions() {
             # ATTEMPT-class shapes (D2-only / 2-only) tag as "attempt
             # session:" so operators can tell forensic-grade hits from
             # session-level attempt residue without parsing reason letters.
-            # Any confirmed-class reason (A/B/D/E/E2/F/H/I) wins.
-            # Quarantine action is identical for both classes; the split is
-            # display-only so --check output reads "attempt session:" vs
-            # "forged session:" without operators having to parse reason
-            # letters. Confirmed-class wins on co-occurrence, so any of
-            # A/B/C/D/E/E2/F/H/I in $reasons keeps class_tag="forged".
+            # Display-only split: confirmed-class (A/B/C/D/E/E2/F/H/I) =
+            # forged; D2/2 alone = attempt. Quarantine action identical.
             local class_tag="forged"
             case ",$reasons," in
                 (*,A,*|*,B,*|*,C,*|*,D,*|*,E,*|*,E2,*|*,F,*|*,H,*|*,I,*) ;;
@@ -1870,28 +1734,10 @@ phase_sessions() {
     fi
 }
 
-# Move a forged session (and any sibling companion files) into the run's
-# backup dir. Strategy:
-#   - cp -a    -> preserves mode / owner / mtime / atime in the copy.
-#   - .info    -> sibling text file recording fields cp -a cannot carry,
-#                 most importantly ctime (which is the inode-change time
-#                 and is unset-only-bumpable in POSIX). Also captures
-#                 sha256, size, octal mode, uid/gid, and the IOC reasons.
-#   - rm       -> remove the original so the leaked cp_security_token
-#                 cannot be reused by the attacker.
-#
-# Companions handled:
-#   - preauth/<sname>: pre-promotion marker (IOC-B). Quarantined when the
-#     IOC ladder fired IOC-B (i.e. has_b=1).
-#   - cache/<sname>:   cpsrvd's propagated copy. Quarantined whenever the
-#     file exists - removing only raw/ leaves the live token store intact.
-#
-# Return codes (highest priority wins across raw + companions):
-#   0 - all copies + .info + rm succeeded
-#   2 - copies + .info ok but at least one rm of an original FAILED
-#   1 - the raw copy itself failed (no .info written, original untouched)
-#
-# Bash 4.1 / coreutils 8.4 compatible.
+# Quarantine a forged session + companions (preauth/<sname> if IOC-B
+# fired; cache/<sname> always when present — leaving cache leaves the
+# token live). cp -a + .info sidecar (ctime, sha256, mode, IOC reasons),
+# then rm. Returns 0 ok, 1 raw cp failed, 2 partial rm failure.
 quarantine_session() {
     local src="$1" reasons="$2" preauth_companion="$3" has_b="$4"
     local cache_companion="${5:-}"
@@ -1967,15 +1813,9 @@ quarantine_session() {
     return 0
 }
 
-# Build the .info sidecar content. Captures every field that cp -a cannot
-# carry across a copy (ctime above all), plus integrity fingerprints
-# (sha256, size) and the IOC reasons that triggered the quarantine.
-#
-# Fields are key=value per line, no quoting, intended for cheap awk/sed
-# consumption by recovery scripts. Values come from stat / sha256sum /
-# script constants - none are unbounded user input - but printf '%s\n'
-# is used over heredoc to dodge any $() / backtick interpretation if a
-# session filename ever does contain shell metacharacters.
+# Build .info sidecar (key=value, no quoting). Captures ctime + sha256 +
+# size + IOC reasons. printf used over heredoc to neutralize any shell
+# metacharacters in session filenames.
 write_session_info() {
     local orig="$1" copy="$2" reasons="$3"
 

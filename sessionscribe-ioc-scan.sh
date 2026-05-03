@@ -153,35 +153,17 @@ PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
 # combined with successful_*_auth_with_timestamp is treated as forgery evidence.
 PASS_FORGERY_MAX_LEN=12
 
-# Pattern E proximity window vs ioc_attacker_ip_2xx_on_cpsess (seconds).
-# Pattern E (websocket/Shell access) and 2xx_on_cpsess (token successfully
-# used) co-occur within an operator session - typically minutes-to-hours
-# apart for a single attacker engagement, occasionally across a multi-day
-# operator window. 7 days is wide enough to capture multi-day attacker
-# sessions while excluding unrelated months-apart events (testdev pattern:
-# Pattern E 2025-11-24, 2xx_on_cpsess 2026-03-26, both pre-CRLF noise).
-# Used by the v2.4.0 pre-compromise gate to distinguish post-CRLF
-# exploitation Pattern E from orphan Pattern E with no nearby exploitation
-# success.
+# Pattern E ↔ 2xx_on_cpsess proximity window. 7d captures multi-day
+# attacker sessions while excluding unrelated months-apart events.
 PATTERN_E_2XX_PROXIMITY_SEC=604800
 
-# Session-file mtime/ctime divergence threshold (seconds). cpsrvd's
-# write-session path sets both timestamps atomically, so a legitimate
-# session has mtime == ctime to the second. Divergence of this magnitude
-# means something modified the file's mtime separately - typically
-# `touch -d <past>` to backdate (the testdev.halcyonplatinum.com pattern:
-# mtime 5 months in the past, ctime current) or `touch -d <future>` to
-# forward-date. 600s gives generous margin for any normal write/sync
-# anomaly while still catching minutes-to-months backdating. Used as an
-# advisory-tier flag (no verdict escalation) so backup-restore artifacts
-# (cp -p / tar xp / rsync -t) on a clean host don't false-positive
-# COMPROMISED. See v3/v4 ioc-scan recommendations Gap 10.
+# Session-file mtime/ctime divergence threshold. cpsrvd writes both
+# atomically; divergence is `touch -d` forgery. Advisory only (cp -p /
+# tar xp / rsync -t restore artifacts also diverge).
 SESSION_MTIME_CTIME_THRESHOLD_SEC=600
 
-# Probe-traffic exclusion. Both the local-marker probe (this script) and the
-# remote probe (sessionscribe-remote-probe.sh) emit distinctive UAs so their
-# own access-log entries don't get mistaken for attacker traffic by --chain-
-# forensic or the attacker-IP cross-check. Updated when probe UAs change.
+# Probe UAs (this script + remote-probe) — excluded from attacker-IP
+# cross-check so we don't tag ourselves.
 PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 
 ###############################################################################
@@ -194,120 +176,83 @@ PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 # Last updated from incident dossier: 2026-05-01.
 ###############################################################################
 
-# Pattern A - .sorry encryptor + qTox ransom note. Encryptor masquerades as
-# /root/sshd; sha256 from VirusTotal sample.
+# Pattern A - .sorry encryptor + qTox ransom note. Masquerades as /root/sshd.
 PATTERN_A_BINARY="/root/sshd"
 PATTERN_A_SHA256="2fc0a056fd4eff5d31d06c103af3298d711f33dbcd5d122cae30b571ac511e5a"
 PATTERN_A_README="/root/README.md"
 PATTERN_A_C2_IP="68.183.190.253"
 PATTERN_A_TOX_ID="3D7889AEC00F2325E1A3FBC0ACA4E521670497F11E47FDE13EADE8FED3144B5EB56D6B198724"
 
-# Pattern B - DB wipe + index.html BTC note. mysql wipe = /var/lib/mysql/mysql
-# removed but /var/lib/mysql kept (DB engine fails to start).
+# Pattern B - DB wipe + index.html BTC note. /var/lib/mysql/mysql removed,
+# parent kept (engine fails to start).
 PATTERN_B_BTC_ADDR="bc1q9nh4revv6yqhj2gc5usncrpsfnh7ypwr9h0sp2"
 PATTERN_B_MYSQL_DIR="/var/lib/mysql"
 PATTERN_B_MYSQL_DB="/var/lib/mysql/mysql"
 
-# Pattern C - Mirai/nuclear.x86 botnet drop. Dropper deletes the binary after
-# launch but the string survives in shell history; C2 host/IP independent so
-# rename of the binary doesn't hide the drop.
+# Pattern C - Mirai/nuclear.x86. Dropper deletes binary; string survives
+# in shell history. C2 host/IP catch the drop even after rename.
 PATTERN_C_BIN="nuclear.x86"
 PATTERN_C_C2_HOST="raw.flameblox.com"
 PATTERN_C_C2_IP="87.121.84.78"
 PATTERN_C_SHA256="c04d526eb0f7c7660a19871d1675383c8eaf5336651b255c15f4da4708835eb7"
 
-# Pattern D - WHM JSON-API recon + reseller-as-persistence. The sptadm
-# reseller, exploit.local contact, and 4ef72197.cpx.local domain are the
-# universal fingerprints observed across the compromised cohort. The
-# WHM_FullRoot API token they create persists post-patch unless revoked,
-# so a clean host_verdict isn't enough - this string in accounting.log
-# means the attacker had root via API token at some point.
+# Pattern D - WHM JSON-API recon + reseller-as-persistence. WHM_FullRoot
+# token persists post-patch unless revoked — accounting.log hit means
+# root-via-API at some point, regardless of host_verdict.
 PATTERN_D_RESELLER="sptadm"
 PATTERN_D_DOMAIN="4ef72197.cpx.local"
 PATTERN_D_EMAIL="a@exploit.local"
 PATTERN_D_TOKEN_NAME="WHM_FullRoot"
 
-# Pattern E - websocket/Shell access-log signature. Operator-attribution
-# uses terminal dimensions (rows×cols in the URL); each distinct dimension
-# observed in the wild has been a distinct toolchain. Detection regex is
-# dimension-agnostic so any rows=N&cols=M lands here; the per-dimension
-# breakout below feeds the unknown-dimension warning that flags new
-# operators day-zero. Updated alongside PATTERNS.md (current rev 4).
+# Pattern E - websocket/Shell. KNOWN_DIMS are observed-attacker terminal
+# sizes; unknown dims warn day-zero on new operators.
 PATTERN_E_WS_RE='GET /cpsess[0-9]+/websocket/Shell'
 PATTERN_E_KNOWN_DIMS="24x80,24x120,24x134,24x200"
 
-# Pattern F - automated harvester wrap. The __S_MARK__/__E_MARK__ envelope
-# is a strong actor fingerprint; only a single grep needed across bash
-# histories to confirm the same toolchain ran.
+# Pattern F - harvester wrap (actor fingerprint).
 PATTERN_F_S_MARK="__S_MARK__"
 PATTERN_F_E_MARK="__E_MARK__"
 
-# Pattern G - SSH key persistence. Suspect keys appear with mtime forged
-# to 2019-12-13 12:59:16 but a recent atime (Apr-May 2026). They masquerade
-# as LW-internal keys with IP-labeled comments. Real LW provisioning keys
-# carry "Parent Child key for <PJID>" comments - anything else in roots
-# /etc/, /var/spool/cron/ is a candidate.
+# Pattern G - SSH key persistence. Forged mtime 2019-12-13 12:59:16
+# masquerading as LW-internal keys with IP-labeled comments.
 PATTERN_G_FORGED_MTIME="2019-12-13"
 
-# Pattern H - seobot SEO defacement / per-site PHP webshell drop.
-# Distinct actor from the nuclear.x86 campaign - actively kills rival
-# infections (xmrig, kswapd01) before deploying. Four independent
-# signals; H1/H2/H4 are dispositive, H3 (ALLDONE marker) is
-# corroborating only.
+# Pattern H - seobot SEO defacement. Distinct actor from nuclear.x86;
+# kills rival infections (xmrig/kswapd01) before deploying.
 PATTERN_H_DROPPER_FILE="seobot.php"
 PATTERN_H_END_MARKER="ALLDONE"
 PATTERN_H_KILL_PRELUDE='pkill -9 nuclear\.x86 kswapd01 xmrig'
 PATTERN_H_ZIP_PATH="/tmp/seobot.zip"
-# base64-encoded prefix of the H-specific dropper zip header. Operator
-# self-cleans /tmp/seobot.zip on success; this catches interrupted runs.
+# Catches interrupted runs that didn't self-clean /tmp/seobot.zip.
 PATTERN_H_ZIP_MAGIC_B64="UEsDBBQACAAIAMhEkVw"
 
-# Pattern I - system-service profile.d backdoor. Fires on every
-# interactive shell login - more discreet than cron. Likely a
-# parallel-cohort secondary infection arriving via lateral movement
-# rather than direct CVE-2026-41940 exploitation, but worth fleet-
-# wide hunting. Filename and binary path are unique to the dossier;
-# no benign system component creates these.
+# Pattern I - system-service profile.d backdoor. Likely lateral-movement
+# secondary, not direct CVE-2026-41940; filename/binary unique to dossier.
 PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 PATTERN_I_BINARY="/root/.local/bin/system-service"
 PATTERN_I_PROCNAME="system-service"
 
-# Pattern G - SSH key persistence anchors. Comments matching these literal
-# IP labels are attacker-planted jumphost-mimic keys (per IC-5790 dossier).
+# Attacker-planted jumphost-mimic SSH key labels (per IC-5790 dossier).
 PATTERN_G_BAD_KEY_LABELS=(
     "209.59.141.49"
     "50.28.104.57"
 )
-# Forged mtime stamp the attackers used (`touch -d "2019-12-13 12:59:16"`).
-# date(1) interprets in local TZ so the stored epoch depends on host offset;
-# forensic pattern_g_deep_checks compares the wall-clock string under both
-# UTC and localtime to catch either interpretation.
+# date(1) parses in local TZ; pattern_g_deep_checks compares the wall-
+# clock string under both UTC and localtime.
 PATTERN_G_FORGED_MTIME_WALL="2019-12-13 12:59:16"
 
-# Known-good SSH key labels — single canonical list now that the forensic
-# script is merged in (matched in inline pattern_g_deep_checks below).
-# Real LW provisioning keys carry "Parent Child key
-# for <PJID>" comments (the PJID is a 6-char alnum project tag). The
-# lwadmin / lw-admin / liquidweb / nexcess prefixes cover the operator-
-# tooling key cohort. A line whose key-comment matches this pattern is
-# legitimate and should NOT trigger Pattern G.
+# Real LW provisioning keys carry "Parent Child key for <PJID>"; lwadmin
+# / lw-admin / liquidweb / nexcess prefixes cover operator-tooling keys.
 SSH_KNOWN_GOOD_RE='(lwadmin|lw-admin|liquidweb|nexcess|Parent Child key for [A-Z0-9]{6})'
 SSH_KEY_FILES=(
     "/root/.ssh/authorized_keys"
     "/root/.ssh/authorized_keys2"
 )
 
-# Attacker source IPs consolidated from the IC-5790 dossier (rev 3,
-# 2026-05-01). Roles annotated by row. Some are blackholed; we still want
-# to count log hits as a late-stage signal in case rotation didn't take.
-# Operators with internal scan boxes can suppress hits via --exclude-ip.
-#
-# 183.82.160.147 is notable: earliest observed websocket Shell hit
-# (24x134 dimension) is from DEC 2025 - approximately four months
-# before WebPros publicly disclosed CVE-2026-41940 on 2026-04-28.
-# Pre-disclosure silent exploitation; the --since default of "all
-# retained logs" is what surfaces these. Operators running --since 90
-# will miss them.
+# Attacker IPs from IC-5790 dossier rev3 (2026-05-01). Some blackholed —
+# still count hits in case rotation didn't take. --exclude-ip suppresses
+# operator scan boxes. 183.82.160.147 has DEC 2025 websocket/Shell hits,
+# four months pre-disclosure — --since 90 misses these.
 ATTACKER_IPS=(
     # badpass exploitation source IPs (initial-access wave)
     68.233.238.100   206.189.2.13     137.184.77.0     38.146.25.154
@@ -365,8 +310,8 @@ NO_LEDGER=0
 LEDGER_DIR_DEFAULT="/var/cpanel/sessionscribe-ioc"
 LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
 
-# Forensic phase defaults (post-merge v2.0.0 — used when --full or --replay
-# is supplied; no-op in default --triage mode).
+# Forensic phase defaults — used when --full or --replay
+# is supplied; no-op in default --triage mode.
 DEFAULT_BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
 DEFAULT_MAX_BUNDLE_MB=2048      # per-tarball cap (NOT bundle-wide)
 DEFAULT_FORENSIC_SINCE_DAYS=90  # forensic-mode default --since when unspecified
@@ -407,30 +352,15 @@ CHAIN_UPLOAD=0
 CHAIN_UPLOAD_URL=""
 CHAIN_UPLOAD_TOKEN=""
 
-# --chain-on-critical: narrow the chain gate from "host_verdict != CLEAN"
-# to "host_verdict == COMPROMISED" (i.e. only when at least one strong
-# host-state IOC fired - ioc_critical > 0). SUSPICIOUS hosts (review-
-# severity hits like stale tfa, IP-labeled keys without forged mtime,
-# token_denied+cp_security_token without badpass) skip the chain in
-# this mode. Implies --chain-forensic. Useful for fleet runs where
-# forensic's per-host time + bundle size matters and operators only
-# want full kill-chain reconstruction on hosts with conclusive
-# exploitation evidence.
+# --chain-on-critical: only run forensic when ioc_critical > 0
+# (skips SUSPICIOUS hosts). Implies --chain-forensic.
 CHAIN_ON_CRITICAL=0
 
-# --chain-on-all: widen the chain gate to "always run forensic phases"
-# (overrides the default CLEAN-skip AND overrides --chain-on-critical).
-# Useful for fleet baseline collection, post-incident "are we definitely
-# clean?" verification, or threat-intel data-lake construction where
-# operators want a kill-chain artifact + envelope + (optionally) bundle
-# upload for EVERY host scanned, regardless of host_verdict. Implies
-# --chain-forensic. Pair with --upload to ship every bundle to intake.
-# When both --chain-on-all and --chain-on-critical are set, this wins
-# (more inclusive — chain-on-all is the operator's explicit "I want
-# everything" override).
+# --chain-on-all: always run forensic regardless of host_verdict.
+# Wins over --chain-on-critical. Implies --chain-forensic.
 CHAIN_ON_ALL=0
 
-# Forensic / merged-mode defaults (post-merge v2.0.0).
+# Forensic / merged-mode defaults.
 FULL_MODE=0                             # 1 if --full set (or back-compat chain flag)
 REPLAY_PATH=""                          # set by --replay PATH
 REPLAY_MODE=0                           # 1 if --replay PATH set (skip detection)
@@ -629,7 +559,7 @@ while [[ $# -gt 0 ]]; do
         --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
         --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
         --chain-on-critical)  FULL_MODE=1; CHAIN_ON_CRITICAL=1; CHAIN_FORENSIC=1; shift ;;
-        # v2.5.0 chain-on-all override — runs forensic phases for EVERY
+        # chain-on-all override — runs forensic phases for EVERY
         # host (including CLEAN). Pair with --upload for unconditional
         # bundle submission across the fleet. Implies --full.
         --chain-on-all|--chain-always) FULL_MODE=1; CHAIN_ON_ALL=1; CHAIN_FORENSIC=1; shift ;;
@@ -701,7 +631,7 @@ TS_EPOCH=$(date -u +%s)
 RUN_ID="${SESSIONSCRIBE_RUN_ID:-${TS_EPOCH}-$$}"
 
 ###############################################################################
-# Forensic state (post-merge v2.0.0)
+# Forensic state
 ###############################################################################
 # When the operator runs --full or --replay, the forensic phases populate
 # these arrays. They stay empty in default --triage mode. All forensic
@@ -755,21 +685,9 @@ CODE_VERDICT="UNKNOWN"
 VERDICT="UNKNOWN"
 EXIT_CODE=0
 
-# v2.4.0 pre-compromise gate state. Populated during check_logs:
-#   LOGS_CRLF_CHAIN_FIRST_EPOCH   first ts of ioc_cve_2026_41940_crlf_access_chain
-#                                 (set by check_crlf_access_primitive). 0 if CRLF
-#                                 chain did not fire on this host. The "is the
-#                                 host actually compromised via CVE-2026-41940?"
-#                                 anchor — second-order signals (token
-#                                 consumption, websocket Shell access) before
-#                                 this epoch are pre-compromise noise.
-#   LOGS_2XX_CPSESS_FIRST_EPOCH   first ts of ioc_attacker_ip_2xx_on_cpsess
-#                                 (set by check_attacker_ips, only when the
-#                                 emit passes the CRLF gate at strong tier).
-#                                 Used as proximity anchor for Pattern E gate
-#                                 in check_destruction_iocs (Pattern E should
-#                                 be co-temporal with successful token use,
-#                                 within PATTERN_E_2XX_PROXIMITY_SEC window).
+# Pre-compromise gate state populated during check_logs. CRLF first-epoch
+# is the compromise anchor; signals before it are pre-compromise noise.
+# 2XX_CPSESS first-epoch is the proximity anchor for Pattern E.
 LOGS_CRLF_CHAIN_FIRST_EPOCH=0
 LOGS_2XX_CPSESS_FIRST_EPOCH=0
 
@@ -804,7 +722,7 @@ BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
 BUNDLE_TGZ=""           # tarball path (set when phase_upload prepares submission)
 
 ###############################################################################
-# Per-section verdict tracking (output primitive v2.1.0)
+# Per-section verdict tracking
 # SECTION_ORDER drives the summary matrix row sequence + section ID display.
 # SECTION_LABEL maps the emit() area to the human-facing matrix row label.
 # SECTION_VERDICT[area] is filled by aggregate_verdict() (worst-wins) and
@@ -860,7 +778,7 @@ else
     CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
 fi
 
-# Glyph table (post-merge v2.0.0) — Unicode for UTF-8 TTYs, ASCII fallback
+# Glyph table — Unicode for UTF-8 TTYs, ASCII fallback
 # otherwise. Forensic renderers and the kill-chain markdown depend on these.
 if [[ -t 2 ]] && [[ "${LC_ALL:-}${LANG:-}${LC_CTYPE:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
 GLYPH_BOX_TL='┌'; GLYPH_BOX_TR='┐'; GLYPH_BOX_BL='└'; GLYPH_BOX_BR='┘'
@@ -868,7 +786,7 @@ GLYPH_BOX_H='─'; GLYPH_BOX_V='│'
 GLYPH_OFFENSE='⚡'; GLYPH_DEFENSE='✓'; GLYPH_ARROW='↳'
 GLYPH_OK='✓';     GLYPH_BAD='✗';     GLYPH_WARN='⚠'
 GLYPH_ELLIPSIS='…'; GLYPH_TIMES='×'
-# Forensic-side color aliases — UTF-8 branch (post-merge v2.0.0).
+# Forensic-side color aliases — UTF-8 branch.
 C_RED="$RED"
 C_GRN="$GREEN"
 C_YEL="$YELLOW"
@@ -882,7 +800,7 @@ GLYPH_BOX_H='-'; GLYPH_BOX_V='|'
 GLYPH_OFFENSE='!'; GLYPH_DEFENSE='+'; GLYPH_ARROW='->'
 GLYPH_OK='+';     GLYPH_BAD='x';     GLYPH_WARN='!'
 GLYPH_ELLIPSIS='...'; GLYPH_TIMES='x'
-# Forensic-side color aliases — ASCII branch (post-merge v2.0.0).
+# Forensic-side color aliases — ASCII branch.
 C_RED="$RED"
 C_GRN="$GREEN"
 C_YEL="$YELLOW"
@@ -987,15 +905,7 @@ print_signal_human() {
         *) tag="[..]"; color="$DIM" ;;
     esac
 
-    # Extract the display-relevant fields from kv pairs. Operators need
-    # explicit pointers (path / log line / IP / user) to verify every
-    # finding without having to re-grep. Three sub-line groups:
-    #   1. WHERE  - path / sample_path / file   ("→ /…/<file>")
-    #   2. WHO    - user / src_ip / login_time / file_mtime / sha256
-    #   3. WHAT   - sample / access_log_line / line / raw  (the evidence
-    #               itself, truncated for terminal readability)
-    # All three are optional; rendered only when populated. Full content
-    # always lands in JSONL (this function only formats the human view).
+    # WHERE / WHO / WHAT sub-lines, all optional. Full kv lands in JSONL.
     local note="" path="" sample_path="" file="" log_file=""
     local user="" src_ip="" login_time="" file_mtime="" mtime=""
     local sample="" access_log_line="" line="" raw=""
@@ -1086,7 +996,7 @@ print_signal_human() {
 }
 
 ###############################################################################
-# Forensic output primitives (post-merge v2.0.0)
+# Forensic output primitives
 # say_* / hdr() mirror ioc-scan's section style with status-prefixed tags so
 # the forensic phase output stays visually distinct from detection sections.
 # All output goes to stderr (never contaminates --jsonl/--json on stdout).
@@ -1102,19 +1012,8 @@ say_def_miss()  { (( QUIET )) || printf '  %s[DEF-MISS]%s %s\n'  "$C_YEL" "$C_NC
 say_ioc()       { (( QUIET )) || printf '  %s[IOC]%s %s\n'       "$C_RED" "$C_NC" "$*" >&2; }
 
 ###############################################################################
-# Forensic signal emitter (post-merge v2.0.0)
-# Wraps emit() with the forensic call-site signature. Severity vocabulary:
-#   forensic    -> ioc-scan emit
-#   pass/info    -> info     (weight 0)
-#   warn         -> warning  (weight 4)
-#   fail         -> strong   (weight 10)
-# Area is passed through unchanged. Forensic areas (defense/offense/reconcile/
-# bundle/upload/summary) are treated as opaque labels by emit().
-#
-# Note on id == key: ioc-scan's emit() takes both `id` (positional 2) and
-# `key` (positional 4). Forensic signals don't have a separate id concept —
-# both positions receive the same value. This keeps the emit() signature
-# stable across detection + forensic call paths.
+# Forensic signal emitter — wraps emit(). pass/info → info(0), warn →
+# warning(4), fail → strong(10). Forensic signals reuse `key` for `id`.
 ###############################################################################
 
 emit_signal() {
@@ -1131,7 +1030,7 @@ emit_signal() {
 }
 
 ###############################################################################
-# Forensic helpers (post-merge v2.0.0) — used by phase_defense / phase_offense
+# Forensic helpers — used by phase_defense / phase_offense
 # / phase_reconcile / render_kill_chain / phase_bundle / phase_upload.
 # No-op in default --triage mode (the phase functions aren't called).
 ###############################################################################
@@ -1229,18 +1128,11 @@ json_num_field() {
 }
 
 ioc_key_to_pattern() {
-    # New v2.2.0 keys (verdict-precision refactor):
-    #   ioc_attacker_ip_2xx_on_cpsess    pattern=X   strong  weight=8   real exploitation
-    #   ioc_attacker_ip_recon_only       pattern=init info   weight=0   probing only
-    #   ioc_failed_exploit_attempt       pattern=X   warning weight=3   cPanel IOC 5 analog
-    # Specific keys MUST appear before the ioc_attacker_ip* glob or the
-    # glob captures them first (case is first-match, not best-match).
+    # Specific keys MUST appear before the ioc_attacker_ip* glob — case is
+    # first-match, not best-match.
     case "$1" in
-        # v2.4.0 pre-compromise gate keys (advisory tier, not real
-        # exploitation). MUST appear before ioc_pattern_e_* + ioc_attacker_ip*
-        # globs so the case-first-match rule routes them to init (kill-chain
-        # reconstruction skips advisory severity, but mapping defensively
-        # protects against future filter changes).
+        # Pre-compromise advisory keys: route to init so kill-chain skips
+        # them. MUST precede the ioc_pattern_e_* + ioc_attacker_ip* globs.
         (ioc_pattern_e_websocket_shell_hits_pre_compromise) echo init ;;
         (ioc_pattern_e_websocket_shell_hits_orphan)         echo init ;;
         (ioc_attacker_ip_2xx_on_cpsess_pre_compromise)      echo init ;;
@@ -1373,27 +1265,18 @@ read_iocs_from_envelope() {
         [[ "$line" =~ ^[[:space:]]*\{\"host\": ]] || continue
         area=$(json_str_field "$line" area)
         severity=$(json_str_field "$line" severity)
-        # Hoisted: $key is needed by the advisory allow-list below, which
-        # must run before the area filter falls through. Pre-fix the key
-        # was assigned AFTER the severity case, so the v2.4.1 advisory
-        # branch saw an empty $key (carried over from a prior iteration
-        # or never set), causing every advisory line to fall through the
-        # inner `(*) continue`. Net effect: the kill-chain renderer
-        # showed advisory=0 even when the envelope contained the gate keys.
+        # $key must be assigned before the advisory allow-list below
+        # checks it (prior layout assigned $key after the severity case,
+        # which silently filtered out every advisory line).
         key=$(json_str_field "$line" key)
         case "$area" in
             (logs|sessions|destruction) ;;
             (*) continue ;;
         esac
-        # v2.4.0 admits the three pre-compromise gate keys (severity=advisory,
-        # weight=0) into kill-chain reconstruction so the visual timeline
-        # surfaces them as PRE-COMPROMISE / EXPLOITATION-DETACHED context
-        # zones rather than dropping them silently. The keys do NOT escalate
-        # host_verdict (advisory severity is invisible to ioc_critical /
-        # ioc_review aggregation) but they ARE part of the operator's
-        # forensic narrative and were artificially hidden in v2.4.0. A
-        # narrow allow-list (not a blanket advisory pass) keeps the filter
-        # tight: any future advisory keys default to filtered-out.
+        # Narrow allow-list for the three pre-compromise advisory keys so
+        # they appear as PRE-COMPROMISE / EXPLOITATION-DETACHED zones in
+        # the kill-chain. Advisory does not escalate host_verdict; any
+        # future advisory keys default to filtered-out.
         case "$severity" in
             (strong|warning) ;;
             (advisory)
@@ -1451,7 +1334,7 @@ read_iocs_from_envelope() {
 }
 
 ###############################################################################
-# Forensic phases — defense / offense / reconcile (post-merge v2.0.0).
+# Forensic phases — defense / offense / reconcile.
 # Run only when --full or --replay is set. Inputs: envelope (read from disk
 # via read_iocs_from_envelope). Outputs: DEFENSE_EVENTS[], OFFENSE_EVENTS[],
 # IOC_PRIMITIVES[], IOC_ANNOTATIONS[], RECONCILED[], N_PRE, N_POST,
@@ -1788,8 +1671,9 @@ phase_defense() {
         fi
         if (( csf_clean )); then
             DEF_CSF_TIME=$(mtime_of /etc/csf/csf.conf)
-            # Prefer the .ic5790.bak file mtime if it exists (Zane's pattern)
-            # since that records the original CSF mutation time.
+            # Prefer the .ic5790.bak file mtime if it exists (operator
+            # pre-mutation backup) since that records the original CSF
+            # mutation time.
             if [[ -f /etc/csf/csf.conf.ic5790.bak ]]; then
                 local bak_time
                 bak_time=$(mtime_of /etc/csf/csf.conf.ic5790.bak)
@@ -1932,18 +1816,9 @@ phase_reconcile() {
     local oe verdict delta
     for oe in "${OFFENSE_EVENTS[@]}"; do
         local ev_epoch ev_pat ev_key ev_note
-        # Record shape: epoch|pattern|key|note|defenses_required (5 fields).
-        # Field 5 (defenses_required) is reserved for future per-pattern
-        # reconciliation but currently every offense fires against the same
-        # patch+modsec pair, so we discard it.
-        #
-        # Pipe-tolerant decode: read into an array, then rejoin parts[3..n-2]
-        # with '|' so a note that legitimately contains '|' (e.g. a quoted
-        # access_log line, a path with embedded '|', a session-attribute
-        # value carrying CRLF-injected content) round-trips intact instead
-        # of being silently truncated at the first '|' inside the note.
-        # Pre-fix `read -r ... ev_note _` set ev_note=<note-prefix> and
-        # discarded the rest, dropping the trailing portion of the note.
+        # Record: epoch|pattern|key|note|defenses_required (field 5 unused).
+        # Pipe-tolerant: rejoin parts[3..n-2] so notes containing '|'
+        # (access_log lines, CRLF-injected values) round-trip intact.
         local _oe_parts _oe_n _note_start _note_end
         IFS='|' read -r -a _oe_parts <<< "$oe"
         _oe_n=${#_oe_parts[@]}
@@ -1966,20 +1841,16 @@ phase_reconcile() {
             ev_note=""
         fi
 
-        # Reset per-iteration verdict/delta — both are function-scope locals
-        # that would otherwise carry over from the prior loop iteration if
-        # the v2.4.0 advisory short-circuit branch below does not assign them.
+        # Reset per-iteration verdict/delta — function-scope locals that
+        # would otherwise carry over if the advisory short-circuit branch
+        # below does not assign them.
         verdict=""
         delta=""
 
-        # v2.4.0 pre-compromise gate keys short-circuit the defense
-        # comparison: they are advisory by design (host wasn't actually
-        # compromised by these events; CRLF anchor is missing or pre-dates
-        # them) so PRE-DEFENSE / POST-DEFENSE / UNDEFENDED bucketing does
-        # not apply. Routed to dedicated verdict slots so the kill-chain
-        # renderer can group them in a clearly-labeled context zone
-        # without mixing them into the actual attack chronology. They do
-        # NOT increment N_PRE / N_POST (those count real attack events).
+        # Pre-compromise advisory keys short-circuit the defense comparison
+        # (they're advisory by design — host wasn't compromised by these
+        # events) and route to dedicated verdict slots. They do NOT
+        # increment N_PRE / N_POST (those count real attack events).
         case "$ev_key" in
             (*_pre_compromise)
                 verdict="ADVISORY-PRE-COMPROMISE"
@@ -2108,7 +1979,7 @@ phase_reconcile() {
 }
 
 ###############################################################################
-# Kill-chain renderer + primitives writer (post-merge v2.0.0).
+# Kill-chain renderer + primitives writer.
 ###############################################################################
 
 # Order patterns canonically for the offense timeline. init is the recon
@@ -2178,10 +2049,9 @@ render_offense_row() {
         PRE-DEFENSE|UNDEFENDED)                  color="$C_RED" ;;
         POST-DEFENSE)                            color="$C_GRN" ;;
         POST-PARTIAL)                            color="$C_YEL" ;;
-        # v2.4.0 advisory verdicts render in cyan to match their zone
-        # header — visible in the timeline but visually distinct from
-        # the red/green/yellow attack-chain palette so operators can
-        # tell at a glance which rows are real exploitation evidence.
+        # Advisory verdicts render in cyan — distinct from the
+        # red/green/yellow attack-chain palette so operators can tell at
+        # a glance which rows are real exploitation evidence.
         ADVISORY-PRE-COMPROMISE|ADVISORY-ORPHAN) color="$C_CYN" ;;
         *)                                       color="$C_DIM" ;;
     esac
@@ -2218,15 +2088,8 @@ render_defense_row() {
         "$note_trim"
 }
 
-# Aggregate attacker IPs from IOC_PRIMITIVES + RECONCILED. Sets globals
-# consumed by the HEADLINE renderer:
-#   ATTACKER_IP_PLAIN          space-separated top-N for copy-paste
-#   ATTACKER_IP_ANNOTATED[]    array of "ip ×count [stages]" annotated forms
-#   ATTACKER_IP_OVERFLOW       "+N more — see kill-chain.md", empty if <=top_n
-#   ATTACKER_IP_TOTAL          count of unique IPs across the chain
-# Sort order: hit-count desc, first-seen epoch asc tiebreak. Top 5 inline,
-# remainder rolled into the overflow line - the bundle's kill-chain.md
-# carries the full enumerated list (sorted same way).
+# Aggregate attacker IPs from IOC_PRIMITIVES + RECONCILED. Sort: hit-count
+# desc, first-seen asc. Top 5 inline; rest in kill-chain.md overflow.
 aggregate_attacker_ips() {
     ATTACKER_IP_PLAIN=""
     ATTACKER_IP_ANNOTATED=()
@@ -2473,12 +2336,10 @@ render_kill_chain() {
                     def)         z_color="$C_GRN";  z_label="DEFENSES"      ;;
                     post)        z_color="$C_GRN";  z_label="POST-DEFENSE"  ;;
                     partial)     z_color="$C_YEL";  z_label="POST-PARTIAL"  ;;
-                    # v2.4.0 advisory zones — pre-compromise context
-                    # (signals fired before / without the CRLF anchor) and
-                    # exploitation-detached (signals after CRLF but with no
-                    # nearby successful token use). Cyan + explicit ADVISORY
-                    # prefix differentiates them from the actual attack
-                    # chronology while still giving operators visibility.
+                    # Advisory zones — pre-compromise context (signals
+                    # before/without the CRLF anchor) and
+                    # exploitation-detached (post-CRLF but no nearby
+                    # successful token use).
                     adv_pre)     z_color="$C_CYN";  z_label="ADVISORY (PRE-COMPROMISE CONTEXT)" ;;
                     adv_orphan)  z_color="$C_CYN";  z_label="ADVISORY (EXPLOITATION-DETACHED)" ;;
                     *)           z_color="$C_DIM";  z_label="$z_id"         ;;
@@ -2608,10 +2469,7 @@ render_kill_chain() {
                 ADVISORY-*) n_adv=$(( n_adv + 1 )) ;;
             esac
         done
-        # iocs counter shows the count of attack-chain events (excludes
-        # advisory rows which are reported separately) so operators can
-        # read it as "how many real exploitation events fired" without
-        # mental subtraction.
+        # iocs counter excludes advisory rows (reported separately).
         local n_iocs_real=$(( ${#OFFENSE_EVENTS[@]} - n_adv ))
         (( n_iocs_real < 0 )) && n_iocs_real=0
         printf '\n  %scounters%s defenses=%d  iocs=%d  pre=%d  undef=%d  post=%d  advisory=%d  attackers=%d\n' \
@@ -2625,16 +2483,8 @@ render_kill_chain() {
 }
 
 ###############################################################################
-# Kill-chain primitives writer - persists the inputs the renderer consumed
-# into the bundle dir so the chain can be reconstructed offline (no need to
-# re-run forensic on the host). Three siblings:
-#
-#   kill-chain.tsv    grep/awk-friendly: one row per IOC plus DEF-* rows
-#   kill-chain.jsonl  one JSON object per row, machine-parseable
-#   kill-chain.md     ANSI-stripped copy of render_kill_chain output for humans
-#
-# Called from phase_bundle so it lives next to the tarballs and is included
-# in the outer upload tarball.
+# Kill-chain primitives writer — persists renderer inputs as
+# kill-chain.{tsv,jsonl,md} for offline reconstruction.
 ###############################################################################
 
 write_kill_chain_primitives() {
@@ -2742,20 +2592,9 @@ write_kill_chain_primitives() {
     } > "$tsv"
     chmod 0600 "$tsv" 2>/dev/null
 
-    # JSONL - same data, machine-parseable. Header row replaced by a single
-    # "meta" object on line 1; each subsequent line is a kind=DEF or kind=IOC
-    # record with envelope-root metadata embedded for self-attribution.
-    #
-    # Schema version tracking:
-    #   v1 (forensic <= 0.9.x): per-IOC field name was "stage"
-    #   v2 (forensic >= 0.10.0): per-IOC field renamed to "pattern" to align
-    #     with the IC-5790 dossier vocabulary.
-    #   v3 (ioc-scan >= 2.2.0): added per-IOC field "cpsess_token" (10-digit
-    #     prefix extracted from /cpsess<10>/ paths at emit-time; populated by
-    #     Pattern E + ioc_attacker_ip_2xx_on_cpsess and any future emits that
-    #     pass the 9th positional arg to ioc_primitive_row()).
-    # The _schema_changes hint in the meta row makes the rename + addition
-    # machine-discoverable for future readers (operator tooling, LLM analyses).
+    # JSONL: line 1 is a meta object; subsequent lines are kind=DEF/IOC.
+    # Schema v3: 'stage' renamed to 'pattern' (v2); 'cpsess_token' added
+    # (v3). _schema_changes in meta lets consumers auto-detect the rename.
     {
         printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":3,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
             "${HOSTNAME_J:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
@@ -2815,12 +2654,9 @@ write_kill_chain_primitives() {
                 local area ip path log_file count h2xx status line cpsess_token
                 IFS="$PRIM_SEP" read -r area ip path log_file count h2xx status line cpsess_token <<< "$prims"
 
-                # JSONL schema v3 (ioc-scan v2.2.0+): per-IOC field 'stage'
-                # was renamed to 'pattern' in v2 (forensic v0.10.0+) to match
-                # the IC-5790 dossier vocabulary; v3 added 'cpsess_token'.
-                # Meta row carries schema_version=3 + a _schema_changes hint
-                # so future readers (operator tooling, LLM analyses) can
-                # auto-detect the rename and addition and adapt.
+                # JSONL schema v3: per-IOC 'stage' was renamed to 'pattern'
+                # in v2; v3 added 'cpsess_token'. Meta row carries
+                # schema_version + _schema_changes so consumers can adapt.
                 printf '{"kind":"IOC","epoch":%s,"ts":"%s","pattern":"%s","verdict":"%s","delta":"%s","defenses_at_ioc":"%s","key":"%s","note":"%s","area":"%s","ip":"%s","path":"%s","log_file":"%s","count":"%s","hits_2xx":"%s","status":"%s","cpsess_token":"%s","line":"%s"}\n' \
                     "$r_epoch" "$(epoch_to_iso "$r_epoch")" \
                     "$(json_esc "$r_pat")" "$(json_esc "$r_verdict")" \
@@ -2849,7 +2685,7 @@ write_kill_chain_primitives() {
 }
 
 ###############################################################################
-# Bundle + upload pipeline (post-merge v2.0.0).
+# Bundle + upload pipeline.
 # Bundle root: $BUNDLE_DIR_ROOT/<TS>-<RUN_ID>/ (set in Phase 4 CLI parsing).
 # Tarball cap: --max-bundle-mb (per-tarball). Upload: --upload (PUT to
 # $INTAKE_URL with $INTAKE_TOKEN).
@@ -3576,20 +3412,9 @@ check_binary() {
         return
     fi
 
-    # Field-observed limit on the binary fingerprint signal (2026-04-29):
-    # on 134-tier, BOTH vulnerable (134.0.17) and patched (134.0.20) binaries
-    # carry these strings - they entered via feature evolution before patch
-    # release, not as part of the patch itself. So a nonzero strings count
-    # CANNOT discriminate vuln from patched on 134+. The version-string check
-    # is the authoritative verdict driver; the binary check is informational
-    # only when strings are present.
-    #
-    # Surfaced signals:
-    #   - both counts 0       → strong vuln evidence (very old / non-cpsrvd
-    #                            binary; consistent with pre-130 vulnerable)
-    #   - either count > 0    → informational only, no score impact (could
-    #                            be patched OR vuln-on-newer-tier; defer to
-    #                            version-string verdict)
+    # On 134+ tier, both vulnerable and patched binaries carry these
+    # strings (feature evolved in pre-patch). Both counts 0 = strong vuln
+    # evidence (pre-130 shape); nonzero is informational only.
     local strings_dump; strings_dump=$(mktemp /tmp/ssioc.strs.XXXXXX)
     strings -a -n 8 "$CPSRVD_BIN" 2>/dev/null > "$strings_dump"
 
@@ -3710,34 +3535,14 @@ check_logs() {
     fi
     rm -f "$tmp"
 
-    # ---- CRLF auth-bypass primitive (deterministic) ----------------------
-    # Direct fingerprint of the CVE-2026-41940 exploitation chain in the
-    # access log: 401 POST /login/?login_only=1 immediately followed by a
-    # 2xx GET /cpsess<N>/* as user "root" from the same IP within 2s.
-    # Independent of session-store evidence; survives mitigate purging.
-    # MUST run BEFORE check_attacker_ips so the CRLF first-epoch is
-    # available as the temporal anchor for the v2.4.0 pre-compromise gate
-    # on ioc_attacker_ip_2xx_on_cpsess (and Pattern E downstream in
-    # check_destruction_iocs). Without CRLF as anchor, second-order
-    # signals (token consumption + websocket Shell access) cannot be
-    # distinguished from pre-disclosure noise (testdev pattern).
+    # CRLF primitive: 401 POST /login/?login_only=1 → 2xx GET /cpsess<N>/*
+    # as root from same IP within 2s. Survives mitigate purging.
+    # MUST run before check_attacker_ips — sets the CRLF first-epoch
+    # anchor used by 2xx_on_cpsess and Pattern E pre-compromise gates.
     check_crlf_access_primitive "$logdir"
-
-    # ---- attacker-IP cross-ref -------------------------------------------
-    # Independent signal: count access_log hits from the consolidated
-    # IC-5790 attacker IP list. Excludes probe-UA traffic and any
-    # operator-supplied --exclude-ip values. A hit here doesn't imply
-    # successful exploitation (the IP may have been blackholed before
-    # request landed) but does mean the attacker reached this host. The
-    # ioc_attacker_ip_2xx_on_cpsess strong-tier emit consults the
-    # LOGS_CRLF_CHAIN_FIRST_EPOCH set by check_crlf_access_primitive
-    # above to distinguish post-CRLF exploitation from pre-CRLF noise.
     check_attacker_ips "$logdir"
 }
 
-# Cross-reference access_log against the dossier attacker-IP list. Pulled
-# out of check_logs() to keep that function readable; called immediately
-# after.
 check_attacker_ips() {
     local logdir="$1"
 
@@ -3749,32 +3554,17 @@ check_attacker_ips() {
     # Anchored to "^IP " so we don't match an IP buried inside a URL/UA.
     ip_re="^(${ip_re}) "
 
-    # Single-pass streaming scan: filter+count+sample in one awk over the
-    # concatenated logs. Previous implementation wrote ALL logs to a /tmp
-    # file (often multi-GB on busy hosts) then ran TWO passes over it
-    # (grep -c + awk). New version streams once - halves IO and eliminates
-    # the /tmp footprint.
-    #
-    # Regexes pass via the environment: `awk -v ip_re='...'` would
-    # interpret `\.` as the escape sequence "." (any char) AND emit a
-    # per-line `warning: escape sequence \. treated as plain .` - a real
-    # correctness + noise bug. ENVIRON[] delivers the variable byte-for-
-    # byte without escape processing.
-    # Build the EXCLUDES env var separately. ${EXCLUDE_IPS[@]:-} on an
-    # empty array under `set -u` is brittle on bash 4.1 (CL6); compute
-    # the value with explicit length-check for portability.
+    # Regexes pass via ENVIRON[]: `awk -v ip_re='...'` would interpret
+    # `\.` as the escape sequence (any char) AND emit per-line warnings.
+    # ${EXCLUDE_IPS[@]:-} on empty arrays is brittle on bash 4.1 (CL6).
     local excludes_env=""
     if (( ${#EXCLUDE_IPS[@]} > 0 )); then
         excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
     fi
 
-    # Per-line src tagging (ASCII US \x1f) preserves rotated-log attribution
-    # through the consumer awk so operators see the exact file each hit
-    # came from.
-    # Bash 4.1 quirks inside the case below:
-    #   - newline after $( required: $({ is a parser bug pre-4.4
-    #   - leading-paren case patterns required: bash <4.4 miscounts the
-    #     closing ) inside $(...) and aborts on ;;
+    # Per-line src tagging (ASCII US \x1f) preserves rotated-log attribution.
+    # Bash <4.4 quirks below: newline after `$(` and leading-paren case
+    # patterns inside $(...) — both miscount otherwise.
     local SEP=$'\x1f'
     local tmp; tmp=$(mktemp /tmp/ssioc.atk.XXXXXX)
     {
@@ -3942,22 +3732,12 @@ check_attacker_ips() {
             if [[ "$_c_path" =~ /cpsess([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])/ ]]; then
                 _c_token="${BASH_REMATCH[1]}"
             fi
-            # v2.4.0 pre-compromise gate. ioc_attacker_ip_2xx_on_cpsess is a
-            # second-order signal (an attacker IP successfully consumed a
-            # cpsess token) - it requires a first-order CVE-2026-41940
-            # exploitation primitive to anchor it as compromise evidence.
-            # Without the deterministic CRLF chain firing AT OR BEFORE
-            # ts_first, the 2xx-on-cpsess hits are most likely:
-            #   (a) shared-infra T1-IP coincidence (the IP also hosts
-            #       legitimate cPanel customers elsewhere);
-            #   (b) recycled cpsess from a long-prior legitimate session;
-            #   (c) pre-disclosure recon that did not yield a successful
-            #       exploit chain (the testdev pattern: 2xx_on_cpsess
-            #       2026-03-26, but no CRLF chain until 2026-04-30).
-            # In any of these cases the hit is pre-compromise enrichment,
-            # not exploitation evidence — demote to advisory (weight 0)
-            # so it does NOT escalate host_verdict but still surfaces in
-            # ADVISORIES + signals[] for fleet aggregator visibility.
+            # Pre-compromise gate. 2xx_on_cpsess (token consumption) is
+            # second-order — it needs the deterministic CRLF chain firing
+            # AT OR BEFORE ts_first to anchor as compromise. Otherwise the
+            # hit is most likely shared-infra T1-IP coincidence, a recycled
+            # cpsess from a prior legitimate session, or pre-disclosure recon.
+            # Demote to advisory; surfaces in signals[] for fleet aggregator.
             local _gate_sev="strong" _gate_key="ioc_attacker_ip_2xx_on_cpsess" _gate_weight=8
             local _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
             if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
@@ -4019,19 +3799,10 @@ check_attacker_ips() {
     rm -f "$tmp"
 }
 
-# Deterministic CRLF auth-bypass fingerprint in access_log.
-#
-# Primitive shape: a `POST /login/?login_only=1` returning 401 immediately
-# followed (≤2s, same source IP) by a `GET /cpsess<N>/<anything>` returning
-# 2xx with the user slot populated as `root`. This is what the CVE-2026-41940
-# CRLF chain looks like at the access-log layer: cpsrvd rejects the POST at
-# the HTTP level (401) but the saveSession() side-effect has already minted
-# the cpsess token, which the attacker then uses against any URL.
-#
-# Detection survives session-file purging by mitigate.sh - whereas the
-# session-store analyzer needs the forged session on disk, this primitive
-# only needs the access_log, which is what most hosts still have intact.
-# Probe-UA traffic is excluded; --since window honored.
+# Deterministic CRLF chain at the access-log layer: 401 POST
+# /login/?login_only=1 then 2xx GET /cpsess<N>/* as root from the same
+# IP within 2s. cpsrvd 401s the POST but saveSession() has already minted
+# the cpsess token. Survives mitigate purging (only needs access_log).
 check_crlf_access_primitive() {
     local logdir="$1"
     local log="$logdir/access_log"
@@ -4091,13 +3862,11 @@ check_crlf_access_primitive() {
              "log_file" "$log" \
              "line" "${crlf_sample:0:240}" \
              "note" "$crlf_hits CRLF-bypass chain(s) in $log: POST /login → 401 then GET /cpsess<N>/* → 2xx as root within 2s. Deterministic CVE-2026-41940 exploitation evidence (CRITICAL)."
-        # v2.4.0: record CRLF first epoch globally so the downstream
-        # second-order signals (ioc_attacker_ip_2xx_on_cpsess in
-        # check_attacker_ips, ioc_pattern_e_websocket_shell_hits in
-        # check_destruction_iocs) can demote pre-compromise events to
-        # advisory tier instead of polluting host_verdict + cluster-
-        # onset timeline (testdev pattern). Numeric coercion via
-        # arithmetic context normalizes empty/non-numeric values to 0.
+        # Record CRLF first epoch globally so downstream second-order
+        # signals (ioc_attacker_ip_2xx_on_cpsess,
+        # ioc_pattern_e_websocket_shell_hits) can demote pre-compromise
+        # events to advisory tier instead of polluting host_verdict +
+        # cluster-onset timeline.
         if [[ "$crlf_ts_first" =~ ^[0-9]+$ ]]; then
             LOGS_CRLF_CHAIN_FIRST_EPOCH="$crlf_ts_first"
         fi
@@ -4105,31 +3874,11 @@ check_crlf_access_primitive() {
 }
 
 # ---- session-store analyzer ----------------------------------------------
-# Single awk pass over a session file. Sets SF_* globals describing the
-# CVE-2026-41940-relevant attribute shape. One subprocess per file replaces
-# 6+ greps; the awk reads the file once and emits structured key=value pairs
-# the bash side parses with a single read loop.
-# Wrapper around emit() that always includes the four identity / provenance
-# KPIs from the most recent analyze_session() call. Use this for EVERY
-# session-IOC emit so fleet aggregators see {user, src_ip, login_time,
-# file_mtime} on every record without having to re-grep the session file.
-#
-#   user         cPanel/WHM account (user= or whm_user=, first occurrence)
-#   src_ip       peer IP (address= or remote_addr=, first occurrence)
-#   login_time   login_time= as ISO-8601 UTC (CAN be forged via injection;
-#                compare against file_mtime to detect)
-#   file_mtime   session file mtime as ISO-8601 UTC (CAN be backdated by
-#                `touch -d` post-write; compare against file_ctime to detect)
-#   file_ctime   session file ctime as ISO-8601 UTC (NOT backdateable by
-#                user-space tools - touch updates ctime to wall-clock).
-#                Legitimate cpsrvd writes have file_mtime == file_ctime.
-#   mtime_ctime_delta_sec   signed seconds (mtime - ctime). Empty when
-#                stat could not provide both; non-zero magnitude means
-#                the mtime was modified separately from the file content
-#                (touch -d forgery, cp -p / tar xp restore artifact).
-#
-# Args identical to emit() minus the area (always "sessions"):
-#   emit_session <key> <severity> <signal> <weight> [k v ...]
+# Single awk pass per session file sets SF_* globals; emit_session() is the
+# wrapper around emit() that attaches identity/provenance KPIs from the
+# most recent analyze_session() call so every fleet record carries
+# {user, src_ip, login_time, file_mtime, file_ctime, mtime_ctime_delta_sec}.
+# login_time and file_mtime are forgeable; file_ctime is not.
 emit_session() {
     local key="$1" sev="$2" sig="$3" weight="$4"
     shift 4
@@ -4150,23 +3899,9 @@ analyze_session() {
     SF_MALFORMED=0;    SF_MALFORMED_SAMPLE=""
     SF_PASS_COUNT=0;   SF_PASS_LEN=0; SF_PASS_PRESENT_NONEMPTY=0
     SF_TD_VAL="";      SF_CP_VAL="";   SF_ORIGIN="";  SF_AUTH_TS=""
-    # Identity + provenance KPIs - always populated when present in the
-    # session file. These travel with EVERY ioc_* emit so fleet aggregators
-    # can answer "which user / which source IP / when" without having to
-    # re-grep the session file.
-    #   SF_USER         user= (cPanel account) or whm_user= (WHM account)
-    #   SF_REMOTE_ADDR  address= (peer IP) or remote_addr= (legacy)
-    #   SF_LOGIN_TIME   login_time= epoch (when cpsrvd recorded the login)
-    #   SF_LOGIN_ISO    login_time formatted as ISO-8601 UTC (operator-friendly)
-    #   SF_FILE_MTIME   file mtime epoch (last write to disk)
-    #   SF_FILE_MTIME_ISO   file mtime as ISO-8601 UTC
-    #   SF_FILE_CTIME   file ctime epoch (last inode metadata change; cannot
-    #                   be backdated by user-space tools - touch updates
-    #                   mtime + atime but ctime tracks the touch itself)
-    #   SF_FILE_CTIME_ISO   file ctime as ISO-8601 UTC
-    #   SF_MTIME_CTIME_DELTA   signed (mtime - ctime) seconds; "" if either
-    #                   timestamp is missing or non-numeric. Used downstream
-    #                   to detect mtime-forgery (Gap 10 IOC).
+    # Identity/provenance KPIs travel on every ioc_* emit. ctime can't be
+    # backdated by user-space (touch updates mtime/atime; ctime tracks the
+    # touch itself), so SF_MTIME_CTIME_DELTA detects forgery (Gap 10 IOC).
     SF_USER="";        SF_REMOTE_ADDR=""
     SF_LOGIN_TIME="";  SF_LOGIN_ISO=""
     SF_FILE_MTIME="";  SF_FILE_MTIME_ISO=""
@@ -4329,18 +4064,9 @@ analyze_session() {
     fi
 }
 
-# ---- access_log token-use cross-ref --------------------------------------
-# When session-store IOCs detect a forged cp_security_token, this helper
-# checks whether the same token was actually used in access_log with a
-# 2xx response. A hit escalates the actionable shape from "session was
-# forged" to "session was forged AND used" - meaningful for IR scoping
-# (token revocation urgency, blast-radius assessment).
-#
-# Uses the same access_log root the rest of the script reads from. The
-# closing-quote-then-status pattern ('" 2[0-9][0-9] ') is the apache
-# combined-log marker for the request-line/status boundary - more
-# robust than a bare " 200 " grep which would false-positive on IPs
-# beginning with 200, response-byte-counts of 200, etc.
+# Escalate "forged token" → "forged AND used" by checking access_log for
+# the token with 2xx. The `" 2[0-9][0-9] ` boundary avoids matching IPs
+# starting with 200 or response-byte counts of 200.
 check_token_used() {
     local session_path="$1" token_val="$2" session_name="$3"
     local log=/usr/local/cpanel/logs/access_log
@@ -4357,19 +4083,9 @@ check_token_used() {
     return 0
 }
 
-# ---- session-store IOC scan ----------------------------------------------
-# Two-pass scan against /var/cpanel/sessions:
-#   (a) IOC ladder over raw/   - deterministic forgery signals; no time bound
-#                                (a stale forgery hit in 2-year-old session
-#                                data is still a real hit).
-#   (b) Heuristic over $d      - root-named sessions lacking expected authz
-#                                fields. Time-bounded by --since because the
-#                                anomalous-shape signal is lower confidence
-#                                and only useful within an investigation window.
-#
-# Sessions tagged with the companion remote probe's canary attribute
-# (nxesec_canary_<nonce>=1) are bucketed as PROBE_ARTIFACT and skipped from
-# the IOC ladder - they are known test collateral, not exploitation.
+# Two-pass scan: (a) IOC ladder over raw/ — deterministic, no time bound.
+# (b) Anomalous-shape heuristic — time-bounded by --since (lower confidence).
+# Sessions with nxesec_canary_<nonce>=1 are PROBE_ARTIFACT and skipped.
 check_sessions() {
     (( NO_SESSIONS )) && return
     hdr_section "sessions" "session-store IOC ladder"
@@ -4409,26 +4125,10 @@ check_sessions() {
             fi
 
             # IOC-A: token_denied + cp_security_token co-occur. Three-tier
-            # classification, mirroring cPanel's published reference
-            # (ioc_checksessions_files.sh):
-            #
-            #   1. badpass + auth markers (hasroot=1 / tfa_verified=1 /
-            #      successful_*_auth_with_timestamp) -> CRITICAL injection.
-            #      The badpass call site (Cpanel/Server.pm:1244-1252)
-            #      cannot legitimately set any of these.
-            #   2. badpass + no auth markers + pass= line present ->
-            #      ATTEMPT. A legitimate badpass session never carries
-            #      pass= (saveSession only writes pass when length>0;
-            #      Cpanel/Session.pm:181). Presence of pass= is anomalous
-            #      but, with no auth markers, the patch held -- the
-            #      injection didn't promote. Failed exploit attempt, NOT
-            #      a compromise. Encoded as `evidence` (records reason,
-            #      but does NOT escalate host_verdict to SUSPICIOUS or
-            #      COMPROMISED on its own).
-            #   3. badpass + no auth markers + no pass= -> INFO. Looks
-            #      like garden-variety failed login retries.
-            #   4. non-badpass + token_denied + cp_security_token ->
-            #      review (may be expired bookmark).
+            # mirrors cPanel's ioc_checksessions_files.sh. badpass call
+            # site (Cpanel/Server.pm:1244-1252) cannot legitimately set
+            # auth markers; saveSession (Cpanel/Session.pm:181) only
+            # writes pass= when length>0.
             if (( SF_TOKEN_DENIED && SF_CP_TOKEN )); then
                 if (( SF_BADPASS )); then
                     if (( SF_HASROOT || SF_TFA || SF_EXT_AUTH || SF_INT_AUTH )); then
@@ -4536,15 +4236,9 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-H: standalone hasroot=1. Per WebPros code-path analysis,
-            # `hasroot` is NOT in cpsrvd's _SESSION_PARTS whitelist
-            # (Cpanel/Server.pm:2216-2247) and a repo-wide grep finds no
-            # caller of Cpanel::Session::Modify->set('hasroot', ...). Its
-            # presence in any session is conclusive newline-injection
-            # evidence, regardless of other markers. Emitted in addition
-            # to IOC-E / IOC-E2 (which already cover the badpass+hasroot
-            # subset) so a session with only hasroot smuggled in still
-            # surfaces.
+            # IOC-H: standalone hasroot=1. Not in cpsrvd's _SESSION_PARTS
+            # whitelist (Cpanel/Server.pm:2216-2247); no caller writes it.
+            # Conclusive injection evidence regardless of other markers.
             if (( SF_HASROOT )); then
                 emit_session "ioc_hasroot_$session_name" "strong" \
                      "ioc_hasroot_in_session" 10 \
@@ -4602,23 +4296,10 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-J: Failed exploit attempt - cPanel IOC 5 analog. Session has
-            # the newline-injection-attempted footprint but the injection did not
-            # promote (no auth markers). Per cPanel's reference checker:
-            # origin=badpass + token_denied present + pass= line present (non-
-            # empty) + no auth markers = the attacker tried, the auth-marker
-            # injection failed, the session is probing cp_security_token without
-            # success.
-            #
-            # Severity=warning so this counts toward ioc_review (SUSPICIOUS) but
-            # NOT ioc_critical (COMPROMISED). Mutually exclusive with IOC-E
-            # (`ioc_token_attempt_*`, also parent key ioc_failed_exploit_attempt)
-            # via `! SF_CP_TOKEN` -- when cp_security_token IS in the session
-            # IOC-E fires (evidence-tier); when ABSENT IOC-J fires (warning-tier).
-            # Without this guard both would emit on the same session against
-            # the same parent key, which double-counts in ss-aggregate.py.
-            # Also mutually exclusive with IOC-E2 (CRITICAL when auth markers
-            # ARE present): the auth-marker guards below prevent that.
+            # IOC-J: failed exploit attempt (cPanel IOC 5 analog). Mutually
+            # exclusive with IOC-E (cp_security_token present) and IOC-E2
+            # (auth markers present) — without these guards all three would
+            # double-count the same session in ss-aggregate.py.
             if (( SF_BADPASS && SF_TOKEN_DENIED && SF_PASS_PRESENT_NONEMPTY \
                   && ! SF_CP_TOKEN \
                   && ! SF_INT_AUTH && ! SF_EXT_AUTH \
@@ -4630,20 +4311,11 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # Gap 10: session_mtime_vs_ctime_anomaly (forensic enrichment).
-            # cpsrvd's session writer sets mtime and ctime atomically via a
-            # single write(2)+fsync(2) - legitimate sessions have mtime ==
-            # ctime to the second. A delta of THRESHOLD seconds means the
-            # mtime was modified separately from the file content - the
-            # signature pattern is `touch -d <past>` to backdate (testdev.
-            # halcyonplatinum.com case: mtime 5 months before ctime, which
-            # falsely anchored cluster-onset analysis 4.5 months before the
-            # real campaign start). Severity is `advisory` (weight 0): does
-            # NOT escalate host_verdict. False positives include cp -p /
-            # tar xp / rsync -t backup-restore (which preserve mtime but
-            # reset ctime to NOW); the section-level summary count helps
-            # operators distinguish single-session forgery from fleet-wide
-            # restore artifacts.
+            # Gap 10: mtime/ctime divergence on a session file. cpsrvd
+            # writes both atomically; divergence is `touch -d` backdating.
+            # Advisory only — cp -p / tar xp / rsync -t restores also
+            # produce divergence. Section-level count distinguishes
+            # single-session forgery from fleet-wide restore artifacts.
             if [[ -n "$SF_MTIME_CTIME_DELTA" ]]; then
                 local _abs_delta="${SF_MTIME_CTIME_DELTA#-}"
                 if [[ "$_abs_delta" =~ ^[0-9]+$ ]] \
@@ -4855,16 +4527,9 @@ check_destruction_iocs() {
             ((hits++))
         fi
     fi
-    # Pattern A anti-forensic subroutine: in addition to encrypting /home
-    # data, the .sorry encryptor walks /var/log + /var/cpanel and encrypts
-    # forensic-evidence files (accounting.log, day-of cpanel-server-traffic
-    # apache log, imunify360 trail, apache2 archive logs, ConsoleKit
-    # history, system trace logs). Detection is bounded to maxdepth 6 with
-    # the cpanel imunify cache pruned (high churn, irrelevant). Threshold:
-    # >=10 .sorry files OR accounting.log encrypted = strong signal that
-    # forensic evidence was deliberately destroyed; fewer with accounting
-    # encrypted = warning. This signal holds even after the encryptor
-    # binary, README, and /home .sorry files have been cleaned by restore.
+    # Anti-forensic: encryptor also walks /var/log + /var/cpanel encrypting
+    # evidence files. ≥10 .sorry OR accounting.log encrypted = strong
+    # destruction signal; survives /home restore.
     local fe_count=0 fe_acct=0 fe_sample=""
     if [[ -d /var/log || -d /var/cpanel ]]; then
         fe_count=$(find /var/log /var/cpanel -maxdepth 6 -name '*.sorry' \
@@ -5012,15 +4677,9 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern D: sptadm reseller / WHM_FullRoot persistence ----------
-    # accounting.log: any of sptadm/4ef72197.cpx.local/exploit.local/
-    # WHM_FullRoot fingerprints. Bounded line-oriented file; single grep.
-    #
-    # Anti-forensic awareness (host2 deep-dig 2026-05-02): Pattern A's
-    # encryptor specifically targets /var/cpanel/accounting.log, leaving
-    # an .sorry-encrypted variant in place. If the live file is missing
-    # but the .sorry exists, emit an evidence-destroyed advisory and skip
-    # the grep (cannot read encrypted content). The /var/cpanel/users/
-    # and api-tokens.cache second-source checks below are unaffected.
+    # Pattern A's encryptor targets accounting.log → .sorry. If live file
+    # missing but .sorry present, emit evidence-destroyed advisory and
+    # skip the grep. Users/ + api-tokens.cache checks below still run.
     local acct_log=/var/cpanel/accounting.log
     local acct_log_sorry=/var/cpanel/accounting.log.sorry
     if [[ -f "$acct_log" ]]; then
@@ -5092,15 +4751,10 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern F: __S_MARK__ harvester envelope -----------------------
-    # IC-5790 dossier rev3: harvester reads bash/zsh/sh/fish histories.
-    # HISTORY_FILES_GLOB hoisted at the top of this function covers all four.
-    #
-    # Timestamp resolution: bash writes `#<epoch>\n<command>` markers when
-    # HISTTIMEFORMAT is set (CL6 default for root). Parse the first such
-    # marker preceding any __S_MARK__ line and emit it as ts_epoch_first;
-    # forensic's ioc_signal_epoch() prefers ts_epoch_first over mtime_epoch
-    # so the kill-chain reconciler classifies the harvester correctly even
-    # when subsequent shell sessions have bumped the file's mtime.
+    # Bash writes `#<epoch>\n<command>` markers when HISTTIMEFORMAT is set
+    # (CL6 default). Use the first marker preceding __S_MARK__ as
+    # ts_epoch_first so kill-chain classifies correctly even when later
+    # shell sessions have bumped the file's mtime.
     local f_hit=""
     f_hit=$(grep -lF "$PATTERN_F_S_MARK" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
     if [[ -n "$f_hit" ]]; then
@@ -5357,19 +5011,10 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern E: websocket/Shell access-log signature ---------------
-    # cPanel exposes an interactive shell via /cpsess<id>/websocket/Shell -
-    # the WHM "Terminal" feature. ANY hit was previously flagged CRITICAL,
-    # but the canonical legitimate caller is RFC1918/loopback admin traffic
-    # (operators, internal jump hosts, mgmt VLAN). True Pattern-E
-    # exploitation requires an EXTERNAL IP getting a 2xx response.
-    #
-    # Categorize per (origin, status):
-    #   external + 2xx     → strong (RCE landed)
-    #   external + non-2xx → warning (probing, host repelled)
-    #   internal + 2xx     → info    (admin Terminal session, benign)
-    #   internal + non-2xx → ignore  (noise)
-    # EXCLUDE_IPS applies here too so operators can suppress known-good
-    # external admin IPs (home VPN exit, monitoring egress, etc).
+    # /cpsess<id>/websocket/Shell is WHM Terminal. Categorize per
+    # (origin, status): external+2xx → strong (RCE landed); external+non-2xx
+    # → warning; internal+2xx → info (admin Terminal); internal+non-2xx
+    # → ignore. EXCLUDE_IPS suppresses known-good external admin IPs.
     local ws_log=/usr/local/cpanel/logs/access_log
     if [[ -f "$ws_log" ]]; then
         local excludes_env=""
@@ -5395,24 +5040,15 @@ check_destruction_iocs() {
                 kn = split(ENVIRON["KNOWN_DIMS"], kd_arr, ",")
                 for (i = 1; i <= kn; i++) if (kd_arr[i] != "") known[kd_arr[i]] = 1
                 ext_total = 0; ext_2xx = 0; int_2xx = 0; int_other = 0
-                # Split ext_2xx by dimension class:
-                #   _known   = 2xx hits whose terminal dim is in the IC-5790
-                #              attacker fingerprint set (24x80/120/134/200 etc)
-                #   _unknown = 2xx hits at dimensions outside that set —
-                #              typically legitimate WHM Terminal admin sessions
-                #              from a real browser. Without this split, every
-                #              cPanel admin from a wide Mac window (24x165 etc)
-                #              trips Pattern E STRONG as "RCE landed".
+                # Split ext_2xx by terminal dim: _known = IC-5790 attacker
+                # fingerprint set; _unknown = legitimate WHM Terminal
+                # sessions from real browsers. Without the split, wide-window
+                # admin sessions (24x165 etc) trip Pattern E STRONG.
                 ext_2xx_known = 0; ext_2xx_unknown = 0
                 ext_sample = ""; int_sample = ""; unknown_dim_sample = ""
-                # ext_known_sample is the FIRST 2xx external line whose
-                # terminal dim is in the attacker-fingerprint set; the
-                # strong-emit ip / path / status / cpsess_token fields
-                # are parsed from THIS line, not from any external line
-                # (4xx probes, unknown-dim admin sessions). Without it,
-                # a host with a 4xx probe at 09:00 plus a known-dim 2xx
-                # at 10:00 would surface the 4xx probe as the strong
-                # emit sample -- contradicting ext_2xx_known > 0.
+                # ext_known_sample = FIRST known-dim 2xx; strong-emit fields
+                # parse from THIS line so a 4xx probe does not shadow the
+                # actual known-dim 2xx as the surfaced sample.
                 ext_known_sample = ""
                 ts_first_ext = 0; burst_n = 0
             }
@@ -5547,16 +5183,9 @@ check_destruction_iocs() {
         #   ext_2xx_unknown> 0 → warning (admin session most likely; review)
         #   ext_total      > 0 → warning (probes only, host repelled)
         if (( ext_2xx_known > 0 )); then
-            # Parse structured fields from the first ATTACKER-DIM 2xx line
-            # (ext_known_sample). ext_sample is any external line, including
-            # 4xx probes and unknown-dim admin sessions, so it could surface
-            # mismatched ip/path/status/cpsess_token relative to the
-            # ext_2xx_known > 0 condition. ext_known_sample is captured
-            # inside `if (d in known)` so it is always representative.
-            # Defensive fallback to ext_sample shouldn't be reached when
-            # ext_2xx_known > 0.
-            # Apache combined-log format: IP - USER [DATE] "METHOD PATH PROTO" STATUS SIZE ...
-            # bash =~ uses libc POSIX ERE (supports {n}) -- only awk regex needs gawk floor.
+            # Parse from ext_known_sample (representative of the matching
+            # known-dim 2xx). ext_sample fallback is defensive.
+            # Apache combined-log: IP - USER [DATE] "METHOD PATH PROTO" STATUS SIZE
             local _e_src="${ext_known_sample:-$ext_sample}"
             local _e_ip _e_path _e_status _e_token=""
             _e_ip=$(printf '%s' "$_e_src" | awk '{print $1}')
@@ -5565,27 +5194,14 @@ check_destruction_iocs() {
             if [[ "$_e_path" =~ /cpsess([0-9]{10})/ ]]; then
                 _e_token="${BASH_REMATCH[1]}"
             fi
-            # v2.4.0 pre-compromise gate. Pattern E (websocket Shell access
-            # at IC-5790 attacker fingerprint dimensions) is a post-RCE
-            # toolchain signal that requires:
-            #   (1) the host actually being compromised via CVE-2026-41940
-            #       (anchor: ioc_cve_2026_41940_crlf_access_chain), AND
-            #   (2) co-temporal successful token consumption
-            #       (anchor: ioc_attacker_ip_2xx_on_cpsess within
-            #        PATTERN_E_2XX_PROXIMITY_SEC of Pattern E first epoch).
-            # Without (1), Pattern E hits are pre-compromise / orphan -
-            # most likely shared-infra attacker IP that ALSO ran legitimate
-            # WHM Terminal sessions on this host, OR pre-disclosure recon
-            # at the attacker dimensions that did not yield successful
-            # exploitation. Without (2), Pattern E is exploitation-detached:
-            # post-CRLF in time but no nearby successful token use - either
-            # operator never escalated past shell open, or the 2xx_on_cpsess
-            # gate above demoted the matching token-use event.
-            # Demote to advisory (weight 0): does NOT escalate host_verdict
-            # to COMPROMISED. Surfaces in ADVISORIES + signals[] for fleet
-            # aggregator visibility; ss-aggregate.py can use the new keys
-            # to discount these events when computing first_x_epoch /
-            # cluster-onset / threat-actor bucketing.
+            # Pre-compromise gate. Pattern E is post-RCE toolchain, so
+            # only count it as compromise evidence when (1) CRLF anchor
+            # fired (ioc_cve_2026_41940_crlf_access_chain), AND (2) Pattern E
+            # first epoch is within PATTERN_E_2XX_PROXIMITY_SEC of a
+            # successful 2xx_on_cpsess. Otherwise demote to advisory: an
+            # orphan Pattern E is most likely shared-infra coincidence or
+            # pre-disclosure recon. Advisory still surfaces in signals[]
+            # so ss-aggregate.py can discount it from cluster-onset.
             local _gate_sev="strong" _gate_key="ioc_pattern_e_websocket_shell_hits" _gate_weight=10
             local _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
             if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
@@ -5892,22 +5508,9 @@ aggregate_verdict() {
     IOC_REVIEW="$ioc_review"
     PROBE_ARTIFACT_COUNT="$probe_artifact_count"
 
-    # Code-state axis (the patch question).
-    #
-    # Version-string is AUTHORITATIVE: on 134+ tier, both vulnerable and
-    # patched cpsrvd binaries carry the same ACL/token-reader strings (the
-    # machinery entered via feature evolution before the patch release), so
-    # the binary fingerprint cannot discriminate. Override hierarchy:
-    #
-    #   1. --ioc-only            → SKIPPED (operator opted out of code-state)
-    #   2. Version says VULN     → VULNERABLE (always; binary/Perl signals
-    #      can't contradict a sub-cutoff build)
-    #   3. Version says PATCHED + score strongly disagrees (score >= 5) →
-    #      INCONCLUSIVE (something else is off - tampered binary, anomalous
-    #      Perl, IOC hit shape - needs human review)
-    #   4. Version says PATCHED + score within tolerance → PATCHED
-    #   5. No version verdict (parse failure / unknown tier) → fall through
-    #      to score-based verdict
+    # Code-state axis. Version is authoritative: on 134+ tier, vulnerable
+    # and patched cpsrvd binaries share ACL/token-reader strings, so the
+    # binary fingerprint cannot discriminate.
     if (( IOC_ONLY )); then
         VERDICT="SKIPPED"
         EXIT_CODE=0
@@ -6139,18 +5742,11 @@ write_json() {
 }
 
 ###############################################################################
-# CSV output - one summary row per host, header row included.
-#
-# Schema: host, ts, tool_version, code_verdict, host_verdict, score, exit_code,
-#         strong, fixed, inconclusive, ioc_critical, ioc_review, advisories,
-#         probe_artifacts, reasons, advisory_ids
-#
-# Designed for fleet roll-up: `cat *.csv | awk -F, ...` or import into SQL/Excel.
-# Use `--csv /dev/stdout` to stream. Multi-value columns (reasons, advisory_ids)
-# are semicolon-separated to keep the comma-delimited shape stable.
+# CSV output — one summary row per host. Multi-value columns (reasons,
+# advisory_ids) use ';' to keep the ',' shape stable for fleet roll-up.
 ###############################################################################
 
-# CSV field: wrap in double quotes, double any embedded quotes (RFC 4180).
+# RFC 4180: wrap in double quotes, double any embedded quotes.
 csv_field() {
     local v="${1//\"/\"\"}"
     printf '"%s"' "$v"
@@ -6192,14 +5788,8 @@ write_csv() {
 }
 
 ###############################################################################
-# Run ledger
-#
-# Append-only JSONL at $LEDGER_DIR/runs.jsonl - one line per run, plus a
-# per-run JSON envelope at $LEDGER_DIR/<RUN_ID>.json (skipped when -o was
-# supplied; the operator gets their own copy at the requested path).
-# Defaults ON; --no-ledger opts out for paranoid runs that must leave no
-# host residue. Soft-fail if the directory isn't writable - do not let
-# logging-permission issues interfere with the scan exit code.
+# Run ledger — append-only JSONL at $LEDGER_DIR/runs.jsonl + per-run
+# envelope (skipped when -o supplied). --no-ledger opts out. Soft-fails.
 ###############################################################################
 
 ledger_write() {
@@ -6270,17 +5860,8 @@ syslog_emit() {
     logger -t sessionscribe-ioc -p auth.notice -- "$msg" 2>/dev/null || true
 }
 
-###############################################################################
-# resolve_replay_envelope
-#
-# Resolve a --replay PATH argument into a concrete envelope JSON file path.
-# Accepts:
-#   PATH.json                — used directly
-#   PATH/                    — looks for *.json (envelope.json or <run_id>.json)
-#   PATH.tgz, PATH.tar.gz    — extracts the envelope to /tmp/sessionscribe-replay-<RUN_ID>/
-# Sets RESOLVED_ENVELOPE_PATH on success; emits to stderr + exits 2 on
-# ambiguity or unreadability (tool error -- pre-scan path resolution).
-###############################################################################
+# Resolve --replay PATH (.json | dir/ | .tgz | .tar.gz) → envelope path.
+# Sets RESOLVED_ENVELOPE_PATH; exits 2 on ambiguity/unreadability.
 RESOLVED_ENVELOPE_PATH=""
 REPLAY_TMPDIR=""
 resolve_replay_envelope() {
