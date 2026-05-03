@@ -585,6 +585,18 @@ epoch_to_iso() {
 
 KILL_ENVELOPE_DIR="/var/cpanel/sessionscribe-ioc"
 
+# Trust regex for ssh-key prune. MUST KEEP IN BYTE-EQUAL SYNC with
+# sessionscribe-ioc-scan.sh:285 (SSH_KNOWN_GOOD_RE). The
+# kill_sshkey_check_trust_drift() gate enforces this at phase_kill startup.
+KILL_SSH_TRUST_RE='(lwadmin|lw-admin|liquidweb|nexcess|Parent Child key for [A-Z0-9]{6})'
+
+# Recognized SSH keytype tokens (awk-portable ERE; gawk 3.x — no `{n}`
+# intervals; `[.]` instead of `\.` to avoid gawk 3.x "escape sequence
+# treated as plain" warnings). Standard: ssh-rsa, ssh-ed25519, ssh-dss,
+# ecdsa-sha2-*. FIDO (OpenSSH 8.2+): sk-ssh-ed25519, sk-ecdsa-sha2-nistp*
+# with optional @openssh.com suffix.
+KILL_SSH_KEYTYPE_RE='(sk-)?(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[a-zA-Z0-9._-]+)(@openssh[.]com)?'
+
 # Newest envelope JSON by mtime; empty if dir absent or no JSON files.
 kill_find_envelope() {
     [[ -d "$KILL_ENVELOPE_DIR" ]] || return 0
@@ -664,6 +676,555 @@ kill_action_for_pattern() {
         (A|C|D|F|G|H|I|J) echo quarantine ;;
         (*) echo skip ;;
     esac
+}
+
+###############################################################################
+# SSH-key prune helpers (v0.7.0 phase_kill --ssh-prune family). Implements
+# the parser + classifier + surgical-prune contract from PLAN-sshkey-prune.md.
+# All helpers are callable under MITIGATE_LIBRARY_ONLY=1 for unit testing.
+###############################################################################
+
+# ssh_key_parse_line LINE — emit "<keytype>\t<comment>\t<base64>" on stdout
+# for a parseable key line. rc=1 (no output) for blank/comment/unparseable.
+# Handles options-prefix lines via FIRST-MATCH-WINS keytype detection
+# (whole-line scan via gawk 2-arg `match()`; the keytype regex is anchored
+# only by what appears in the source — substring matching is intentional
+# so options-prefix syntax like `from="..." ssh-rsa AAAA user` works).
+# Empty comment is a valid result (rc=0 with "<keytype>\t\t<base64>"); the
+# classifier applies policy.
+ssh_key_parse_line() {
+    local line="${1-}"
+    [[ -z "$line" ]] && return 1
+    # Strip leading whitespace; refuse comment-only lines.
+    local trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" ]] && return 1
+    [[ "$trimmed" == \#* ]] && return 1
+    # gawk 3.x 2-arg match() sets RSTART/RLENGTH globally. We locate the
+    # FIRST keytype substring on the line, then take the next whitespace
+    # token after it as the base64 blob and the remainder (joined by
+    # single spaces) as the comment. The 3rd field (base64) is the
+    # load-bearing identity for ssh_key_fingerprint.
+    awk -v keyre="$KILL_SSH_KEYTYPE_RE" '
+        {
+            if (! match($0, keyre)) exit 1
+            kt = substr($0, RSTART, RLENGTH)
+            rest = substr($0, RSTART + RLENGTH)
+            # Strip leading whitespace from rest, then split into base64
+            # + comment-tail.
+            sub(/^[[:space:]]+/, "", rest)
+            if (rest == "") exit 1
+            # The base64 blob is the first whitespace-delimited token of
+            # the remainder. Everything after the next whitespace run is
+            # the (joined-by-single-space) comment.
+            i = match(rest, /[[:space:]]+/)
+            if (i == 0) {
+                b64 = rest
+                cmt = ""
+            } else {
+                b64 = substr(rest, 1, i - 1)
+                cmt = substr(rest, i + RLENGTH)
+                # Collapse internal whitespace runs to single spaces and
+                # strip trailing whitespace.
+                gsub(/[[:space:]]+/, " ", cmt)
+                sub(/[[:space:]]+$/, "", cmt)
+            }
+            printf "%s\t%s\t%s\n", kt, cmt, b64
+        }
+    ' <<< "$line"
+}
+
+# ssh_key_fingerprint LINE — emit a non-cryptographic identifier. Tries
+# ssh-keygen MD5 first (EL6 OpenSSH 5.3 baseline) and falls back to a
+# base64-decoded sha256 of the key blob (B64SHA256:<hex>). Always returns
+# rc=0; empty output if both methods fail or the line is unparseable.
+ssh_key_fingerprint() {
+    local line="${1-}" parsed b64 fp
+    parsed=$(ssh_key_parse_line "$line") || { printf ''; return 0; }
+    b64=$(printf '%s' "$parsed" | awk -F'\t' '{print $3}')
+    [[ -z "$b64" ]] && { printf ''; return 0; }
+    if have_cmd ssh-keygen; then
+        fp=$(ssh-keygen -lf <(printf '%s\n' "$line") 2>/dev/null | awk '{print $2}')
+        if [[ -n "$fp" ]]; then
+            # ssh-keygen 5.3+ emits "<bits> <fp> <comment>". Older
+            # versions print bare hex; normalize to MD5: prefix when
+            # the value is colon-quad without a prefix.
+            case "$fp" in
+                (MD5:*|SHA256:*) printf '%s' "$fp" ;;
+                (*:*:*)          printf 'MD5:%s' "$fp" ;;
+                (*)              printf '%s' "$fp" ;;
+            esac
+            return 0
+        fi
+    fi
+    if have_cmd base64 && have_cmd sha256sum; then
+        fp=$(printf '%s' "$b64" | base64 -d 2>/dev/null | sha256sum 2>/dev/null | awk '{print $1}')
+        if [[ -n "$fp" ]]; then
+            printf 'B64SHA256:%s' "$fp"
+            return 0
+        fi
+    fi
+    printf ''
+    return 0
+}
+
+# ssh_keys_classify FILE TRUST_RE [--include-unlabeled-as-prune] — stream
+# a file as TSV: action<TAB>line_no<TAB>keytype<TAB>comment<TAB>fingerprint
+# <TAB>base64_first_24. action ∈ {keep, prune, keep_unlabeled, skip}. rc:
+#   0 — successful classification
+#   2 — symlink refused
+#   3 — at least one non-blank/non-comment line failed to parse
+ssh_keys_classify() {
+    local file="$1" trust_re="$2" flag="${3-}"
+    local include_unlabeled=0
+    [[ "$flag" == "--include-unlabeled-as-prune" ]] && include_unlabeled=1
+    [[ -L "$file" ]] && return 2
+    [[ -r "$file" ]] || return 3
+    local lineno=0 line trimmed parsed kt cmt b64 fp first24 action
+    local parse_failed=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$trimmed" || "$trimmed" == \#* ]]; then
+            printf 'skip\t%d\t\t\t\t\n' "$lineno"
+            continue
+        fi
+        parsed=$(ssh_key_parse_line "$line") || { parse_failed=1; continue; }
+        kt=$(printf '%s' "$parsed" | awk -F'\t' '{print $1}')
+        cmt=$(printf '%s' "$parsed" | awk -F'\t' '{print $2}')
+        b64=$(printf '%s' "$parsed" | awk -F'\t' '{print $3}')
+        first24="${b64:0:24}"
+        fp=$(ssh_key_fingerprint "$line")
+        if [[ -z "$cmt" ]]; then
+            if (( include_unlabeled )); then
+                action=prune
+            else
+                action=keep_unlabeled
+            fi
+        elif [[ "$cmt" =~ $trust_re ]]; then
+            action=keep
+        else
+            action=prune
+        fi
+        printf '%s\t%d\t%s\t%s\t%s\t%s\n' \
+            "$action" "$lineno" "$kt" "$cmt" "$fp" "$first24"
+    done < "$file"
+    (( parse_failed )) && return 3
+    return 0
+}
+
+# ssh_keys_prune FILE TRUST_RE BACKUP_DEST FLAGS — surgical rewrite per
+# the contract in PLAN-sshkey-prune.md (steps 1-14). FLAGS is a CSV
+# subset of {allow_lockout, prune_unlabeled}. Caller-visible globals:
+#   KILL_LAST_PRUNE_RESULT  — bare primary from result vocabulary
+#   KILL_LAST_PRUNE_DETAIL  — human-readable detail line
+#   KILL_LAST_PRUNE_KEEP    — count of effective-kept keys
+#   KILL_LAST_PRUNE_PRUNED  — count of pruned keys
+#   KILL_LAST_PRUNE_SHA_PRE — sha256 of source before rewrite
+#   KILL_LAST_PRUNE_SHA_POST — sha256 of result after mv (apply only)
+#   KILL_LAST_PRUNE_BACKUP  — backup path on apply
+#   KILL_LAST_PRUNE_SIDECAR — removed-keys sidecar path on apply
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_RESULT=""
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_DETAIL=""
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_KEEP=0
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_PRUNED=0
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_SHA_PRE=""
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_SHA_POST=""
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_BACKUP=""
+# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+KILL_LAST_PRUNE_SIDECAR=""
+
+# shellcheck disable=SC2034  # KILL_LAST_PRUNE_* globals consumed by P2/P3
+ssh_keys_prune() {
+    local path="$1" trust_re="$2" backup_dest="$3" flags="${4-}"
+    KILL_LAST_PRUNE_RESULT=""
+    KILL_LAST_PRUNE_DETAIL=""
+    KILL_LAST_PRUNE_KEEP=0
+    KILL_LAST_PRUNE_PRUNED=0
+    KILL_LAST_PRUNE_SHA_PRE=""
+    KILL_LAST_PRUNE_SHA_POST=""
+    KILL_LAST_PRUNE_BACKUP=""
+    KILL_LAST_PRUNE_SIDECAR=""
+
+    # Step 1: refuse symlink + missing file BEFORE any I/O.
+    if [[ -L "$path" ]]; then
+        KILL_LAST_PRUNE_RESULT=refused_symlink
+        return 0
+    fi
+    if [[ ! -f "$path" ]]; then
+        KILL_LAST_PRUNE_RESULT=gone
+        return 0
+    fi
+
+    # Step 2: pre-rewrite sha256 (used by step 8 concurrent_modification
+    # detection + step 6 backup integrity check).
+    local sha_pre
+    sha_pre=$(sha256sum "$path" 2>/dev/null | awk '{print $1}')
+    if [[ -z "$sha_pre" ]]; then
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="cannot read source sha256"
+        return 1
+    fi
+    KILL_LAST_PRUNE_SHA_PRE="$sha_pre"
+
+    # Step 3: classify (read-only).
+    local class_tmp
+    class_tmp=$(mktemp /tmp/sessionscribe-sshkey-class-XXXXXX 2>/dev/null) || {
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="mktemp class failed"
+        return 1
+    }
+    local include_arg=""
+    [[ "$flags" == *prune_unlabeled* ]] && include_arg="--include-unlabeled-as-prune"
+    # Capture rc without `if !` (which masks $? to 1 in some bash 4.1
+    # contexts). Direct invocation + explicit rc capture is portable.
+    ssh_keys_classify "$path" "$trust_re" $include_arg > "$class_tmp"
+    local cls_rc=$?
+    if (( cls_rc != 0 )); then
+        rm -f "$class_tmp"
+        case "$cls_rc" in
+            (2) KILL_LAST_PRUNE_RESULT=refused_symlink ;;
+            (3) KILL_LAST_PRUNE_RESULT=refused_unparseable ;;
+            (*) KILL_LAST_PRUNE_RESULT=prune_failed
+                KILL_LAST_PRUNE_DETAIL="classify rc=$cls_rc" ;;
+        esac
+        return 0
+    fi
+
+    # Step 4: counts → decision.
+    local n_keep n_prune n_keep_unlabeled
+    n_keep=$(awk -F'\t' '$1=="keep"{n++} END{print n+0}' "$class_tmp")
+    n_prune=$(awk -F'\t' '$1=="prune"{n++} END{print n+0}' "$class_tmp")
+    n_keep_unlabeled=$(awk -F'\t' '$1=="keep_unlabeled"{n++} END{print n+0}' "$class_tmp")
+    KILL_LAST_PRUNE_PRUNED="$n_prune"
+
+    if (( n_prune == 0 )); then
+        rm -f "$class_tmp"
+        KILL_LAST_PRUNE_KEEP=$(( n_keep + n_keep_unlabeled ))
+        if (( n_keep_unlabeled > 0 )); then
+            KILL_LAST_PRUNE_RESULT=kept_unlabeled_warned
+            KILL_LAST_PRUNE_DETAIL="$n_keep_unlabeled unlabeled key(s) kept; review"
+        else
+            KILL_LAST_PRUNE_RESULT=nothing_to_prune
+        fi
+        return 0
+    fi
+
+    # Lockout gate. Effective "kept" = n_keep + n_keep_unlabeled (the
+    # latter remain under default policy).
+    local n_effective_kept=$(( n_keep + n_keep_unlabeled ))
+    KILL_LAST_PRUNE_KEEP="$n_effective_kept"
+    if (( n_effective_kept == 0 )); then
+        if [[ "$flags" != *allow_lockout* ]]; then
+            rm -f "$class_tmp"
+            KILL_LAST_PRUNE_RESULT=would_lock_out
+            KILL_LAST_PRUNE_DETAIL="$n_prune key(s) would be pruned, none kept; pass --ssh-allow-lockout to proceed"
+            return 0
+        fi
+        # Operator-authorized full prune; promote AFTER successful rewrite.
+    fi
+
+    # Step 5: --check short-circuit. Emits BARE primary; the manifest
+    # emit-site in P2 prefixes "planned_".
+    if [[ "${MODE:-check}" != "apply" ]]; then
+        rm -f "$class_tmp"
+        if (( n_effective_kept == 0 )); then
+            KILL_LAST_PRUNE_RESULT=forced_full_prune
+        else
+            KILL_LAST_PRUNE_RESULT=pruned_ok
+        fi
+        KILL_LAST_PRUNE_DETAIL="$n_prune planned to prune, $n_effective_kept to keep"
+        return 0
+    fi
+
+    # Step 6: backup precondition chain.
+    local backup_orig="${backup_dest}.original-pre-prune"
+    if ! mkdir -p "$(dirname "$backup_dest")" 2>/dev/null; then
+        rm -f "$class_tmp"
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="backup_mkdir failed: $(dirname "$backup_dest")"
+        return 1
+    fi
+    if ! cp -a "$path" "$backup_orig" 2>/dev/null; then
+        rm -f "$class_tmp"
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="backup_failed: cp -a $path -> $backup_orig"
+        return 1
+    fi
+    if [[ ! -s "$backup_orig" && -s "$path" ]]; then
+        rm -f "$class_tmp"
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="backup_zero_byte: source non-empty but backup is 0 bytes"
+        return 1
+    fi
+    local sha_backup
+    sha_backup=$(sha256sum "$backup_orig" 2>/dev/null | awk '{print $1}')
+    if [[ "$sha_backup" != "$sha_pre" ]]; then
+        rm -f "$class_tmp"
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="backup_integrity: sha256 mismatch source vs backup"
+        return 1
+    fi
+    KILL_LAST_PRUNE_BACKUP="$backup_orig"
+
+    # Step 7: lock + rewrite. flock -x -n retry loop (no -w on EL6
+    # util-linux 2.17). On signal, clean up tmp+class_tmp and exit
+    # 130/143 explicitly; bash 4.1's signal-queue semantics make
+    # `kill -INT $$` non-portable.
+    local lock_attempts=0 lock_max=10 lock_acquired=0
+    local tmp="$path.kill-prune-tmp.$$"
+
+    # shellcheck disable=SC2064  # expand $tmp/$class_tmp now (signal-time scope)
+    trap "rm -f \"$tmp\" \"$class_tmp\" 2>/dev/null; exit 130" INT
+    # shellcheck disable=SC2064  # expand $tmp/$class_tmp now
+    trap "rm -f \"$tmp\" \"$class_tmp\" 2>/dev/null; exit 143" TERM
+
+    exec 200<>"$path"
+    while (( lock_attempts < lock_max )); do
+        if flock -x -n 200; then
+            lock_acquired=1
+            break
+        fi
+        sleep 1
+        lock_attempts=$((lock_attempts + 1))
+    done
+    if (( lock_acquired == 0 )); then
+        exec 200>&-
+        rm -f "$class_tmp"
+        trap - INT TERM
+        KILL_LAST_PRUNE_RESULT=lock_contended
+        KILL_LAST_PRUNE_DETAIL="flock contended after ${lock_max}s; another writer holds $path"
+        return 0
+    fi
+
+    # Step 8: concurrent-modification check #1 (post-lock sha re-read).
+    local sha_now
+    sha_now=$(sha256sum "$path" 2>/dev/null | awk '{print $1}')
+    if [[ "$sha_now" != "$sha_pre" ]]; then
+        flock -u 200; exec 200>&-
+        rm -f "$class_tmp"
+        trap - INT TERM
+        KILL_LAST_PRUNE_RESULT=concurrent_modification
+        KILL_LAST_PRUNE_DETAIL="source modified between sha256_pre and lock acquisition"
+        return 0
+    fi
+
+    # Step 9: seed tmp with original metadata, then truncate + rewrite.
+    if ! cp --preserve=all "$path" "$tmp" 2>/dev/null; then
+        flock -u 200; exec 200>&-
+        rm -f "$tmp" "$class_tmp"
+        trap - INT TERM
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="cp --preserve=all failed (seed tmp)"
+        return 1
+    fi
+    : > "$tmp"
+
+    # Stream from class_tmp; emit only skip|keep|keep_unlabeled lines,
+    # re-reading the original line at line_no from $path so attacker-
+    # crafted comments don't get round-tripped through awk's tab
+    # escaping.
+    local cls ln_no _kt _cmt _fp _b24 orig_line
+    while IFS=$'\t' read -r cls ln_no _kt _cmt _fp _b24; do
+        case "$cls" in
+            (skip|keep|keep_unlabeled)
+                orig_line=$(sed -n "${ln_no}p" "$path")
+                printf '%s\n' "$orig_line" >> "$tmp"
+                ;;
+            (prune)
+                ;;  # drop
+        esac
+    done < "$class_tmp"
+
+    sync "$tmp" 2>/dev/null || true
+
+    # Step 10: line-count verify of tmp before mv.
+    local tmp_keep_count
+    tmp_keep_count=$(grep -cE '^[^[:space:]#]' "$tmp" 2>/dev/null || true)
+    tmp_keep_count="${tmp_keep_count:-0}"
+    if (( tmp_keep_count != n_effective_kept )); then
+        flock -u 200; exec 200>&-
+        rm -f "$tmp" "$class_tmp"
+        trap - INT TERM
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="tmp line-count $tmp_keep_count != expected $n_effective_kept"
+        return 1
+    fi
+
+    # Step 11: atomic-mv.
+    if ! mv "$tmp" "$path" 2>/dev/null; then
+        flock -u 200; exec 200>&-
+        rm -f "$tmp" "$class_tmp"
+        trap - INT TERM
+        KILL_LAST_PRUNE_RESULT=prune_failed
+        KILL_LAST_PRUNE_DETAIL="mv $tmp -> $path failed"
+        return 1
+    fi
+    flock -u 200; exec 200>&-
+
+    # Step 12: post-mv concurrent-modification check #2.
+    local sha_post
+    sha_post=$(sha256sum "$path" 2>/dev/null | awk '{print $1}')
+    KILL_LAST_PRUNE_SHA_POST="$sha_post"
+    local post_class_tmp
+    post_class_tmp=$(mktemp /tmp/sessionscribe-sshkey-postclass-XXXXXX 2>/dev/null || true)
+    if [[ -n "$post_class_tmp" ]]; then
+        ssh_keys_classify "$path" "$trust_re" $include_arg > "$post_class_tmp" 2>/dev/null || true
+        local n_prune_post
+        n_prune_post=$(awk -F'\t' '$1=="prune"{n++} END{print n+0}' "$post_class_tmp")
+        rm -f "$post_class_tmp"
+        if (( n_prune_post > 0 )); then
+            rm -f "$class_tmp"
+            trap - INT TERM
+            KILL_LAST_PRUNE_RESULT=clobbered_post_mv
+            KILL_LAST_PRUNE_DETAIL="$n_prune_post suspect key(s) re-appeared post-rewrite; another writer (likely WHM) overwrote our changes"
+            return 1
+        fi
+    fi
+
+    # Step 13: SELinux relabel if enforcing + restorecon present.
+    local relabel_warn=""
+    if have_cmd getenforce && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]] \
+       && have_cmd restorecon; then
+        if ! restorecon -F "$path" 2>/dev/null; then
+            relabel_warn="restorecon_failed"
+        fi
+    fi
+
+    # Step 14: write removed-keys JSONL sidecar.
+    local removed_sidecar="${backup_dest}.removed-keys"
+    {
+        printf '# sessionscribe v0.7.0 ssh-key prune — removed keys for %s\n' "$path"
+        printf '# run_id=%s ts=%s sha256_pre=%s sha256_post=%s\n' \
+            "${RUN_ID:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sha_pre" "$sha_post"
+        awk -F'\t' '$1=="prune" {
+            printf "{\"line_no\":%s,\"type\":\"%s\",\"comment\":\"%s\",\"fingerprint\":\"%s\"}\n",
+                   $2, $3, $4, $5
+        }' "$class_tmp"
+    } > "$removed_sidecar" 2>/dev/null || true
+    KILL_LAST_PRUNE_SIDECAR="$removed_sidecar"
+
+    rm -f "$class_tmp"
+    trap - INT TERM
+
+    if (( n_effective_kept == 0 )); then
+        KILL_LAST_PRUNE_RESULT=forced_full_prune
+        KILL_LAST_PRUNE_DETAIL="$n_prune key(s) pruned; file empty (operator-authorized)"
+    else
+        KILL_LAST_PRUNE_RESULT=pruned_ok
+        KILL_LAST_PRUNE_DETAIL="$n_prune key(s) pruned; $n_effective_kept kept"
+    fi
+    [[ -n "$relabel_warn" ]] && KILL_LAST_PRUNE_DETAIL+=" (selinux: $relabel_warn)"
+    return 0
+}
+
+# kill_sshkey_canonical_paths — emit canonical authorized_keys paths one
+# per line. Used by both the orphan-tmp sweep and the P2 manifest
+# enumerator. Root home discovered via getent passwd; /root fallback.
+kill_sshkey_canonical_paths() {
+    local root_home
+    root_home=$(getent passwd root 2>/dev/null | cut -d: -f6)
+    [[ -z "$root_home" || "$root_home" == "/" ]] && root_home="/root"
+    printf '%s/.ssh/authorized_keys\n'  "$root_home"
+    printf '%s/.ssh/authorized_keys2\n' "$root_home"
+    if [[ -d /home ]]; then
+        local h
+        while IFS= read -r -d '' h; do
+            printf '%s/.ssh/authorized_keys\n'  "$h"
+            printf '%s/.ssh/authorized_keys2\n' "$h"
+        done < <(find /home -maxdepth 2 -mindepth 1 -type d -print0 2>/dev/null)
+    fi
+}
+
+# kill_sshkey_check_trust_drift — refuse phase_kill if the trust regex
+# literal in this file has drifted from sessionscribe-ioc-scan.sh's
+# SSH_KNOWN_GOOD_RE. KILL_SSH_ALLOW_DRIFT=1 bypasses with loud WARN.
+# KILL_SSH_TRUST_DRIFT_TEST_PATH is an env-only test seam (not a flag).
+kill_sshkey_check_trust_drift() {
+    local mitigate_dir ioc_path=""
+    mitigate_dir=$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" 2>/dev/null)
+    [[ -z "$mitigate_dir" ]] && mitigate_dir="."
+    if [[ -n "${KILL_SSH_TRUST_DRIFT_TEST_PATH:-}" && -f "${KILL_SSH_TRUST_DRIFT_TEST_PATH}" ]]; then
+        ioc_path="$KILL_SSH_TRUST_DRIFT_TEST_PATH"
+    else
+        local cand
+        for cand in \
+            "${mitigate_dir}/sessionscribe-ioc-scan.sh" \
+            "/usr/local/sbin/sessionscribe-ioc-scan.sh" \
+            "$(command -v sessionscribe-ioc-scan.sh 2>/dev/null)"; do
+            if [[ -n "$cand" && -f "$cand" ]]; then
+                ioc_path="$cand"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$ioc_path" ]]; then
+        if (( ${KILL_SSH_ALLOW_DRIFT:-0} )); then
+            say_warn "ioc-scan companion not found; --ssh-allow-drift bypasses trust-regex sync check"
+            return 0
+        fi
+        say_fail "cannot verify trust-regex sync: sessionscribe-ioc-scan.sh not found in $mitigate_dir, /usr/local/sbin/, or PATH. Install ioc-scan alongside mitigate, or pass --ssh-allow-drift to bypass (operator-authorized)."
+        return 1
+    fi
+
+    # Paired-quote strip: only strip leading + trailing quote when they
+    # match. Avoids stripping a meaningful trailing quote that's part of
+    # the regex literal.
+    local rhs_ioc rhs_mit
+    rhs_ioc=$(grep -oE "^SSH_KNOWN_GOOD_RE=.*" "$ioc_path" | head -1 \
+              | sed -E "s/^[^=]+=//; s/^'(.*)'[[:space:]]*\$/\1/; s/^\"(.*)\"[[:space:]]*\$/\1/")
+    rhs_mit=$(grep -oE "^KILL_SSH_TRUST_RE=.*" "${BASH_SOURCE[0]:-$0}" | head -1 \
+              | sed -E "s/^[^=]+=//; s/^'(.*)'[[:space:]]*\$/\1/; s/^\"(.*)\"[[:space:]]*\$/\1/")
+
+    if [[ -z "$rhs_ioc" ]]; then
+        if (( ${KILL_SSH_ALLOW_DRIFT:-0} )); then
+            say_warn "ioc-scan SSH_KNOWN_GOOD_RE not found at expected line; --ssh-allow-drift bypasses"
+            return 0
+        fi
+        say_fail "cannot extract SSH_KNOWN_GOOD_RE from $ioc_path"
+        return 1
+    fi
+
+    if [[ "$rhs_ioc" != "$rhs_mit" ]]; then
+        if (( ${KILL_SSH_ALLOW_DRIFT:-0} )); then
+            say_warn "trust-regex DRIFT vs ioc-scan: mit=$rhs_mit ioc=$rhs_ioc; --ssh-allow-drift bypassing (operator-authorized)"
+            return 0
+        fi
+        say_fail "trust-regex drift detected: mitigate=$rhs_mit vs ioc-scan=$rhs_ioc. Pruning would mis-classify operator keys. Update mitigate's KILL_SSH_TRUST_RE to match, OR pass --ssh-allow-drift if the divergence is intentional."
+        return 1
+    fi
+    return 0
+}
+
+# kill_sshkey_orphan_tmp_sweep — at phase_kill startup, detect leftover
+# .kill-prune-tmp.* files from a prior interrupted run. Logged as WARN;
+# NOT auto-deleted (could be operator recovery material).
+kill_sshkey_orphan_tmp_sweep() {
+    local p tmps t
+    local -a orphans=()
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        tmps=$(find "$(dirname "$p")" -maxdepth 1 \
+                    -name "$(basename "$p").kill-prune-tmp.*" 2>/dev/null)
+        if [[ -n "$tmps" ]]; then
+            while IFS= read -r t; do
+                [[ -n "$t" ]] && orphans+=("$t")
+            done <<< "$tmps"
+        fi
+    done < <(kill_sshkey_canonical_paths)
+    if (( ${#orphans[@]} > 0 )); then
+        local o
+        for o in "${orphans[@]}"; do
+            say_warn "orphan ssh-prune tmp from prior interrupted run: $o (manual review; do NOT auto-delete)"
+        done
+    fi
 }
 
 # Pure-bash absolute-path normalizer. Collapses /./ and /../ segments
@@ -3278,6 +3839,452 @@ run_phase() {
 # every helper function is in scope, but the banner, phases, and exit logic
 # below are skipped. Used by K1+ test harnesses; never set in production.
 if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
+    if [[ "${MITIGATE_RUN_P1_TESTS:-0}" == "1" ]]; then
+        # P1 test harness — 29 cases from PLAN-sshkey-prune.md lines 488-525.
+        # Each test prints OK(<n> <description>) or FAIL(<n> <description>:
+        # <diagnostic>) on stdout. Exits 0 on all-OK, 1 on any FAIL.
+        _t_pass=0
+        _t_fail=0
+        _t_dir=$(mktemp -d /tmp/sessionscribe-p1-tests-XXXXXX)
+        _t_ok()   { _t_pass=$((_t_pass+1)); printf 'OK(%s %s)\n' "$1" "$2"; }
+        _t_fail() { _t_fail=$((_t_fail+1)); printf 'FAIL(%s %s: %s)\n' "$1" "$2" "$3"; }
+
+        # Tests 1-11: ssh_key_parse_line
+        _r=$(ssh_key_parse_line "ssh-rsa AAAAB3 ryan@laptop")
+        if [[ "$_r" == $'ssh-rsa\tryan@laptop\tAAAAB3' ]]; then
+            _t_ok 1 "parse_line basic rsa"
+        else
+            _t_fail 1 "parse_line basic rsa" "got: $_r"
+        fi
+
+        _r=$(ssh_key_parse_line "ssh-ed25519 AAAA Parent Child key for W9Z2DL")
+        if [[ "$_r" == $'ssh-ed25519\tParent Child key for W9Z2DL\tAAAA' ]]; then
+            _t_ok 2 "parse_line Parent Child comment"
+        else
+            _t_fail 2 "parse_line Parent Child comment" "got: $_r"
+        fi
+
+        _r=$(ssh_key_parse_line 'from="1.2.3.4",no-pty ssh-rsa AAAA user@host')
+        if [[ "$_r" == $'ssh-rsa\tuser@host\tAAAA' ]]; then
+            _t_ok 3 "parse_line options-prefix"
+        else
+            _t_fail 3 "parse_line options-prefix" "got: $_r"
+        fi
+
+        _r=$(ssh_key_parse_line "ssh-rsa AAAA")
+        if [[ "$_r" == $'ssh-rsa\t\tAAAA' ]]; then
+            _t_ok 4 "parse_line empty comment"
+        else
+            _t_fail 4 "parse_line empty comment" "got: $_r"
+        fi
+
+        if ssh_key_parse_line "" >/dev/null 2>&1; then
+            _t_fail 5 "parse_line empty input" "rc=0 expected rc=1"
+        else
+            _t_ok 5 "parse_line empty input"
+        fi
+
+        if ssh_key_parse_line "# a comment" >/dev/null 2>&1; then
+            _t_fail 6 "parse_line comment-only line" "rc=0 expected rc=1"
+        else
+            _t_ok 6 "parse_line comment-only line"
+        fi
+
+        if ssh_key_parse_line "garbage line no-keytype" >/dev/null 2>&1; then
+            _t_fail 7 "parse_line no keytype" "rc=0 expected rc=1"
+        else
+            _t_ok 7 "parse_line no keytype"
+        fi
+
+        _r=$(ssh_key_parse_line "ecdsa-sha2-nistp256 AAAA legit")
+        if [[ "$_r" == $'ecdsa-sha2-nistp256\tlegit\tAAAA' ]]; then
+            _t_ok 8 "parse_line ecdsa keytype"
+        else
+            _t_fail 8 "parse_line ecdsa keytype" "got: $_r"
+        fi
+
+        _r=$(ssh_key_parse_line "sk-ssh-ed25519@openssh.com AAAA fido-key")
+        if [[ "$_r" == $'sk-ssh-ed25519@openssh.com\tfido-key\tAAAA' ]]; then
+            _t_ok 9 "parse_line FIDO sk-ed25519"
+        else
+            _t_fail 9 "parse_line FIDO sk-ed25519" "got: $_r"
+        fi
+
+        _r=$(ssh_key_parse_line 'command="echo a b" ssh-rsa AAAA c')
+        if [[ "$_r" == $'ssh-rsa\tc\tAAAA' ]]; then
+            _t_ok 10 "parse_line options with quoted command"
+        else
+            _t_fail 10 "parse_line options with quoted command" "got: $_r"
+        fi
+
+        # Test 11: documented edge case — first-keytype-token-match wins.
+        # `command="ssh-rsa fake" ssh-rsa AAAA real` — the first keytype
+        # token is the `ssh-rsa` inside the quoted command, so the parsed
+        # base64 is `fake"` and the comment is `ssh-rsa AAAA real`.
+        _r=$(ssh_key_parse_line 'command="ssh-rsa fake" ssh-rsa AAAA real')
+        _expected_11=$'ssh-rsa\tssh-rsa AAAA real\tfake"'
+        if [[ "$_r" == "$_expected_11" ]]; then
+            _t_ok 11 "parse_line first-token-wins edge"
+        else
+            _t_fail 11 "parse_line first-token-wins edge" "got: $_r"
+        fi
+
+        # Test 12: classify on 4-line file
+        _f12="$_t_dir/12.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+            printf '\n'
+            printf '# a comment\n'
+        } > "$_f12"
+        _out12=$(ssh_keys_classify "$_f12" "$KILL_SSH_TRUST_RE")
+        _actions12=$(printf '%s\n' "$_out12" | awk -F'\t' '{print $1}' | tr '\n' ',' | sed 's/,$//')
+        if [[ "$_actions12" == "keep,prune,skip,skip" ]]; then
+            _t_ok 12 "classify 4-line mixed"
+        else
+            _t_fail 12 "classify 4-line mixed" "actions=$_actions12"
+        fi
+
+        # Test 13: classify on file with a malformed line → rc=3
+        _f13="$_t_dir/13.keys"
+        {
+            printf 'ssh-rsa AAAA legit@nexcess\n'
+            printf 'garbage line no-keytype here\n'
+        } > "$_f13"
+        ssh_keys_classify "$_f13" "$KILL_SSH_TRUST_RE" >/dev/null 2>&1
+        _rc13=$?
+        if (( _rc13 == 3 )); then
+            _t_ok 13 "classify malformed -> rc=3"
+        else
+            _t_fail 13 "classify malformed -> rc=3" "rc=$_rc13"
+        fi
+
+        # Test 14: classify on a symlink → rc=2
+        _f14_target="$_t_dir/14.target"
+        _f14_link="$_t_dir/14.link"
+        printf 'ssh-rsa AAAA legit@nexcess\n' > "$_f14_target"
+        ln -s "$_f14_target" "$_f14_link"
+        ssh_keys_classify "$_f14_link" "$KILL_SSH_TRUST_RE" >/dev/null 2>&1
+        _rc14=$?
+        if (( _rc14 == 2 )); then
+            _t_ok 14 "classify symlink -> rc=2"
+        else
+            _t_fail 14 "classify symlink -> rc=2" "rc=$_rc14"
+        fi
+
+        # Test 15: classify with empty-comment, default policy -> keep_unlabeled
+        _f15="$_t_dir/15.keys"
+        printf 'ssh-rsa AAAA\n' > "$_f15"
+        _out15=$(ssh_keys_classify "$_f15" "$KILL_SSH_TRUST_RE" | awk -F'\t' '{print $1}')
+        if [[ "$_out15" == "keep_unlabeled" ]]; then
+            _t_ok 15 "classify empty-comment default -> keep_unlabeled"
+        else
+            _t_fail 15 "classify empty-comment default -> keep_unlabeled" "got=$_out15"
+        fi
+
+        # Test 16: classify with --include-unlabeled-as-prune
+        _out16=$(ssh_keys_classify "$_f15" "$KILL_SSH_TRUST_RE" --include-unlabeled-as-prune \
+                  | awk -F'\t' '{print $1}')
+        if [[ "$_out16" == "prune" ]]; then
+            _t_ok 16 "classify empty-comment with flag -> prune"
+        else
+            _t_fail 16 "classify empty-comment with flag -> prune" "got=$_out16"
+        fi
+
+        # Test 17: ssh_keys_prune mixed file -> pruned_ok (under MODE=apply).
+        # `grep -c PAT FILE` always prints a count and exits 0 (match) or
+        # 1 (no-match); both cases give a clean integer on stdout. Don't
+        # chain `|| echo 0` — it doubles the output on no-match.
+        MODE="apply"
+        _f17="$_t_dir/17.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f17"
+        _b17="$_t_dir/17-backup/keys"
+        ssh_keys_prune "$_f17" "$KILL_SSH_TRUST_RE" "$_b17" "" >/dev/null 2>&1
+        _kept17=$(grep -c 'Parent Child' "$_f17" 2>/dev/null)
+        _pruned17=$(grep -c 'evil@host' "$_f17" 2>/dev/null)
+        _backup_has=$(grep -c 'evil@host' "${_b17}.original-pre-prune" 2>/dev/null)
+        _sidecar_has=$(grep -c 'evil@host' "${_b17}.removed-keys" 2>/dev/null)
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "pruned_ok" \
+              && "$_kept17" == "1" && "$_pruned17" == "0" \
+              && "$_backup_has" == "1" && "$_sidecar_has" == "1" ]]; then
+            _t_ok 17 "prune mixed -> pruned_ok"
+        else
+            _t_fail 17 "prune mixed -> pruned_ok" \
+                "result=$KILL_LAST_PRUNE_RESULT kept=$_kept17 pruned=$_pruned17 backup=$_backup_has sidecar=$_sidecar_has"
+        fi
+
+        # Test 18: all-suspect file, no allow_lockout -> would_lock_out
+        _f18="$_t_dir/18.keys"
+        printf 'ssh-rsa AAAA evil1@host\nssh-rsa BBBB evil2@host\n' > "$_f18"
+        _f18_pre=$(sha256sum "$_f18" | awk '{print $1}')
+        _b18="$_t_dir/18-backup/keys"
+        ssh_keys_prune "$_f18" "$KILL_SSH_TRUST_RE" "$_b18" "" >/dev/null 2>&1
+        _f18_post=$(sha256sum "$_f18" | awk '{print $1}')
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "would_lock_out" \
+              && "$_f18_pre" == "$_f18_post" ]]; then
+            _t_ok 18 "prune all-suspect default -> would_lock_out"
+        else
+            _t_fail 18 "prune all-suspect default -> would_lock_out" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f18_pre post=$_f18_post"
+        fi
+
+        # Test 19: all-suspect with allow_lockout -> forced_full_prune
+        _f19="$_t_dir/19.keys"
+        printf 'ssh-rsa AAAA evil1@host\nssh-rsa BBBB evil2@host\n' > "$_f19"
+        _b19="$_t_dir/19-backup/keys"
+        ssh_keys_prune "$_f19" "$KILL_SSH_TRUST_RE" "$_b19" "allow_lockout" >/dev/null 2>&1
+        _f19_size=$(wc -c < "$_f19" | tr -d ' ')
+        _b19_has=$(grep -c 'evil1@host' "${_b19}.original-pre-prune" 2>/dev/null)
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "forced_full_prune" \
+              && "$_f19_size" == "0" && "$_b19_has" == "1" ]]; then
+            _t_ok 19 "prune all-suspect allow_lockout -> forced_full_prune"
+        else
+            _t_fail 19 "prune all-suspect allow_lockout -> forced_full_prune" \
+                "result=$KILL_LAST_PRUNE_RESULT size=$_f19_size backup_has_evil=$_b19_has"
+        fi
+
+        # Test 20: all-trusted file -> nothing_to_prune
+        _f20="$_t_dir/20.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB lwadmin@bastion\n'
+        } > "$_f20"
+        _f20_pre=$(sha256sum "$_f20" | awk '{print $1}')
+        ssh_keys_prune "$_f20" "$KILL_SSH_TRUST_RE" "$_t_dir/20-backup/keys" "" >/dev/null 2>&1
+        _f20_post=$(sha256sum "$_f20" | awk '{print $1}')
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "nothing_to_prune" \
+              && "$_f20_pre" == "$_f20_post" ]]; then
+            _t_ok 20 "prune all-trusted -> nothing_to_prune"
+        else
+            _t_fail 20 "prune all-trusted -> nothing_to_prune" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f20_pre post=$_f20_post"
+        fi
+
+        # Test 21: only-unlabeled keys, default -> kept_unlabeled_warned
+        _f21="$_t_dir/21.keys"
+        printf 'ssh-rsa AAAA\nssh-rsa BBBB\n' > "$_f21"
+        _f21_pre=$(sha256sum "$_f21" | awk '{print $1}')
+        ssh_keys_prune "$_f21" "$KILL_SSH_TRUST_RE" "$_t_dir/21-backup/keys" "" >/dev/null 2>&1
+        _f21_post=$(sha256sum "$_f21" | awk '{print $1}')
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "kept_unlabeled_warned" \
+              && "$_f21_pre" == "$_f21_post" ]]; then
+            _t_ok 21 "prune only-unlabeled default -> kept_unlabeled_warned"
+        else
+            _t_fail 21 "prune only-unlabeled default -> kept_unlabeled_warned" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f21_pre post=$_f21_post"
+        fi
+
+        # Test 22: missing path -> gone
+        ssh_keys_prune "$_t_dir/does-not-exist" "$KILL_SSH_TRUST_RE" "$_t_dir/22-backup/keys" "" >/dev/null 2>&1
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "gone" ]]; then
+            _t_ok 22 "prune missing path -> gone"
+        else
+            _t_fail 22 "prune missing path -> gone" "result=$KILL_LAST_PRUNE_RESULT"
+        fi
+
+        # Test 23: symlink -> refused_symlink, target untouched
+        _f23_target="$_t_dir/23.target"
+        _f23_link="$_t_dir/23.link"
+        printf 'sentinel-content\n' > "$_f23_target"
+        _f23_pre=$(sha256sum "$_f23_target" | awk '{print $1}')
+        ln -s "$_f23_target" "$_f23_link"
+        ssh_keys_prune "$_f23_link" "$KILL_SSH_TRUST_RE" "$_t_dir/23-backup/keys" "" >/dev/null 2>&1
+        _f23_post=$(sha256sum "$_f23_target" | awk '{print $1}')
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "refused_symlink" \
+              && "$_f23_pre" == "$_f23_post" ]]; then
+            _t_ok 23 "prune symlink -> refused_symlink"
+        else
+            _t_fail 23 "prune symlink -> refused_symlink" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f23_pre post=$_f23_post"
+        fi
+
+        # Test 24: malformed line -> refused_unparseable, no mutation
+        _f24="$_t_dir/24.keys"
+        {
+            printf 'ssh-rsa AAAA legit@nexcess\n'
+            printf 'nokeytype garbage here\n'
+        } > "$_f24"
+        _f24_pre=$(sha256sum "$_f24" | awk '{print $1}')
+        ssh_keys_prune "$_f24" "$KILL_SSH_TRUST_RE" "$_t_dir/24-backup/keys" "" >/dev/null 2>&1
+        _f24_post=$(sha256sum "$_f24" | awk '{print $1}')
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "refused_unparseable" \
+              && "$_f24_pre" == "$_f24_post" ]]; then
+            _t_ok 24 "prune malformed -> refused_unparseable"
+        else
+            _t_fail 24 "prune malformed -> refused_unparseable" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f24_pre post=$_f24_post"
+        fi
+
+        # Test 25: sha256-mismatch-injection via a sha256sum SHIM on PATH.
+        # An on-disk wrapper script intercepts every sha256sum invocation
+        # — including pipeline-fork subshells where in-process function
+        # overrides are unreliable on bash 4.1 (function-table inheritance
+        # across pipeline stages is implementation-defined). The shim
+        # uses a file-counter to fabricate a non-matching sha on the 3rd
+        # call (step 8's post-lock re-read), causing
+        # concurrent_modification.
+        _real_sha256sum=$(command -v sha256sum)
+        _shim_dir="$_t_dir/shim"
+        mkdir -p "$_shim_dir"
+        # Shim source body: $vars must NOT expand at WRITE time (they are
+        # the shim's own runtime state, not the harness's). Single quotes
+        # are intentional. shellcheck disable=SC2016.
+        # shellcheck disable=SC2016
+        {
+            printf '#!/bin/bash\n'
+            printf 'set -u\n'
+            printf 'COUNTER="%s/count"\n' "$_t_dir"
+            printf 'TRIGGER="%s/trigger"\n' "$_t_dir"
+            printf 'REAL="%s"\n' "$_real_sha256sum"
+            printf 'n=$(cat "$COUNTER" 2>/dev/null || printf 0)\n'
+            printf 'n=$((n + 1))\n'
+            printf 'printf "%%d\\n" "$n" > "$COUNTER"\n'
+            printf 't=$(cat "$TRIGGER" 2>/dev/null || printf 0)\n'
+            printf 'if (( n == t )); then\n'
+            printf '  if [[ -n "${1-}" ]]; then\n'
+            printf '    printf "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  %%s\\n" "$1"\n'
+            printf '  else\n'
+            printf '    printf "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  -\\n"\n'
+            printf '  fi\n'
+            printf '  exit 0\n'
+            printf 'fi\n'
+            printf 'exec "$REAL" "$@"\n'
+        } > "$_shim_dir/sha256sum"
+        chmod +x "$_shim_dir/sha256sum"
+        _orig_PATH="$PATH"
+
+        _f25="$_t_dir/25.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f25"
+        _f25_pre=$(command "$_real_sha256sum" "$_f25" | awk '{print $1}')
+        printf '0\n' > "$_t_dir/count"
+        # Call sequence on a 2-key file when ssh-keygen lacks the
+        # algorithm and falls back to base64-decoded sha256:
+        #   1 = step 2 (sha_pre)
+        #   2,3 = ssh_key_fingerprint per key during classify
+        #   4 = step 6 (backup integrity)
+        #   5 = step 8 (post-lock sha_now) ← target the abort path here
+        #   6 = step 12 (sha_post)
+        # Trigger=5 fabricates step 8's sha_now → concurrent_modification.
+        printf '5\n' > "$_t_dir/trigger"
+        # PATH-shimmed sha256sum is now active. ssh_keys_prune will hit
+        # the wrapper at every step 2/6/8/12 invocation.
+        PATH="$_shim_dir:$_orig_PATH"
+        hash -r 2>/dev/null || true
+        ssh_keys_prune "$_f25" "$KILL_SSH_TRUST_RE" "$_t_dir/25-backup/keys" "" >/dev/null 2>&1
+        PATH="$_orig_PATH"
+        hash -r 2>/dev/null || true
+        _f25_post=$(command "$_real_sha256sum" "$_f25" | awk '{print $1}')
+        # Expected: step 8 catches sha_now != sha_pre → concurrent_modification.
+        # Original preserved (no rewrite — step 8 aborts pre-mv).
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "concurrent_modification" \
+              && "$_f25_pre" == "$_f25_post" ]]; then
+            _t_ok 25 "prune sha-mismatch injection -> concurrent_modification"
+        else
+            _t_fail 25 "prune sha-mismatch injection -> concurrent_modification" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f25_pre post=$_f25_post"
+        fi
+
+        # Test 26: mid-flight modification — fabricate sha_pre on the
+        # 1st call (step 2). Step 6's backup integrity check (call 2 =
+        # sha of backup) returns the real sha, which won't match the
+        # fabricated sha_pre → prune_failed (backup_integrity). Original
+        # preserved.
+        _f26="$_t_dir/26.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f26"
+        _f26_pre=$(command "$_real_sha256sum" "$_f26" | awk '{print $1}')
+        printf '0\n' > "$_t_dir/count"
+        printf '1\n' > "$_t_dir/trigger"   # fabricate on call 1 (sha_pre)
+        PATH="$_shim_dir:$_orig_PATH"
+        hash -r 2>/dev/null || true
+        ssh_keys_prune "$_f26" "$KILL_SSH_TRUST_RE" "$_t_dir/26-backup/keys" "" >/dev/null 2>&1
+        PATH="$_orig_PATH"
+        hash -r 2>/dev/null || true
+        _f26_post=$(command "$_real_sha256sum" "$_f26" | awk '{print $1}')
+        # Step 6 backup_integrity fires → prune_failed; OR step 8 fires
+        # → concurrent_modification. Either is the abort path; the
+        # load-bearing invariant is "original preserved".
+        if [[ ( "$KILL_LAST_PRUNE_RESULT" == "prune_failed" \
+                || "$KILL_LAST_PRUNE_RESULT" == "concurrent_modification" ) \
+              && "$_f26_pre" == "$_f26_post" ]]; then
+            _t_ok 26 "prune mid-flight modification -> abort+preserve"
+        else
+            _t_fail 26 "prune mid-flight modification -> abort+preserve" \
+                "result=$KILL_LAST_PRUNE_RESULT pre=$_f26_pre post=$_f26_post"
+        fi
+
+        # Test 27: FIDO key + Parent Child mix
+        _f27="$_t_dir/27.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'sk-ssh-ed25519@openssh.com BBBB lwadmin-yubikey-01\n'
+            printf 'sk-ecdsa-sha2-nistp256 CCCC\n'
+        } > "$_f27"
+        ssh_keys_prune "$_f27" "$KILL_SSH_TRUST_RE" "$_t_dir/27-backup/keys" "" >/dev/null 2>&1
+        # Default policy: Parent Child kept, lwadmin-yubikey kept
+        # (matches lwadmin), unlabeled FIDO kept_unlabeled. n_prune=0
+        # → kept_unlabeled_warned (because there's an unlabeled key).
+        _kept_pc=$(grep -c 'Parent Child' "$_f27" 2>/dev/null)
+        _kept_yk=$(grep -c 'lwadmin-yubikey' "$_f27" 2>/dev/null)
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "kept_unlabeled_warned" \
+              && "$_kept_pc" == "1" && "$_kept_yk" == "1" ]]; then
+            _t_ok 27 "prune FIDO+ParentChild+unlabeled -> kept_unlabeled_warned"
+        else
+            _t_fail 27 "prune FIDO+ParentChild+unlabeled -> kept_unlabeled_warned" \
+                "result=$KILL_LAST_PRUNE_RESULT pc=$_kept_pc yk=$_kept_yk"
+        fi
+
+        # Test 28: trust-drift gate, identical regex -> rc=0
+        _f28="$_t_dir/28-iocscan.sh"
+        {
+            printf '#!/bin/bash\n'
+            printf "SSH_KNOWN_GOOD_RE='%s'\n" "$KILL_SSH_TRUST_RE"
+        } > "$_f28"
+        KILL_SSH_TRUST_DRIFT_TEST_PATH="$_f28"
+        if kill_sshkey_check_trust_drift >/dev/null 2>&1; then
+            _t_ok 28 "drift gate identical -> rc=0"
+        else
+            _t_fail 28 "drift gate identical -> rc=0" "rc=$?"
+        fi
+        unset KILL_SSH_TRUST_DRIFT_TEST_PATH
+
+        # Test 29: trust-drift gate, different regex -> rc=1 (and rc=0 with KILL_SSH_ALLOW_DRIFT=1)
+        _f29="$_t_dir/29-iocscan.sh"
+        {
+            printf '#!/bin/bash\n'
+            printf "SSH_KNOWN_GOOD_RE='(bogus|prefix|here)'\n"
+        } > "$_f29"
+        KILL_SSH_TRUST_DRIFT_TEST_PATH="$_f29"
+        KILL_SSH_ALLOW_DRIFT=0
+        kill_sshkey_check_trust_drift >/dev/null 2>&1
+        _rc29a=$?
+        KILL_SSH_ALLOW_DRIFT=1
+        kill_sshkey_check_trust_drift >/dev/null 2>&1
+        _rc29b=$?
+        if (( _rc29a == 1 )) && (( _rc29b == 0 )); then
+            _t_ok 29 "drift gate divergent rc=1; bypass with allow_drift rc=0"
+        else
+            _t_fail 29 "drift gate divergent" "no_bypass=$_rc29a with_bypass=$_rc29b"
+        fi
+        unset KILL_SSH_TRUST_DRIFT_TEST_PATH
+        KILL_SSH_ALLOW_DRIFT=0
+
+        rm -rf "$_t_dir"
+        printf '\n'
+        printf 'P1 tests: %d/%d passed\n' "$_t_pass" $(( _t_pass + _t_fail ))
+        if (( _t_fail > 0 )); then
+            exit 1
+        fi
+        exit 0
+    fi
     return 0 2>/dev/null || exit 0
 fi
 
