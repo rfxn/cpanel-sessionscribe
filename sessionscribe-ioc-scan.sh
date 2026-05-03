@@ -4931,49 +4931,49 @@ check_pattern_j_persistence() {
 
             local f
             if (( ${#_unit_unowned[@]} > 0 )); then
-            for f in "${_unit_unowned[@]}"; do
-                local _mtime _exec_path _desc _now _age _is_recent=0
-                _mtime=$(stat -c %Y "$f" 2>/dev/null)
-                _now=$(date -u +%s 2>/dev/null || echo 0)
-                _age=$(( _now - ${_mtime:-0} ))
-                (( _age < PATTERN_J_RECENT_DAYS * 86400 )) && _is_recent=1
-                _exec_path=$(grep -m1 -E '^[[:space:]]*ExecStart[[:space:]]*=' "$f" 2>/dev/null \
-                    | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[+!@-]*//' \
-                    | awk '{print $1}')
-                _desc=$(grep -m1 -E '^[[:space:]]*Description[[:space:]]*=' "$f" 2>/dev/null \
-                    | sed -E 's/^[[:space:]]*Description[[:space:]]*=//')
+                for f in "${_unit_unowned[@]}"; do
+                    local _mtime _exec_path _desc _now _age _is_recent=0
+                    _mtime=$(stat -c %Y "$f" 2>/dev/null)
+                    _now=$(date -u +%s 2>/dev/null || echo 0)
+                    _age=$(( _now - ${_mtime:-0} ))
+                    (( _age < PATTERN_J_RECENT_DAYS * 86400 )) && _is_recent=1
+                    _exec_path=$(grep -m1 -E '^[[:space:]]*ExecStart[[:space:]]*=' "$f" 2>/dev/null \
+                        | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[+!@-]*//' \
+                        | awk '{print $1}')
+                    _desc=$(grep -m1 -E '^[[:space:]]*Description[[:space:]]*=' "$f" 2>/dev/null \
+                        | sed -E 's/^[[:space:]]*Description[[:space:]]*=//')
 
-                # Strong-tier conjunction: /usr/share/ ExecStart AND Description
-                # shadows known service AND mtime recent. Otherwise warning/4.
-                local _strong_match=0
-                if [[ "$_exec_path" =~ ^/usr/share/ ]] \
-                   && [[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] \
-                   && (( _is_recent )); then
-                    _strong_match=1
-                fi
+                    # Strong-tier conjunction: /usr/share/ ExecStart AND Description
+                    # shadows known service AND mtime recent. Otherwise warning/4.
+                    local _strong_match=0
+                    if [[ "$_exec_path" =~ ^/usr/share/ ]] \
+                       && [[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] \
+                       && (( _is_recent )); then
+                        _strong_match=1
+                    fi
 
-                local _sev _wt _key
-                if (( snapshot_mode )); then
-                    _sev=info; _wt=2
-                    _key="ioc_pattern_j_systemd_unit_snapshot"
-                elif (( _strong_match )); then
-                    _sev=strong; _wt=10
-                    _key="ioc_pattern_j_systemd_unit_present"
-                else
-                    _sev=warning; _wt=4
-                    _key="ioc_pattern_j_systemd_unit_candidate"
-                fi
-                emit "destruction" "ioc_pattern_j_systemd_unit" "$_sev" \
-                     "$_key" "$_wt" \
-                     "path" "$f" "mtime_epoch" "${_mtime:-0}" \
-                     "exec_start" "${_exec_path:-}" \
-                     "description" "${_desc:0:120}" \
-                     "shadow_match" "$([[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] && echo 1 || echo 0)" \
-                     "is_recent" "$_is_recent" \
-                     "snapshot" "$snapshot_mode" \
-                     "note" "Pattern J2 systemd unit at $f - non-allowlist ExecStart=$_exec_path and not package-owned."
-                ((hits++))
-            done
+                    local _sev _wt _key
+                    if (( snapshot_mode )); then
+                        _sev=info; _wt=2
+                        _key="ioc_pattern_j_systemd_unit_snapshot"
+                    elif (( _strong_match )); then
+                        _sev=strong; _wt=10
+                        _key="ioc_pattern_j_systemd_unit_present"
+                    else
+                        _sev=warning; _wt=4
+                        _key="ioc_pattern_j_systemd_unit_candidate"
+                    fi
+                    emit "destruction" "ioc_pattern_j_systemd_unit" "$_sev" \
+                         "$_key" "$_wt" \
+                         "path" "$f" "mtime_epoch" "${_mtime:-0}" \
+                         "exec_start" "${_exec_path:-}" \
+                         "description" "${_desc:0:120}" \
+                         "shadow_match" "$([[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] && echo 1 || echo 0)" \
+                         "is_recent" "$_is_recent" \
+                         "snapshot" "$snapshot_mode" \
+                         "note" "Pattern J2 systemd unit at $f - non-allowlist ExecStart=$_exec_path and not package-owned."
+                    ((hits++))
+                done
             fi
         fi
     fi
