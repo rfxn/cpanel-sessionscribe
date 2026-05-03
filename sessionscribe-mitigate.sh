@@ -199,6 +199,22 @@ DO_PROBE=0              # --probe opt-in
 RUN_KILL=0              # --kill opt-in (phase_kill from IOC envelope)
 KILL_ENVELOPE=""        # --envelope PATH override; empty = auto-discover
 KILL_ANYWAY=0           # --kill-anyway: bypass host_verdict gate
+# v0.7.0 ssh-key prune knobs. P3 wires the --ssh-* CLI flags; P2 reads the
+# globals so the manifest sweep + apply consumer + supersede check are
+# operable under MITIGATE_LIBRARY_ONLY=1 unit tests via the
+# MITIGATE_FORCE_SSH_PRUNE=1 test seam (un-documented, NOT a usage flag).
+KILL_SSH_PRUNE=0
+KILL_SSH_PRUNE_UNLABELED=0
+KILL_SSH_ALLOW_LOCKOUT=0
+KILL_SSH_ALLOW_DRIFT=0
+KILL_SSH_TRUST_RE_EFFECTIVE=""
+# shellcheck disable=SC2034  # populated by --ssh-allow REGEX (P3 CLI flag)
+declare -a KILL_SSH_ALLOW_EXTRAS=()
+# Populated ONCE at phase_kill startup (P3 wiring) so the supersede check
+# is O(1) per signal. P2's manifest sweep falls back to a direct
+# kill_sshkey_canonical_paths invocation when the cache is empty
+# (testability under MITIGATE_LIBRARY_ONLY).
+declare -a KILL_SSHKEY_CANONICAL_CACHE=()
 declare -A PHASE_DISABLED=()
 JSON_OUT=0
 JSONL_OUT=0
@@ -1227,6 +1243,174 @@ kill_sshkey_orphan_tmp_sweep() {
     fi
 }
 
+# kill_sshkey_populate_canonical_cache — fill KILL_SSHKEY_CANONICAL_CACHE
+# from kill_sshkey_canonical_paths. Called by phase_kill at startup (P3
+# wiring); P2 leaves it as a callable placeholder so the manifest-build
+# sweep can fall back to an inline walk when the cache is empty.
+kill_sshkey_populate_canonical_cache() {
+    KILL_SSHKEY_CANONICAL_CACHE=()
+    local _p
+    while IFS= read -r _p; do
+        [[ -z "$_p" ]] && continue
+        KILL_SSHKEY_CANONICAL_CACHE+=("$_p")
+    done < <(kill_sshkey_canonical_paths)
+}
+
+# kill_sshkey_path_canonical PATH — rc=0 if PATH is in the populated
+# canonical cache. Empty cache always returns rc=1 (no inline /home walk
+# fallback here; the supersede check is O(1) by design and a non-populated
+# cache means --ssh-prune isn't active).
+kill_sshkey_path_canonical() {
+    local probe="$1" canonical
+    (( ${#KILL_SSHKEY_CANONICAL_CACHE[@]} > 0 )) || return 1
+    for canonical in "${KILL_SSHKEY_CANONICAL_CACHE[@]}"; do
+        [[ "$probe" == "$canonical" ]] && return 0
+    done
+    return 1
+}
+
+# kill_sshkey_recovery_hint PATH BACKUP_DIR — emit the single-line
+# operator recovery command baked into the manifest item. Keeps the hint
+# co-located with the audit trail so a paged-out 3am operator can grep
+# for it without reading source. quarantine layout mirrors the logic in
+# kill_quarantine_one ($BACKUP_DIR/quarantine/${path#/}).
+kill_sshkey_recovery_hint() {
+    local path="$1" backup_dir="$2"
+    local mirror="${backup_dir}/quarantine/${path#/}.original-pre-prune"
+    printf 'cp -a %s %s && restorecon -F %s 2>/dev/null && systemctl reload sshd' \
+        "$mirror" "$path" "$path"
+}
+
+# kill_sshkey_emit_manifest_item PATH TRUST_RE TRUST_RE_EFFECTIVE BACKUP_DIR
+#                                MODE_STR
+# Run ssh_keys_prune in classify-only / classify-and-rewrite mode (governed
+# by the calling MODE) and emit ONE JSON object representing the
+# kind:sshkey manifest item. Caller is responsible for the leading `,\n`
+# separator. This helper isolates the JSON-shape concern from
+# kill_build_manifest's printf chain and the JSON's nested pruned_keys[]
+# array shape from inline-printf gymnastics.
+#
+# In MODE_STR=check the result is prefixed `planned_`. In MODE_STR=apply
+# the result field is null (the apply-path consumer
+# prune_ssh_keys_from_manifest patches it via sidecar).
+kill_sshkey_emit_manifest_item() {
+    local path="$1" trust_re="$2" trust_re_eff="$3" backup_dir="$4" mode_str="$5"
+
+    # Skip absent paths at build time (empty-fleet case): per plan
+    # "no ~/.ssh/authorized_keys files anywhere → manifest sshkey items=0".
+    # Symlinks ARE surfaced (refused_symlink) so an operator sees the
+    # backdoor pattern in the manifest; only outright-absent paths are
+    # silently skipped.
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        return 1
+    fi
+
+    # Run classifier through ssh_keys_prune (MODE != apply branch always
+    # short-circuits in step 5 with a bare-primary KILL_LAST_PRUNE_RESULT;
+    # apply branch returns the same primary post-rewrite, but at
+    # manifest-build time we always force classify-only by setting
+    # MODE=check locally — apply-path mutation happens later in
+    # prune_ssh_keys_from_manifest).
+    local saved_mode="${MODE:-check}"
+    MODE="check"
+    local flags=""
+    (( KILL_SSH_PRUNE_UNLABELED )) && flags="prune_unlabeled"
+    (( KILL_SSH_ALLOW_LOCKOUT ))   && flags="${flags:+$flags,}allow_lockout"
+    # backup_dest mirror (same shape kill_quarantine_one uses).
+    local backup_dest="${backup_dir}/quarantine/${path#/}"
+    ssh_keys_prune "$path" "$trust_re_eff" "$backup_dest" "$flags" >/dev/null 2>&1
+    MODE="$saved_mode"
+
+    local primary="${KILL_LAST_PRUNE_RESULT:-prune_failed}"
+    local detail="${KILL_LAST_PRUNE_DETAIL:-}"
+    local sha_pre="${KILL_LAST_PRUNE_SHA_PRE:-}"
+
+    # Re-classify the file (read-only) to populate pruned_keys[] +
+    # tally counts; ssh_keys_prune's class_tmp is consumed and rm'd
+    # internally so we re-run here. For sentinel result strings (gone,
+    # refused_symlink, refused_unparseable, lock_contended) the
+    # classifier won't have anything actionable; pruned_keys[] stays
+    # empty and counts are zero.
+    local class_out=""
+    local n_keep=0 n_prune=0 n_keep_unl=0 n_total=0
+    if [[ "$primary" != "gone" && "$primary" != "refused_symlink" \
+          && "$primary" != "refused_unparseable" ]]; then
+        local include_arg=""
+        (( KILL_SSH_PRUNE_UNLABELED )) && include_arg="--include-unlabeled-as-prune"
+        class_out=$(ssh_keys_classify "$path" "$trust_re_eff" $include_arg 2>/dev/null)
+        if [[ -n "$class_out" ]]; then
+            n_keep=$(printf '%s\n' "$class_out" | awk -F'\t' '$1=="keep"{n++} END{print n+0}')
+            n_prune=$(printf '%s\n' "$class_out" | awk -F'\t' '$1=="prune"{n++} END{print n+0}')
+            n_keep_unl=$(printf '%s\n' "$class_out" | awk -F'\t' '$1=="keep_unlabeled"{n++} END{print n+0}')
+            n_total=$(( n_keep + n_prune + n_keep_unl ))
+        fi
+    fi
+
+    # Build pruned_keys[] from `prune` rows only (not keep / keep_unlabeled
+    # / skip). Each row: {"line_no":N,"type":...,"comment":...,
+    # "fingerprint":...,"base64_first_24":...}.
+    local pruned_arr="" pk_first=1
+    if [[ -n "$class_out" ]]; then
+        local pcls pln_no pkt pcmt pfp pb24
+        # awk-emit only prune rows so we don't shell-escape every line.
+        local prune_rows
+        prune_rows=$(printf '%s\n' "$class_out" | awk -F'\t' '$1=="prune"')
+        if [[ -n "$prune_rows" ]]; then
+            while IFS=$'\t' read -r pcls pln_no pkt pcmt pfp pb24; do
+                [[ "$pcls" != "prune" ]] && continue
+                (( pk_first )) || pruned_arr+=","
+                pk_first=0
+                pruned_arr+=$(printf '{"line_no":%d,"type":"%s","comment":"%s","fingerprint":"%s","base64_first_24":"%s"}' \
+                    "${pln_no:-0}" \
+                    "$(json_esc "$pkt")" \
+                    "$(json_esc "$pcmt")" \
+                    "$(json_esc "$pfp")" \
+                    "$(json_esc "$pb24")")
+            done <<< "$prune_rows"
+        fi
+    fi
+
+    # Result-field translation.
+    local result_field result_detail_field sha_pre_field
+    if [[ "$mode_str" == "apply" ]]; then
+        # Apply path patches via sidecar; emit null at build time.
+        result_field="null"
+        result_detail_field="null"
+        sha_pre_field="null"
+    else
+        result_field="\"planned_${primary}\""
+        if [[ -n "$detail" ]]; then
+            result_detail_field="\"$(json_esc "$detail")\""
+        else
+            result_detail_field="null"
+        fi
+        if [[ -n "$sha_pre" ]]; then
+            sha_pre_field="\"$(json_esc "$sha_pre")\""
+        else
+            sha_pre_field="null"
+        fi
+    fi
+
+    local backup_path_field sidecar_path_field
+    backup_path_field=$(json_esc "${backup_dest}.original-pre-prune")
+    sidecar_path_field=$(json_esc "${backup_dest}.removed-keys")
+    local recovery
+    recovery=$(kill_sshkey_recovery_hint "$path" "$backup_dir")
+
+    printf '    {"kind":"sshkey","path":"%s","action":"prune","trust_re":"%s","trust_re_effective":"%s","keys_total":%d,"keys_kept":%d,"keys_kept_unlabeled":%d,"keys_pruned":%d,"pruned_keys":[%s],"result":%s,"result_detail":%s,"sha256_pre":%s,"sha256_post":null,"original_backup_path":"%s","removed_keys_sidecar_path":"%s","recovery_hint":"%s"}' \
+        "$(json_esc "$path")" \
+        "$(json_esc "$trust_re")" \
+        "$(json_esc "$trust_re_eff")" \
+        "$n_total" "$n_keep" "$n_keep_unl" "$n_prune" \
+        "$pruned_arr" \
+        "$result_field" \
+        "$result_detail_field" \
+        "$sha_pre_field" \
+        "$backup_path_field" \
+        "$sidecar_path_field" \
+        "$(json_esc "$recovery")"
+}
+
 # Pure-bash absolute-path normalizer. Collapses /./ and /../ segments
 # without touching the filesystem; needed when neither realpath -m nor
 # readlink -m is available (EL6 coreutils 8.4) AND the path's parent
@@ -1666,6 +1850,10 @@ quarantine_from_manifest() {
     local line path key pattern fails=0
     while IFS= read -r line; do
         [[ "$line" =~ \"kind\":\"file\" ]] || continue
+        # F-11 supersede: kind:file items whose action was rewritten to
+        # superseded_by_sshkey at manifest-build time are audit-trail
+        # only; the kind:sshkey item handles the surgical action.
+        [[ "$line" =~ \"action\":\"superseded_by_sshkey\" ]] && continue
         [[ "$line" =~ \"action\":\"quarantine\" ]] || continue
         path=$(kill_json_str_field "$line" path)
         key=$(kill_json_str_field "$line" ioc_key)
@@ -1677,6 +1865,108 @@ quarantine_from_manifest() {
     done < "$manifest"
 
     return $fails
+}
+
+# Append one ssh-key-prune action record to the kill-actions sidecar
+# JSONL. Mirrors kill_action_record / kill_ip_action_record / kill_csf_
+# action_record shape: kind={file,ip,csf,sshkey} → 4th sidecar value the
+# v0.6.1 verdict-merger pipeline already understands. P3 wires the
+# verdict-promotion read into kill_compute_verdict; P2 just writes the
+# rows so the apply-path is fully audited even before P3 ships.
+kill_sshkey_action_record() {
+    local sidecar="$1" path="$2" result="$3" detail="$4"
+    local keys_pruned="$5" keys_kept="$6" sha_pre="$7" sha_post="$8"
+    local backup_path="$9" sidecar_path="${10}"
+    {
+        printf '{"kind":"sshkey","path":"%s","result":"%s","result_detail":"%s",' \
+            "$(json_esc "$path")" \
+            "$(json_esc "$result")" \
+            "$(json_esc "$detail")"
+        if [[ -n "$keys_pruned" && "$keys_pruned" =~ ^[0-9]+$ ]]; then
+            printf '"keys_pruned":%s,' "$keys_pruned"
+        else
+            printf '"keys_pruned":null,'
+        fi
+        if [[ -n "$keys_kept" && "$keys_kept" =~ ^[0-9]+$ ]]; then
+            printf '"keys_kept":%s,' "$keys_kept"
+        else
+            printf '"keys_kept":null,'
+        fi
+        printf '"sha256_pre":"%s","sha256_post":"%s",' \
+            "$(json_esc "$sha_pre")" "$(json_esc "$sha_post")"
+        printf '"original_backup_path":"%s","removed_keys_sidecar_path":"%s","ts":"%s"}\n' \
+            "$(json_esc "$backup_path")" \
+            "$(json_esc "$sidecar_path")" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "$sidecar"
+}
+
+# Walk a manifest, prune every kind:sshkey action:prune item via
+# ssh_keys_prune. Apply-path consumer (called from phase_kill in P3
+# under MODE=apply). Sidecar shape is the BARE primary result (no
+# `planned_` prefix — that translation is at the manifest emit-site
+# in --check mode only).
+#
+# Returns the number of items that produced a fail-class result
+# (prune_failed | clobbered_post_mv); benign skips
+# (gone | refused_symlink | nothing_to_prune | kept_unlabeled_warned
+# | would_lock_out | concurrent_modification | lock_contended) do not
+# contribute to the failure count — verdict-promotion logic in
+# kill_compute_verdict (P3) handles WARN promotion.
+prune_ssh_keys_from_manifest() {
+    local manifest="$1"
+    [[ -n "$manifest" && -f "$manifest" ]] || return 1
+    local sidecar="${manifest%.json}.actions.jsonl"
+
+    local line path original_backup_path removed_sidecar_path
+    local flags="" fails=0
+    (( KILL_SSH_PRUNE_UNLABELED )) && flags="prune_unlabeled"
+    (( KILL_SSH_ALLOW_LOCKOUT ))   && flags="${flags:+$flags,}allow_lockout"
+
+    local trust_re_eff="${KILL_SSH_TRUST_RE_EFFECTIVE:-$KILL_SSH_TRUST_RE}"
+
+    while IFS= read -r line; do
+        [[ "$line" =~ \"kind\":\"sshkey\" ]] || continue
+        [[ "$line" =~ \"action\":\"prune\" ]] || continue
+        path=$(kill_json_str_field "$line" path)
+        [[ -z "$path" ]] && continue
+
+        # Pull the manifest's pre-baked backup paths so the apply-path
+        # writes to the same locations the manifest's recovery_hint
+        # field promised the operator. Falls back to the canonical
+        # mirror layout if the manifest somehow elides the field
+        # (defensive — kill_sshkey_emit_manifest_item always writes
+        # them).
+        original_backup_path=$(kill_json_str_field "$line" original_backup_path)
+        removed_sidecar_path=$(kill_json_str_field "$line" removed_keys_sidecar_path)
+        local backup_dest
+        if [[ -n "$original_backup_path" ]]; then
+            backup_dest="${original_backup_path%.original-pre-prune}"
+        else
+            backup_dest="$BACKUP_DIR/quarantine/${path#/}"
+        fi
+
+        ssh_keys_prune "$path" "$trust_re_eff" "$backup_dest" "$flags" >/dev/null 2>&1
+        local primary="${KILL_LAST_PRUNE_RESULT:-prune_failed}"
+        local detail="${KILL_LAST_PRUNE_DETAIL:-}"
+        local kp="${KILL_LAST_PRUNE_PRUNED:-0}"
+        local kk="${KILL_LAST_PRUNE_KEEP:-0}"
+        local sp="${KILL_LAST_PRUNE_SHA_PRE:-}"
+        local sP="${KILL_LAST_PRUNE_SHA_POST:-}"
+        local bp="${KILL_LAST_PRUNE_BACKUP:-$original_backup_path}"
+        local sd="${KILL_LAST_PRUNE_SIDECAR:-$removed_sidecar_path}"
+
+        kill_sshkey_action_record "$sidecar" "$path" "$primary" "$detail" \
+            "$kp" "$kk" "$sp" "$sP" "$bp" "$sd"
+
+        case "$primary" in
+            (prune_failed|clobbered_post_mv)
+                fails=$((fails + 1))
+                ;;
+        esac
+    done < "$manifest"
+
+    return "$fails"
 }
 
 # Build a sidecar lookup. Streams the *.actions.jsonl into stdout as
@@ -2042,6 +2332,22 @@ kill_build_manifest() {
     local ts_planned
     ts_planned=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+    # MITIGATE_FORCE_SSH_PRUNE=1 is a P2 test seam (NOT a documented flag).
+    # P3 wires --ssh-prune to set KILL_SSH_PRUNE directly; under
+    # MITIGATE_LIBRARY_ONLY this env var lets tests exercise the manifest
+    # sweep + supersede paths without going through arg parsing. Local
+    # toggle so the seam doesn't leak past this function.
+    local _ssh_prune_eff="${KILL_SSH_PRUNE:-0}"
+    if [[ "${MITIGATE_FORCE_SSH_PRUNE:-0}" == "1" ]]; then
+        _ssh_prune_eff=1
+    fi
+    # Effective trust regex: KILL_SSH_TRUST_RE plus any --ssh-allow extras
+    # P3 appends. P2 falls back to the base regex when extras are unset.
+    local _trust_re_eff="${KILL_SSH_TRUST_RE_EFFECTIVE:-}"
+    if [[ -z "$_trust_re_eff" ]]; then
+        _trust_re_eff="$KILL_SSH_TRUST_RE"
+    fi
+
     local files_tmp ips_tmp refused_tmp
     files_tmp=$(mktemp /tmp/sessionscribe-kill-files-XXXXXX) || return 1
     ips_tmp=$(mktemp /tmp/sessionscribe-kill-ips-XXXXXX) || { rm -f "$files_tmp"; return 1; }
@@ -2090,6 +2396,14 @@ kill_build_manifest() {
         if ! kill_path_in_allowlist "$path"; then
             printf '%s\t%s\t%s\t%s\n' "$pattern" "$key" "$path" "path_outside_allowlist" >> "$refused_tmp"
             continue
+        fi
+
+        # F-11 supersede: when --ssh-prune is active, the kind:sshkey item
+        # (emitted below) handles surgical per-line removal for canonical
+        # authorized_keys paths; the kind:file row stays as audit trail
+        # but with action rewritten so quarantine_from_manifest skips it.
+        if (( _ssh_prune_eff )) && kill_sshkey_path_canonical "$path"; then
+            action="superseded_by_sshkey"
         fi
 
         printf '%s\t%s\t%s\t%s\n' "$pattern" "$key" "$path" "$action" >> "$files_tmp"
@@ -2170,6 +2484,43 @@ kill_build_manifest() {
                 printf '    {"kind":"ip","ip":"%s","first_seen_epoch":%s,"hits":%s,"source_signal":"%s","action":"csf-deny","result":null}' \
                     "$(json_esc "$ip_a")" "${ts_a:-0}" "${hits_a:-0}" "$(json_esc "$key_a")"
             done <<< "$ips_agg"
+        fi
+
+        # kind:sshkey block. Order in manifest: file → ip → sshkey. Only
+        # emitted when --ssh-prune is active (KILL_SSH_PRUNE=1, set by P3
+        # arg-parse OR the MITIGATE_FORCE_SSH_PRUNE=1 P2 test seam). Uses
+        # KILL_SSHKEY_CANONICAL_CACHE if populated (P3 phase_kill startup
+        # walks /home once into the cache); otherwise falls back to a
+        # direct kill_sshkey_canonical_paths invocation here so unit
+        # tests can drive the manifest sweep without phase_kill setup.
+        if (( _ssh_prune_eff )); then
+            local _sk_path
+            if (( ${#KILL_SSHKEY_CANONICAL_CACHE[@]} > 0 )); then
+                local _sk_p
+                for _sk_p in "${KILL_SSHKEY_CANONICAL_CACHE[@]}"; do
+                    [[ -z "$_sk_p" ]] && continue
+                    if [[ ! -e "$_sk_p" && ! -L "$_sk_p" ]]; then
+                        continue
+                    fi
+                    (( first )) || printf ',\n'
+                    first=0
+                    kill_sshkey_emit_manifest_item \
+                        "$_sk_p" "$KILL_SSH_TRUST_RE" "$_trust_re_eff" \
+                        "$BACKUP_DIR" "${MODE:-check}"
+                done
+            else
+                while IFS= read -r _sk_path; do
+                    [[ -z "$_sk_path" ]] && continue
+                    if [[ ! -e "$_sk_path" && ! -L "$_sk_path" ]]; then
+                        continue
+                    fi
+                    (( first )) || printf ',\n'
+                    first=0
+                    kill_sshkey_emit_manifest_item \
+                        "$_sk_path" "$KILL_SSH_TRUST_RE" "$_trust_re_eff" \
+                        "$BACKUP_DIR" "${MODE:-check}"
+                done < <(kill_sshkey_canonical_paths)
+            fi
         fi
 
         printf '\n  ],\n'
@@ -4276,6 +4627,194 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         fi
         unset KILL_SSH_TRUST_DRIFT_TEST_PATH
         KILL_SSH_ALLOW_DRIFT=0
+
+        # ===================================================================
+        # P2 tests (30-35). Manifest sweep + apply consumer + canonical-cache
+        # supersede gate. Same _t_dir, same _t_ok / _t_fail; the harness is
+        # additive over P1 so a single MITIGATE_RUN_P1_TESTS=1 invocation
+        # covers all 35 cases.
+        # ===================================================================
+
+        # Test 30: prune_ssh_keys_from_manifest applied to a planted file
+        # with one Parent Child + one evil@host → sidecar gets one
+        # sshkey record with result=pruned_ok.
+        MODE="apply"
+        BACKUP_DIR="$_t_dir/30-bdir"
+        mkdir -p "$BACKUP_DIR"
+        _f30="$_t_dir/30.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f30"
+        _m30="$_t_dir/30-manifest.json"
+        _bd30="$BACKUP_DIR/quarantine/${_f30#/}"
+        {
+            printf '{\n  "items":[\n'
+            printf '    {"kind":"sshkey","path":"%s","action":"prune",' "$_f30"
+            printf '"trust_re":"%s","trust_re_effective":"%s",' "$KILL_SSH_TRUST_RE" "$KILL_SSH_TRUST_RE"
+            printf '"keys_total":2,"keys_kept":1,"keys_kept_unlabeled":0,"keys_pruned":1,'
+            printf '"pruned_keys":[{"line_no":2,"type":"ssh-rsa","comment":"evil@host","fingerprint":"","base64_first_24":"BBBB"}],'
+            printf '"result":null,"result_detail":null,"sha256_pre":null,"sha256_post":null,'
+            printf '"original_backup_path":"%s.original-pre-prune","removed_keys_sidecar_path":"%s.removed-keys",' "$_bd30" "$_bd30"
+            printf '"recovery_hint":"cp -a ..."}\n'
+            printf '  ]\n}\n'
+        } > "$_m30"
+        : > "${_m30%.json}.actions.jsonl"   # mimic quarantine_from_manifest reset
+        prune_ssh_keys_from_manifest "$_m30" >/dev/null 2>&1
+        _scar30="${_m30%.json}.actions.jsonl"
+        _sk30=$(grep -c '"kind":"sshkey"' "$_scar30" 2>/dev/null)
+        _ok30=$(grep -c '"result":"pruned_ok"' "$_scar30" 2>/dev/null)
+        _kept30=$(grep -c 'Parent Child' "$_f30" 2>/dev/null)
+        _pruned30=$(grep -c 'evil@host' "$_f30" 2>/dev/null)
+        if [[ "$_sk30" == "1" && "$_ok30" == "1" \
+              && "$_kept30" == "1" && "$_pruned30" == "0" ]]; then
+            _t_ok 30 "prune_ssh_keys_from_manifest -> sidecar pruned_ok + file rewritten"
+        else
+            _t_fail 30 "prune_ssh_keys_from_manifest -> sidecar pruned_ok" \
+                "sshkey_rows=$_sk30 ok_rows=$_ok30 kept=$_kept30 pruned=$_pruned30"
+        fi
+
+        # Test 31: same fixture but Parent Child only → result=nothing_to_prune.
+        _f31="$_t_dir/31.keys"
+        printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n' > "$_f31"
+        _m31="$_t_dir/31-manifest.json"
+        _bd31="$BACKUP_DIR/quarantine/${_f31#/}"
+        {
+            printf '{\n  "items":[\n'
+            printf '    {"kind":"sshkey","path":"%s","action":"prune",' "$_f31"
+            printf '"trust_re":"%s","trust_re_effective":"%s",' "$KILL_SSH_TRUST_RE" "$KILL_SSH_TRUST_RE"
+            printf '"keys_total":1,"keys_kept":1,"keys_kept_unlabeled":0,"keys_pruned":0,'
+            printf '"pruned_keys":[],'
+            printf '"result":null,"result_detail":null,"sha256_pre":null,"sha256_post":null,'
+            printf '"original_backup_path":"%s.original-pre-prune","removed_keys_sidecar_path":"%s.removed-keys",' "$_bd31" "$_bd31"
+            printf '"recovery_hint":"cp -a ..."}\n'
+            printf '  ]\n}\n'
+        } > "$_m31"
+        : > "${_m31%.json}.actions.jsonl"
+        prune_ssh_keys_from_manifest "$_m31" >/dev/null 2>&1
+        _scar31="${_m31%.json}.actions.jsonl"
+        _ntp31=$(grep -c '"result":"nothing_to_prune"' "$_scar31" 2>/dev/null)
+        if [[ "$_ntp31" == "1" ]]; then
+            _t_ok 31 "prune_ssh_keys_from_manifest Parent-Child-only -> nothing_to_prune"
+        else
+            _t_fail 31 "prune_ssh_keys_from_manifest Parent-Child-only -> nothing_to_prune" \
+                "ntp_rows=$_ntp31 sidecar=$(cat "$_scar31" 2>/dev/null)"
+        fi
+
+        # Test 32: kill_sshkey_path_canonical against a populated cache.
+        KILL_SSHKEY_CANONICAL_CACHE=( "/root/.ssh/authorized_keys" "/root/.ssh/authorized_keys2" )
+        if kill_sshkey_path_canonical "/root/.ssh/authorized_keys"; then
+            _hit32_pos=1
+        else
+            _hit32_pos=0
+        fi
+        if kill_sshkey_path_canonical "/etc/passwd"; then
+            _hit32_neg=1
+        else
+            _hit32_neg=0
+        fi
+        if (( _hit32_pos == 1 )) && (( _hit32_neg == 0 )); then
+            _t_ok 32 "kill_sshkey_path_canonical hit + miss against populated cache"
+        else
+            _t_fail 32 "kill_sshkey_path_canonical hit + miss" \
+                "pos=$_hit32_pos neg=$_hit32_neg"
+        fi
+
+        # Test 33: kill_sshkey_path_canonical with empty cache always rc=1.
+        KILL_SSHKEY_CANONICAL_CACHE=()
+        if kill_sshkey_path_canonical "/root/.ssh/authorized_keys"; then
+            _hit33=1
+        else
+            _hit33=0
+        fi
+        if (( _hit33 == 0 )); then
+            _t_ok 33 "kill_sshkey_path_canonical empty cache -> rc=1"
+        else
+            _t_fail 33 "kill_sshkey_path_canonical empty cache -> rc=1" \
+                "got rc=0 unexpectedly"
+        fi
+
+        # Test 34: kill_build_manifest in --check mode emits kind:sshkey
+        # with result=planned_pruned_ok for a planted authorized_keys
+        # under the cache. Exercises the full sweep+emit path under
+        # MITIGATE_FORCE_SSH_PRUNE=1 (test seam). Synthetic envelope is
+        # an empty-signal envelope (no kind:file / kind:ip rows); the
+        # sweep is signal-independent so this is enough to drive emission.
+        MODE="check"
+        _f34="$_t_dir/34.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f34"
+        _env34="$_t_dir/34-envelope.json"
+        {
+            printf '{\n  "host":"test","host_verdict":"COMPROMISED","run_id":"test","tool_version":"test",\n'
+            printf '  "signals":[]\n}\n'
+        } > "$_env34"
+        _m34="$_t_dir/34-manifest.json"
+        BACKUP_DIR="$_t_dir/34-bdir"
+        mkdir -p "$BACKUP_DIR"
+        KILL_SSHKEY_CANONICAL_CACHE=( "$_f34" )
+        MITIGATE_FORCE_SSH_PRUNE=1 \
+            kill_build_manifest "$_env34" "$_m34" >/dev/null 2>&1
+        _sk34_rows=$(grep -c '"kind":"sshkey"' "$_m34" 2>/dev/null)
+        _planned34=$(grep -c '"result":"planned_pruned_ok"' "$_m34" 2>/dev/null)
+        _path34=$(grep -c "\"path\":\"$_f34\"" "$_m34" 2>/dev/null)
+        # File must NOT have been mutated in --check.
+        _kept34=$(grep -c 'Parent Child' "$_f34" 2>/dev/null)
+        _evil34=$(grep -c 'evil@host' "$_f34" 2>/dev/null)
+        if [[ "$_sk34_rows" == "1" && "$_planned34" == "1" && "$_path34" == "1" \
+              && "$_kept34" == "1" && "$_evil34" == "1" ]]; then
+            _t_ok 34 "kill_build_manifest --check -> kind:sshkey result=planned_pruned_ok"
+        else
+            _t_fail 34 "kill_build_manifest --check -> kind:sshkey result=planned_pruned_ok" \
+                "rows=$_sk34_rows planned=$_planned34 path=$_path34 kept=$_kept34 evil=$_evil34"
+        fi
+        KILL_SSH_PRUNE=0
+        unset MITIGATE_FORCE_SSH_PRUNE
+
+        # Test 35: same fixture but kill_build_manifest in --apply mode
+        # → result is null in the manifest (apply path patches via
+        # sidecar). File is also NOT mutated by kill_build_manifest
+        # itself (rewrite happens in prune_ssh_keys_from_manifest).
+        MODE="apply"
+        _f35="$_t_dir/35.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f35"
+        _env35="$_t_dir/35-envelope.json"
+        {
+            printf '{\n  "host":"test","host_verdict":"COMPROMISED","run_id":"test","tool_version":"test",\n'
+            printf '  "signals":[]\n}\n'
+        } > "$_env35"
+        _m35="$_t_dir/35-manifest.json"
+        BACKUP_DIR="$_t_dir/35-bdir"
+        mkdir -p "$BACKUP_DIR"
+        KILL_SSHKEY_CANONICAL_CACHE=( "$_f35" )
+        MITIGATE_FORCE_SSH_PRUNE=1 \
+            kill_build_manifest "$_env35" "$_m35" >/dev/null 2>&1
+        _sk35_rows=$(grep -c '"kind":"sshkey"' "$_m35" 2>/dev/null)
+        # apply mode must emit `"result":null` and NOT `"result":"planned_*"`.
+        # `pruned_keys` array contains nested `}` chars so we can't just
+        # span [^}]* between kind:sshkey and result; check the literal
+        # null-form on the line + the absence of any planned_ match.
+        _null35=$(grep -cE '"kind":"sshkey".*"result":null' "$_m35" 2>/dev/null)
+        _planned35=$(grep -cE '"result":"planned_' "$_m35" 2>/dev/null)
+        # File must not have been rewritten by kill_build_manifest itself.
+        _evil35=$(grep -c 'evil@host' "$_f35" 2>/dev/null)
+        _kept35=$(grep -c 'Parent Child' "$_f35" 2>/dev/null)
+        if [[ "$_sk35_rows" == "1" && "$_null35" == "1" \
+              && "$_planned35" == "0" \
+              && "$_evil35" == "1" && "$_kept35" == "1" ]]; then
+            _t_ok 35 "kill_build_manifest --apply -> kind:sshkey result=null (sidecar patches)"
+        else
+            _t_fail 35 "kill_build_manifest --apply -> kind:sshkey result=null" \
+                "rows=$_sk35_rows null=$_null35 planned=$_planned35 evil=$_evil35 kept=$_kept35"
+        fi
+        KILL_SSH_PRUNE=0
+        KILL_SSHKEY_CANONICAL_CACHE=()
+        unset MITIGATE_FORCE_SSH_PRUNE
 
         rm -rf "$_t_dir"
         printf '\n'
