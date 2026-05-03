@@ -4,6 +4,49 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.4 — 2026-05-03
+
+### Added
+- **Pattern J2 ExecStart allowlist: `/usr/local/lp/`.** Liquid Web management
+  infra (Prometheus exporters under `/usr/local/lp/opt/exporters/<name>/<name>`)
+  is RPM-unowned by design but operator-deployed, not attacker-planted.
+  Field run on `web02.marathonpress.com` produced 5 false-positive
+  `ioc_pattern_j_systemd_unit_candidate` warnings on
+  `apache_exporter` / `node_exporter` / `blackbox_exporter` /
+  `php-fpm_exporter` / `mysqld_exporter`. Allowlist now includes
+  `/usr/local/(bin|sbin|cpanel|lsws|directadmin|lp)`. The `/usr/share/`
+  attacker-shape branch is unaffected.
+
+### Fixed
+- **Bash 4.1 floor regression: `${path: -25}` negative-substring** at
+  `fmt_offense_detail()`. Introduced 2026-05-02 (commit `2122ef0d`).
+  Negative-offset substring is bash 4.2+; on the EL6/CL6 floor (bash
+  4.1.2) the parser rejects it, breaking the kill-chain renderer the
+  moment it formats a path > 50 chars. Replaced with explicit-offset
+  form `${path:$((${#path}-25)):25}`. Latent until `--full` mode hit
+  a long IOC path.
+- **Empty-array deref under `set -u` (4 additional sites).** v2.7.3
+  guarded the Pattern J persistence checker; the same class of bug
+  remains in `phase_reconcile()` (`DEFENSE_EVENTS[@]` at the
+  earliest-offense-vs-latest-defense compare), `write_kill_chain_primitives()`
+  (two `DEFENSE_EVENTS[@]` subshell loops, TSV + JSONL writers), and
+  `phase_bundle()` (`def_static[@]` when no defense files exist on a
+  stock host). All five guarded with the project's
+  `(( ${#arr[@]} > 0 ))` length-check idiom.
+
+## sessionscribe-ioc-scan.sh v2.7.3 — 2026-05-03
+
+### Fixed
+- **Bash 4.1 floor regression: empty-array deref in
+  `check_pattern_j_persistence`.** v2.7.1 introduced six unguarded
+  `${arr[@]}` references. On bash 4.1 + `set -u` (CL6/EL6 floor) any
+  declared-but-empty array trips `unbound variable`. Field-reported on
+  a host with udev rules present but zero shape-matches:
+  `bash: line 4823: _hit_shape_strong[@]: unbound variable`. Bash 4.4+
+  tolerates this so it slipped past local tests. All six sites guarded
+  with the project length-check idiom (matches Pattern A `readme_hits`
+  and the eight other guards already in the script).
+
 ## sessionscribe-ioc-scan.sh v2.7.2 — 2026-05-03
 
 ### Added

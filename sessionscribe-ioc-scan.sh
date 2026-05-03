@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.3
+# sessionscribe-ioc-scan.sh v2.7.4
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.3"
+VERSION="2.7.4"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -255,8 +255,11 @@ PATTERN_J_UDEV_DIRS=(/etc/udev/rules.d /run/udev/rules.d)
 PATTERN_J_SYSTEMD_UNIT_DIRS=(/etc/systemd/system)
 # ExecStart-allowed binary roots. Legit cPanel/LSWS/Plesk extras included
 # so a stock control-panel host doesn't FP. /usr/lib/systemd/ covers
-# upstream systemd's own service binaries.
-PATTERN_J_EXECSTART_ALLOWED_RE='^(/usr/(bin|sbin|lib/systemd|lib(64)?/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|local/(bin|sbin|cpanel|lsws|directadmin))|/opt/|/var/(cpanel|lib/dovecot|lib/mysql)|/bin/|/sbin/)'
+# upstream systemd's own service binaries. /usr/local/lp/ covers Liquid
+# Web management infra (Prometheus exporters under
+# /usr/local/lp/opt/exporters/, etc.) - LW-managed binaries are
+# RPM-unowned by design but operator-deployed and not attacker-planted.
+PATTERN_J_EXECSTART_ALLOWED_RE='^(/usr/(bin|sbin|lib/systemd|lib(64)?/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|local/(bin|sbin|cpanel|lsws|directadmin|lp))|/opt/|/var/(cpanel|lib/dovecot|lib/mysql)|/bin/|/sbin/)'
 # Description shadow list - legit systemd/cPanel service names an attacker
 # might mimic with a `<name>-helper` / `<name>-cleanup` / `<name>2` suffix.
 PATTERN_J_DESC_SHADOW_RE='\b(dbus-broker|systemd-(resolved|networkd|timesyncd|logind|udevd)|cpsrvd|cphulkd|queueprocd|exim-altport|chkservd|tailwatchd|cpanel-dovecot)\b'
@@ -2142,14 +2145,18 @@ phase_reconcile() {
         done
 
         local max_def=""
-        for de in "${DEFENSE_EVENTS[@]}"; do
-            local ts
-            ts=$(echo "$de" | cut -d'|' -f1)
-            [[ -z "$ts" ]] && continue
-            if [[ -z "$max_def" ]] || (( ts > max_def )); then
-                max_def="$ts"
-            fi
-        done
+        # bash 4.1 (CL6/EL6 floor) + set -u: empty array deref crashes;
+        # guard with project length-check idiom (see v2.7.3 Pattern J fix).
+        if (( ${#DEFENSE_EVENTS[@]} > 0 )); then
+            for de in "${DEFENSE_EVENTS[@]}"; do
+                local ts
+                ts=$(echo "$de" | cut -d'|' -f1)
+                [[ -z "$ts" ]] && continue
+                if [[ -z "$max_def" ]] || (( ts > max_def )); then
+                    max_def="$ts"
+                fi
+            done
+        fi
 
         if [[ -n "$min_off" ]]; then
             say_info "first compromise indicator: $(epoch_to_iso "$min_off")"
@@ -2218,7 +2225,9 @@ fmt_offense_detail() {
         [[ -n "$status" ]] && d="$d $status"
     elif [[ -n "$path" ]]; then
         if (( ${#path} > 50 )); then
-            d="${path:0:24}${GLYPH_ELLIPSIS}${path: -25}"
+            # bash 4.1 (CL6/EL6 floor) lacks ${var: -N} negative-substring;
+            # compute the offset explicitly. Guard above ensures len > 50.
+            d="${path:0:24}${GLYPH_ELLIPSIS}${path:$((${#path}-25)):25}"
         else
             d="$path"
         fi
@@ -2704,11 +2713,15 @@ write_kill_chain_primitives() {
 
         # Defense rows.
         local de de_epoch de_key de_note _de_line
-        local sorted_def
-        sorted_def=$(
-            local d
-            for d in "${DEFENSE_EVENTS[@]}"; do printf '%s\n' "$d"; done | sort -t'|' -k1,1n
-        )
+        local sorted_def=""
+        # bash 4.1 (CL6/EL6 floor) + set -u: empty-array deref inside the
+        # subshell crashes; guard with the project length-check idiom.
+        if (( ${#DEFENSE_EVENTS[@]} > 0 )); then
+            sorted_def=$(
+                local d
+                for d in "${DEFENSE_EVENTS[@]}"; do printf '%s\n' "$d"; done | sort -t'|' -k1,1n
+            )
+        fi
         # Pipe-tolerant decode (notes may contain '|').
         while IFS= read -r _de_line; do
             [[ -z "$_de_line" ]] && continue
@@ -2798,11 +2811,15 @@ write_kill_chain_primitives() {
             "${eff_patch:-}" "${eff_modsec:-}"
 
         local de de_epoch de_key de_note _de_line
-        local sorted_def
-        sorted_def=$(
-            local d
-            for d in "${DEFENSE_EVENTS[@]}"; do printf '%s\n' "$d"; done | sort -t'|' -k1,1n
-        )
+        local sorted_def=""
+        # bash 4.1 (CL6/EL6 floor) + set -u: empty-array deref inside the
+        # subshell crashes; guard with the project length-check idiom.
+        if (( ${#DEFENSE_EVENTS[@]} > 0 )); then
+            sorted_def=$(
+                local d
+                for d in "${DEFENSE_EVENTS[@]}"; do printf '%s\n' "$d"; done | sort -t'|' -k1,1n
+            )
+        fi
         # Pipe-tolerant decode (notes may contain '|').
         while IFS= read -r _de_line; do
             [[ -z "$_de_line" ]] && continue
@@ -3214,8 +3231,12 @@ phase_bundle() {
     [[ -f "$MODSEC_USER_CONF" ]] && def_static+=("$MODSEC_USER_CONF")
     local def_list; def_list=$(mktemp /tmp/forensic-def.XXXXXX)
     {
+        # bash 4.1 (CL6/EL6 floor) + set -u: empty-array deref crashes;
+        # def_static may be empty on a stock host with no defense files.
         local p
-        for p in "${def_static[@]}"; do printf '%s\0' "$p"; done
+        if (( ${#def_static[@]} > 0 )); then
+            for p in "${def_static[@]}"; do printf '%s\0' "$p"; done
+        fi
         collect_recent /var/cpanel/updatelogs
     } > "$def_list" 2>/dev/null
     bundle_tar "defense-state.tgz" "defense state" filtered "$def_list"
