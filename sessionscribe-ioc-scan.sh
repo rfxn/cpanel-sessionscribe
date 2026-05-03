@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.5
+# sessionscribe-ioc-scan.sh v2.7.6
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.5"
+VERSION="2.7.6"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -1545,9 +1545,13 @@ read_iocs_from_envelope() {
 pattern_g_deep_checks() {
     local ak_files=(/root/.ssh/authorized_keys /root/.ssh/authorized_keys2)
     local h
+    # -maxdepth 1 (NOT 2): canonical paths are at depth-1 only. -maxdepth 2
+    # also returned depth-2 subdirs (/home/<user>/sub), and appending
+    # /.ssh/authorized_keys to those produced non-canonical probe targets.
+    # Mirrors the same fix in mitigate's kill_sshkey_canonical_paths.
     while IFS= read -r -d '' h; do
         ak_files+=("$h/.ssh/authorized_keys" "$h/.ssh/authorized_keys2")
-    done < <(find /home -maxdepth 2 -mindepth 1 -type d -print0 2>/dev/null)
+    done < <(find /home -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
 
     local ak mtime_pre atime_pre ctime_pre mt_utc mt_local
     for ak in "${ak_files[@]}"; do

@@ -223,6 +223,34 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.6 — 2026-05-03
+
+### Fixed
+- **`pattern_g_deep_checks`: `find -maxdepth 2` produced non-canonical
+  authorized_keys probe paths.** Mirrors the same fix in mitigate
+  v0.7.1's `kill_sshkey_canonical_paths` (sentinel finding A-01).
+  `find /home -maxdepth 2 -mindepth 1 -type d` returns BOTH depth-1
+  user homes (`/home/<user>`) and depth-2 subdirs
+  (`/home/<user>/<sub>`). Appending `/.ssh/authorized_keys` to the
+  depth-2 paths produced non-canonical probe targets like
+  `/home/<user>/<sub>/.ssh/authorized_keys`. Mostly cosmetic — the
+  build-time `[[ -f ]]` skip filtered most non-existent paths — but
+  the per-key-comment validation loop (Pattern G's
+  `SSH_KNOWN_GOOD_RE` whitelist) ran against any depth-2 file that
+  happened to exist with a `.ssh/authorized_keys` shape, which is
+  not the cPanel canonical layout.
+
+  Fix: `-maxdepth 1` (depth-1 only).
+
+  Mirror policy (workspace CLAUDE.md): "Shared-lib bug → verify all
+  consumers." The `find /home -maxdepth N` pattern is the de-facto
+  shared idiom for canonical authorized_keys discovery across
+  mitigate + ioc-scan; both got the fix in the same triage cycle.
+
+### Verification
+- bash -n + shellcheck -S error pass.
+- gawk 3.x floor preserved (no `{n}` intervals, no 3-arg `match`).
+
 ## sessionscribe-ioc-scan.sh v2.7.5 — 2026-05-03
 
 ### Fixed
