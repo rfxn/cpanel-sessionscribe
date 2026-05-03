@@ -4,6 +4,38 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.7.0 — 2026-05-03
+
+### Added
+- **`phase_kill` ssh-key surgical prune** (`--ssh-prune`) sweeps canonical SSH-key paths (`~root/.ssh/authorized_keys{,2}` + every `/home/*/.ssh/authorized_keys{,2}`) and surgically removes any key whose comment doesn't match the LW trust regex (`Parent Child key for [A-Z0-9]{6}` + `lwadmin`/`lw-admin`/`liquidweb`/`nexcess` prefixes). Per-line precision — Parent Child provisioning key preserved while attacker-planted keys are quarantined.
+- **`--ssh-allow REGEX`** for site-specific trust-regex extensions. Repeatable; values concatenated via `|`. Validated as POSIX ERE at parse time against empty + non-empty input probes; overly broad patterns (`.*`, `.+`, `''`, `.`) emit a WARN.
+- **`--ssh-allow-lockout`** to authorize full root-key wipes on hosts where every key would be pruned. Off by default — the `would_lock_out` gate is fail-safe.
+- **`--ssh-prune-unlabeled`** to also prune empty-comment keys. Default policy KEEPS unlabeled keys with WARN, since real fleets have unlabeled root keys (cloud-init, ansible templates, sysadmin paste); silent default prune was too high-blast-radius.
+- **`--ssh-allow-drift`** to bypass the trust-regex sync gate. Off by default — drift between mitigate's `KILL_SSH_TRUST_RE` and ioc-scan's `SSH_KNOWN_GOOD_RE` refuses to run `--ssh-prune` (defense against silent regex drift that could mis-classify operator keys).
+- **New `kind:sshkey` manifest item class** with chain-of-custody:
+  - sha256 pre/post rewrite verification
+  - pre-vs-lock-acquired sha256 catches mid-flight modification (`concurrent_modification`)
+  - post-mv re-classify catches clobber-after-our-rename (`clobbered_post_mv`)
+  - original whole file preserved at `BACKUP_DIR/quarantine/<path>.original-pre-prune`
+  - pruned-keys JSONL sidecar at `BACKUP_DIR/quarantine/<path>.removed-keys`
+  - `recovery_hint` field per item carrying a single-line `cp -a` restore command for paged-out 3am operators.
+- **`kind:sshkey` summary fields** in the manifest summary block: `sshkeys_files_planned`, `sshkeys_files_pruned`, `sshkeys_files_clean`, `sshkeys_files_kept_unlabeled`, `sshkeys_files_lock_out`, `sshkeys_files_failed`, `sshkeys_files_concurrent_mod`, `sshkeys_files_lock_contended`, `sshkeys_keys_pruned`, `sshkeys_keys_kept`, `sshkeys_keys_kept_unlabeled`.
+
+### Behavior
+- When `--ssh-prune` is active, Pattern G whole-file quarantine is suppressed for canonical authorized_keys paths (`action:"superseded_by_sshkey"` — manifest-visible audit, no double-action). Off-path SSH key material continues to use whole-file quarantine.
+- `--ssh-prune` respects the `host_verdict==COMPROMISED` gate. For fleet-wide hygiene runs (rotate keys regardless of compromise verdict), use `--ssh-prune --kill-anyway`.
+- Empty-comment keys (e.g., bare `ssh-rsa AAAA` with no comment) are KEPT by default with verdict-promote-WARN (`kept_unlabeled_warned`). Pass `--ssh-prune-unlabeled` to also remove them.
+- All sshkey actions are recorded in the kill-actions sidecar (`<manifest>.actions.jsonl`); verdict is computed from the sidecar in `--apply` and from the manifest's planned items in `--check`.
+
+### Floor compliance
+- **bash 4.1.2 / gawk 3.1.7** — no `mapfile`, no `${var,,}`, no `printf -v arr[$i]`, no `${var: -1}`, no `declare -g`, no `local -n`, no `wait -n`, no `coproc`, no `${var@Q}`. No 3-arg `match()`, no `{n}` interval expressions in awk regexes.
+- **coreutils 8.4** — `cp --preserve=all` honored; `realpath -m` not relied on (uses the v0.6.1 pure-bash normalizer for path-allowlist).
+- **util-linux 2.17** — NO `flock -w` (timeout flag is util-linux 2.21+). Lock contention handled by `flock -x -n` retry loop with 1-second sleep, default 10 attempts.
+- **OpenSSH 5.3** (EL6) — `ssh-keygen -lf` MD5 fingerprint for RSA/DSA/ECDSA; base64-decoded sha256 fallback (`B64SHA256:...`) for ed25519 + FIDO/U2F (`sk-ssh-ed25519`, `sk-ecdsa-sha2-*`) keytypes that EL6's ssh-keygen can't parse.
+
+### Note
+- This release supersedes the earlier v0.7.0 reservation in PLAN-killchain.md K9 ("Reverse / un-quarantine"). Restore tooling defers to v0.8.0, covering both file un-quarantine and ssh-key un-prune. The v0.7.0 prioritization reflects active threat containment urgency: a fleet-wide surgical SSH-key prune capability is more time-sensitive than restore tooling.
+
 ## sessionscribe-mitigate.sh v0.6.1 — 2026-05-03
 
 ### Fixed
