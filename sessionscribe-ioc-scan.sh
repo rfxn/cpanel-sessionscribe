@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.4
+# sessionscribe-ioc-scan.sh v2.7.5
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.4"
+VERSION="2.7.5"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -5198,21 +5198,122 @@ check_destruction_iocs() {
     # Three independent signals: literal binary name in shell history,
     # binary still on disk in known drop paths (sha256 anchored), or C2
     # host/IP referenced in history or persistence files.
-    local nuke_hit=""
-    nuke_hit=$(grep -lF "$PATTERN_C_BIN" \
-                  /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
-    if [[ -z "$nuke_hit" ]]; then
-        nuke_hit=$(grep -lF "$PATTERN_C_BIN" /tmp/*.log /var/tmp/*.log 2>/dev/null | head -1)
+    #
+    # bash_history hits are classified hostile-shape vs diagnostic-shape
+    # before emit. LW responders routinely run `history | grep -F
+    # "nuclear.x86"` or `cat /root/.bash_history | grep nuclear.x86` post-
+    # patch as part of an IR/QA check; without classification, every
+    # checked host emits strong/COMPROMISED. Field-reported by V.Narayanan
+    # + R.Poulose on 2026-05-03 against patched-clean cPanel hosts.
+    # Hostile shape = download (wget/curl/fetch/tftp) / pipe-to-shell /
+    # chmod +x / ./<bin> / source-eval-exec verb / bin-as-leading-token.
+    # Diagnostic shape = read-only verb (history/cat/grep/find/ls/...) at
+    # line start with no hostile verb anywhere.
+    local nuke_files=()
+    local _nf
+    for _nf in /root/.bash_history /home/*/.bash_history; do
+        [[ -f "$_nf" ]] && grep -qF "$PATTERN_C_BIN" "$_nf" 2>/dev/null \
+            && nuke_files+=("$_nf")
+    done
+    if (( ${#nuke_files[@]} == 0 )); then
+        for _nf in /tmp/*.log /var/tmp/*.log; do
+            [[ -f "$_nf" ]] && grep -qF "$PATTERN_C_BIN" "$_nf" 2>/dev/null \
+                && nuke_files+=("$_nf")
+        done
     fi
-    if [[ -n "$nuke_hit" ]]; then
-        local nuke_mtime
-        nuke_mtime=$(stat -c %Y "$nuke_hit" 2>/dev/null)
-        emit "destruction" "ioc_pattern_c_nuke_trace" "strong" \
-             "ioc_pattern_c_nuclear_x86_referenced" 10 \
-             "sample_path" "$nuke_hit" \
-             "mtime_epoch" "${nuke_mtime:-0}" \
-             "note" "$PATTERN_C_BIN dropper string in $nuke_hit (Mirai botnet drop, Abuse 46488376)."
-        ((hits++))
+    if (( ${#nuke_files[@]} > 0 )); then
+        local _nh_total=0 _nd_total=0 _nu_total=0
+        local _nfhe="" _nfh_file=""
+        local _nf_class _nf_h _nf_d _nf_u _nf_fhe
+        # awk needle is built from PATTERN_C_BIN with literal-dot escape.
+        export RE_NEEDLE='nuclear\.x86'
+        for _nf in "${nuke_files[@]}"; do
+            _nf_class=$(awk '
+                BEGIN {
+                    needle_re      = ENVIRON["RE_NEEDLE"]
+                    diag_re        = "^[[:space:]]*(history|cat|less|more|tail|head|grep|egrep|fgrep|zgrep|awk|find|ls|locate|file|ps|netstat|ss|stat)([[:space:]]|$)"
+                    download_re    = "(wget|curl|fetch|lwp-download|tftp)([[:space:]]|$)"
+                    pipe_shell_re  = "[|][[:space:]]*(sh|bash|ash|zsh|/bin/sh|/bin/bash)([[:space:]]|$)"
+                    chmod_re       = "chmod[[:space:]]+([+]x|[0-7][0-7][0-7])"
+                    exec_verb_re   = "(^|[[:space:]]|;|&)(source|eval|exec|bash|sh)[[:space:]]"
+                    last_epoch=""; h=0; d=0; u=0; fhe=""
+                }
+                /^#[0-9]+$/ { last_epoch = substr($0, 2); next }
+                $0 !~ needle_re { next }
+                {
+                    is_hostile = 0
+                    if ($0 ~ download_re)                    is_hostile = 1
+                    else if ($0 ~ pipe_shell_re)             is_hostile = 1
+                    else if ($0 ~ chmod_re)                  is_hostile = 1
+                    else if ($0 ~ ("\\./" needle_re))        is_hostile = 1
+                    else if ($0 ~ exec_verb_re)              is_hostile = 1
+                    else if ($0 ~ ("^[[:space:]]*" needle_re)) is_hostile = 1
+                    if (is_hostile) {
+                        h++
+                        if (fhe == "" && last_epoch != "") fhe = last_epoch
+                    } else if ($0 ~ diag_re) {
+                        d++
+                    } else {
+                        u++
+                        if (fhe == "" && last_epoch != "") fhe = last_epoch
+                    }
+                }
+                END { printf "h=%d d=%d u=%d fhe=%s\n", h, d, u, fhe }
+            ' "$_nf" 2>/dev/null)
+            _nf_h=$(  echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="h"){print $(i+1);exit}}')
+            _nf_d=$(  echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="d"){print $(i+1);exit}}')
+            _nf_u=$(  echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="u"){print $(i+1);exit}}')
+            _nf_fhe=$(echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="fhe"){print $(i+1);exit}}')
+            _nh_total=$((_nh_total + ${_nf_h:-0}))
+            _nd_total=$((_nd_total + ${_nf_d:-0}))
+            _nu_total=$((_nu_total + ${_nf_u:-0}))
+            if [[ -z "$_nfhe" && -n "$_nf_fhe" ]]; then
+                _nfhe="$_nf_fhe"; _nfh_file="$_nf"
+            fi
+        done
+        unset RE_NEEDLE
+
+        local _nuke_sample="${nuke_files[0]}" _nuke_mtime
+        _nuke_mtime=$(stat -c %Y "$_nuke_sample" 2>/dev/null)
+
+        if (( _nh_total > 0 )); then
+            # Hostile-shape line(s) present - real dropper trace; emit
+            # strong as before, with classifier counts for IR triage.
+            local _hf="${_nfh_file:-$_nuke_sample}"
+            local _he="${_nfhe:-${_nuke_mtime:-0}}"
+            emit "destruction" "ioc_pattern_c_nuke_trace" "strong" \
+                 "ioc_pattern_c_nuclear_x86_referenced" 10 \
+                 "sample_path" "$_hf" \
+                 "mtime_epoch" "${_nuke_mtime:-0}" \
+                 "ts_epoch_first" "$_he" \
+                 "hostile_lines" "$_nh_total" \
+                 "diagnostic_lines" "$_nd_total" \
+                 "unknown_lines" "$_nu_total" \
+                 "note" "$PATTERN_C_BIN dropper-shape command in $_hf (Mirai botnet drop, Abuse 46488376)."
+            ((hits++))
+        elif (( _nu_total > 0 )); then
+            # Unknown-shape only - no clear dropper verb but no clear
+            # diagnostic either; warning-tier so IR can review.
+            emit "destruction" "ioc_pattern_c_nuke_trace_review" "warning" \
+                 "ioc_pattern_c_nuclear_x86_review" 4 \
+                 "sample_path" "$_nuke_sample" \
+                 "mtime_epoch" "${_nuke_mtime:-0}" \
+                 "diagnostic_lines" "$_nd_total" \
+                 "unknown_lines" "$_nu_total" \
+                 "note" "$PATTERN_C_BIN string in $_nuke_sample but no dropper shape - manual review."
+            ((hits++))
+        else
+            # All hits diagnostic-shape - operator/IR search command
+            # (history|grep, cat|grep, find -name, etc). Info-tier so
+            # the audit trail records the classification but verdict is
+            # not affected (severity=info, weight=0 per emit() vocabulary).
+            emit "destruction" "ioc_pattern_c_nuke_trace_diagnostic" "info" \
+                 "ioc_pattern_c_nuclear_x86_diagnostic_only" 0 \
+                 "sample_path" "$_nuke_sample" \
+                 "mtime_epoch" "${_nuke_mtime:-0}" \
+                 "diagnostic_lines" "$_nd_total" \
+                 "note" "$PATTERN_C_BIN appears only in diagnostic-shape commands (history|grep, cat|grep, find -name, etc) - operator/IR search, not an IOC."
+        fi
     fi
     # Live binary on disk - hash anchor distinguishes confirmed sample from
     # a same-named variant.

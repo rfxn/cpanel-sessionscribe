@@ -118,6 +118,50 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.5 — 2026-05-03
+
+### Fixed
+- **Pattern C `nuke_trace` false-positive on responder-checked hosts.**
+  Field-reported by V. Narayanan and R. Poulose on 2026-05-03 against
+  patched-clean cPanel hosts that the sheet flagged "CONFIRMED COMPROMISED"
+  due to `ioc_pattern_c_nuclear_x86_referenced`. Root cause: LW responders
+  routinely run `history | grep -F "nuclear.x86"` or
+  `cat /root/.bash_history | grep nuclear.x86` post-patch as part of an
+  IR/QA check. The check command itself lands in `bash_history`, and the
+  next ioc-scan run matches the literal string and emits strong → host
+  gets escalated to COMPROMISED.
+
+  Pattern C bash_history lines are now classified before emit:
+  - **hostile-shape** (download verb `wget`/`curl`/`fetch`/`tftp`,
+    pipe-to-shell `| sh|bash|...`, `chmod +x`, `./<bin>`,
+    `source/eval/exec/bash/sh` verb adjacent, or binary as the leading
+    token) → emits `ioc_pattern_c_nuke_trace` `strong`/10 (unchanged).
+    Adds new fields: `hostile_lines`, `diagnostic_lines`,
+    `unknown_lines`, `ts_epoch_first` (the first hostile-line epoch from
+    the embedded `#<epoch>` markers, useful for kill-chain alignment).
+  - **diagnostic-shape only** (line starts with read-only verb
+    `history`/`cat`/`grep`/`egrep`/`fgrep`/`zgrep`/`find`/`ls`/`locate`/
+    `file`/`ps`/`netstat`/`ss`/`stat`/`tail`/`head`/`less`/`more`/`awk`
+    AND has no hostile verb anywhere) → emits new info-tier
+    `ioc_pattern_c_nuke_trace_diagnostic` / `ioc_pattern_c_nuclear_x86_diagnostic_only`
+    weight 0. Records the classification for the audit trail without
+    contributing to the verdict score.
+  - **unknown-shape only** (no clear dropper verb but no clear
+    diagnostic verb either) → emits warning-tier
+    `ioc_pattern_c_nuke_trace_review` / `ioc_pattern_c_nuclear_x86_review`
+    weight 4 for manual review.
+
+  All five canned scenarios pass (Vishnu's `host2`, Rino's one-liner,
+  mixed real-attacker history, clean history, unknown shape). The
+  on-disk binary checks (`PATTERN_C_BIN` sha256 anchor in
+  `/tmp/`/`/var/tmp/`/`/dev/shm/`) and C2 host/IP / persistence-path
+  checks are unchanged — those primitives are unique to compromise per
+  the project's "primitives unique to compromise" doctrine.
+
+  Implementation is gawk-3.x-clean (2-arg match via `~`, char-class
+  repetition `[0-7][0-7][0-7]` not `{3}`, ENVIRON-passed needle, no
+  3-arg `match()`).
+
 ## sessionscribe-ioc-scan.sh v2.7.4 — 2026-05-03
 
 ### Added
