@@ -158,8 +158,8 @@ PROBE_CANARY_PAT='^nxesec_canary_[A-Za-z0-9]+='
 # Phase registry - ordered list of (id, function, description, default-on)
 ###############################################################################
 
-PHASE_IDS=(snapshot patch preflight upcp proxysub csf apf runfw apache modsec sessions probe)
-PHASE_DEFAULT_ON=(1        1     1         1    1        1   1   1     1      1      1        0)
+PHASE_IDS=(snapshot patch preflight upcp proxysub csf apf runfw apache modsec sessions probe kill)
+PHASE_DEFAULT_ON=(1        1     1         1    1        1   1   1     1      1      1        0     0)
 declare -A PHASE_DESC=(
     [snapshot]="pre-mitigation evidence capture (sessions, users, accounting.log)"
     [patch]="cpanel -V vs published patched-build cutoffs"
@@ -173,6 +173,7 @@ declare -A PHASE_DESC=(
     [modsec]="modsec2.user.conf contains required CVE rule IDs"
     [sessions]="quarantine forged session files (CRLF-injection IOC ladder)"
     [probe]="(opt-in) self-probe against 127.0.0.1 via remote-probe"
+    [kill]="(opt-in) targeted quarantine + IP block from IOC envelope (--kill)"
 )
 
 ###############################################################################
@@ -182,6 +183,9 @@ declare -A PHASE_DESC=(
 MODE="check"            # check | apply
 ONLY_LIST=""            # CSV phase IDs; empty = all defaults-on
 DO_PROBE=0              # --probe opt-in
+RUN_KILL=0              # --kill opt-in (phase_kill from IOC envelope)
+KILL_ENVELOPE=""        # --envelope PATH override; empty = auto-discover
+KILL_ANYWAY=0           # --kill-anyway: bypass host_verdict gate
 declare -A PHASE_DISABLED=()
 JSON_OUT=0
 JSONL_OUT=0
@@ -217,11 +221,23 @@ PHASE SELECTION
                              --no-snapshot  --no-patch       --no-preflight
                              --no-upcp      --no-proxysub    --no-csf
                              --no-apf       --no-runfw       --no-apache
-                             --no-modsec    --no-sessions
+                             --no-modsec    --no-sessions    --no-kill
     --no-fw                Shorthand for --no-csf --no-apf --no-runfw.
     --probe                Enable the optional probe phase (opt-in).
                            Runs sessionscribe-remote-probe.sh against
                            127.0.0.1:2087; expects SAFE/blocked verdict.
+    --kill                 Enable the optional kill-chain phase (opt-in).
+                           Reads the latest sessionscribe-ioc-scan envelope,
+                           builds a manifest of quarantine actions + attacker
+                           IP blocks, and (with --apply) executes them.
+                           Gated on host_verdict == COMPROMISED unless
+                           --kill-anyway is set.
+    --envelope PATH        Use this IOC envelope JSON instead of auto-
+                           discovering the newest under /var/cpanel/
+                           sessionscribe-ioc/*.json. Implies --kill.
+    --kill-anyway          Run the kill chain even if host_verdict is not
+                           COMPROMISED (operator-confirmed override).
+                           Implies --kill.
     --list-phases          Print phase IDs + descriptions, then exit.
 
 OUTPUT (mutually exclusive on stdout - last flag wins)
@@ -300,6 +316,10 @@ while [[ $# -gt 0 ]]; do
         --apply)            MODE="apply";  shift ;;
         --only)             ONLY_LIST="$2"; shift 2 ;;
         --probe)            DO_PROBE=1; shift ;;
+        --kill)             RUN_KILL=1; shift ;;
+        --envelope)         KILL_ENVELOPE="$2"; RUN_KILL=1; shift 2 ;;
+        --kill-anyway)      KILL_ANYWAY=1; RUN_KILL=1; shift ;;
+        --no-kill)          PHASE_DISABLED[kill]=1; shift ;;
         --no-snapshot)      PHASE_DISABLED[snapshot]=1; shift ;;
         --no-upcp)          PHASE_DISABLED[upcp]=1; shift ;;
         --no-modsec)        PHASE_DISABLED[modsec]=1; shift ;;
@@ -378,6 +398,10 @@ fi
 # --probe opt-in toggles probe phase regardless of defaults.
 if (( DO_PROBE )) && [[ -z "${PHASE_DISABLED[probe]:-}" ]]; then
     PHASE_ACTIVE[probe]=1
+fi
+# --kill opt-in toggles the kill-chain phase regardless of defaults.
+if (( RUN_KILL )) && [[ -z "${PHASE_DISABLED[kill]:-}" ]]; then
+    PHASE_ACTIVE[kill]=1
 fi
 
 ###############################################################################
@@ -1131,12 +1155,24 @@ kill_compute_verdict() {
     local total_ok=$(( files_q + ips_ok + csf_changed ))
     local total_pending=$(( csf_pending ))
 
+    # Read planned counts from the manifest - K1 wrote them. In --check
+    # mode the manifest is the only source of truth; sidecar records are
+    # absent (K3/K4 didn't run) or are limited to K5's would-* records.
+    local files_planned ips_planned
+    files_planned=$(grep -oE '"files_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
+    ips_planned=$(grep -oE '"ips_planned":[0-9]+'   "$manifest" | head -1 | grep -oE '[0-9]+')
+    files_planned="${files_planned:-0}"
+    ips_planned="${ips_planned:-0}"
+
     if (( total_fail > 0 )); then
         LAST_KILL_VERDICT="FAIL"
         LAST_KILL_DETAIL="${files_f} file fail(s), ${ips_fail} csf-deny fail(s), ${csf_failed} csf-conf fail(s)"
     elif (( total_ok > 0 )); then
         LAST_KILL_VERDICT="ACTION"
         LAST_KILL_DETAIL="${files_q} quarantined, ${ips_ok} blocked, ${csf_changed} csf change(s); skips=${files_g}+${files_special}+${ips_skip}+${files_refused}"
+    elif [[ "$MODE" != "apply" ]] && (( files_planned + ips_planned > 0 || total_pending > 0 )); then
+        LAST_KILL_VERDICT="WARN"
+        LAST_KILL_DETAIL="${files_planned} file(s) + ${ips_planned} ip(s) planned; ${total_pending} csf change(s) pending; needs --apply"
     elif (( total_pending > 0 )); then
         LAST_KILL_VERDICT="WARN"
         LAST_KILL_DETAIL="${total_pending} csf change(s) need --apply; ${files_refused} path(s) refused"
@@ -2903,6 +2939,122 @@ phase_probe() {
     esac
 }
 
+# phase_kill - targeted quarantine + IP block from an IOC envelope. Opt-in
+# via --kill. Default-off; never runs unless RUN_KILL=1. Gated on
+# host_verdict == COMPROMISED unless --kill-anyway is set.
+#
+# Pipeline: K1 manifest build -> K3 file quarantine -> K4 csf -d ->
+# K5 csf.blocklists register -> K6 finalize manifest + verdict. K3/K4/K5
+# are mutating and require --apply. csf -ra reload at end if any csf
+# state changed.
+phase_kill() {
+    P_CUR=kill
+    phase_begin kill
+
+    if (( RUN_KILL == 0 )); then
+        sk kill_optout
+        say_skip "--kill not specified (opt-in)"
+        phase_set kill SKIPPED "opt-in"
+        return
+    fi
+
+    # Resolve the envelope.
+    local env="$KILL_ENVELOPE"
+    if [[ -z "$env" ]]; then
+        env=$(kill_find_envelope)
+    fi
+    if [[ -z "$env" || ! -f "$env" ]]; then
+        sk kill_no_envelope path "$env"
+        say_skip "no IOC envelope (looked at: ${env:-$KILL_ENVELOPE_DIR/*.json}; run sessionscribe-ioc-scan --full first or pass --envelope PATH)"
+        phase_set kill SKIPPED "no envelope"
+        return
+    fi
+    say_info "envelope: $env"
+
+    # Gate on host_verdict.
+    local hv
+    hv=$(kill_envelope_root_field "$env" host_verdict)
+    sk kill_gate envelope "$env" host_verdict "$hv"
+    if [[ "$hv" != "COMPROMISED" && $KILL_ANYWAY -eq 0 ]]; then
+        say_skip "host_verdict=$hv (need COMPROMISED, or pass --kill-anyway)"
+        phase_set kill SKIPPED "host_verdict=$hv"
+        return
+    fi
+    if [[ "$hv" != "COMPROMISED" ]]; then
+        say_warn "host_verdict=$hv but --kill-anyway is set (operator override)"
+    fi
+
+    # Phase needs BACKUP_DIR; create only on --apply.
+    if [[ "$MODE" == "apply" ]]; then
+        ensure_backup_dir || { phase_set kill FAIL "backup-dir create failed"; return; }
+    else
+        # In --check we still need a path for the manifest; use BACKUP_DIR
+        # under a deterministic-but-not-yet-created location.
+        mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    fi
+
+    local manifest="$BACKUP_DIR/kill-manifest.json"
+
+    # K1: build manifest.
+    if ! kill_build_manifest "$env" "$manifest"; then
+        sk kill_manifest_failed
+        say_fail "manifest build failed"
+        phase_set kill FAIL "manifest build failed"
+        return
+    fi
+    local files_planned ips_planned files_refused
+    files_planned=$(grep -oE '"files_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
+    ips_planned=$(grep -oE '"ips_planned":[0-9]+'   "$manifest" | head -1 | grep -oE '[0-9]+')
+    files_refused=$(grep -oE '"files_refused":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
+    say_info "manifest: $manifest (files=${files_planned:-0}, ips=${ips_planned:-0}, refused=${files_refused:-0})"
+
+    if [[ "$MODE" == "apply" ]]; then
+        # K3: file quarantine.
+        quarantine_from_manifest "$manifest" || true
+        # K4: csf -d per attacker IP.
+        apply_csf_blocks "$manifest" || true
+        # K5: rfxn blocklist register (mutates csf.conf + csf.blocklists).
+        register_rfxn_blocklist "$manifest" || true
+
+        # csf -ra reload if anything csf-related changed.
+        local sidecar="${manifest%.json}.actions.jsonl"
+        local need_reload=0
+        if [[ -f "$sidecar" ]]; then
+            if grep -qE '"kind":"ip","[^}]*"result":"ok"' "$sidecar"; then need_reload=1; fi
+            if grep -qE '"kind":"csf","[^}]*"result":"ok"' "$sidecar"; then need_reload=1; fi
+            if grep -qE '"kind":"csf","[^}]*"result":"created_new_file"' "$sidecar"; then need_reload=1; fi
+        fi
+        if (( need_reload )) && have_cmd csf; then
+            sk kill_csf_reload
+            if csf -ra >/dev/null 2>&1; then
+                say_action "csf -ra reloaded"
+            else
+                say_warn "csf -ra reload failed; review manually"
+            fi
+        fi
+    else
+        # K5 in check mode reports needs-apply but mutates nothing. Useful
+        # for dry-run reporting against the same manifest.
+        register_rfxn_blocklist "$manifest" || true
+    fi
+
+    # K6: finalize manifest + compute verdict.
+    finalize_manifest "$manifest" || {
+        say_fail "manifest finalize failed"
+        phase_set kill FAIL "finalize failed"
+        return
+    }
+
+    sk kill_summary manifest "$manifest" verdict "$LAST_KILL_VERDICT"
+    case "$LAST_KILL_VERDICT" in
+        ACTION)  say_action "$LAST_KILL_DETAIL" ;;
+        FAIL)    say_fail   "$LAST_KILL_DETAIL" ;;
+        WARN)    say_warn   "$LAST_KILL_DETAIL" ;;
+        OK|*)    say_pass   "$LAST_KILL_DETAIL" ;;
+    esac
+    phase_set kill "$LAST_KILL_VERDICT" "$LAST_KILL_DETAIL"
+}
+
 ###############################################################################
 # Output: summary, JSON envelope, CSV row
 ###############################################################################
@@ -3044,6 +3196,7 @@ run_phase() {
         modsec)     phase_modsec ;;
         sessions)   phase_sessions ;;
         probe)      phase_probe ;;
+        kill)       phase_kill ;;
     esac
 }
 
