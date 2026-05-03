@@ -20,3 +20,11 @@ watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py
 # operational detail. Patterns themselves stay in PATTERNS.md (mechanical
 # only); this file holds the attribution layer.
 INTERNAL-NOTES.md
+
+# Working collateral - planning docs, state snapshots, agent guidance.
+# Kept local; never publish. History was scrubbed of these patterns on
+# 2026-05-03; any reintroduction is unintentional.
+PLAN*
+STATE*
+CLAUDE*
+.rdf/
