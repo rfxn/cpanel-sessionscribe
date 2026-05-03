@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.7.0
+# sessionscribe-mitigate.sh v0.7.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -92,7 +92,7 @@
 
 set -u
 
-VERSION="0.7.0"
+VERSION="0.7.1"
 
 ###############################################################################
 # Constants
@@ -1126,9 +1126,19 @@ ssh_keys_prune() {
 
     sync "$tmp" 2>/dev/null || true
 
-    # Step 10: line-count verify of tmp before mv.
+    # Step 10: line-count verify of tmp before mv. Count any non-blank,
+    # non-comment line — the previous `grep -cE '^[^[:space:]#]'`
+    # excluded leading-whitespace key lines (rare but legal per
+    # sshd(8) AUTHORIZED_KEYS FILE FORMAT) and produced a spurious
+    # `prune_failed: tmp line-count 0 != expected 1` against files
+    # that contained indented keys.
     local tmp_keep_count
-    tmp_keep_count=$(grep -cE '^[^[:space:]#]' "$tmp" 2>/dev/null || true)
+    tmp_keep_count=$(awk '
+        /^[[:space:]]*$/    {next}
+        /^[[:space:]]*#/    {next}
+        {n++}
+        END {print n+0}
+    ' "$tmp" 2>/dev/null || true)
     tmp_keep_count="${tmp_keep_count:-0}"
     if (( tmp_keep_count != n_effective_kept )); then
         flock -u 200; exec 200>&-
@@ -1179,16 +1189,30 @@ ssh_keys_prune() {
         fi
     fi
 
-    # Step 14: write removed-keys JSONL sidecar.
+    # Step 14: write removed-keys JSONL sidecar. The class_tmp comment
+    # field ($4) is attacker-controlled (it's whatever they planted in
+    # the authorized_keys line), so a `"` or `\` in the comment would
+    # break the emitted JSON unless we escape. The main manifest emit
+    # site uses bash json_esc; here we emit inside an awk block, so
+    # define jesc() inline. Tabs/CR/LF cannot appear in $4 because the
+    # parser collapses [[:space:]]+ to a single space, leaving only `"`
+    # and `\` as real risks. Type/fingerprint are alphanumeric+dash+
+    # colon only, but pass them through jesc() defensively.
     local removed_sidecar="${backup_dest}.removed-keys"
     {
-        printf '# sessionscribe v0.7.0 ssh-key prune — removed keys for %s\n' "$path"
+        printf '# sessionscribe v0.7.1 ssh-key prune — removed keys for %s\n' "$path"
         printf '# run_id=%s ts=%s sha256_pre=%s sha256_post=%s\n' \
             "${RUN_ID:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sha_pre" "$sha_post"
-        awk -F'\t' '$1=="prune" {
-            printf "{\"line_no\":%s,\"type\":\"%s\",\"comment\":\"%s\",\"fingerprint\":\"%s\"}\n",
-                   $2, $3, $4, $5
-        }' "$class_tmp"
+        awk -F'\t' '
+            function jesc(s) {
+                gsub(/\\/, "\\\\", s)
+                gsub(/"/,  "\\\"", s)
+                return s
+            }
+            $1=="prune" {
+                printf "{\"line_no\":%s,\"type\":\"%s\",\"comment\":\"%s\",\"fingerprint\":\"%s\"}\n",
+                       $2, jesc($3), jesc($4), jesc($5)
+            }' "$class_tmp"
     } > "$removed_sidecar" 2>/dev/null || true
     KILL_LAST_PRUNE_SIDECAR="$removed_sidecar"
 
@@ -1216,11 +1240,17 @@ kill_sshkey_canonical_paths() {
     printf '%s/.ssh/authorized_keys\n'  "$root_home"
     printf '%s/.ssh/authorized_keys2\n' "$root_home"
     if [[ -d /home ]]; then
+        # -maxdepth 1 (NOT 2): canonical paths are at depth-1 only
+        # (/home/<user>/.ssh/authorized_keys). With -maxdepth 2, find
+        # also returned depth-2 subdirs (e.g. /home/<user>/sub) and the
+        # caller appended /.ssh/authorized_keys to those, producing
+        # non-canonical paths that polluted the supersede cache and
+        # triggered build-time misses.
         local h
         while IFS= read -r -d '' h; do
             printf '%s/.ssh/authorized_keys\n'  "$h"
             printf '%s/.ssh/authorized_keys2\n' "$h"
-        done < <(find /home -maxdepth 2 -mindepth 1 -type d -print0 2>/dev/null)
+        done < <(find /home -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
     fi
 }
 
@@ -5272,6 +5302,65 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         else
             _t_fail 44 "phase_kill drift gate" \
                 "no_override_v=$_v44a no_override_d='$_d44a' override_v=$_v44b override_d='$_d44b'"
+        fi
+
+        # Test 45 (v0.7.1 sentinel-fix A-02): attacker-controlled comment
+        # with `"` and `\` in it must round-trip through the JSONL sidecar
+        # as valid JSON. v0.7.0 emitted bare $4 in awk printf, producing
+        # `{"comment":"evil"with-quote",...}` which json.loads/jq reject.
+        MODE="apply"
+        _f45="$_t_dir/45.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil"with-quote and\\backslash\n'
+        } > "$_f45"
+        _b45="$_t_dir/45-backup/keys"
+        ssh_keys_prune "$_f45" "$KILL_SSH_TRUST_RE" "$_b45" "" >/dev/null 2>&1
+        _sidecar45="${_b45}.removed-keys"
+        # Strip metadata header lines (#-prefixed) and parse remainder as
+        # JSONL. Use python3 (universally available); jq is not.
+        _parse45_rc=1
+        if [[ -s "$_sidecar45" ]] && have_cmd python3; then
+            python3 -c '
+import json, sys
+ok = 0
+for line in open(sys.argv[1]):
+    if line.startswith("#") or not line.strip():
+        continue
+    obj = json.loads(line)
+    if obj.get("comment") == "evil\"with-quote and\\backslash":
+        ok = 1
+sys.exit(0 if ok else 1)
+' "$_sidecar45" >/dev/null 2>&1
+            _parse45_rc=$?
+        fi
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "pruned_ok" && "$_parse45_rc" == "0" ]]; then
+            _t_ok 45 "sidecar JSONL escapes attacker comment quote+backslash"
+        else
+            _t_fail 45 "sidecar JSONL escapes attacker comment quote+backslash" \
+                "result=$KILL_LAST_PRUNE_RESULT parse_rc=$_parse45_rc sidecar=$_sidecar45"
+        fi
+
+        # Test 46 (v0.7.1 sentinel-fix A-03): leading-whitespace key lines
+        # are legal per sshd(8) AUTHORIZED_KEYS FILE FORMAT. v0.7.0's
+        # `grep -cE '^[^[:space:]#]'` excluded them from the post-rewrite
+        # tmp line-count and produced a spurious prune_failed.
+        MODE="apply"
+        _f46="$_t_dir/46.keys"
+        {
+            printf '   ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f46"
+        _b46="$_t_dir/46-backup/keys"
+        ssh_keys_prune "$_f46" "$KILL_SSH_TRUST_RE" "$_b46" "" >/dev/null 2>&1
+        _kept46=$(grep -c 'Parent Child' "$_f46" 2>/dev/null)
+        _pruned46=$(grep -c 'evil@host' "$_f46" 2>/dev/null)
+        if [[ "$KILL_LAST_PRUNE_RESULT" == "pruned_ok" \
+              && "$_kept46" == "1" && "$_pruned46" == "0" ]]; then
+            _t_ok 46 "prune leading-whitespace key kept; attacker key removed"
+        else
+            _t_fail 46 "prune leading-whitespace key kept; attacker key removed" \
+                "result=$KILL_LAST_PRUNE_RESULT detail='$KILL_LAST_PRUNE_DETAIL' kept=$_kept46 pruned=$_pruned46"
         fi
 
         rm -rf "$_t_dir"

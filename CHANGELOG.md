@@ -4,6 +4,79 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.7.1 — 2026-05-03
+
+### Fixed
+- **`ssh_keys_prune`: sidecar `*.removed-keys` JSONL escapes attacker-
+  controlled comment field.** Step 14's awk `printf` wrote the comment
+  field (`$4` from `class_tmp`) verbatim, so an attacker-planted comment
+  containing `"` or `\` produced malformed JSON that `jq` and
+  `json.loads()` reject. The main `kill-manifest.json` already passes
+  every value through `json_esc()` at the bash level (line 1432); only
+  the per-file sidecar lacked escaping. Defeats chain-of-custody when
+  responder pipelines parse the sidecar.
+
+  Fix: inline awk `jesc()` function inside the JSONL emit block,
+  mirroring `json_esc()`'s `\\` then `\"` ordering. Tabs/CR/LF cannot
+  reach this field — the parser collapses `[[:space:]]+` to a single
+  space — so the two-substitution form is sufficient. Defensive: the
+  same `jesc()` is also applied to the keytype + fingerprint fields,
+  which are alphanumeric+colon+dash by construction but get the wrap
+  for free.
+
+  Regression: test 45 ('sidecar JSONL escapes attacker comment quote+
+  backslash') under `MITIGATE_LIBRARY_ONLY=1 MITIGATE_RUN_P1_TESTS=1`
+  plants a key with `"` and `\` in the comment, runs `ssh_keys_prune`
+  in apply mode, then asserts every JSONL record in the resulting
+  sidecar parses cleanly via `python3 -c 'import json; json.loads(...)'`
+  with the comment field round-tripping the original literal.
+
+- **`ssh_keys_prune`: leading-whitespace key lines counted in step-10
+  verify.** Step 10's `grep -cE '^[^[:space:]#]'` excluded indented key
+  lines from the post-rewrite tmp count. Indented authorized_keys
+  entries are rare but legal per `sshd(8)` AUTHORIZED_KEYS FILE FORMAT,
+  and the classifier preserves the original line bytes (including
+  leading whitespace) when emitting through `sed -n "${ln_no}p"`. So
+  a file that started with `   ssh-rsa AAAA Parent Child key for X`
+  was rewritten correctly but the verify said `tmp line-count 0 !=
+  expected 1`, returning `prune_failed` and triggering the operator-
+  visible `KILL_LAST_PRUNE_DETAIL` mismatch warning. Fail-safe (the
+  rewrite was already correct; the verify just lied).
+
+  Fix: replace `grep -cE` with an awk count that skips blank +
+  comment-only lines (under both leading-whitespace and unindented
+  shapes) and counts everything else.
+
+  Regression: test 46 ('prune leading-whitespace key kept; attacker
+  key removed') plants `   ssh-rsa AAAA Parent Child...\nssh-rsa BBBB
+  evil@host\n`, asserts `KILL_LAST_PRUNE_RESULT=pruned_ok` and that
+  the indented Parent-Child line survived while the attacker key was
+  removed.
+
+- **`kill_sshkey_canonical_paths`: `find -maxdepth 2` produced
+  non-canonical paths.** `find /home -maxdepth 2 -mindepth 1 -type d`
+  returns BOTH depth-1 user homes (`/home/<user>`) and depth-2
+  subdirs (`/home/<user>/<sub>`). Appending `/.ssh/authorized_keys`
+  to depth-2 subdirs produced paths like
+  `/home/<user>/<sub>/.ssh/authorized_keys` that are not the canonical
+  authorized_keys path. Mostly cosmetic — the build-time `[[ -f ]]`
+  skip filtered most non-existent paths — but the supersede check
+  (`kill_sshkey_path_canonical`) does an exact-match lookup, so a
+  Pattern G IOC at a depth-2 path could be misclassified. Mirrored
+  the same pattern in `sessionscribe-ioc-scan.sh`'s
+  `pattern_g_deep_checks` (separate v2.7.7 commit).
+
+  Fix: `-maxdepth 1` (depth-1 only). Trust-regex sync gate still
+  passes since the regex literal is unchanged.
+
+### Verification
+- 44/44 → 46/46 P1+P2+P3 unit tests pass under
+  `MITIGATE_LIBRARY_ONLY=1 MITIGATE_RUN_P1_TESTS=1`. Two regression
+  tests added: 45 (A-02 sidecar JSONL escape) + 46 (A-03 leading-
+  whitespace count).
+- bash 4.1.2 / gawk 3.1.7 floor preserved (no new `{n}` intervals,
+  no 3-arg `match`, no `flock -w`).
+
 ## sessionscribe-mitigate.sh v0.7.0 — 2026-05-03
 
 ### Added
