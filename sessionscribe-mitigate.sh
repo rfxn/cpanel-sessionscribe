@@ -827,6 +827,113 @@ kill_ip_action_record() {
     } >> "$sidecar"
 }
 
+# Append one CSF-action record to the sidecar JSONL.
+kill_csf_action_record() {
+    local sidecar="$1" key="$2" value="$3" result="$4"
+    {
+        printf '{"kind":"csf","key":"%s","value":"%s","result":"%s","ts":"%s"}\n' \
+            "$(json_esc "$key")" "$(json_esc "$value")" \
+            "$(json_esc "$result")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "$sidecar"
+}
+
+# Read a CSF config scalar (KEY = "value" form). Empty if absent. Mirrors
+# phase_csf's existing extraction shape (mitigate line 1156 pattern).
+kill_csf_conf_get() {
+    local conf="$1" key="$2"
+    [[ -f "$conf" ]] || return 0
+    grep -E "^${key}[[:space:]]*=" "$conf" | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/'
+}
+
+# Set a CSF config scalar in place via sed -i. Backs up first via
+# backup_file. Returns sed's rc.
+kill_csf_conf_set() {
+    local conf="$1" key="$2" value="$3"
+    [[ -f "$conf" ]] || return 1
+    backup_file "$conf"
+    sed -i -E "s|^(${key}[[:space:]]*=[[:space:]]*\")[^\"]*(\".*)$|\1${value}\2|" "$conf"
+}
+
+# Register the rfxn fleet blocklist as a CSF-managed ipset. Idempotent.
+# Verifies LF_IPSET=1 (flips to 1 on --apply if 0, warns in --check).
+# Optional 2nd arg: csf root dir (default /etc/csf) - used for testing.
+#
+# Side effects (only in --apply):
+#   - /etc/csf/csf.conf: LF_IPSET 0 -> 1 (with backup_file)
+#   - /etc/csf/csf.blocklists: append RFXN_FH_L2L3|86400|0|<url> (with backup)
+register_rfxn_blocklist() {
+    local manifest="$1"
+    local csf_dir="${2:-/etc/csf}"
+    [[ -n "$manifest" && -f "$manifest" ]] || return 1
+    local sidecar="${manifest%.json}.actions.jsonl"
+    local conf="$csf_dir/csf.conf"
+    local blocklists="$csf_dir/csf.blocklists"
+    local name="RFXN_FH_L2L3"
+    local url="https://cdn.rfxn.com/downloads/rfxn_fh-l2_l3_webserver.netset"
+    local entry="${name}|86400|0|${url}"
+
+    if [[ ! -f "$conf" ]]; then
+        kill_csf_action_record "$sidecar" "csf_present" "no" "csf_not_installed"
+        return 0
+    fi
+
+    # 1. LF_IPSET probe + flip if needed.
+    local cur_lf
+    cur_lf=$(kill_csf_conf_get "$conf" LF_IPSET)
+    if [[ "$cur_lf" == "0" ]]; then
+        if [[ "$MODE" == "apply" ]]; then
+            if kill_csf_conf_set "$conf" LF_IPSET 1; then
+                kill_csf_action_record "$sidecar" "LF_IPSET" "0->1" "ok"
+            else
+                kill_csf_action_record "$sidecar" "LF_IPSET" "0" "config_set_failed"
+                return 1
+            fi
+        else
+            kill_csf_action_record "$sidecar" "LF_IPSET" "0" "needs_apply_to_flip"
+        fi
+    elif [[ "$cur_lf" == "1" ]]; then
+        kill_csf_action_record "$sidecar" "LF_IPSET" "1" "already_enabled"
+    else
+        kill_csf_action_record "$sidecar" "LF_IPSET" "${cur_lf:-(absent)}" "missing_or_unexpected"
+    fi
+
+    # 2. LF_IPSET_MAXELEM (informational; default 65536 fits the netset's
+    # ~11,642 entries with 5x headroom).
+    local maxelem
+    maxelem=$(kill_csf_conf_get "$conf" LF_IPSET_MAXELEM)
+    kill_csf_action_record "$sidecar" "LF_IPSET_MAXELEM" "${maxelem:-default}" "noted"
+
+    # 3. csf.blocklists registration.
+    if [[ ! -f "$blocklists" ]]; then
+        if [[ "$MODE" == "apply" ]]; then
+            {
+                printf '# sessionscribe-managed entries\n'
+                printf '%s\n' "$entry"
+            } > "$blocklists"
+            chmod 0600 "$blocklists" 2>/dev/null
+            kill_csf_action_record "$sidecar" "blocklist_register" "$name" "created_new_file"
+        else
+            kill_csf_action_record "$sidecar" "blocklist_register" "$name" "needs_apply_to_create"
+        fi
+        return 0
+    fi
+
+    if grep -qE "^${name}\|" "$blocklists" 2>/dev/null; then
+        kill_csf_action_record "$sidecar" "blocklist_register" "$name" "already_registered"
+        return 0
+    fi
+
+    if [[ "$MODE" == "apply" ]]; then
+        backup_file "$blocklists"
+        printf '%s\n' "$entry" >> "$blocklists"
+        kill_csf_action_record "$sidecar" "blocklist_register" "$name" "ok"
+    else
+        kill_csf_action_record "$sidecar" "blocklist_register" "$name" "needs_apply_to_register"
+    fi
+
+    return 0
+}
+
 # Walk a manifest, csf -d every kind=ip action=csf-deny item. Skips
 # private/loopback/link-local/multicast IPs (envelope-injection guard).
 # Skips IPs already present in /etc/csf/csf.deny (idempotent re-runs).
