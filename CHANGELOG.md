@@ -4,6 +4,77 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.6.1 — 2026-05-02
+
+### Fixed
+- **`manifest.txt` and `kill-chain.jsonl` meta record now carry real values.**
+  `CPANEL_NORM`, `PRIMARY_IP`, `OS_PRETTY`, `LP_UID`, and their JSON-escaped
+  twins were declared empty at top-level with comments saying "set by
+  banner()" — but `banner()` only printed. Result: every bundle since the
+  meta record was added had empty `cpanel_version` / `primary_ip` / `os` /
+  `uid`. Fleet aggregation that read those fields silently lost ~100% of
+  host context. Added `collect_host_meta()` (data-only key=value parser
+  for `/etc/os-release` with double- and single-quote stripping; same
+  cpanel-V resolution chain as `check_version()`; `ip route get` →
+  `hostname -I` for primary IP; env-var override for `LP_UID`).
+- **`PATCHED_BUILDS_CPANEL` was declared empty and never populated.**
+  `phase_defense`'s patched-build for-loop walked a 0-element array on
+  every host, so no host could ever reach the PATCHED branch via the
+  build-equality check. Now populated from `PATCHED_TIERS_KEYS` /
+  `PATCHED_TIERS_VALS` at startup, producing strings of shape
+  `11.<tier>.0.<build>` that match `CPANEL_NORM`.
+- **`PATCHED_BUILD_WPSQUARED` was declared empty and never assigned.**
+  WP Squared hosts (build 136.1.7) could never match the equality test.
+  Now set to `"11.136.1.7"` per the source comment.
+- **`UNPATCHED_TIERS` was a scalar string iterated as an array.**
+  `for t in "${UNPATCHED_TIERS[@]}"` over `"112 114 116 120 122 128"`
+  iterated ONCE with `t` set to the entire string, so `[[ "$tier" == "$t" ]]`
+  never matched. Every UNPATCHABLE-tier host (112/114/116/120/122/128)
+  was misclassified as UNPATCHED in `phase_defense`. Converted to an
+  array; both `phase_defense` and `check_version` now use the same
+  substring-match idiom against the derived `UNPATCHED_TIERS_STR`.
+- **`LP_UID` env-var override was clobbered.** `LP_UID="${LP_UID:-}"`
+  inside `collect_host_meta` came AFTER the top-level `LP_UID=""` had
+  already wiped the inherited env. Changed top-level to
+  `: "${LP_UID:=}"` so `LP_UID=nx-prod-12 ./sessionscribe-ioc-scan ...`
+  at fleet dispatch survives the initialization.
+- **`/etc/os-release` parser was shell-injection-vulnerable.** Original
+  `eval "$(awk ... print "VAR="$2)"` interpolated raw values; a
+  `PRETTY_NAME="end"; touch /tmp/x; X="rest"` would execute the `touch`.
+  Trust boundary holds today (root-owned file), but a snapshot/offline
+  run could consume an attacker-influenced copy. Replaced with a
+  data-only `while IFS='=' read -r _k _v; do ... done` parser.
+- **`check_version()` and `collect_host_meta()` regex paths diverged.**
+  `check_version` was unanchored (`([0-9]{2,3})\.0...`) — input like
+  `"1234.0 (build 5)"` matched the trailing `234` via leftmost-not-
+  anchored bash regex. `collect_host_meta` was anchored. Both now use
+  `^[[:space:]]*(...)` and the `cpanel -V` read uses the same
+  `2>/dev/null | head -1 | tr -d '\r'` form so they produce identical
+  output on stderr-noisy hosts.
+
+### Removed
+- Dead `to_epoch()` and `extract_log_ts()` helpers (zero callers).
+- Orphan globals: `BUNDLE_TGZ`, `ENV_STRONG`, `ENV_FIXED`,
+  `ENV_INCONCLUSIVE`, `ENV_IOC_CRITICAL`, `ENV_IOC_REVIEW`. The latter
+  five were assigned by `read_envelope_meta`'s summary-block parser but
+  never read; the parser block was deleted with them.
+- `HOSTNAME_J` global — duplicated `HOSTNAME_JSON` (same json_esc'd
+  hostname, different consumers). Consolidated to `HOSTNAME_JSON`.
+
+### Changed
+- VERSION 2.5.0 → 2.6.1. Skipping 2.6.0 because the same fix landed on
+  the engineering branch under that label before the slop-cleanup
+  cycle expanded scope; 2.6.1 is the first published release.
+
+### Notes
+- The `version_detect` signal in `signals[]` was already populated
+  correctly pre-fix (it's emitted from local `tier`/`build` parsing
+  inside `check_version`, independent of the broken globals). For fleet
+  aggregation that needs cpanel version, query
+  `signals[].id == "version_detect" → version` as the authoritative
+  source. The `meta` record's `cpanel_version` field is now also
+  reliable as of v2.6.1.
+
 ## sessionscribe-ioc-scan.sh v2.5.0 — 2026-05-02
 
 ### Added

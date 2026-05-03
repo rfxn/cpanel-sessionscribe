@@ -109,7 +109,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.5.0"
+VERSION="2.6.1"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -122,7 +122,12 @@ PATCHED_TIERS_VALS=(41 97  63  35  54  19  29  20  5)
 # unavailable; hosts must be upgraded to a patched tier. Tier 124 was
 # in this list pre-advisory but was given an in-place patch (.35), so
 # is now moved into PATCHED_TIERS_KEYS above.
-UNPATCHED_TIERS="112 114 116 120 122 128"
+# Maintained as an array (UNPATCHED_TIERS) so adding/removing tiers stays a
+# one-token edit; the derived UNPATCHED_TIERS_STR is what both call sites
+# (phase_defense and check_version) actually consume via the same substring-
+# match idiom (` $UNPATCHED_TIERS_STR ` == *" $tier "*).
+UNPATCHED_TIERS=(112 114 116 120 122 128)
+UNPATCHED_TIERS_STR="${UNPATCHED_TIERS[*]}"
 
 # cpsrvd ACL machinery strings - present (>=8 unique) in patched cpsrvd,
 # absent (0) in vulnerable cpsrvd we examined.
@@ -320,9 +325,9 @@ INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
 # cap per token. For fleet use, supply --upload-token or RFXN_INTAKE_TOKEN.
 INTAKE_DEFAULT_TOKEN="cd88c9970c3176997c9671a2566fadc84904be0b73edd5e3b071452eade796e1"
 
-# cpanel build cutoff list (was forensic-side PATCHED_BUILDS_CPANEL).
-# Mirrors the list ioc-scan check_version already uses; declared here so
-# phase_defense can reuse one source of truth.
+# Sentinel file whose mtime phase_defense uses to estimate when a host
+# adopted the vendor cPanel patch (Load.pm is the file the patch rewrites).
+# Empty/missing canary => host has never been patched in-place.
 PATCH_CANARY_FILE="/usr/local/cpanel/Cpanel/Session/Load.pm"
 MITIGATE_BACKUP_ROOT="/var/cpanel/sessionscribe-mitigation"
 MODSEC_USER_CONFS=(
@@ -657,11 +662,6 @@ ENV_SCORE=""
 ENV_IOC_TOOL_VERSION=""
 ENV_IOC_RUN_ID=""
 ENV_IOC_TS=""
-ENV_STRONG=""
-ENV_FIXED=""
-ENV_INCONCLUSIVE=""
-ENV_IOC_CRITICAL=""
-ENV_IOC_REVIEW=""
 N_PRE=0                 # PRE-DEFENSE event count (set in phase_reconcile)
 N_POST=0                # POST-DEFENSE event count (set in phase_reconcile)
 N_DEF=0                 # defense-event count (informational, set at render time)
@@ -691,22 +691,35 @@ EXIT_CODE=0
 LOGS_CRLF_CHAIN_FIRST_EPOCH=0
 LOGS_2XX_CPSESS_FIRST_EPOCH=0
 
-# PATCHED_BUILDS_CPANEL / PATCHED_BUILD_WPSQUARED / CPANEL_NORM / PRIMARY_IP /
-# OS_PRETTY / LP_UID / INCIDENT_ID: referenced by write_kill_chain_primitives
-# and phase_defense. Set during main flow (check_version / banner / local_init);
-# declared here so forensic functions referencing them never see "unbound".
-PATCHED_BUILDS_CPANEL=()   # filled from PATCHED_TIERS_KEYS/VALS in main flow
-PATCHED_BUILD_WPSQUARED="" # WP Squared build cutoff (forensic-side compat shim)
-CPANEL_NORM=""             # normalised cPanel version string (e.g. 11.110.0.103)
-PRIMARY_IP=""              # primary outbound IP; set by banner()
-OS_PRETTY=""               # short OS description; set by banner()
-LP_UID=""                  # hosting provider UID; set by banner()
+# Host-meta globals consumed by phase_defense (CPANEL_NORM patch matching),
+# print_verdict (host/cpanel/os summary), phase_bundle (manifest.txt), and
+# write_kill_chain_primitives (meta record). Values are assigned by
+# collect_host_meta() in the main flow; declared empty here so any reference
+# before that assignment yields "" instead of "unbound" under set -u.
+# Earlier revisions documented these as `set by banner()` but banner() only
+# printed - manifest/meta fields rendered empty in every bundle until the
+# host-meta phase was added.
+#
+# LP_UID is the exception: declared with `:=` so an inherited environment
+# variable (`LP_UID=nx-prod-12 ./sessionscribe-ioc-scan ...`) survives this
+# initialization. A plain `LP_UID=""` would clobber the env-var before any
+# function had a chance to read it.
+PATCHED_BUILDS_CPANEL=()   # populated from PATCHED_TIERS_KEYS/VALS just below
+for _i in "${!PATCHED_TIERS_KEYS[@]}"; do
+    PATCHED_BUILDS_CPANEL+=("11.${PATCHED_TIERS_KEYS[$_i]}.0.${PATCHED_TIERS_VALS[$_i]}")
+done
+unset _i
+PATCHED_BUILD_WPSQUARED="11.136.1.7"  # WP Squared product line (separate
+                            # patch lineage; see comment at PATCHED_TIERS_KEYS)
+CPANEL_NORM=""             # normalised cPanel version "11.<tier>.0.<build>"
+PRIMARY_IP=""              # primary outbound IPv4 (ip-route-get probe)
+OS_PRETTY=""               # /etc/os-release PRETTY_NAME or redhat-release line
+: "${LP_UID:=}"            # hosting-provider UID; env-overridable, default ""
 INCIDENT_ID="IC-5790"      # dossier identifier baked into all forensic output
-HOSTNAME_J=""              # json_esc'd HOSTNAME_FQDN; set by banner()
-PRIMARY_IP_J=""            # json_esc'd PRIMARY_IP; set by banner()
-LP_UID_J=""                # json_esc'd LP_UID; set by banner()
-OS_J=""                    # json_esc'd OS_PRETTY; set by banner()
-CPV_J=""                   # json_esc'd CPANEL_NORM; set by banner()
+PRIMARY_IP_J=""            # json_esc'd PRIMARY_IP
+LP_UID_J=""                # json_esc'd LP_UID
+OS_J=""                    # json_esc'd OS_PRETTY
+CPV_J=""                   # json_esc'd CPANEL_NORM
 
 # Defense extraction outputs (set by phase_defense, read by phase_reconcile +
 # write_kill_chain_primitives). Empty = "defense state unknown".
@@ -719,7 +732,6 @@ PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 
 # Bundle output paths (set by phase_bundle, read by phase_upload).
 BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
-BUNDLE_TGZ=""           # tarball path (set when phase_upload prepares submission)
 
 ###############################################################################
 # Per-section verdict tracking
@@ -823,6 +835,99 @@ banner() {
     else
         printf ' lookback: unlimited (all retained logs/sessions)\n' >&2
     fi
+}
+
+# Populate host-meta globals (CPANEL_NORM / PRIMARY_IP / OS_PRETTY / LP_UID
+# and their *_J twins) read by phase_defense, print_verdict, phase_bundle's
+# manifest, and write_json's meta record. Called once from the main flow
+# after local_init() (so $CPANEL_ROOT is set) and before any phase that
+# consumes these globals or any envelope/manifest write.
+#
+# Resolution order for CPANEL_NORM mirrors check_version() so both yield
+# the same value from the same source. LP_UID has no canonical filesystem
+# source today; honor an `LP_UID` env-var override at fleet dispatch and
+# default to empty (envelope/manifest field stays empty when not applicable,
+# but is now operator-configurable, not silently never-assigned).
+collect_host_meta() {
+    # OS_PRETTY: /etc/os-release preferred; /etc/redhat-release fallback for
+    # EL6 hosts that predate os-release. Read with a data-only key=value
+    # parser (no eval, no `.` sourcing) so the file is treated as data even
+    # when it contains shell metachars like `$(...)` or backticks. /etc/os-
+    # release is root-owned so adversarial content shouldn't be reachable,
+    # but a snapshot/offline run may consume an attacker-influenced copy and
+    # we'd rather be safe by construction.
+    OS_PRETTY=""
+    if [[ -r /etc/os-release ]]; then
+        local _k="" _v="" _name=""
+        while IFS='=' read -r _k _v; do
+            # Strip surrounding double OR single quotes from the raw value.
+            # The os-release spec permits both; modern distros use double, but
+            # a snapshot-fed file may use either or none.
+            _v="${_v#\"}"; _v="${_v%\"}"
+            _v="${_v#\'}"; _v="${_v%\'}"
+            case "$_k" in
+                (PRETTY_NAME) OS_PRETTY="$_v" ;;
+                (NAME)        _name="$_v" ;;
+            esac
+        done < /etc/os-release
+        [[ -z "$OS_PRETTY" ]] && OS_PRETTY="$_name"
+    elif [[ -r /etc/redhat-release ]]; then
+        OS_PRETTY=$(head -1 /etc/redhat-release 2>/dev/null)
+    fi
+    [[ -z "$OS_PRETTY" ]] && OS_PRETTY="unknown"
+
+    # CPANEL_NORM: same four-source resolution chain check_version() walks.
+    # Two raw shapes accepted:
+    #   "110.0 (build 97)"   -> 11.110.0.97
+    #   "11.110.0.97"        -> 11.110.0.97 (already normalized)
+    # Bash `=~` uses libc POSIX ERE - `{2,3}` interval expressions are safe
+    # (only awk regexes need the gawk-3.x-safe rewrite per project floor).
+    local _root="${CPANEL_ROOT:-/usr/local/cpanel}" _raw=""
+    CPANEL_NORM=""
+    if [[ -n "${VERSION_OVERRIDE:-}" ]]; then
+        _raw="$VERSION_OVERRIDE"
+    elif [[ -x "${_root}/cpanel" ]]; then
+        _raw=$("${_root}/cpanel" -V 2>/dev/null | head -1 | tr -d '\r')
+    elif [[ -f "${_root}/version" ]]; then
+        _raw=$(< "${_root}/version")
+    elif [[ -f "${_root}/../meta/cpanel-version-raw.txt" ]]; then
+        _raw=$(< "${_root}/../meta/cpanel-version-raw.txt")
+    fi
+    # Anchor to start-of-string (skipping leading whitespace) so a tier with
+    # >3 digits doesn't match its trailing 2-3 digits via leftmost-not-anchored
+    # bash regex behavior (e.g. "1234.0 (build 5)" -> 11.234.0.5).
+    if [[ "$_raw" =~ ^[[:space:]]*([0-9]{2,3})\.0[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
+        CPANEL_NORM="11.${BASH_REMATCH[1]}.0.${BASH_REMATCH[2]}"
+    elif [[ "$_raw" =~ ^[[:space:]]*(11\.)?([0-9]{2,3})\.0\.([0-9]+) ]]; then
+        CPANEL_NORM="11.${BASH_REMATCH[2]}.0.${BASH_REMATCH[3]}"
+    fi
+    [[ -z "$CPANEL_NORM" ]] && CPANEL_NORM="unknown"
+
+    # PRIMARY_IP: source IP the kernel would use to reach the public, without
+    # sending any traffic. `ip route get` is preferred; `hostname -I` is the
+    # net-tools fallback (first token = primary). 1.1.1.1 picks the default
+    # route; on hosts with no default route both probes return empty.
+    PRIMARY_IP=""
+    if command -v ip >/dev/null 2>&1; then
+        PRIMARY_IP=$(ip -4 route get 1.1.1.1 2>/dev/null \
+            | awk '{ for (i=1;i<=NF;i++) if ($i=="src") { print $(i+1); exit } }')
+    fi
+    if [[ -z "$PRIMARY_IP" ]]; then
+        PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    [[ -z "$PRIMARY_IP" ]] && PRIMARY_IP="unknown"
+
+    # LP_UID is the hosting-provider tag. No filesystem source defined today;
+    # operators set it via the LP_UID env-var at fleet dispatch time. The
+    # top-level `: "${LP_UID:=}"` declaration preserves an inherited env-var
+    # so we don't reassign it here - if the env was set, it's already in
+    # LP_UID; if unset, top-level defaulted it to "".
+
+    # JSON-escaped variants used by the meta record at write_kill_chain_primitives.
+    PRIMARY_IP_J=$(json_esc "$PRIMARY_IP")
+    OS_J=$(json_esc "$OS_PRETTY")
+    CPV_J=$(json_esc "$CPANEL_NORM")
+    LP_UID_J=$(json_esc "$LP_UID")
 }
 
 ###############################################################################
@@ -1037,38 +1142,6 @@ emit_signal() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Verbatim from forensic. Handles cpanel MM/DD/YYYY:HH:MM:SS
-# bracket form AND apache CLF DD/Mon/YYYY:HH:MM:SS bracket form. Returns
-# epoch seconds (or empty string on failure).
-to_epoch() {
-    local s="$1"
-    [[ -z "$s" ]] && { echo ""; return; }
-    # Strip surrounding [] if present.
-    s="${s#[}"; s="${s%]}"
-    # Apache CLF: 30/Apr/2026:09:30:50 +0000 -> 30 Apr 2026 09:30:50 +0000
-    if [[ "$s" =~ ^[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}: ]]; then
-        s=$(echo "$s" | sed -E 's|^([0-9]{1,2})/([A-Za-z]{3})/([0-9]{4}):([0-9:]+)([[:space:]]+(.*))?$|\1 \2 \3 \4\5|')
-        date -u -d "$s" +%s 2>/dev/null
-        return
-    fi
-    # cpanel: 04/30/2026:09:30:50 -0500. date(1) won't parse MM/DD/YYYY-
-    # with the colon separator; rebuild as "YYYY-MM-DD HH:MM:SS TZ".
-    if [[ "$s" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4}):([0-9:]+)([[:space:]]+([+-][0-9]{4}))?$ ]]; then
-        local mm="${BASH_REMATCH[1]}" dd="${BASH_REMATCH[2]}" yyyy="${BASH_REMATCH[3]}"
-        local hms="${BASH_REMATCH[4]}" tz="${BASH_REMATCH[6]:-+0000}"
-        date -u -d "${yyyy}-${mm}-${dd} ${hms} ${tz}" +%s 2>/dev/null
-        return
-    fi
-    date -u -d "$s" +%s 2>/dev/null
-}
-
-extract_log_ts() {
-    local line="$1" m
-    m=$(grep -oE '\[[0-9]{2}/[0-9]{2}/[0-9]{4}:[0-9:]+( [+-][0-9]{4})?\]' <<< "$line" | head -1)
-    [[ -z "$m" ]] && m=$(grep -oE '\[[0-9]{1,2}/[A-Za-z]{3}/[0-9]{4}:[0-9:]+( [+-][0-9]{4})?\]' <<< "$line" | head -1)
-    echo "$m"
-}
-
 mtime_of() {
     local f="$1"
     [[ -e "$f" ]] || { echo ""; return; }
@@ -1208,16 +1281,6 @@ read_envelope_meta() {
     ENV_IOC_TOOL_VERSION=$(envelope_root_field "$env" tool_version)
     ENV_IOC_RUN_ID=$(envelope_root_field "$env" run_id)
     ENV_IOC_TS=$(envelope_root_field "$env" ts)
-    # summary block lives on a single line: "summary": {"strong":N,...},
-    local summary
-    summary=$(grep -E '^[[:space:]]+"summary":' "$env" 2>/dev/null | head -1)
-    if [[ -n "$summary" ]]; then
-        ENV_STRONG=$(echo "$summary"        | grep -oE '"strong":[0-9]+'        | cut -d: -f2)
-        ENV_FIXED=$(echo "$summary"         | grep -oE '"fixed":[0-9]+'         | cut -d: -f2)
-        ENV_INCONCLUSIVE=$(echo "$summary"  | grep -oE '"inconclusive":[0-9]+'  | cut -d: -f2)
-        ENV_IOC_CRITICAL=$(echo "$summary"  | grep -oE '"ioc_critical":[0-9]+'  | cut -d: -f2)
-        ENV_IOC_REVIEW=$(echo "$summary"    | grep -oE '"ioc_review":[0-9]+'    | cut -d: -f2)
-    fi
 }
 
 ioc_primitive_row() {
@@ -1531,10 +1594,8 @@ phase_defense() {
             # released a patch for, or one of the no-in-place-patch tiers?
             local tier
             tier=$(echo "$CPANEL_NORM" | awk -F. '{print $2}')
-            local is_unpatchable=0 t
-            for t in "${UNPATCHED_TIERS[@]}"; do
-                [[ "$tier" == "$t" ]] && is_unpatchable=1
-            done
+            local is_unpatchable=0
+            [[ " $UNPATCHED_TIERS_STR " == *" $tier "* ]] && is_unpatchable=1
             if (( is_unpatchable )); then
                 PATCH_STATE="UNPATCHABLE"
                 say_def_miss "cpanel tier $tier has NO in-place patch - upgrade major series or migrate"
@@ -2597,7 +2658,7 @@ write_kill_chain_primitives() {
     # (v3). _schema_changes in meta lets consumers auto-detect the rename.
     {
         printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":3,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
-            "${HOSTNAME_J:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
+            "${HOSTNAME_JSON:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
             "$VERSION" "${INCIDENT_ID:-}" "$RUN_ID" \
             "$(json_esc "${ENV_IOC_RUN_ID:-}")" "$(json_esc "${ENV_IOC_TOOL_VERSION:-}")" "$(json_esc "${ENV_IOC_TS:-}")" \
             "$(json_esc "${ENV_HOST_VERDICT:-}")" "$(json_esc "${ENV_CODE_VERDICT:-}")" "$(json_esc "${ENV_SCORE:-}")" \
@@ -3211,7 +3272,12 @@ check_version() {
     if [[ -n "$VERSION_OVERRIDE" ]]; then
         raw="$VERSION_OVERRIDE"
     elif [[ -x "${CPANEL_ROOT}/cpanel" ]]; then
-        raw=$("${CPANEL_ROOT}/cpanel" -V 2>&1 | head -1)
+        # Discard stderr (perl deprecation noise can precede the version line
+        # on some cpanel builds) and strip CR so a CRLF-translated pipe
+        # doesn't leave \r inside the captured build digits. Matches the
+        # read form in collect_host_meta() so both paths produce identical
+        # raw strings on the same host.
+        raw=$("${CPANEL_ROOT}/cpanel" -V 2>/dev/null | head -1 | tr -d '\r')
     elif [[ -f "${CPANEL_ROOT}/version" ]]; then
         raw=$(< "${CPANEL_ROOT}/version")
     elif [[ -f "${CPANEL_ROOT}/../meta/cpanel-version-raw.txt" ]]; then
@@ -3223,10 +3289,14 @@ check_version() {
         return
     fi
 
+    # Anchored to start-of-string (skipping leading whitespace) so a stray
+    # 4+ digit prefix doesn't match its trailing 2-3 digits via leftmost-not-
+    # anchored bash regex behavior. Mirrors collect_host_meta() so both
+    # functions yield the same value from the same source.
     local tier="" build=""
-    if [[ "$raw" =~ ([0-9]{2,3})\.0[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
+    if [[ "$raw" =~ ^[[:space:]]*([0-9]{2,3})\.0[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
         tier="${BASH_REMATCH[1]}"; build="${BASH_REMATCH[2]}"
-    elif [[ "$raw" =~ (11\.)?([0-9]{2,3})\.0\.([0-9]+) ]]; then
+    elif [[ "$raw" =~ ^[[:space:]]*(11\.)?([0-9]{2,3})\.0\.([0-9]+) ]]; then
         tier="${BASH_REMATCH[2]}"; build="${BASH_REMATCH[3]}"
     fi
 
@@ -3245,7 +3315,7 @@ check_version() {
              "tier" "$tier" "note" "Pre-LTS - no vendor patch will be issued. Migrate or decommission."
         return
     fi
-    if [[ " $UNPATCHED_TIERS " == *" $tier "* ]]; then
+    if [[ " $UNPATCHED_TIERS_STR " == *" $tier "* ]]; then
         emit "version" "tier_class" "strong" "vulnerable_no_vendor_patch" 5 \
              "tier" "$tier" \
              "note" "Tier excluded from vendor patch list. In-place patch unavailable - must upgrade tier."
@@ -5939,6 +6009,7 @@ if (( ! REPLAY_MODE )); then
     banner
 
     local_init
+    collect_host_meta
     if (( IOC_ONLY )); then
         hdr_section "ioc-only" "code-state checks skipped"
     else
