@@ -840,10 +840,10 @@ phase_patch() {
 repo_is_healthy() {
     local r="$1"
     if have_cmd dnf; then
-        dnf -q -y --disablerepo='*' --enablerepo="$r" makecache --refresh \
+        timeout 5m dnf -q -y --disablerepo='*' --enablerepo="$r" makecache --refresh \
             >/dev/null 2>&1
     elif have_cmd yum; then
-        yum -q -y --disablerepo='*' --enablerepo="$r" makecache fast \
+        timeout 5m yum -q -y --disablerepo='*' --enablerepo="$r" makecache fast \
             >/dev/null 2>&1
     else
         return 0  # no pkg manager - assume healthy (can't tell)
@@ -906,15 +906,15 @@ phase_preflight() {
 
     # 2b: epel-release installed.
     sk epel
-    if rpm -q epel-release >/dev/null 2>&1; then
+    if timeout 5m rpm -q epel-release >/dev/null 2>&1; then
         say_pass "epel-release installed"
     else
         if [[ "$MODE" == "apply" ]]; then
             local pkg_ok=0
             if have_cmd dnf; then
-                dnf install -y epel-release >/dev/null 2>&1 && pkg_ok=1
+                timeout 5m dnf install -y epel-release >/dev/null 2>&1 && pkg_ok=1
             elif have_cmd yum; then
-                yum install -y epel-release >/dev/null 2>&1 && pkg_ok=1
+                timeout 5m yum install -y epel-release >/dev/null 2>&1 && pkg_ok=1
             fi
             if (( pkg_ok )); then
                 say_action "installed epel-release"
@@ -934,13 +934,13 @@ phase_preflight() {
     # Leaves packages/, dbcache/, and downloaded RPMs intact (vs `clean all`).
     sk repo_clean
     if have_cmd dnf; then
-        if dnf clean metadata >/dev/null 2>&1; then
+        if timeout 5m dnf clean metadata >/dev/null 2>&1; then
             say_info "dnf clean metadata (cached repodata invalidated)"
         else
             say_warn "dnf clean metadata failed; sweep may use stale cache"
         fi
     elif have_cmd yum; then
-        if yum clean metadata >/dev/null 2>&1; then
+        if timeout 5m yum clean metadata >/dev/null 2>&1; then
             say_info "yum clean metadata (cached repodata invalidated)"
         else
             say_warn "yum clean metadata failed; sweep may use stale cache"
@@ -951,7 +951,7 @@ phase_preflight() {
     sk repo_sweep
     if have_cmd dnf; then
         local enabled_repos r
-        enabled_repos=$(dnf repolist --enabled -q 2>/dev/null \
+        enabled_repos=$(timeout 5m dnf repolist --enabled -q 2>/dev/null \
                         | awk 'NR>1 && $1 != "" {print $1}')
         if [[ -z "$enabled_repos" ]]; then
             say_skip "no enabled repos enumerated by dnf"
@@ -967,7 +967,7 @@ phase_preflight() {
                         warns=$((warns+1))
                     else
                         if [[ "$MODE" == "apply" ]]; then
-                            if dnf config-manager --set-disabled "$r" \
+                            if timeout 5m dnf config-manager --set-disabled "$r" \
                                     >/dev/null 2>&1; then
                                 say_action "disabled broken repo: $r"
                                 actions=$((actions+1))
