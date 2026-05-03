@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.2
+# sessionscribe-ioc-scan.sh v2.7.3
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.2"
+VERSION="2.7.3"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -4815,12 +4815,17 @@ check_pattern_j_persistence() {
 
         # FP gate: not RPM-owned. In snapshot mode skip ownership check
         # (no rpmdb) and always demote tier by one notch.
+        # bash 4.1 (CL6/EL6) + set -u trips 'unbound variable' on
+        # ${arr[@]} for any declared-but-empty array; guard each
+        # dereference with a length check.
         local _strong_unowned=() _warn_unowned=()
         if (( snapshot_mode )); then
-            _strong_unowned=("${_hit_shape_strong[@]}")
-            _warn_unowned=("${_hit_shape_warn[@]}")
+            (( ${#_hit_shape_strong[@]} > 0 )) && _strong_unowned=("${_hit_shape_strong[@]}")
+            (( ${#_hit_shape_warn[@]}   > 0 )) && _warn_unowned=("${_hit_shape_warn[@]}")
         else
-            local _all=("${_hit_shape_strong[@]}" "${_hit_shape_warn[@]}")
+            local _all=()
+            (( ${#_hit_shape_strong[@]} > 0 )) && _all+=("${_hit_shape_strong[@]}")
+            (( ${#_hit_shape_warn[@]}   > 0 )) && _all+=("${_hit_shape_warn[@]}")
             local _own_lines=""
             if (( ${#_all[@]} > 0 )); then
                 _own_lines=$(bulk_rpm_owned_filter "${_all[@]}")
@@ -4830,7 +4835,12 @@ check_pattern_j_persistence() {
                 [[ -z "$_path" ]] && continue
                 # rc=0 owned, rc=1 not_owned, rc=2 no_probe (treat as warn)
                 if [[ "$_rc" == "1" || "$_rc" == "2" ]]; then
-                    if printf '%s\n' "${_hit_shape_strong[@]}" | grep -qxF "$_path"; then
+                    local _is_strong=0
+                    if (( ${#_hit_shape_strong[@]} > 0 )) \
+                       && printf '%s\n' "${_hit_shape_strong[@]}" | grep -qxF "$_path"; then
+                        _is_strong=1
+                    fi
+                    if (( _is_strong )); then
                         _strong_unowned+=("$_path")
                     else
                         _warn_unowned+=("$_path")
@@ -4839,30 +4849,34 @@ check_pattern_j_persistence() {
             done <<< "$_own_lines"
         fi
 
-        for f in "${_strong_unowned[@]}"; do
-            local _mtime _run_line
-            _mtime=$(stat -c %Y "$f" 2>/dev/null)
-            _run_line=$(grep -m1 -E 'RUN[+=]+=.*sh -c.*\|[[:space:]]*at[[:space:]]+now\b' "$f" 2>/dev/null)
-            local _sev=strong _wt=10 _conf=""
-            if (( snapshot_mode )); then
-                _sev=info; _wt=2; _conf="degraded_confidence_snapshot=1; "
-            fi
-            emit "destruction" "ioc_pattern_j_udev_run" "$_sev" \
-                 "ioc_pattern_j_udev_run_at_now" "$_wt" \
-                 "path" "$f" "mtime_epoch" "${_mtime:-0}" \
-                 "sample" "${_run_line:0:300}" \
-                 "note" "${_conf}Pattern J1 udev rule at $f backgrounds shell via 'at now' and is not package-owned (CRITICAL)."
-            ((hits++))
-        done
-        for f in "${_warn_unowned[@]}"; do
-            local _mtime
-            _mtime=$(stat -c %Y "$f" 2>/dev/null)
-            emit "destruction" "ioc_pattern_j_udev_async" "warning" \
-                 "ioc_pattern_j_udev_async_run" 4 \
-                 "path" "$f" "mtime_epoch" "${_mtime:-0}" \
-                 "note" "Pattern J1 candidate: udev rule at $f backgrounds shell (nohup/setsid/disown) and is not package-owned (REVIEW)."
-            ((hits++))
-        done
+        if (( ${#_strong_unowned[@]} > 0 )); then
+            for f in "${_strong_unowned[@]}"; do
+                local _mtime _run_line
+                _mtime=$(stat -c %Y "$f" 2>/dev/null)
+                _run_line=$(grep -m1 -E 'RUN[+=]+=.*sh -c.*\|[[:space:]]*at[[:space:]]+now\b' "$f" 2>/dev/null)
+                local _sev=strong _wt=10 _conf=""
+                if (( snapshot_mode )); then
+                    _sev=info; _wt=2; _conf="degraded_confidence_snapshot=1; "
+                fi
+                emit "destruction" "ioc_pattern_j_udev_run" "$_sev" \
+                     "ioc_pattern_j_udev_run_at_now" "$_wt" \
+                     "path" "$f" "mtime_epoch" "${_mtime:-0}" \
+                     "sample" "${_run_line:0:300}" \
+                     "note" "${_conf}Pattern J1 udev rule at $f backgrounds shell via 'at now' and is not package-owned (CRITICAL)."
+                ((hits++))
+            done
+        fi
+        if (( ${#_warn_unowned[@]} > 0 )); then
+            for f in "${_warn_unowned[@]}"; do
+                local _mtime
+                _mtime=$(stat -c %Y "$f" 2>/dev/null)
+                emit "destruction" "ioc_pattern_j_udev_async" "warning" \
+                     "ioc_pattern_j_udev_async_run" 4 \
+                     "path" "$f" "mtime_epoch" "${_mtime:-0}" \
+                     "note" "Pattern J1 candidate: udev rule at $f backgrounds shell (nohup/setsid/disown) and is not package-owned (REVIEW)."
+                ((hits++))
+            done
+        fi
     fi
 
     # ---- J2: systemd units with non-allowlisted ExecStart ----------------
@@ -4916,6 +4930,7 @@ check_pattern_j_persistence() {
             fi
 
             local f
+            if (( ${#_unit_unowned[@]} > 0 )); then
             for f in "${_unit_unowned[@]}"; do
                 local _mtime _exec_path _desc _now _age _is_recent=0
                 _mtime=$(stat -c %Y "$f" 2>/dev/null)
@@ -4959,6 +4974,7 @@ check_pattern_j_persistence() {
                      "note" "Pattern J2 systemd unit at $f - non-allowlist ExecStart=$_exec_path and not package-owned."
                 ((hits++))
             done
+            fi
         fi
     fi
 
