@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.6.0
+# sessionscribe-mitigate.sh v0.6.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -92,7 +92,7 @@
 
 set -u
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 
 ###############################################################################
 # Constants
@@ -666,6 +666,48 @@ kill_action_for_pattern() {
     esac
 }
 
+# Pure-bash absolute-path normalizer. Collapses /./ and /../ segments
+# without touching the filesystem; needed when neither realpath -m nor
+# readlink -m is available (EL6 coreutils 8.4) AND the path's parent
+# directories may not exist (a traversal probe like
+# /home/foo/../../etc/shadow where /home/foo is absent makes
+# `readlink -f` return empty). Returns 1 on relative input or on
+# above-root traversal (e.g. /../etc -> error). bash 4.1 / set -u safe.
+kill_normalize_abs_path() {
+    local input="$1" segment out p
+    local -a parts=()
+    [[ -n "$input" ]] || return 1
+    [[ "$input" == /* ]] || return 1
+    local IFS=/
+    # shellcheck disable=SC2206  # word-splitting on / is intentional
+    local raw=( $input )
+    # Guard empty-array iteration under set -u + bash 4.1.
+    if (( ${#raw[@]} > 0 )); then
+        for segment in "${raw[@]}"; do
+            case "$segment" in
+                (""|".") continue ;;
+                ("..")
+                    if (( ${#parts[@]} > 0 )); then
+                        unset 'parts[${#parts[@]}-1]'
+                    else
+                        return 1
+                    fi
+                    ;;
+                (*) parts+=("$segment") ;;
+            esac
+        done
+    fi
+    out=""
+    if (( ${#parts[@]} > 0 )); then
+        for p in "${parts[@]}"; do
+            out+="/$p"
+        done
+    else
+        out="/"
+    fi
+    printf '%s' "$out"
+}
+
 # Path-allowlist gate. Refuses any path outside the documented allowlist
 # of mutable roots; protects against (a) malformed envelopes, (b) path
 # traversal from a compromised ioc-scan, (c) operator misconfiguration.
@@ -680,25 +722,47 @@ kill_action_for_pattern() {
 #   /var/spool/cron/                    user crontabs
 #   /usr/local/cpanel/var/              cPanel reseller token files (Pattern D)
 #
-# Shape probes:
-#   - Path must be absolute (envelope contract; relative is operator error)
-#   - No control chars (NUL, newline, tab, etc.) - envelope-injection guard
-#   - realpath -m resolves symlinks + .. components; falls back to readlink -f
-#     on hosts where realpath is absent (EL6 coreutils 8.4 has both, but
-#     keep the fallback for cross-distro defensiveness).
+# Shape probes (envelope-injection defense):
+#   - Path must be absolute (envelope contract; relative is operator
+#     error).
+#   - No control chars (NUL, newline, tab, ESC).
+#   - No `..` segments. The IOC scanner writes paths absolute + already
+#     normalized at source; any `..` here is intent-hidden traversal
+#     (operator misconfig or compromised upstream). Refusing on
+#     presence is stricter than collapse-then-match, because a path
+#     like /home/x/../etc/shadow would collapse to /home/etc/shadow
+#     and slip past the case below.
+#
+# Resolution chain (after shape probes pass): prefer `realpath -m`
+# (handles symlinks + non-existent paths), fall back to `readlink -f`
+# (handles symlinks but needs every intermediate dir to exist), fall
+# back to the pure-bash normalizer (no symlink resolution, but
+# collapses /. and absorbs an absolute-path no-op). `realpath -m` is
+# coreutils 8.15+; the EL6 floor (coreutils 8.4) may have realpath
+# without `-m` OR no realpath at all - probe before relying on -m so
+# we don't fail-open on every path with a misleading "invalid option".
 kill_path_in_allowlist() {
-    local path="$1" resolved
+    local path="$1" resolved=""
     [[ -n "$path" ]] || return 1
     [[ "$path" == /* ]] || return 1
     [[ "$path" =~ [[:cntrl:]] ]] && return 1
+    # Refuse any path containing a `..` segment outright. The envelope
+    # writes IOC paths absolute + normalized at source; any `..` in a
+    # path here is intent-hidden traversal (operator misconfiguration
+    # or compromised upstream). Match leading "../", embedded "/../",
+    # and trailing "/..".
+    case "$path" in
+        (*/../*|*/..) return 1 ;;
+    esac
 
-    if have_cmd realpath; then
-        resolved=$(realpath -m "$path" 2>/dev/null) || return 1
-    elif have_cmd readlink; then
+    if have_cmd realpath && realpath -m / >/dev/null 2>&1; then
+        resolved=$(realpath -m "$path" 2>/dev/null)
+    fi
+    if [[ -z "$resolved" ]] && have_cmd readlink; then
         resolved=$(readlink -f "$path" 2>/dev/null)
-        [[ -z "$resolved" ]] && resolved="$path"
-    else
-        resolved="$path"
+    fi
+    if [[ -z "$resolved" ]]; then
+        resolved=$(kill_normalize_abs_path "$path") || return 1
     fi
     [[ -n "$resolved" ]] || return 1
     [[ "$resolved" == /* ]] || return 1
@@ -1226,7 +1290,6 @@ finalize_manifest() {
                 if (n < 4) continue
                 lkind = a[1]; lkey = a[2]; field = a[3]; value = a[4]
                 store[lkind, lkey, field] = value
-                if (lkind == "csf") csf_keys[lkey] = 1
             }
             close(lookup)
 
@@ -1265,13 +1328,16 @@ finalize_manifest() {
                                             next }
         /^  \},$/ && in_csf               { in_csf = 0; print; next }
         /^  "summary":\{$/                { in_summary = 1
-                                            files_planned_str = lookup_summary_orig("files_planned")
-                                            ips_planned_str = lookup_summary_orig("ips_planned")
-                                            files_refused_str = lookup_summary_orig("files_refused")
                                             print
-                                            printf "    \"files_planned\":%s,\n",  files_planned_str
-                                            printf "    \"ips_planned\":%s,\n",    ips_planned_str
-                                            printf "    \"files_refused\":%s,\n",  files_refused_str
+                                            # files_planned / ips_planned / files_refused
+                                            # are emitted as "0" placeholders here; the
+                                            # sed pass after awk re-extracts the real K1
+                                            # values from the source manifest and patches
+                                            # them in. Source of truth = the original
+                                            # summary block on disk.
+                                            printf "    \"files_planned\":0,\n"
+                                            printf "    \"ips_planned\":0,\n"
+                                            printf "    \"files_refused\":0,\n"
                                             printf "    \"files_quarantined\":%d,\n", files_q
                                             printf "    \"files_failed\":%d,\n",      files_f
                                             printf "    \"files_gone\":%d,\n",        files_g
@@ -1357,13 +1423,6 @@ finalize_manifest() {
             if (j == 0) return ""
             return substr(rest, 1, j - 1)
         }
-        function lookup_summary_orig(field) {
-            # Read the existing summary value from the manifest (passed via
-            # global ORIG_SUMMARY[]). Fallback "0" when absent.
-            v = ORIG_SUMMARY[field]
-            if (v == "") return "0"
-            return v
-        }
         function csf_registered_value() {
             br = store["csf", "blocklist_register", "result"]
             if (br == "ok" || br == "created_new_file" || br == "already_registered") return "true"
@@ -1380,11 +1439,12 @@ finalize_manifest() {
         }
     ' "$manifest" > "$tmp" || { rm -f "$tmp" "$lookup"; return 1; }
 
-    # Preserve the original summary file_planned/ips_planned/files_refused
-    # values from the source manifest (K1 wrote them; K6 re-emits them).
-    # awk handled it via the in_summary block above by reading them via
-    # json_str() before re-emitting - but we need a pre-pass to seed
-    # ORIG_SUMMARY[]. Simpler: re-extract here and patch.
+    # Source of truth for files_planned / ips_planned / files_refused is
+    # the original "summary":{} block written by K1. The awk pass above
+    # emits "0" placeholders for these three keys (because the summary
+    # block sits at the end of the manifest, awk has already re-emitted
+    # its replacement before the original lines arrive). Re-extract the
+    # K1 values from the on-disk manifest and patch the placeholders.
     local fp ip_p fr
     fp=$(grep -oE '"files_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
     ip_p=$(grep -oE '"ips_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')

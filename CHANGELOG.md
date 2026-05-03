@@ -4,6 +4,53 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.6.1 — 2026-05-03
+
+### Fixed
+- **`kill_path_in_allowlist`: path-traversal bypass on EL6 floor.** Two
+  cascading coreutils-8.4 issues let the allowlist fail-open on
+  non-existent traversal paths:
+  1. `realpath -m` is coreutils 8.15+. EL6 ships 8.4. On hosts where a
+     third-party `realpath` exists *without* `-m`, `have_cmd realpath`
+     returned 0 and `realpath -m` errored "invalid option" - the
+     surrounding `2>/dev/null || return 1` then refused **every** path,
+     making `phase_kill` a silent no-op.
+  2. The `readlink -f` fallback requires every intermediate path
+     component to exist. For traversal probes such as
+     `/home/foo/../../etc/shadow` (where `/home/foo` is absent),
+     `readlink -f` returned empty; the fallback kept the unresolved
+     string, the `case` statement matched `/home/*`, and the allowlist
+     was bypassed.
+
+  Fix: three-part defense.
+  - **Refuse on `..` presence** (new shape probe). The IOC scanner
+    writes paths absolute + already normalized at source; any `..` in
+    a path reaching `kill_path_in_allowlist` is intent-hidden
+    traversal. Reject before resolution. Stricter than collapse-then-
+    match (`/home/x/../etc/shadow` would collapse to
+    `/home/etc/shadow` and slip past the `case` on `/home/*`).
+  - **Probe `realpath -m`** with a `realpath -m / >/dev/null` smoke
+    test before relying on the flag - so a third-party realpath
+    without `-m` doesn't fail-closed-on-everything.
+  - **Pure-bash fallback** (`kill_normalize_abs_path`) collapses `/./`
+    and `/../` segments without filesystem access, so the gate works
+    on EL6 hosts that have neither `realpath -m` nor a `readlink -f`
+    that handles non-existent intermediate directories.
+
+  bash 4.1 / set -u / gawk 3.x floor preserved (no `local -n`, no
+  `mapfile`, empty-array iteration guarded).
+
+### Cleanup
+- **`finalize_manifest`: dead awk code removed.** The `lookup_summary_orig()`
+  function read from `ORIG_SUMMARY[]`, an array that was never populated
+  (no `awk -v` for it, no `BEGIN` block read it from the manifest). It
+  always returned `"0"` and the post-awk `sed -i` pass overwrote the
+  result anyway. Replaced the awk re-emission of `files_planned` /
+  `ips_planned` / `files_refused` with literal `"0"` placeholders;
+  the existing `sed` pass remains the single source of truth for those
+  three counters. Also dropped the unread `csf_keys[lkey] = 1`
+  assignment in the lookup-load loop.
+
 ## sessionscribe-mitigate.sh v0.6.0 — 2026-05-03
 
 ### Added
