@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.11
+# sessionscribe-ioc-scan.sh v2.7.12
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.11"
+VERSION="2.7.12"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -829,6 +829,10 @@ manage_telemetry_cron() {
 # file. Use '--telemetry-cron remove' to uninstall, or re-run 'add' with
 # different flags to update.
 #
+# Perms: 0600 root:root. The cron line below may embed an --upload-token
+# value; world-readability would expose the credential to any local user.
+# crond reads /etc/cron.d/* as root, so 0600 doesn't break execution.
+#
 # The 5-180s sleep prefix spreads fleet load: a 1000-host fleet hitting
 # intake at minute 0 distributes across ~3 minutes (~6 hosts/sec average).
 SHELL=/bin/bash
@@ -843,9 +847,17 @@ CRONEOF
     fi
 
     # install(1) atomically replaces the target with correct perms/owner.
-    # Mode 0644 is the cron.d standard (cron daemon reads as root, world-
-    # readable for inspection; not world-writable).
-    if ! install -m 0644 -o root -g root "$tmp" "$TELEMETRY_CRON_FILE" 2>/dev/null; then
+    # Mode 0600 (root-only) instead of the cron.d-standard 0644 because the
+    # generated cron line embeds --upload-token values verbatim — leaving
+    # the file world-readable would expose the intake credential to any
+    # local user via `cat /etc/cron.d/sessionscribe-telemetry`. cronie /
+    # vixie-cron read /etc/cron.d/* as root and don't require world-
+    # readability; verified locally that 0600 entries are picked up
+    # normally with no journal rejection. We use 0600 unconditionally
+    # (even without an embedded token) for consistency — the file's
+    # contents aren't otherwise sensitive but mode-uniformity makes
+    # operator audit trivial.
+    if ! install -m 0600 -o root -g root "$tmp" "$TELEMETRY_CRON_FILE" 2>/dev/null; then
         rm -f "$tmp"
         echo "Error: install failed (cannot write $TELEMETRY_CRON_FILE)" >&2
         exit 2

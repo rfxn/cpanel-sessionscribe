@@ -402,6 +402,38 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.12 — 2026-05-03
+
+### Security
+- **Tighten `/etc/cron.d/sessionscribe-telemetry` perms 0644 → 0600.**
+  The v2.7.11 install used the cron.d-conventional 0644 (root rw,
+  world-readable), but our generated cron line embeds the
+  `--upload-token` value verbatim when one is passed at install time.
+  World-readable + embedded credential meant any local user on the
+  host could read the intake token via `cat /etc/cron.d/sessionscribe-
+  telemetry`. cronie / vixie-cron read `/etc/cron.d/*` as root and
+  don't require world-readability — verified on Fedora 40 (cronie):
+  0600 entries are picked up by crond normally with no
+  `BAD FILE MODE` rejection in the journal.
+
+  Mode uniformity: 0600 unconditionally (even without an embedded
+  token) so operator audit is trivial — every cron file we install
+  has the same restrictive perms regardless of whether the operator
+  passed a custom token. The file's other contents (script path,
+  schedule, --upload-url) aren't credential-grade but the uniform
+  policy is easier to reason about than "0644 normally / 0600 when
+  embedding token".
+
+  Operator inspection: `sudo cat /etc/cron.d/sessionscribe-telemetry`
+  (root needed; previously any user).
+
+  Pre-existing token-in-`ps` exposure during the `curl -T -H
+  X-Upload-Token: ...` PUT remains unchanged — that's the existing
+  intake-system curl invocation and the user explicitly scoped this
+  pass to NOT touch phase_upload. Operators concerned about argv-
+  exposure of the token should use `--upload-token-file` (not
+  implemented; would be a follow-up if needed).
+
 ## sessionscribe-ioc-scan.sh v2.7.11 — 2026-05-03
 
 ### Added
