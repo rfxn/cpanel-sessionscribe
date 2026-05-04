@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.6
+# sessionscribe-ioc-scan.sh v2.7.9
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.6"
+VERSION="2.7.9"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -198,10 +198,12 @@ PATTERN_B_MYSQL_DIR="/var/lib/mysql"
 PATTERN_B_MYSQL_DB="/var/lib/mysql/mysql"
 
 # Pattern C - Mirai/nuclear.x86. Dropper deletes binary; string survives
-# in shell history. C2 host/IP catch the drop even after rename.
+# in shell history. C2 host/IP catch the drop even after rename. _IP_2
+# is the rev5 second binary host (same /24, same actor scaling infra).
 PATTERN_C_BIN="nuclear.x86"
 PATTERN_C_C2_HOST="raw.flameblox.com"
 PATTERN_C_C2_IP="87.121.84.78"
+PATTERN_C_C2_IP_2="87.121.84.243"
 PATTERN_C_SHA256="c04d526eb0f7c7660a19871d1675383c8eaf5336651b255c15f4da4708835eb7"
 
 # Pattern D - WHM JSON-API recon + reseller-as-persistence. WHM_FullRoot
@@ -217,9 +219,12 @@ PATTERN_D_TOKEN_NAME="WHM_FullRoot"
 PATTERN_E_WS_RE='GET /cpsess[0-9]+/websocket/Shell'
 PATTERN_E_KNOWN_DIMS="24x80,24x120,24x134,24x200"
 
-# Pattern F - harvester wrap (actor fingerprint).
+# Pattern F - harvester wrap (actor fingerprint). __S_MARK__/__E_MARK__
+# wraps recon; __CMD_DONE_<nanos>__ is an additional same-actor marker
+# (rev5: Vishnu's host, imagicktest).
 PATTERN_F_S_MARK="__S_MARK__"
 PATTERN_F_E_MARK="__E_MARK__"
+PATTERN_F_CMD_DONE_RE='__CMD_DONE_[0-9]+__'
 
 # Pattern G - SSH key persistence. Forged mtime 2019-12-13 12:59:16
 # masquerading as LW-internal keys with IP-labeled comments.
@@ -271,6 +276,26 @@ PATTERN_J_RECENT_DAYS=90
 # ~30-50 units in /etc/systemd/system/ - 200 is a generous cap.
 PATTERN_J_MAX_UNITS=200
 
+# Pattern K - Cloudflare-fronted /Update second-stage backdoor. Hostname
+# is Cloudflare shared anycast - do NOT blocklist at edge (coordinate
+# Cloudflare T&S for zone takedown). _TMP_RE [$][$] char-class matches
+# both literal `$$` (as-typed) and `[0-9]+` (echo-expanded) forms.
+PATTERN_K_BACKDOOR_HOST="cp.dene.de.com"
+PATTERN_K_TMP_RE='F=/tmp/\.u([$][$]|[0-9]+)'
+
+# Pattern L - filesystem-nuke (rm -rf --no-preserve-root /). The
+# --no-preserve-root flag is the load-bearing IOC; GNU coreutils
+# defaults to --preserve-root specifically to block accidental nukes.
+# Trailing-`/`-as-target anchor (followed by whitespace, special char,
+# or EOL) avoids FP on `--no-preserve-root /tmp/foo` (operator just
+# disabled the safety on a non-root target). __CMD_START__/__CMD_END__
+# wraps destructive commands (Pattern F-family marker; distinct from
+# __S_MARK__/__E_MARK__ recon envelope).
+PATTERN_L_NUKE_RE="rm[[:space:]]+-rf[[:space:]]+--no-preserve-root[[:space:]]+/([[:space:]&;\"']|\$)"
+PATTERN_L_CMD_START="__CMD_START__"
+PATTERN_L_CMD_END="__CMD_END__"
+PATTERN_L_CMD_ENVELOPE_RE="${PATTERN_L_CMD_START}|${PATTERN_L_CMD_END}"
+
 # Attacker-planted jumphost-mimic SSH key labels (per IC-5790 dossier).
 PATTERN_G_BAD_KEY_LABELS=(
     "209.59.141.49"
@@ -317,6 +342,17 @@ ATTACKER_IPS=(
     # payload-binary fingerprint shipped yet (sha256 will land in the
     # dossier when the binary is fully analyzed).
     45.92.1.188
+    # rev5 (2026-05-03): second nuclear.x86 binary host (Pattern C
+    # variant - same /24 as 87.121.84.78, same actor scaling
+    # infrastructure). Surfaced on host.eworksinc.com (Rahul Krishnan
+    # case 46501374) with multiple active nuclear.x86 processes still
+    # running as root; binary persisted and beaconing - confirms
+    # Pattern C can run in active-process mode in addition to the
+    # originally-documented hit-and-run.
+    87.121.84.243
+    # rev5 (2026-05-03): badpass exploit IP null-routed by Jamie 8:02
+    # CDT. Source host: cloudvpstemplate.1g9j3u-lwsites.com.
+    67.205.166.246
 )
 
 ###############################################################################
@@ -792,7 +828,7 @@ BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
 # consumed by print_verdict() to render the 7-row matrix at the top of
 # the summary block.
 ###############################################################################
-SECTION_ORDER=(version static binary logs sessions destruction probe)
+SECTION_ORDER=(version static binary logs sessions destruction posture probe)
 declare -A SECTION_LABEL=(
     [version]="version"
     [static]="patterns"
@@ -800,6 +836,7 @@ declare -A SECTION_LABEL=(
     [logs]="iocscan"
     [sessions]="sessions"
     [destruction]="destruct"
+    [posture]="posture"
     [probe]="probe"
 )
 declare -A SECTION_VERDICT=()      # area -> worst tag observed in SIGNALS[]
@@ -1053,7 +1090,7 @@ print_signal_human() {
         error)    tag="[ERR]";      color="$RED"    ;;
         info)
             case "$key" in
-                patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs)
+                patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|posture_csf_active)
                     tag="[OK]"; color="$GREEN" ;;
                 *)  tag="[..]"; color="$DIM"   ;;
             esac
@@ -1348,6 +1385,8 @@ ioc_key_to_pattern() {
         (ioc_pattern_h_*)                       echo H ;;
         (ioc_pattern_i_*)                       echo I ;;
         (ioc_pattern_j_*)                       echo J ;;
+        (ioc_pattern_k_*)                       echo K ;;
+        (ioc_pattern_l_*)                       echo L ;;
         # Mitigate-quarantine secondary-read replay signals - synthetic
         # emits derived from sidecar fields, NOT from re-running the live
         # IOC ladder. Routed to X (forged-session evidence) since that's
@@ -5006,6 +5045,193 @@ check_pattern_j_persistence() {
     PATTERN_J_HITS="$hits"
 }
 
+# ---- _classify_history_match ---------------------------------------------
+# Diagnostic-shape classifier hoisted from v2.7.5 Pattern C inline awk so
+# Patterns C, F, H3 share one source of truth.
+#   $1 mode  : "regex"   - <needle> is awk ERE (e.g. nuclear\.x86)
+#              "literal" - <needle> is literal substring (e.g. __S_MARK__)
+#   $2 needle: matcher per mode
+#   $3.. files
+# Output (one line): h=N d=N u=N fhe=EPOCH file_h=PATH
+# Counts are AGGREGATE across all matched files (matches v2.7.5 Pattern C
+# precedent); file_h is the file containing the first hostile-or-unknown
+# match. fhe = embedded `#<epoch>` marker before that match - diagnostic-
+# only matches do not pollute the kill-chain epoch.
+_classify_history_match() {
+    local mode="$1" needle="$2"
+    shift 2
+    local _hf _out _h _d _u _fhe_part
+    local _h_total=0 _d_total=0 _u_total=0 _fhe="" _file_h=""
+    export _CLF_MODE="$mode" _CLF_NEEDLE="$needle"
+    for _hf in "$@"; do
+        [[ -f "$_hf" ]] || continue
+        _out=$(awk '
+            BEGIN {
+                mode           = ENVIRON["_CLF_MODE"]
+                needle         = ENVIRON["_CLF_NEEDLE"]
+                diag_re        = "^[[:space:]]*(history|cat|less|more|tail|head|grep|egrep|fgrep|zgrep|awk|find|ls|locate|file|ps|netstat|ss|stat)([[:space:]]|$)"
+                download_re    = "(wget|curl|fetch|lwp-download|tftp)([[:space:]]|$)"
+                pipe_shell_re  = "[|][[:space:]]*(sh|bash|ash|zsh|/bin/sh|/bin/bash)([[:space:]]|$)"
+                chmod_re       = "chmod[[:space:]]+([+]x|[0-7][0-7][0-7])"
+                exec_verb_re   = "(^|[[:space:]]|;|&)(source|eval|exec|bash|sh|/bin/sh|/bin/bash|/usr/bin/sh|/usr/bin/bash)[[:space:]]"
+                last_epoch=""; h=0; d=0; u=0; fhe=""
+            }
+            /^#[0-9]+$/ { last_epoch = substr($0, 2); next }
+            {
+                hit = 0
+                if (mode == "regex") { if ($0 ~ needle) hit = 1 }
+                else                 { if (index($0, needle) > 0) hit = 1 }
+                if (!hit) next
+                is_hostile = 0
+                if      ($0 ~ download_re)   is_hostile = 1
+                else if ($0 ~ pipe_shell_re) is_hostile = 1
+                else if ($0 ~ chmod_re)      is_hostile = 1
+                else if ($0 ~ exec_verb_re)  is_hostile = 1
+                else if (mode == "regex") {
+                    # Wrap needle in (...) to scope alternation - awk ERE
+                    # `|` has lowest precedence, so `^[[:space:]]*A|B`
+                    # would parse as `(^[[:space:]]*A)|(B)` and FP-match
+                    # B anywhere in the line.
+                    if ($0 ~ ("\\./(" needle ")"))                 is_hostile = 1
+                    else if ($0 ~ ("^[[:space:]]*(" needle ")"))   is_hostile = 1
+                } else {
+                    if (index($0, "./" needle) > 0) {
+                        is_hostile = 1
+                    } else {
+                        line = $0
+                        sub("^[[:space:]]+", "", line)
+                        if (substr(line, 1, length(needle)) == needle) is_hostile = 1
+                    }
+                }
+                if (is_hostile) {
+                    h++
+                    if (fhe == "" && last_epoch != "") fhe = last_epoch
+                } else if ($0 ~ diag_re) {
+                    d++
+                } else {
+                    u++
+                    if (fhe == "" && last_epoch != "") fhe = last_epoch
+                }
+            }
+            END { printf "h=%d d=%d u=%d fhe=%s\n", h, d, u, fhe }
+        ' "$_hf" 2>/dev/null)
+        _h=$(       printf '%s\n' "$_out" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="h"){print $(i+1);exit}}')
+        _d=$(       printf '%s\n' "$_out" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="d"){print $(i+1);exit}}')
+        _u=$(       printf '%s\n' "$_out" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="u"){print $(i+1);exit}}')
+        _fhe_part=$(printf '%s\n' "$_out" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="fhe"){print $(i+1);exit}}')
+        _h_total=$((_h_total + ${_h:-0}))
+        _d_total=$((_d_total + ${_d:-0}))
+        _u_total=$((_u_total + ${_u:-0}))
+        if [[ -z "$_fhe" && -n "$_fhe_part" ]]; then
+            _fhe="$_fhe_part"; _file_h="$_hf"
+        fi
+    done
+    unset _CLF_MODE _CLF_NEEDLE
+    printf 'h=%d d=%d u=%d fhe=%s file_h=%s\n' "$_h_total" "$_d_total" "$_u_total" "$_fhe" "$_file_h"
+}
+
+# Pull named field (h|d|u|fhe|file_h) from a classifier output line.
+_classify_field() {
+    awk -v k="$1" -F'[ =]' '
+        { for (i = 1; i <= NF; i++) if ($i == k) { print $(i+1); exit } }
+    ' <<< "$2"
+}
+
+# ---- _classify_kill_prelude_context --------------------------------------
+# Pattern H2 adjacency classifier. `pkill -9 nuclear.x86 kswapd01 xmrig`
+# is destructive on both attacker (prelude before drop) and responder
+# (cleanup) paths, so diag_re shape doesn't apply - classify by what
+# FOLLOWS within ctx command lines (epoch markers don't count).
+#   hostile  : same line OR any next-ctx line matches install primitive
+#              (wget|curl|fetch|tftp|base64 -d|chmod +x|<octal>|bash <(|./seobot)
+#   diagnostic: next-ctx line matches ps|pgrep|echo|exit|true at line start
+#              or is empty
+#   unknown  : kill matched but neither condition - review tier
+#   $1 file  $2 ERE (PATTERN_H_KILL_PRELUDE)  $3 ctx (default 3)
+# Output: h=N d=N u=N fhe=EPOCH file_h=PATH
+_classify_kill_prelude_context() {
+    local _kf="$1" _kre="$2" _kctx="${3:-3}"
+    if [[ ! -f "$_kf" ]]; then
+        printf 'h=0 d=0 u=0 fhe= file_h=\n'
+        return
+    fi
+    export _KP_RE="$_kre" _KP_CTX="$_kctx"
+    local _out
+    _out=$(awk '
+        BEGIN {
+            kill_re      = ENVIRON["_KP_RE"]
+            ctx          = ENVIRON["_KP_CTX"] + 0
+            install_re   = "(wget|curl|fetch|lwp-download|tftp|base64[[:space:]]+-d|chmod[[:space:]]+([+]x|[0-7][0-7][0-7])|bash[[:space:]]*<\\(|\\./seobot)"
+            verify_re    = "^[[:space:]]*(ps([[:space:]]|$)|pgrep([[:space:]]|$)|echo([[:space:]]|$)|exit([[:space:]]|$)|true([[:space:]]|$))"
+            last_epoch=""; h=0; d=0; u=0; fhe=""
+            n_pending=0; n_pending_lines=0; pending_epoch=""
+        }
+        function commit_pending(   k, cl, shape) {
+            shape = "u"
+            for (k = 0; k < n_pending_lines; k++) {
+                cl = pending_ctx[k]
+                if (cl ~ install_re) { shape = "h"; break }
+            }
+            if (shape != "h") {
+                for (k = 0; k < n_pending_lines; k++) {
+                    cl = pending_ctx[k]
+                    if (cl ~ verify_re || cl == "") { shape = "d"; break }
+                }
+            }
+            if (shape == "h") {
+                h++
+                if (fhe == "" && pending_epoch != "") fhe = pending_epoch
+            } else if (shape == "d") {
+                d++
+            } else {
+                u++
+                if (fhe == "" && pending_epoch != "") fhe = pending_epoch
+            }
+            n_pending = 0
+            n_pending_lines = 0
+            pending_epoch = ""
+            for (k = 0; k < ctx; k++) pending_ctx[k] = ""
+        }
+        /^#[0-9]+$/ {
+            last_epoch = substr($0, 2)
+            next
+        }
+        {
+            if ($0 ~ kill_re) {
+                if (n_pending > 0) commit_pending()
+                pending_epoch = last_epoch
+                # Same-line install primitive (`pkill ...; wget ...`)
+                # short-circuits to hostile - no need to wait for ctx.
+                if ($0 ~ install_re) {
+                    h++
+                    if (fhe == "" && pending_epoch != "") fhe = pending_epoch
+                    pending_epoch = ""
+                    next
+                }
+                n_pending = ctx
+                n_pending_lines = 0
+                next
+            }
+            if (n_pending > 0) {
+                pending_ctx[n_pending_lines++] = $0
+                n_pending--
+                if (n_pending == 0) commit_pending()
+            }
+        }
+        END {
+            if (n_pending > 0 || n_pending_lines > 0) commit_pending()
+            printf "h=%d d=%d u=%d fhe=%s\n", h, d, u, fhe
+        }
+    ' "$_kf" 2>/dev/null)
+    unset _KP_RE _KP_CTX
+    local _h _d _u _fhe_part
+    _h=$(_classify_field h        "$_out")
+    _d=$(_classify_field d        "$_out")
+    _u=$(_classify_field u        "$_out")
+    _fhe_part=$(_classify_field fhe "$_out")
+    printf 'h=%d d=%d u=%d fhe=%s file_h=%s\n' "${_h:-0}" "${_d:-0}" "${_u:-0}" "${_fhe_part}" "$_kf"
+}
+
 # ---- destruction-stage IOC scan (Patterns A-J) ---------------------------
 # Cheap, bounded host-state probes for late-stage compromise residue.
 # Scoped to /home, /var/www, /root, /etc, /var/spool/cron, /tmp, /var/tmp -
@@ -5091,29 +5317,61 @@ check_destruction_iocs() {
              "note" "found .sorry-encrypted files (Pattern A); re-run with --full for the full kill-chain + bundle (CRITICAL)."
         ((hits++))
     fi
-    # qTox ransom README. Drop locations: /root/README.md (canonical) +
-    # /home/*/README.md (per-user). Either qtox/TOX ID/Sorry-ID strings or
-    # the dossier-known TOX ID hex.
+    # qTox ransom README at /root/README.md (canonical) + /home/*/README.md
+    # (per-user). Content/path-shape filter (added 2.7.6) demotes long files
+    # (>200 lines = documentation, real ransom notes are <50 lines) and
+    # IR-notes filename shapes to info-tier so responder docs that
+    # reference the dossier TOX_ID hash don't FP-strong. Path-prefix
+    # branches (^/root/(IR|notes|runbooks|.claude|.cache)/) are
+    # future-proofing - the current candidate-file walk only reaches
+    # /root/README.md + /home/*/README.md, none of which match those
+    # subtrees; the filename-substring branches (IR-notes, runbook,
+    # notes-<digit>) are the active filter for /home/*/README.md
+    # operator-notes drops.
     local readme_hits=()
     [[ -f "$PATTERN_A_README" ]] && readme_hits+=("$PATTERN_A_README")
     while IFS= read -r rf; do
         [[ -f "$rf" ]] && readme_hits+=("$rf")
     done < <(find /home -maxdepth 2 -name 'README.md' 2>/dev/null)
+    local _ir_paths_re='^/root/(IR|notes|runbooks|\.claude|\.cache)/|IR-notes|runbook|notes-[0-9]'
     # Length-check guard: ${arr[@]} on a declared-but-empty array trips
     # `set -u` on bash 4.1 (CL6). Matches the EXCLUDE_IPS pattern above.
     local rf
     if (( ${#readme_hits[@]} > 0 )); then
         for rf in "${readme_hits[@]}"; do
             if grep -qE "qtox|TOX ID|Sorry-ID|${PATTERN_A_TOX_ID}" "$rf" 2>/dev/null; then
-                local rf_mtime tox_match=0
+                local rf_mtime tox_match=0 _rf_lines=0 _rf_doc_shape=0
                 rf_mtime=$(stat -c %Y "$rf" 2>/dev/null)
                 grep -qF "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && tox_match=1
-                emit "destruction" "ioc_pattern_a_readme" "strong" \
-                     "ioc_pattern_a_ransom_readme" 10 \
-                     "path" "$rf" "tox_id_match" "$tox_match" \
-                     "mtime_epoch" "${rf_mtime:-0}" \
-                     "note" "qTox ransom README at $rf (tox_id_exact_match=$tox_match) - Pattern A drop (CRITICAL)."
-                ((hits++))
+                _rf_lines=$(wc -l < "$rf" 2>/dev/null | tr -d ' ')
+                _rf_lines="${_rf_lines:-0}"
+                if [[ "$rf" =~ $_ir_paths_re ]] || (( _rf_lines > 200 )); then
+                    _rf_doc_shape=1
+                fi
+                if (( _rf_doc_shape )); then
+                    emit "destruction" "ioc_pattern_a_readme_documentation" "info" \
+                         "ioc_pattern_a_ransom_readme_documentation" 0 \
+                         "path" "$rf" "tox_id_match" "$tox_match" \
+                         "line_count" "$_rf_lines" \
+                         "mtime_epoch" "${rf_mtime:-0}" \
+                         "note" "qtox/Sorry-ID/TOX_ID strings in $rf (lines=$_rf_lines) but file is in IR-notes path or too long for a ransom README - documentation-shape, not Pattern A drop."
+                elif (( tox_match )); then
+                    emit "destruction" "ioc_pattern_a_readme" "strong" \
+                         "ioc_pattern_a_ransom_readme" 10 \
+                         "path" "$rf" "tox_id_match" "$tox_match" \
+                         "line_count" "$_rf_lines" \
+                         "mtime_epoch" "${rf_mtime:-0}" \
+                         "note" "qTox ransom README at $rf (tox_id_exact_match=1, lines=$_rf_lines) - Pattern A drop (CRITICAL)."
+                    ((hits++))
+                else
+                    emit "destruction" "ioc_pattern_a_readme_review" "warning" \
+                         "ioc_pattern_a_ransom_readme_review" 5 \
+                         "path" "$rf" "tox_id_match" "$tox_match" \
+                         "line_count" "$_rf_lines" \
+                         "mtime_epoch" "${rf_mtime:-0}" \
+                         "note" "qtox/Sorry-ID strings in $rf (lines=$_rf_lines) without exact TOX_ID hash match - manual review (may be IR documentation referencing the dossier)."
+                    ((hits++))
+                fi
             fi
         done
     fi
@@ -5226,84 +5484,44 @@ check_destruction_iocs() {
         done
     fi
     if (( ${#nuke_files[@]} > 0 )); then
-        local _nh_total=0 _nd_total=0 _nu_total=0
-        local _nfhe="" _nfh_file=""
-        local _nf_class _nf_h _nf_d _nf_u _nf_fhe
-        # awk needle is built from PATTERN_C_BIN with literal-dot escape.
-        export RE_NEEDLE='nuclear\.x86'
-        for _nf in "${nuke_files[@]}"; do
-            _nf_class=$(awk '
-                BEGIN {
-                    needle_re      = ENVIRON["RE_NEEDLE"]
-                    diag_re        = "^[[:space:]]*(history|cat|less|more|tail|head|grep|egrep|fgrep|zgrep|awk|find|ls|locate|file|ps|netstat|ss|stat)([[:space:]]|$)"
-                    download_re    = "(wget|curl|fetch|lwp-download|tftp)([[:space:]]|$)"
-                    pipe_shell_re  = "[|][[:space:]]*(sh|bash|ash|zsh|/bin/sh|/bin/bash)([[:space:]]|$)"
-                    chmod_re       = "chmod[[:space:]]+([+]x|[0-7][0-7][0-7])"
-                    exec_verb_re   = "(^|[[:space:]]|;|&)(source|eval|exec|bash|sh)[[:space:]]"
-                    last_epoch=""; h=0; d=0; u=0; fhe=""
-                }
-                /^#[0-9]+$/ { last_epoch = substr($0, 2); next }
-                $0 !~ needle_re { next }
-                {
-                    is_hostile = 0
-                    if ($0 ~ download_re)                    is_hostile = 1
-                    else if ($0 ~ pipe_shell_re)             is_hostile = 1
-                    else if ($0 ~ chmod_re)                  is_hostile = 1
-                    else if ($0 ~ ("\\./" needle_re))        is_hostile = 1
-                    else if ($0 ~ exec_verb_re)              is_hostile = 1
-                    else if ($0 ~ ("^[[:space:]]*" needle_re)) is_hostile = 1
-                    if (is_hostile) {
-                        h++
-                        if (fhe == "" && last_epoch != "") fhe = last_epoch
-                    } else if ($0 ~ diag_re) {
-                        d++
-                    } else {
-                        u++
-                        if (fhe == "" && last_epoch != "") fhe = last_epoch
-                    }
-                }
-                END { printf "h=%d d=%d u=%d fhe=%s\n", h, d, u, fhe }
-            ' "$_nf" 2>/dev/null)
-            _nf_h=$(  echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="h"){print $(i+1);exit}}')
-            _nf_d=$(  echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="d"){print $(i+1);exit}}')
-            _nf_u=$(  echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="u"){print $(i+1);exit}}')
-            _nf_fhe=$(echo "$_nf_class" | awk -F'[ =]' '{for(i=1;i<=NF;i++)if($i=="fhe"){print $(i+1);exit}}')
-            _nh_total=$((_nh_total + ${_nf_h:-0}))
-            _nd_total=$((_nd_total + ${_nf_d:-0}))
-            _nu_total=$((_nu_total + ${_nf_u:-0}))
-            if [[ -z "$_nfhe" && -n "$_nf_fhe" ]]; then
-                _nfhe="$_nf_fhe"; _nfh_file="$_nf"
-            fi
-        done
-        unset RE_NEEDLE
+        local _nuke_class _nh _nd _nu _nfhe _nfh_file
+        _nuke_class=$(_classify_history_match regex 'nuclear\.x86' "${nuke_files[@]}")
+        _nh=$(_classify_field h      "$_nuke_class")
+        _nd=$(_classify_field d      "$_nuke_class")
+        _nu=$(_classify_field u      "$_nuke_class")
+        _nfhe=$(_classify_field fhe  "$_nuke_class")
+        _nfh_file=$(_classify_field file_h "$_nuke_class")
 
         local _nuke_sample="${nuke_files[0]}" _nuke_mtime
         _nuke_mtime=$(stat -c %Y "$_nuke_sample" 2>/dev/null)
 
-        if (( _nh_total > 0 )); then
+        if (( ${_nh:-0} > 0 )); then
             # Hostile-shape line(s) present - real dropper trace; emit
             # strong as before, with classifier counts for IR triage.
+            # mtime_epoch tracks the actual hostile-file (which may
+            # differ from _nuke_sample when multiple history files match).
             local _hf="${_nfh_file:-$_nuke_sample}"
-            local _he="${_nfhe:-${_nuke_mtime:-0}}"
+            local _hf_mtime
+            _hf_mtime=$(stat -c %Y "$_hf" 2>/dev/null)
             emit "destruction" "ioc_pattern_c_nuke_trace" "strong" \
                  "ioc_pattern_c_nuclear_x86_referenced" 10 \
                  "sample_path" "$_hf" \
-                 "mtime_epoch" "${_nuke_mtime:-0}" \
-                 "ts_epoch_first" "$_he" \
-                 "hostile_lines" "$_nh_total" \
-                 "diagnostic_lines" "$_nd_total" \
-                 "unknown_lines" "$_nu_total" \
+                 "mtime_epoch" "${_hf_mtime:-${_nuke_mtime:-0}}" \
+                 "ts_epoch_first" "${_nfhe:-0}" \
+                 "hostile_lines" "${_nh:-0}" \
+                 "diagnostic_lines" "${_nd:-0}" \
+                 "unknown_lines" "${_nu:-0}" \
                  "note" "$PATTERN_C_BIN dropper-shape command in $_hf (Mirai botnet drop, Abuse 46488376)."
             ((hits++))
-        elif (( _nu_total > 0 )); then
+        elif (( ${_nu:-0} > 0 )); then
             # Unknown-shape only - no clear dropper verb but no clear
             # diagnostic either; warning-tier so IR can review.
             emit "destruction" "ioc_pattern_c_nuke_trace_review" "warning" \
                  "ioc_pattern_c_nuclear_x86_review" 4 \
                  "sample_path" "$_nuke_sample" \
                  "mtime_epoch" "${_nuke_mtime:-0}" \
-                 "diagnostic_lines" "$_nd_total" \
-                 "unknown_lines" "$_nu_total" \
+                 "diagnostic_lines" "${_nd:-0}" \
+                 "unknown_lines" "${_nu:-0}" \
                  "note" "$PATTERN_C_BIN string in $_nuke_sample but no dropper shape - manual review."
             ((hits++))
         else
@@ -5315,7 +5533,7 @@ check_destruction_iocs() {
                  "ioc_pattern_c_nuclear_x86_diagnostic_only" 0 \
                  "sample_path" "$_nuke_sample" \
                  "mtime_epoch" "${_nuke_mtime:-0}" \
-                 "diagnostic_lines" "$_nd_total" \
+                 "diagnostic_lines" "${_nd:-0}" \
                  "note" "$PATTERN_C_BIN appears only in diagnostic-shape commands (history|grep, cat|grep, find -name, etc) - operator/IR search, not an IOC."
         fi
     fi
@@ -5349,7 +5567,7 @@ check_destruction_iocs() {
     # the search to where attackers stash the re-pull command (cron, rc.local,
     # profile.d, systemd unit files).
     local flame_hit=""
-    flame_hit=$(grep -lE "${PATTERN_C_C2_HOST}|${PATTERN_C_C2_IP//./\\.}" \
+    flame_hit=$(grep -lE "${PATTERN_C_C2_HOST}|${PATTERN_C_C2_IP//./\\.}|${PATTERN_C_C2_IP_2//./\\.}" \
                    /root/.bash_history /home/*/.bash_history 2>/dev/null | head -1)
     if [[ -n "$flame_hit" ]]; then
         local flame_mtime
@@ -5358,11 +5576,11 @@ check_destruction_iocs() {
              "ioc_pattern_c_c2_referenced" 8 \
              "sample_path" "$flame_hit" \
              "mtime_epoch" "${flame_mtime:-0}" \
-             "note" "Mirai C2 ($PATTERN_C_C2_HOST / $PATTERN_C_C2_IP) referenced in $flame_hit."
+             "note" "Mirai C2 ($PATTERN_C_C2_HOST / $PATTERN_C_C2_IP / $PATTERN_C_C2_IP_2) referenced in $flame_hit."
         ((hits++))
     fi
     local persist_hit=""
-    persist_hit=$(grep -rIlE "nuclear\.x86|${PATTERN_C_C2_HOST}|${PATTERN_C_C2_IP//./\\.}" \
+    persist_hit=$(grep -rIlE "nuclear\.x86|${PATTERN_C_C2_HOST}|${PATTERN_C_C2_IP//./\\.}|${PATTERN_C_C2_IP_2//./\\.}" \
                      /etc/crontab /etc/cron.d /etc/cron.hourly /etc/cron.daily \
                      /var/spool/cron /etc/profile.d /etc/rc.local \
                      /etc/systemd/system /etc/init.d 2>/dev/null | head -1)
@@ -5452,33 +5670,117 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern F: __S_MARK__ harvester envelope -----------------------
-    # Bash writes `#<epoch>\n<command>` markers when HISTTIMEFORMAT is set
-    # (CL6 default). Use the first marker preceding __S_MARK__ as
-    # ts_epoch_first so kill-chain classifies correctly even when later
-    # shell sessions have bumped the file's mtime.
-    local f_hit=""
-    f_hit=$(grep -lF "$PATTERN_F_S_MARK" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
-    if [[ -n "$f_hit" ]]; then
-        local f_mtime f_smark_epoch
-        f_mtime=$(stat -c %Y "$f_hit" 2>/dev/null)
-        f_smark_epoch=$(awk -v mark="$PATTERN_F_S_MARK" '
-            /^#[0-9]+$/ { last=substr($0,2); next }
-            index($0, mark) { if (last != "") { print last; exit } }
-        ' "$f_hit" 2>/dev/null)
-        f_smark_epoch="${f_smark_epoch:-0}"
-        emit "destruction" "ioc_pattern_f_harvester" "strong" \
-             "ioc_pattern_f_smark_envelope" 10 \
-             "sample_path" "$f_hit" \
-             "ts_epoch_first" "$f_smark_epoch" \
-             "mtime_epoch" "${f_mtime:-0}" \
-             "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $f_hit - automated post-exploit recon (CRITICAL)."
-        ((hits++))
+    # Diagnostic-shape filter via shared _classify_history_match (same
+    # primitive as v2.7.5 Pattern C). Without it `grep __S_MARK__
+    # /root/.bash_history` (responder check) lands the literal in history
+    # and the next scan fires strong/COMPROMISED on a clean host.
+    local _f_files=()
+    local _ff
+    while IFS= read -r _ff; do
+        [[ -n "$_ff" ]] && _f_files+=("$_ff")
+    done < <(grep -lF "$PATTERN_F_S_MARK" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+    if (( ${#_f_files[@]} > 0 )); then
+        local _f_class _fh _fd _fu _ffhe _ffile_h
+        _f_class=$(_classify_history_match literal "$PATTERN_F_S_MARK" "${_f_files[@]}")
+        _fh=$(_classify_field h        "$_f_class")
+        _fd=$(_classify_field d        "$_f_class")
+        _fu=$(_classify_field u        "$_f_class")
+        _ffhe=$(_classify_field fhe    "$_f_class")
+        _ffile_h=$(_classify_field file_h "$_f_class")
+
+        local _f_sample="${_ffile_h:-${_f_files[0]}}"
+        local _f_mtime
+        _f_mtime=$(stat -c %Y "$_f_sample" 2>/dev/null)
+
+        if (( ${_fh:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_f_harvester" "strong" \
+                 "ioc_pattern_f_smark_envelope" 10 \
+                 "sample_path" "$_f_sample" \
+                 "ts_epoch_first" "${_ffhe:-0}" \
+                 "mtime_epoch" "${_f_mtime:-0}" \
+                 "hostile_lines" "${_fh:-0}" \
+                 "diagnostic_lines" "${_fd:-0}" \
+                 "unknown_lines" "${_fu:-0}" \
+                 "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $_f_sample - automated post-exploit recon (CRITICAL)."
+            ((hits++))
+        elif (( ${_fu:-0} > 0 )); then
+            local _f_review_sample="${_f_files[0]}"
+            local _f_review_mtime
+            _f_review_mtime=$(stat -c %Y "$_f_review_sample" 2>/dev/null)
+            emit "destruction" "ioc_pattern_f_review_undetermined" "warning" \
+                 "ioc_pattern_f_smark_review" 5 \
+                 "sample_path" "$_f_review_sample" \
+                 "mtime_epoch" "${_f_review_mtime:-0}" \
+                 "diagnostic_lines" "${_fd:-0}" \
+                 "unknown_lines" "${_fu:-0}" \
+                 "note" "$PATTERN_F_S_MARK in $_f_review_sample without harvester-shape verb - manual review."
+            ((hits++))
+        else
+            local _f_diag_sample="${_f_files[0]}"
+            local _f_diag_mtime
+            _f_diag_mtime=$(stat -c %Y "$_f_diag_sample" 2>/dev/null)
+            emit "destruction" "ioc_pattern_f_diagnostic_only" "info" \
+                 "ioc_pattern_f_smark_diagnostic_only" 0 \
+                 "sample_path" "$_f_diag_sample" \
+                 "mtime_epoch" "${_f_diag_mtime:-0}" \
+                 "diagnostic_lines" "${_fd:-0}" \
+                 "note" "$PATTERN_F_S_MARK appears only in diagnostic-shape commands (history|grep, find -name, etc) in $_f_diag_sample - operator/IR search, not an IOC."
+        fi
+    fi
+
+    # Pattern F additional marker: __CMD_DONE_<nanos>__ (rev5 dossier).
+    local _fc_files=()
+    local _fcf
+    while IFS= read -r _fcf; do
+        [[ -n "$_fcf" ]] && _fc_files+=("$_fcf")
+    done < <(grep -lE "$PATTERN_F_CMD_DONE_RE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+    if (( ${#_fc_files[@]} > 0 )); then
+        local _fc_class _fch _fcd _fcu _fcfhe _fcfile_h
+        _fc_class=$(_classify_history_match regex "$PATTERN_F_CMD_DONE_RE" "${_fc_files[@]}")
+        _fch=$(_classify_field h "$_fc_class")
+        _fcd=$(_classify_field d "$_fc_class")
+        _fcu=$(_classify_field u "$_fc_class")
+        _fcfhe=$(_classify_field fhe "$_fc_class")
+        _fcfile_h=$(_classify_field file_h "$_fc_class")
+        local _fc_sample="${_fcfile_h:-${_fc_files[0]}}"
+        local _fc_mtime
+        _fc_mtime=$(stat -c %Y "$_fc_sample" 2>/dev/null)
+        if (( ${_fch:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_f_cmd_done" "strong" \
+                 "ioc_pattern_f_cmd_done_marker" 8 \
+                 "sample_path" "$_fc_sample" \
+                 "ts_epoch_first" "${_fcfhe:-0}" \
+                 "mtime_epoch" "${_fc_mtime:-0}" \
+                 "hostile_lines" "${_fch:-0}" \
+                 "diagnostic_lines" "${_fcd:-0}" \
+                 "unknown_lines" "${_fcu:-0}" \
+                 "note" "Pattern F additional marker __CMD_DONE_<nanos>__ in $_fc_sample - same harvester actor toolchain as __S_MARK__/__E_MARK__."
+            ((hits++))
+        elif (( ${_fcu:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_f_cmd_done_review" "warning" \
+                 "ioc_pattern_f_cmd_done_review" 3 \
+                 "sample_path" "${_fc_files[0]}" \
+                 "mtime_epoch" "${_fc_mtime:-0}" \
+                 "diagnostic_lines" "${_fcd:-0}" \
+                 "unknown_lines" "${_fcu:-0}" \
+                 "note" "__CMD_DONE_<nanos>__ marker in ${_fc_files[0]} without harvester-shape verb - manual review."
+            ((hits++))
+        else
+            emit "destruction" "ioc_pattern_f_cmd_done_diagnostic" "info" \
+                 "ioc_pattern_f_cmd_done_diagnostic_only" 0 \
+                 "sample_path" "${_fc_files[0]}" \
+                 "mtime_epoch" "${_fc_mtime:-0}" \
+                 "diagnostic_lines" "${_fcd:-0}" \
+                 "note" "__CMD_DONE_<nanos>__ marker appears only in diagnostic-shape commands in ${_fc_files[0]} - operator/IR search, not an IOC."
+        fi
     fi
 
     # ---- Pattern G: suspect SSH keys ------------------------------------
     # IC-5790 fingerprint: mtime forged to 2019-12-13 + IP-shaped key
     # comment. Both required (LW provisioning legitimately uses IP-labeled
-    # keys) so we don't FP on real ops.
+    # keys) so we don't FP on real ops. _g_hit feeds the lsyncd-
+    # amplification check at end of this block.
+    local _g_hit=0
     local key_file
     for key_file in "${SSH_KEY_FILES[@]}"; do
         [[ -f "$key_file" ]] || continue
@@ -5499,6 +5801,7 @@ check_destruction_iocs() {
                  "mtime_epoch" "${key_mtime_epoch:-0}" \
                  "note" "$key_file mtime forged to $key_mtime_iso + $ip_labeled_lines IP-labeled key(s) - Pattern G persistence (CRITICAL)."
             ((hits++))
+            _g_hit=1
         elif (( ip_labeled_lines > 0 )); then
             emit "destruction" "ioc_pattern_g_ip_keys_review" "warning" \
                  "ioc_pattern_g_ip_labeled_keys_present" 3 \
@@ -5506,6 +5809,7 @@ check_destruction_iocs() {
                  "mtime_epoch" "${key_mtime_epoch:-0}" \
                  "note" "$ip_labeled_lines IP-labeled SSH key comment(s) in $key_file - review (may be legitimate provisioning)."
             ((hits++))
+            _g_hit=1
         fi
     done
     # Keys planted in non-canonical locations (cron, /etc). Single find walk
@@ -5548,13 +5852,43 @@ check_destruction_iocs() {
                  "mtime_epoch" "${odd_mtime:-0}" \
                  "note" "$oddkey_count authorized_keys file(s) in /etc or /var/spool/cron - non-standard, review."
             ((hits++))
+            _g_hit=1
+        fi
+    fi
+
+    # Pattern G lsyncd-amplification: master compromise = implicit
+    # replica compromise via the cluster's replication keypair (Norman
+    # Dumond, 5/3 dossier). Doesn't escalate THIS host's verdict but
+    # surfaces blast-radius for remediation (revoke + reissue cluster
+    # keypair, not just master's key).
+    if (( _g_hit )); then
+        local _lsyncd_evidence=""
+        if command -v pgrep >/dev/null 2>&1 && pgrep -x lsyncd >/dev/null 2>&1; then
+            _lsyncd_evidence="process"
+        elif [[ -d /etc/lsyncd ]]; then
+            _lsyncd_evidence="config_dir"
+        elif compgen -G '/etc/lsyncd*.conf' >/dev/null 2>&1 \
+          || compgen -G '/etc/lsyncd*.lua' >/dev/null 2>&1; then
+            _lsyncd_evidence="config_file"
+        fi
+        if [[ -n "$_lsyncd_evidence" ]]; then
+            emit "destruction" "ioc_pattern_g_lsyncd_amplification" "warning" \
+                 "ioc_pattern_g_lsyncd_cluster_blast_radius" 4 \
+                 "evidence" "$_lsyncd_evidence" \
+                 "note" "Pattern G hit on host with lsyncd present ($_lsyncd_evidence) - cluster replicas implicitly compromised via replication keypair. Revoke + reissue the cluster's keypair, not just this host's."
+            ((hits++))
         fi
     fi
 
     # ---- Pattern H: seobot defacement / SEO spam dropper -----------------
-    # Four independent signals - any one of H1/H2/H4 is dispositive (strong);
-    # H3 (ALLDONE) is warning-tier because the marker is generic enough to
-    # FP without corroboration.
+    # Four signals: H1/H2-hostile/H4 each strong on their own; H3 (ALLDONE)
+    # generic English so emits only when corroborated by H1, H2 (any tier
+    # incl. review - kill-prelude line existing at all is corroboration
+    # for the operator end-marker), or H4. H2 uses adjacency classifier
+    # (pkill is destructive on both sides; diag_re shape check from C/F
+    # doesn't apply).
+    local _h1_hit=0 _h2_hostile=0 _h2_review=0 _h4_hit=0
+    local _h_alldone_hit=""
 
     # H1: seobot.php in any cPanel-managed docroot. Derive docroots from
     # /var/cpanel/userdata/<user>/<site> (canonical); fall back to
@@ -5592,43 +5926,73 @@ check_destruction_iocs() {
              "sample_path" "$h_seobot_hit" "mtime_epoch" "${h_mtime:-0}" \
              "note" "$PATTERN_H_DROPPER_FILE planted in $h_seobot_hit - Pattern H SEO defacement (CRITICAL)."
         ((hits++))
+        _h1_hit=1
     fi
 
-    # H2: kill-prelude (`pkill -9 nuclear.x86 kswapd01 xmrig`) in any history
-    # file. Reuses HISTORY_FILES_GLOB hoisted at the top of this function.
-    # Embedded #<epoch> markers parsed for ts_epoch_first (same fix as Pattern F).
-    local h_kill_hit=""
-    h_kill_hit=$(grep -lE "$PATTERN_H_KILL_PRELUDE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
-    if [[ -n "$h_kill_hit" ]]; then
-        local h_kill_mtime h_kill_epoch
-        h_kill_mtime=$(stat -c %Y "$h_kill_hit" 2>/dev/null)
-        h_kill_epoch=$(awk -v re="$PATTERN_H_KILL_PRELUDE" '
-            /^#[0-9]+$/ { last=substr($0,2); next }
-            $0 ~ re { if (last != "") { print last; exit } }
-        ' "$h_kill_hit" 2>/dev/null)
-        h_kill_epoch="${h_kill_epoch:-0}"
-        emit "destruction" "ioc_pattern_h_kill_prelude" "strong" \
-             "ioc_pattern_h_competitor_kill" 8 \
-             "sample_path" "$h_kill_hit" \
-             "ts_epoch_first" "$h_kill_epoch" \
-             "mtime_epoch" "${h_kill_mtime:-0}" \
-             "note" "Pattern H competitor-kill prelude in $h_kill_hit (kills nuclear.x86/kswapd01/xmrig before drop)."
-        ((hits++))
+    # H2: `pkill -9 nuclear.x86 kswapd01 xmrig` in any history file -
+    # adjacency-classified via _classify_kill_prelude_context (ctx=3).
+    local _h_kill_files=()
+    local _hkf
+    while IFS= read -r _hkf; do
+        [[ -n "$_hkf" ]] && _h_kill_files+=("$_hkf")
+    done < <(grep -lE "$PATTERN_H_KILL_PRELUDE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+    if (( ${#_h_kill_files[@]} > 0 )); then
+        local _hk_h_total=0 _hk_d_total=0 _hk_u_total=0
+        local _hk_fhe="" _hk_file_h=""
+        local _hk_file _hk_class _hk_h _hk_d _hk_u _hk_fhe_part _hk_file_h_part
+        for _hk_file in "${_h_kill_files[@]}"; do
+            _hk_class=$(_classify_kill_prelude_context "$_hk_file" "$PATTERN_H_KILL_PRELUDE" 3)
+            _hk_h=$(_classify_field h         "$_hk_class")
+            _hk_d=$(_classify_field d         "$_hk_class")
+            _hk_u=$(_classify_field u         "$_hk_class")
+            _hk_fhe_part=$(_classify_field fhe "$_hk_class")
+            _hk_file_h_part=$(_classify_field file_h "$_hk_class")
+            _hk_h_total=$((_hk_h_total + ${_hk_h:-0}))
+            _hk_d_total=$((_hk_d_total + ${_hk_d:-0}))
+            _hk_u_total=$((_hk_u_total + ${_hk_u:-0}))
+            if [[ -z "$_hk_fhe" && -n "$_hk_fhe_part" && "${_hk_h:-0}" -gt 0 ]]; then
+                _hk_fhe="$_hk_fhe_part"
+                _hk_file_h="${_hk_file_h_part:-$_hk_file}"
+            fi
+        done
+        local _hk_sample="${_hk_file_h:-${_h_kill_files[0]}}"
+        local _hk_mtime
+        _hk_mtime=$(stat -c %Y "$_hk_sample" 2>/dev/null)
+        if (( _hk_h_total > 0 )); then
+            emit "destruction" "ioc_pattern_h_kill_prelude" "strong" \
+                 "ioc_pattern_h_competitor_kill" 8 \
+                 "sample_path" "$_hk_sample" \
+                 "ts_epoch_first" "${_hk_fhe:-0}" \
+                 "mtime_epoch" "${_hk_mtime:-0}" \
+                 "hostile_lines" "$_hk_h_total" \
+                 "diagnostic_lines" "$_hk_d_total" \
+                 "unknown_lines" "$_hk_u_total" \
+                 "note" "Pattern H competitor-kill prelude in $_hk_sample followed by install primitive (kills nuclear.x86/kswapd01/xmrig before drop)."
+            ((hits++))
+            _h2_hostile=1
+        elif (( _hk_u_total > 0 )); then
+            emit "destruction" "ioc_pattern_h_kill_prelude_review" "warning" \
+                 "ioc_pattern_h_competitor_kill_review" 4 \
+                 "sample_path" "${_h_kill_files[0]}" \
+                 "mtime_epoch" "${_hk_mtime:-0}" \
+                 "diagnostic_lines" "$_hk_d_total" \
+                 "unknown_lines" "$_hk_u_total" \
+                 "note" "Pattern H kill-prelude line in ${_h_kill_files[0]} with no adjacent install primitive and no defensive verify - manual review (attacker prep or operator cleanup)."
+            ((hits++))
+            _h2_review=1
+        else
+            emit "destruction" "ioc_pattern_h_kill_prelude_diagnostic" "info" \
+                 "ioc_pattern_h_competitor_kill_diagnostic_only" 0 \
+                 "sample_path" "${_h_kill_files[0]}" \
+                 "mtime_epoch" "${_hk_mtime:-0}" \
+                 "diagnostic_lines" "$_hk_d_total" \
+                 "note" "Pattern H kill-prelude line in ${_h_kill_files[0]} adjacent to defensive verify (ps/pgrep/echo done/exit) - responder cleanup, not attacker prep."
+        fi
     fi
 
-    # H3: ALLDONE end marker. Warning-tier - generic enough to FP, useful
-    # only alongside H1/H2/H4.
-    local h_alldone_hit=""
-    h_alldone_hit=$(grep -lF "$PATTERN_H_END_MARKER" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
-    if [[ -n "$h_alldone_hit" ]]; then
-        local h_alldone_mtime
-        h_alldone_mtime=$(stat -c %Y "$h_alldone_hit" 2>/dev/null)
-        emit "destruction" "ioc_pattern_h_alldone" "warning" \
-             "ioc_pattern_h_alldone_marker" 5 \
-             "sample_path" "$h_alldone_hit" "mtime_epoch" "${h_alldone_mtime:-0}" \
-             "note" "Pattern H operator end-marker '$PATTERN_H_END_MARKER' in $h_alldone_hit - review for corroborating signals."
-        ((hits++))
-    fi
+    # H3: ALLDONE detection only - emit deferred until after H4 so the
+    # corroboration gate (H1 || H2-hostile || H4) is decidable.
+    _h_alldone_hit=$(grep -lF "$PATTERN_H_END_MARKER" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null | head -1)
 
     # H4: dropper archive on disk. Self-cleans per dossier; this catches
     # slow operators or interrupted runs. Encode first 16 bytes (raw zip
@@ -5647,7 +6011,33 @@ check_destruction_iocs() {
                  "path" "$PATTERN_H_ZIP_PATH" "mtime_epoch" "${h_zip_mtime:-0}" \
                  "note" "Pattern H dropper archive at $PATTERN_H_ZIP_PATH (base64 zip header matches H signature - operator did not self-clean)."
             ((hits++))
+            _h4_hit=1
         fi
+    fi
+
+    # H3 deferred emit: corroboration-gated. ALLDONE alone is too generic
+    # (responder `grep ALLDONE`, deployment `echo "ALLDONE"`, copy-pasted
+    # CI output) to justify IR queue capacity. H2-review (kill prelude
+    # with ambiguous adjacency: id/whoami/cd in ctx window) ALSO
+    # corroborates - the kill-prelude line existing at all alongside an
+    # ALLDONE marker is enough signal to surface for IR (sentinel finding).
+    if [[ -n "$_h_alldone_hit" ]] \
+       && (( _h1_hit || _h2_hostile || _h2_review || _h4_hit )); then
+        local _h_alldone_mtime
+        _h_alldone_mtime=$(stat -c %Y "$_h_alldone_hit" 2>/dev/null)
+        local _h_corrob=""
+        (( _h1_hit ))     && _h_corrob+="H1(seobot.php),"
+        (( _h2_hostile )) && _h_corrob+="H2(hostile-shape kill prelude),"
+        (( _h2_review ))  && _h_corrob+="H2(review-tier kill prelude),"
+        (( _h4_hit ))     && _h_corrob+="H4(seobot.zip),"
+        _h_corrob="${_h_corrob%,}"
+        emit "destruction" "ioc_pattern_h_alldone" "warning" \
+             "ioc_pattern_h_alldone_marker" 5 \
+             "sample_path" "$_h_alldone_hit" \
+             "mtime_epoch" "${_h_alldone_mtime:-0}" \
+             "corroborated_by" "$_h_corrob" \
+             "note" "Pattern H operator end-marker '$PATTERN_H_END_MARKER' in $_h_alldone_hit, corroborated by $_h_corrob."
+        ((hits++))
     fi
 
     # ---- Pattern I: system-service profile.d backdoor --------------------
@@ -6023,9 +6413,457 @@ check_destruction_iocs() {
         fi
     fi
 
+    # ---- Pattern K: Cloudflare-fronted /Update second-stage backdoor ----
+    # K1 (PATTERN_K_BACKDOOR_HOST literal) routed through
+    # _classify_history_match so responder `grep cp.dene` doesn't FP.
+    # K2 (PATTERN_K_TMP_RE shape) corroborates K1; standalone emit only
+    # when K1 didn't fire strong-or-warning (sentinel-driven gate -
+    # diagnostic-only K1 must not silently swallow a real K2 signal).
+    local _k1_files=()
+    local _k1f
+    while IFS= read -r _k1f; do
+        [[ -n "$_k1f" ]] && _k1_files+=("$_k1f")
+    done < <(grep -lF "$PATTERN_K_BACKDOOR_HOST" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+    local _k2_files=()
+    local _k2f
+    while IFS= read -r _k2f; do
+        [[ -n "$_k2f" ]] && _k2_files+=("$_k2f")
+    done < <(grep -lE "$PATTERN_K_TMP_RE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+
+    local _k1_emit_real=0
+    if (( ${#_k1_files[@]} > 0 )); then
+        local _k1_class _k1h _k1d _k1u _k1fhe _k1file_h
+        _k1_class=$(_classify_history_match literal "$PATTERN_K_BACKDOOR_HOST" "${_k1_files[@]}")
+        _k1h=$(_classify_field h "$_k1_class")
+        _k1d=$(_classify_field d "$_k1_class")
+        _k1u=$(_classify_field u "$_k1_class")
+        _k1fhe=$(_classify_field fhe "$_k1_class")
+        _k1file_h=$(_classify_field file_h "$_k1_class")
+        local _k1_sample="${_k1file_h:-${_k1_files[0]}}"
+        local _k1_mtime
+        _k1_mtime=$(stat -c %Y "$_k1_sample" 2>/dev/null)
+        local _k1_corrob=""
+        (( ${#_k2_files[@]} > 0 )) && _k1_corrob="K2(F=/tmp/.u-tempfile shape)"
+        if (( ${_k1h:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_k_backdoor_fetch" "strong" \
+                 "ioc_pattern_k_backdoor_host_referenced" 8 \
+                 "sample_path" "$_k1_sample" \
+                 "ts_epoch_first" "${_k1fhe:-0}" \
+                 "mtime_epoch" "${_k1_mtime:-0}" \
+                 "hostile_lines" "${_k1h:-0}" \
+                 "diagnostic_lines" "${_k1d:-0}" \
+                 "unknown_lines" "${_k1u:-0}" \
+                 "corroborated_by" "${_k1_corrob:-(none)}" \
+                 "note" "Pattern K backdoor host $PATTERN_K_BACKDOOR_HOST referenced in $_k1_sample (Cloudflare-fronted /Update second-stage; coordinate with Cloudflare T&S, do NOT blackhole at edge)."
+            ((hits++))
+            _k1_emit_real=1
+        elif (( ${_k1u:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_k_backdoor_review" "warning" \
+                 "ioc_pattern_k_backdoor_host_review" 4 \
+                 "sample_path" "${_k1_files[0]}" \
+                 "mtime_epoch" "${_k1_mtime:-0}" \
+                 "diagnostic_lines" "${_k1d:-0}" \
+                 "unknown_lines" "${_k1u:-0}" \
+                 "corroborated_by" "${_k1_corrob:-(none)}" \
+                 "note" "$PATTERN_K_BACKDOOR_HOST in ${_k1_files[0]} without download/exec verb - manual review."
+            ((hits++))
+            _k1_emit_real=1
+        else
+            emit "destruction" "ioc_pattern_k_backdoor_diagnostic" "info" \
+                 "ioc_pattern_k_backdoor_diagnostic_only" 0 \
+                 "sample_path" "${_k1_files[0]}" \
+                 "mtime_epoch" "${_k1_mtime:-0}" \
+                 "diagnostic_lines" "${_k1d:-0}" \
+                 "note" "$PATTERN_K_BACKDOOR_HOST appears only in diagnostic-shape commands in ${_k1_files[0]} - operator/IR search, not an IOC."
+        fi
+    fi
+
+    # K2 standalone emit when no real K1: F=/tmp/.u shape alone has FP
+    # risk in legitimate sysadmin scripts so warning-tier only.
+    if (( ${#_k2_files[@]} > 0 && _k1_emit_real == 0 )); then
+        local _k2_sample="${_k2_files[0]}"
+        local _k2_mtime
+        _k2_mtime=$(stat -c %Y "$_k2_sample" 2>/dev/null)
+        emit "destruction" "ioc_pattern_k_tmpfile_paranoid" "warning" \
+             "ioc_pattern_k_pid_tempfile_shape" 3 \
+             "sample_path" "$_k2_sample" \
+             "mtime_epoch" "${_k2_mtime:-0}" \
+             "note" "Pattern K paranoid-cleanup F=/tmp/.u<pid> tempfile shape in $_k2_sample without $PATTERN_K_BACKDOOR_HOST corroboration - manual review (low-confidence shape signal alone)."
+        ((hits++))
+    fi
+
+    # ---- Pattern L: filesystem-nuke (rm -rf --no-preserve-root /) -------
+    # L1 (PATTERN_L_NUKE_RE) routed through _classify_history_match for
+    # diag-shape FP filtering. L2 (__CMD_START__/__CMD_END__ envelope)
+    # corroborates L1; standalone emit only when L1 didn't fire strong-
+    # or-warning (sentinel-driven gate parallel to K1/K2).
+    local _l1_files=()
+    local _l1f
+    while IFS= read -r _l1f; do
+        [[ -n "$_l1f" ]] && _l1_files+=("$_l1f")
+    done < <(grep -lE "$PATTERN_L_NUKE_RE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+
+    # L2 envelope routed through classifier so responder `grep
+    # __CMD_START__ /root/.bash_history` doesn't FP. Diag-only envelope
+    # presence is ignored (responder pollution); hostile or unknown
+    # shape counts as real corroboration.
+    local _l2_files=()
+    local _l2f
+    while IFS= read -r _l2f; do
+        [[ -n "$_l2f" ]] && _l2_files+=("$_l2f")
+    done < <(grep -lE "$PATTERN_L_CMD_ENVELOPE_RE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+    local _l2_h=0 _l2_u=0 _l2_sample="" _l_envelope_corrob=""
+    if (( ${#_l2_files[@]} > 0 )); then
+        local _l2_class _l2_file_h
+        _l2_class=$(_classify_history_match regex "$PATTERN_L_CMD_ENVELOPE_RE" "${_l2_files[@]}")
+        _l2_h=$(_classify_field h "$_l2_class")
+        _l2_u=$(_classify_field u "$_l2_class")
+        _l2_file_h=$(_classify_field file_h "$_l2_class")
+        _l2_sample="${_l2_file_h:-${_l2_files[0]}}"
+        if (( ${_l2_h:-0} > 0 || ${_l2_u:-0} > 0 )); then
+            _l_envelope_corrob="__CMD_START__/__CMD_END__ envelope present"
+        fi
+    fi
+
+    local _l1_emit_real=0
+    if (( ${#_l1_files[@]} > 0 )); then
+        local _l1_class _l1h _l1d _l1u _l1fhe _l1file_h
+        _l1_class=$(_classify_history_match regex "$PATTERN_L_NUKE_RE" "${_l1_files[@]}")
+        _l1h=$(_classify_field h "$_l1_class")
+        _l1d=$(_classify_field d "$_l1_class")
+        _l1u=$(_classify_field u "$_l1_class")
+        _l1fhe=$(_classify_field fhe "$_l1_class")
+        _l1file_h=$(_classify_field file_h "$_l1_class")
+        local _l1_sample="${_l1file_h:-${_l1_files[0]}}"
+        local _l1_mtime
+        _l1_mtime=$(stat -c %Y "$_l1_sample" 2>/dev/null)
+        if (( ${_l1h:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_l_filesystem_nuke" "strong" \
+                 "ioc_pattern_l_no_preserve_root_rm" 10 \
+                 "sample_path" "$_l1_sample" \
+                 "ts_epoch_first" "${_l1fhe:-0}" \
+                 "mtime_epoch" "${_l1_mtime:-0}" \
+                 "hostile_lines" "${_l1h:-0}" \
+                 "diagnostic_lines" "${_l1d:-0}" \
+                 "unknown_lines" "${_l1u:-0}" \
+                 "corroborated_by" "${_l_envelope_corrob:-(none)}" \
+                 "note" "Pattern L filesystem-nuke (rm -rf --no-preserve-root /) in $_l1_sample - scorched-earth destruction, REIMAGE only (CRITICAL)."
+            ((hits++))
+            _l1_emit_real=1
+        elif (( ${_l1u:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_l_filesystem_nuke_review" "warning" \
+                 "ioc_pattern_l_no_preserve_root_review" 4 \
+                 "sample_path" "${_l1_files[0]}" \
+                 "mtime_epoch" "${_l1_mtime:-0}" \
+                 "diagnostic_lines" "${_l1d:-0}" \
+                 "unknown_lines" "${_l1u:-0}" \
+                 "corroborated_by" "${_l_envelope_corrob:-(none)}" \
+                 "note" "rm -rf --no-preserve-root / in ${_l1_files[0]} without leading-token shape - manual review."
+            ((hits++))
+            _l1_emit_real=1
+        else
+            emit "destruction" "ioc_pattern_l_filesystem_nuke_diagnostic" "info" \
+                 "ioc_pattern_l_no_preserve_root_diagnostic_only" 0 \
+                 "sample_path" "${_l1_files[0]}" \
+                 "mtime_epoch" "${_l1_mtime:-0}" \
+                 "diagnostic_lines" "${_l1d:-0}" \
+                 "note" "rm -rf --no-preserve-root / appears only in diagnostic-shape commands in ${_l1_files[0]} - operator/IR search, not an IOC."
+        fi
+    fi
+
+    # L2 standalone emit when no real L1: destructive-class harvester
+    # ran but command may have been rotated/redacted out of history.
+    if [[ -n "$_l_envelope_corrob" ]] && (( _l1_emit_real == 0 )); then
+        local _l_env_mtime
+        _l_env_mtime=$(stat -c %Y "$_l2_sample" 2>/dev/null)
+        emit "destruction" "ioc_pattern_l_cmd_envelope" "warning" \
+             "ioc_pattern_l_destructive_cmd_envelope" 4 \
+             "sample_path" "$_l2_sample" \
+             "mtime_epoch" "${_l_env_mtime:-0}" \
+             "envelope_lines" "$((_l2_h + _l2_u))" \
+             "note" "Pattern L __CMD_START__/__CMD_END__ destructive-command envelope in $_l2_sample without the rm -rf --no-preserve-root command itself - destructive-class harvester ran, manual review (command may have been rotated/redacted)."
+        ((hits++))
+    fi
+
     if (( hits == 0 )); then
         emit "destruction" "destruction_scan" "info" "no_destruction_iocs" 0 \
-             "note" "no destruction-stage residue (Patterns A-I) found"
+             "note" "no destruction-stage residue (Patterns A-L) found"
+    fi
+}
+
+# ---- CSF firewall posture ------------------------------------------------
+# Validates that ConfigServer Firewall is installed AND actually enforcing on
+# the host. Fleet hosts are expected to run CSF; "installed but not loaded"
+# (chains absent, lfd dead, TESTING=1, csf.disable, ipset gap) is a common
+# silent-failure mode — the binary lives in PATH and the operator assumes
+# protection while iptables is wide open.
+#
+# Severity discipline: posture findings are DEFENSIVE-degradation signals,
+# not exploit IOCs. Keys use the `posture_` prefix (never `ioc_`) so they
+# surface in the section matrix and JSON envelope without flipping
+# host_verdict to SUSPICIOUS/COMPROMISED. The IOC engine is reserved for
+# attacker-evidence rows.
+#
+# Probe ladder (each phase is independent; later phases run even when an
+# earlier phase finds a fault, so a single run surfaces every break-mode):
+#   1. presence              — csf binary + /etc/csf/csf.conf
+#   2. csf.disable           — administrative kill-switch (advisory + return)
+#   3. csf.conf missing      — broken install (binary without config)
+#   4. TESTING=1             — production posture requires TESTING=0
+#   5. lfd liveness          — pidfile → /proc/<pid>/comm → pidof/pgrep
+#   6. iptables availability — binary on PATH or /sbin or /usr/sbin
+#   7. csf -v self-test      — binary cannot self-report version
+#   8. chain enumeration     — LOCALINPUT/LOCALOUTPUT/LOGDROPIN in iptables -nL
+#   9. INPUT->LOCALINPUT     — orphaned-chain detection
+#  10. LOCALINPUT rule count — chain hydrated (kill -9 mid-load FP)
+#  11. LF_IPSET=1 promised   — ipset binary present, set list non-empty
+#  12. healthy roll-up       — info-tier emit with rule_count, lfd_pid, version
+#
+# Snapshot mode (--root): all live probes skipped; emits a single info row.
+# Bash 4.1 / set -u safe: every local initialized; no [[ -v ]]; no namerefs.
+check_csf_posture() {
+    if [[ -n "$ROOT_OVERRIDE" ]]; then
+        hdr_section "posture" "CSF posture (skipped: snapshot mode)"
+        emit "posture" "csf_snapshot_skip" "info" "posture_csf_snapshot_skip" 0 \
+             "note" "Snapshot/--root mode: CSF posture probes live iptables/lfd state and is skipped on offline trees."
+        return
+    fi
+
+    hdr_section "posture" "CSF firewall posture (chains, lfd, testing flag)"
+
+    # ---- 1. presence ------------------------------------------------------
+    local csf_bin="" csf_conf="/etc/csf/csf.conf"
+    if [[ -x /usr/sbin/csf ]]; then
+        csf_bin=/usr/sbin/csf
+    elif [[ -x /etc/csf/csf.pl ]]; then
+        csf_bin=/etc/csf/csf.pl
+    fi
+
+    if [[ -z "$csf_bin" && ! -f "$csf_conf" ]]; then
+        emit "posture" "csf_not_installed" "advisory" "posture_csf_not_installed" 0 \
+             "note" "CSF/lfd not installed (no /usr/sbin/csf, no /etc/csf/csf.conf). cPanel/WHM fleet hosts are expected to run ConfigServer Firewall."
+        return
+    fi
+
+    # ---- 2. administratively disabled ------------------------------------
+    if [[ -f /etc/csf/csf.disable ]]; then
+        local _dis_mtime=0
+        _dis_mtime=$(stat -c %Y /etc/csf/csf.disable 2>/dev/null)
+        emit "posture" "csf_disabled" "advisory" "posture_csf_administratively_disabled" 0 \
+             "path" "/etc/csf/csf.disable" \
+             "mtime_epoch" "${_dis_mtime:-0}" \
+             "note" "/etc/csf/csf.disable present - CSF is administratively disabled. lfd will not start, chains stay flushed. Remove the file and 'csf -r' to re-enable."
+        return
+    fi
+
+    # ---- 3. csf.conf missing while binary present -----------------------
+    if [[ -n "$csf_bin" && ! -f "$csf_conf" ]]; then
+        emit "posture" "csf_conf_missing" "warning" "posture_csf_conf_missing" 4 \
+             "path" "$csf_conf" \
+             "note" "CSF binary at $csf_bin but $csf_conf is missing - broken install; reinstall the csf rpm/tarball."
+        # Continue — chains/lfd may still be probable.
+    fi
+
+    # ---- 4. TESTING flag --------------------------------------------------
+    local testing=0 testing_interval=""
+    if [[ -r "$csf_conf" ]]; then
+        if grep -Eq '^[[:space:]]*TESTING[[:space:]]*=[[:space:]]*"1"' \
+            "$csf_conf" 2>/dev/null; then
+            testing=1
+        fi
+        testing_interval=$(grep -E '^[[:space:]]*TESTING_INTERVAL[[:space:]]*=' \
+            "$csf_conf" 2>/dev/null | head -1 \
+            | sed -n 's/.*"\([0-9]\{1,\}\)".*/\1/p')
+    fi
+    if (( testing )); then
+        emit "posture" "csf_testing_mode" "warning" "posture_csf_testing_mode" 4 \
+             "path" "$csf_conf" \
+             "testing_interval_min" "${testing_interval:-5}" \
+             "note" "TESTING=\"1\" in csf.conf - lfd cron auto-flushes iptables every ${testing_interval:-5} min. Production posture requires TESTING=\"0\" + 'csf -r'."
+    fi
+
+    # ---- 5. lfd daemon liveness -----------------------------------------
+    # Robust 3-stage probe: pidfile + /proc/<pid>/comm verification, then
+    # pidof, then pgrep. The /proc check defends against stale-pid reuse
+    # (a different process inheriting the lfd PID after lfd crashed).
+    local lfd_pid=0 lfd_alive=0 _lfd_comm=""
+    local lfd_pidfile="/var/run/lfd.pid"
+    if [[ -r "$lfd_pidfile" ]]; then
+        lfd_pid=$(head -1 "$lfd_pidfile" 2>/dev/null | tr -dc '0-9')
+        lfd_pid="${lfd_pid:-0}"
+    fi
+    if (( lfd_pid > 0 )) && [[ -d "/proc/${lfd_pid}" ]]; then
+        if [[ -r "/proc/${lfd_pid}/comm" ]]; then
+            _lfd_comm=$(head -1 "/proc/${lfd_pid}/comm" 2>/dev/null)
+        fi
+        # lfd's `comm` is "lfd" on EL7+, "perl" on EL6 (lfd.pl exec'd via
+        # perl interpreter). Accept both.
+        if [[ "$_lfd_comm" == lfd* ]] || [[ "$_lfd_comm" == perl* ]]; then
+            lfd_alive=1
+        fi
+    fi
+    if (( ! lfd_alive )) && command -v pidof >/dev/null 2>&1; then
+        local _p
+        _p=$(pidof lfd 2>/dev/null | awk '{print $1}')
+        if [[ -n "$_p" && -d "/proc/${_p}" ]]; then
+            lfd_pid="$_p"; lfd_alive=1
+        fi
+    fi
+    if (( ! lfd_alive )) && command -v pgrep >/dev/null 2>&1; then
+        local _p
+        _p=$(pgrep -f 'lfd \(' 2>/dev/null | head -1)
+        [[ -z "$_p" ]] && _p=$(pgrep -f '/etc/csf/lfd\.pl|/usr/sbin/lfd' 2>/dev/null | head -1)
+        if [[ -n "$_p" && -d "/proc/${_p}" ]]; then
+            lfd_pid="$_p"; lfd_alive=1
+        fi
+    fi
+
+    if (( ! lfd_alive )); then
+        local _stale=0
+        [[ -f "$lfd_pidfile" ]] && _stale=1
+        emit "posture" "csf_lfd_dead" "warning" "posture_csf_lfd_not_running" 4 \
+             "lfd_pidfile_present" "$_stale" \
+             "lfd_pid_recorded" "$lfd_pid" \
+             "note" "lfd daemon not running. Login-failure scanning + dynamic blocks inactive. Start with 'service lfd start' (CL6) or 'systemctl start lfd' (EL7+)."
+    fi
+
+    # ---- 6. iptables availability ---------------------------------------
+    local ipt_bin=""
+    if command -v iptables >/dev/null 2>&1; then
+        ipt_bin="iptables"
+    elif [[ -x /sbin/iptables ]]; then
+        ipt_bin="/sbin/iptables"
+    elif [[ -x /usr/sbin/iptables ]]; then
+        ipt_bin="/usr/sbin/iptables"
+    fi
+    if [[ -z "$ipt_bin" ]]; then
+        emit "posture" "csf_iptables_missing" "warning" "posture_csf_iptables_missing" 4 \
+             "note" "iptables binary not found in PATH or /sbin or /usr/sbin. CSF cannot enforce rules without iptables."
+        return
+    fi
+
+    # ---- 7. csf -v self-test --------------------------------------------
+    local csf_version=""
+    if [[ -n "$csf_bin" ]]; then
+        local _v_out _v_rc=0
+        _v_out=$("$csf_bin" -v 2>&1) || _v_rc=$?
+        if (( _v_rc != 0 )); then
+            emit "posture" "csf_binary_broken" "warning" "posture_csf_binary_self_test_fail" 4 \
+                 "rc" "$_v_rc" \
+                 "sample" "$(printf '%s' "$_v_out" | head -1 | tr -d '\n' | cut -c1-160)" \
+                 "note" "'$csf_bin -v' returned rc=$_v_rc - csf binary cannot self-report version. Likely Perl module gap or corrupt install."
+        else
+            # Extract the "vNN.NN" token for the healthy roll-up note.
+            csf_version=$(printf '%s' "$_v_out" | head -1 \
+                | sed -n 's/.*\bv\([0-9][0-9.]*\).*/\1/p')
+        fi
+    fi
+
+    # ---- 8. chain enumeration -------------------------------------------
+    # iptables -n (no DNS) is critical: -L without -n hangs 30+s on hosts
+    # whose nameservers are firewalled by the very rules we're inspecting.
+    local ipt_nl="" ipt_nl_rc=0
+    ipt_nl=$("$ipt_bin" -n -L 2>/dev/null) || ipt_nl_rc=$?
+    if (( ipt_nl_rc != 0 )) || [[ -z "$ipt_nl" ]]; then
+        emit "posture" "csf_iptables_unreadable" "warning" "posture_csf_iptables_list_failed" 4 \
+             "rc" "$ipt_nl_rc" \
+             "note" "'$ipt_bin -n -L' returned rc=$ipt_nl_rc / empty - cannot enumerate chains. Run as root; check kernel iptables modules."
+        return
+    fi
+
+    local has_localin=0 has_localout=0 has_logdropin=0 has_invdrop=0
+    grep -q '^Chain LOCALINPUT' <<<"$ipt_nl"  && has_localin=1
+    grep -q '^Chain LOCALOUTPUT' <<<"$ipt_nl" && has_localout=1
+    grep -q '^Chain LOGDROPIN' <<<"$ipt_nl"   && has_logdropin=1
+    grep -q '^Chain INVDROP' <<<"$ipt_nl"     && has_invdrop=1
+
+    # INPUT default policy. iptables -n -L emits a single "Chain INPUT
+    # (policy DROP|ACCEPT)" header line; sed -n '1p' on the matched lines
+    # is enough.
+    local input_policy=""
+    input_policy=$(printf '%s\n' "$ipt_nl" \
+        | sed -n 's/^Chain INPUT (policy \([A-Z]\{1,\}\).*/\1/p' | head -1)
+    [[ -z "$input_policy" ]] && input_policy="UNKNOWN"
+
+    # ---- 9. INPUT -> LOCALINPUT jump ------------------------------------
+    local input_jumps_to_csf=0
+    if (( has_localin )); then
+        if "$ipt_bin" -S INPUT 2>/dev/null \
+            | grep -qE '^-A INPUT( |[[:space:]].* )-j LOCALINPUT( |$)'; then
+            input_jumps_to_csf=1
+        fi
+    fi
+
+    # ---- 10. LOCALINPUT rule count --------------------------------------
+    local localin_rule_count=0
+    if (( has_localin )); then
+        localin_rule_count=$("$ipt_bin" -S LOCALINPUT 2>/dev/null \
+            | grep -c '^-A LOCALINPUT ')
+        localin_rule_count="${localin_rule_count:-0}"
+    fi
+
+    # Aggregate chain-state finding (one emit per break-mode, in priority
+    # order — chains absent dominates orphaned, which dominates empty).
+    if (( ! has_localin && ! has_localout && ! has_logdropin )); then
+        # CSF chains entirely absent. If INPUT policy is also ACCEPT the
+        # firewall is effectively off — bump severity to evidence.
+        local _sev="warning" _wt=4 _key="posture_csf_chains_absent"
+        if [[ "$input_policy" == "ACCEPT" ]]; then
+            _sev="evidence"; _wt=6; _key="posture_csf_firewall_open"
+        fi
+        emit "posture" "csf_chains_absent" "$_sev" "$_key" "$_wt" \
+             "input_policy" "$input_policy" \
+             "has_localinput" "$has_localin" \
+             "has_logdropin" "$has_logdropin" \
+             "note" "CSF terminal chains (LOCALINPUT/LOCALOUTPUT/LOGDROPIN) not loaded; INPUT policy=${input_policy}. CSF installed but rules are not hydrated - run 'csf -r'."
+    elif (( has_localin && ! input_jumps_to_csf )); then
+        emit "posture" "csf_chains_orphaned" "warning" "posture_csf_chains_orphaned" 4 \
+             "input_policy" "$input_policy" \
+             "localin_rules" "$localin_rule_count" \
+             "note" "LOCALINPUT chain exists with $localin_rule_count rules but INPUT does not jump to it - chain orphaned, no traffic enforced. Likely partial iptables flush; run 'csf -r'."
+    elif (( has_localin && localin_rule_count == 0 )); then
+        emit "posture" "csf_chains_empty" "warning" "posture_csf_chains_empty" 4 \
+             "input_policy" "$input_policy" \
+             "note" "LOCALINPUT chain exists and INPUT jumps to it, but the chain is empty - no allow/deny rules. Likely interrupted 'csf -r' or kill -9 mid-load."
+    fi
+
+    # ---- 11. LF_IPSET drift ---------------------------------------------
+    local lf_ipset=0 ipset_set_count=0
+    if [[ -r "$csf_conf" ]] \
+       && grep -Eq '^[[:space:]]*LF_IPSET[[:space:]]*=[[:space:]]*"1"' \
+            "$csf_conf" 2>/dev/null; then
+        lf_ipset=1
+    fi
+    if (( lf_ipset )); then
+        if ! command -v ipset >/dev/null 2>&1; then
+            emit "posture" "csf_ipset_missing" "warning" "posture_csf_ipset_binary_missing" 4 \
+                 "note" "csf.conf has LF_IPSET=\"1\" but the 'ipset' binary is not installed - CSF can't materialize set-based blocklists. Install 'ipset' rpm and 'csf -r'."
+        else
+            ipset_set_count=$(ipset -L -n 2>/dev/null | grep -c '^[A-Za-z0-9_]')
+            ipset_set_count="${ipset_set_count:-0}"
+            if (( ipset_set_count == 0 )); then
+                emit "posture" "csf_ipset_empty" "warning" "posture_csf_ipset_no_sets" 4 \
+                     "note" "LF_IPSET=\"1\" and ipset binary present, but no sets are loaded. Run 'csf -r' to rehydrate."
+            fi
+        fi
+    fi
+
+    # ---- 12. healthy roll-up --------------------------------------------
+    # All hard-fail probes passed: emit an info-tier signal so fleet
+    # aggregators can confirm green-status per host. This row is suppressed
+    # in print_signal_human's no-detail clean-info bucket via key match.
+    if (( has_localin && has_localout && has_logdropin \
+          && input_jumps_to_csf && lfd_alive && ! testing \
+          && localin_rule_count > 0 )); then
+        emit "posture" "csf_active" "info" "posture_csf_active" 0 \
+             "input_policy" "$input_policy" \
+             "localin_rules" "$localin_rule_count" \
+             "has_invdrop" "$has_invdrop" \
+             "lfd_pid" "$lfd_pid" \
+             "csf_version" "${csf_version:-unknown}" \
+             "lf_ipset" "$lf_ipset" \
+             "ipset_sets" "$ipset_set_count" \
+             "note" "CSF active: LOCALINPUT/LOCALOUTPUT/LOGDROPIN loaded, INPUT->LOCALINPUT jump present (${localin_rule_count} rules), lfd pid=${lfd_pid}, csf=${csf_version:-?}, INPUT policy=${input_policy}."
     fi
 }
 
@@ -6124,7 +6962,7 @@ aggregate_verdict() {
                 advisory)         _tag="[ADVISORY]" ;;
                 info)
                     case "$key" in
-                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|no_destruction_iocs|request_complete|marker_logged)
+                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|no_destruction_iocs|request_complete|marker_logged|posture_csf_active)
                             _tag="[OK]" ;;
                     esac
                     ;;
@@ -6146,7 +6984,7 @@ aggregate_verdict() {
                 advisory) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} advisory" ;;
                 info)
                     case "$key" in
-                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|no_destruction_iocs|request_complete|marker_logged)
+                        patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|no_destruction_iocs|request_complete|marker_logged|posture_csf_active)
                             SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} ok" ;;
                     esac
                     ;;
@@ -6663,6 +7501,7 @@ if (( ! REPLAY_MODE )); then
     check_logs
     check_sessions
     check_destruction_iocs
+    check_csf_posture
     check_localhost_probe
 
     aggregate_verdict
