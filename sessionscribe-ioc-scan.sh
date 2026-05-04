@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.17"
+VERSION="2.7.18"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -488,8 +488,9 @@ TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 
 # --telemetry-cron <add|remove> [1h|2h|6h|12h|24h]: install or remove a system
 # cron entry under /etc/cron.d/ that runs the telemetry path on a fixed
-# interval (default 6h). The generated cron self-fetches the script from the
-# CDN at each tick, atomically installs it to a stable path, runs syntax
+# interval (default 6h). The generated cron self-fetches the script with a
+# canonical→fallback source order at each tick (GitHub raw primary, rfxn
+# CDN fallback), atomically installs it to a stable path, runs syntax
 # validation (bash -n) before exec, then runs the scan under timeout 300.
 # This makes the cron entry portable (curl-pipe install needs no on-disk
 # script) and keeps fleet hosts on the latest released version with no
@@ -497,12 +498,24 @@ TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 TELEMETRY_CRON_ACTION=""
 TELEMETRY_CRON_INTERVAL="6h"
 TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
-# Self-fetch source + destination for the cron-line. Hard-coded constants
+# Self-fetch sources + destination for the cron-line. Hard-coded constants
 # (no flags) — operators wanting a private mirror or alternate path can
 # hand-edit /etc/cron.d/sessionscribe-telemetry after install or fork.
-# Both must be single-quote-free; we single-quote them inside the cron
-# line. CDN URL must be HTTPS (curl -f rejects 4xx/5xx; Caddy serves 0-byte
-# 200 for missing files, caught by the [ -s "$_T" ] size check below).
+#
+# Two-tier source order at each cron tick (canonical → fallback):
+#   1. GitHub raw — canonical, updated within ~5min of every `git push`
+#                   to https://github.com/rfxn/cpanel-sessionscribe
+#   2. sh.rfxn.com CDN — fallback, updated by the freedom-syncs publish
+#                   workflow (manual `/root/bin/sync_local-remote` or
+#                   hourly cron); resilient against GitHub outages
+# The `(curl github || curl cdn)` chain in the cron line tries primary
+# first and falls back on any curl failure (HTTP error, network timeout,
+# rate limit, DNS).
+#
+# All three must be single-quote-free; they're single-quoted inside the
+# cron line. URLs must be HTTPS (curl -f rejects 4xx/5xx; Caddy serves
+# 0-byte 200 for missing files on the CDN tree, caught by [ -s "$_T" ]).
+TELEMETRY_CRON_GITHUB_URL="https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh"
 TELEMETRY_CRON_CDN_URL="https://sh.rfxn.com/sessionscribe-ioc-scan.sh"
 TELEMETRY_CRON_INSTALL_PATH="/usr/local/bin/sessionscribe-ioc-scan.sh"
 
@@ -660,17 +673,29 @@ Telemetry (low-disk-usage fleet collection):
                              disk is unaffected.
       --telemetry-cron add [INTERVAL]
                              Install a system cron entry at
-                             /etc/cron.d/sessionscribe-telemetry. Each cron
-                             tick: (1) sleeps 5-300s for fleet splay,
-                             (2) curl-fetches the latest script from the
-                             rfxn CDN (https://sh.rfxn.com/...) into a
-                             tempfile, (3) validates with bash -n, (4)
-                             atomic-installs to /usr/local/bin/ at mode
-                             0755, then (5) runs the scan under
-                             'timeout 300'. Self-bootstrapping: works via
-                             curl-pipe (no on-disk script required at
-                             install time); always-current (each tick
-                             pulls latest CDN release).
+                             /etc/cron.d/sessionscribe-telemetry. Each
+                             cron tick:
+                               (1) sleeps 5-300s for fleet splay,
+                               (2) mktemp creates a tempfile in the install
+                                   directory (same fs for atomic rename),
+                               (3) curl-fetches the latest script — primary
+                                   source is GitHub raw
+                                   (raw.githubusercontent.com/rfxn/cpanel-
+                                   sessionscribe), fallback is the rfxn CDN
+                                   (sh.rfxn.com); if GitHub is unreachable
+                                   the second curl runs automatically,
+                               (4) size-guards (catches Caddy 200+0 fallback
+                                   for missing files on the CDN tree),
+                               (5) validates with bash -n,
+                               (6) atomic-installs to /usr/local/bin/ at
+                                   mode 0755 root:root,
+                               (7) runs the scan under 'timeout 300'.
+                             Self-bootstrapping: works via curl-pipe (no
+                             on-disk script required at install time);
+                             always-current (each tick pulls the latest
+                             release; GitHub raw updates within ~5 min of
+                             every git push, so the maximum fleet drift
+                             window is one cron interval + ~5 min).
                              Allowed: 1h | 2h | 6h | 12h | 24h. Default: 6h.
                              Requires root (writes /etc/cron.d/). If
                              --upload-url and/or --upload-token are also
@@ -718,11 +743,13 @@ EOF
 ###############################################################################
 # Telemetry cron management — install / remove /etc/cron.d/<name> entry that
 # runs the telemetry path on a fixed interval (1h/2h/6h/12h/24h). Generated
-# cron is self-bootstrapping: each tick curl-fetches the latest script from
-# the rfxn CDN, atomic-installs to /usr/local/bin/ after a `bash -n` syntax
-# check, then runs under `timeout 300`. Splay 5-300s spreads fleet load.
-# Curl-pipe install works (no on-disk script required at --telemetry-cron
-# add time) since the cron line embeds the CDN URL, not $0.
+# cron is self-bootstrapping: each tick curl-fetches the latest script —
+# canonical source is GitHub raw (raw.githubusercontent.com/rfxn/cpanel-
+# sessionscribe), fallback is the rfxn CDN (sh.rfxn.com) — atomic-installs
+# to /usr/local/bin/ after a size guard + `bash -n` syntax check, then
+# runs under `timeout 300`. Splay 5-300s spreads fleet load. Curl-pipe
+# install works (no on-disk script required at --telemetry-cron add time)
+# since the cron line embeds the source URLs, not $0.
 #
 # Cron file format chosen: /etc/cron.d/<name>. Reasons:
 #   - System cron (works under cronie / vixie-cron / EL9 systemd-cron-shim);
@@ -770,22 +797,23 @@ manage_telemetry_cron() {
         exit 2
     fi
 
-    # The cron line is self-bootstrapping: it embeds the CDN URL + install
-    # path constants, not $0. So `--telemetry-cron add` works correctly when
-    # invoked via curl-pipe (where $0 is bash, not a real script path) — the
-    # cron entry is generated and installed regardless of how this script was
-    # launched. Validate the constants don't contain single-quotes (we
-    # single-quote both inside the heredoc; an embedded quote would close
-    # the outer quoting). Also validate the install path's parent exists so
-    # the per-tick mktemp doesn't fail on missing directory.
-    if [[ "$TELEMETRY_CRON_CDN_URL" == *"'"* ]]; then
-        echo "Error: TELEMETRY_CRON_CDN_URL contains single-quote — cannot embed in cron line: $TELEMETRY_CRON_CDN_URL" >&2
-        exit 2
-    fi
-    if [[ "$TELEMETRY_CRON_INSTALL_PATH" == *"'"* ]]; then
-        echo "Error: TELEMETRY_CRON_INSTALL_PATH contains single-quote — cannot embed in cron line: $TELEMETRY_CRON_INSTALL_PATH" >&2
-        exit 2
-    fi
+    # The cron line is self-bootstrapping: it embeds source URL constants
+    # (GitHub canonical + CDN fallback) and the install path constant, not
+    # $0. So `--telemetry-cron add` works correctly when invoked via
+    # curl-pipe (where $0 is bash, not a real script path) — the cron entry
+    # is generated and installed regardless of how this script was launched.
+    # Validate that none of the embedded constants contain single-quotes
+    # (we single-quote all of them inside the heredoc; an embedded quote
+    # would close the outer quoting). Also validate the install path's
+    # parent exists so the per-tick mktemp doesn't fail on missing dir.
+    local _const _const_name
+    for _const_name in TELEMETRY_CRON_GITHUB_URL TELEMETRY_CRON_CDN_URL TELEMETRY_CRON_INSTALL_PATH; do
+        eval "_const=\${$_const_name}"
+        if [[ "$_const" == *"'"* ]]; then
+            echo "Error: $_const_name contains single-quote — cannot embed in cron line: $_const" >&2
+            exit 2
+        fi
+    done
     local _install_dir
     _install_dir="$(dirname "$TELEMETRY_CRON_INSTALL_PATH")"
     if [[ ! -d "$_install_dir" ]]; then
@@ -867,23 +895,29 @@ manage_telemetry_cron() {
 # value; world-readability would expose the credential to any local user.
 # crond reads /etc/cron.d/* as root, so 0600 doesn't break execution.
 #
-# Self-fetch shape: each cron tick downloads the latest script from the
-# rfxn CDN, validates with bash -n, atomically installs to a stable
-# path, then runs under timeout 300. Always-current; no operator-side
-# push for routine updates. The 5-300s splay spreads fleet intake load
-# across the minute mark (~5 minutes for a 1000-host fleet).
+# Self-fetch shape: each cron tick downloads the latest script with a
+# canonical -> fallback source order: (1) GitHub raw (canonical, updated
+# within ~5min of every git push), (2) sh.rfxn.com CDN (fallback, updated
+# by the freedom-syncs publish workflow). The (curl GH || curl CDN)
+# subshell tries primary first and falls back on any curl failure. After
+# fetch the script is size-guarded, syntax-validated with bash -n, atomic-
+# installed at mode 0755, then run under timeout 300. Always-current; no
+# operator-side push for routine updates. Splay 5-300s spreads fleet
+# intake load across the minute mark (~5 min for a 1000-host fleet).
 #
 # Failure modes (each gated by &&-chain so a failure short-circuits cleanly):
 #   mktemp fails  -> chain bails before curl, prior install runs unchanged
-#   curl fails    -> partial file removed by curl -f, rm -f cleans temp,
-#                    prior install runs unchanged ([ -x "\$_D" ] still true)
-#   0-byte CDN    -> [ -s "\$_T" ] catches it (Caddy serves 200+0 for missing)
+#   GH unreachable-> CDN fallback fires (the || curl) and runs second
+#   both fail     -> chain bails after the (||) group fails, prior install
+#                    runs unchanged ([ -x "\$_D" ] still true on second tick)
+#   0-byte body   -> [ -s "\$_T" ] catches it (Caddy serves 200+0 for missing
+#                    on the CDN tree; GH raw returns 404 caught by curl -f)
 #   bad bash      -> bash -n catches truncation/HTML-error-page corruption
 #   install fails -> destination keeps prior version; rm -f cleans temp
 #   cold start    -> [ -x "\$_D" ] short-circuits exec, no error spam
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
-${schedule} root { sleep \$((5 + RANDOM % 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}' && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}; } >/dev/null 2>&1
+${schedule} root { sleep \$((5 + RANDOM % 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && (curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_GITHUB_URL}' || curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}') && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}; } >/dev/null 2>&1
 CRONEOF
 
     if [[ ! -s "$tmp" ]]; then
@@ -918,14 +952,18 @@ CRONEOF
     fi
 
     # Operator-facing summary. Source/destination shown so it's clear the
-    # cron line self-fetches; Test now: line is the equivalent one-shot.
+    # cron line self-fetches; Test now: line is the equivalent one-shot
+    # using the canonical GitHub source (operators can swap to the CDN
+    # if GitHub is unreachable during a manual test).
     echo "Installed: $TELEMETRY_CRON_FILE"
     echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-300s, fetch-timeout=60s, exec-timeout=300s)"
-    echo "Source:    $TELEMETRY_CRON_CDN_URL → $TELEMETRY_CRON_INSTALL_PATH"
+    echo "Source:    primary  $TELEMETRY_CRON_GITHUB_URL"
+    echo "           fallback $TELEMETRY_CRON_CDN_URL"
+    echo "Install:   $TELEMETRY_CRON_INSTALL_PATH (mode 0755, root:root)"
     echo "Command:   timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
     echo
     echo "Inspect:   cat $TELEMETRY_CRON_FILE"
-    echo "Test now:  curl -fsS --max-time 60 -o '$TELEMETRY_CRON_INSTALL_PATH' '$TELEMETRY_CRON_CDN_URL' && timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Test now:  curl -fsS --max-time 60 -o '$TELEMETRY_CRON_INSTALL_PATH' '$TELEMETRY_CRON_GITHUB_URL' && timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
     echo "Remove:    '$TELEMETRY_CRON_INSTALL_PATH' --telemetry-cron remove"
     exit 0
 }

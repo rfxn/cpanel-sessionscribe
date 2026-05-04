@@ -402,6 +402,75 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.18 — 2026-05-04
+
+### Changed
+- **Canonical source promoted from `sh.rfxn.com` CDN to GitHub raw.**
+  The cron line now tries
+  `https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh`
+  as primary on every tick and falls back to
+  `https://sh.rfxn.com/sessionscribe-ioc-scan.sh` only if GitHub
+  returns an error or times out. Failover is `(curl GH || curl CDN)`
+  inside the &&-chain.
+
+  Why: GitHub raw reflects every `git push` within ~5 min via Fastly's
+  CDN — no manual publish step, no waiting on the freedom-syncs hourly
+  cron at quench.rfxn.com. The sh.rfxn.com CDN remains as a resilience
+  fallback for when GitHub is rate-limited (raw.githubusercontent.com
+  is generous but not unlimited), unreachable, or serving stale Fastly
+  edges. Net effect: fleet drift window collapses from "next CDN
+  publish + interval boundary" (worst case ~1h+24h = 25h) to "GitHub
+  Fastly edge refresh + interval boundary" (~5min+24h ≈ 24h, but
+  typically <6min+6h ≈ 6h on the default schedule).
+
+  **New cron line shape** (single line in `/etc/cron.d/sessionscribe-telemetry`):
+
+  ```
+  ${schedule} root { sleep $((5 + RANDOM % 296)); _D='/usr/local/bin/sessionscribe-ioc-scan.sh'; _T=$(mktemp "$_D.XXXXXX" 2>/dev/null) && (curl -fsS --max-time 60 -o "$_T" 'https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh' || curl -fsS --max-time 60 -o "$_T" 'https://sh.rfxn.com/sessionscribe-ioc-scan.sh') && [ -s "$_T" ] && bash -n "$_T" && install -m 0755 -o root -g root "$_T" "$_D"; rm -f "$_T" 2>/dev/null; [ -x "$_D" ] && timeout 300 "$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl --upload-url '<URL>' --upload-token '<TOKEN>'; } >/dev/null 2>&1
+  ```
+
+  Failover semantics: the `(curl GH || curl CDN)` subshell exits 0 if
+  either curl succeeds. The outer `&&` continues to the size guard +
+  bash -n + install only on success of at least one source. If both
+  fail, the chain bails before `[ -s "$_T" ]` and the prior install
+  (if any) keeps running on the next tick via `[ -x "$_D" ]`.
+
+- **New constant `TELEMETRY_CRON_GITHUB_URL`.** Hard-coded to the rfxn
+  repo's `main` branch raw URL. Like the existing CDN URL constant,
+  hand-edit the cron file post-install if your fleet runs a private
+  fork or vendored mirror. All three constants
+  (`TELEMETRY_CRON_GITHUB_URL`, `TELEMETRY_CRON_CDN_URL`,
+  `TELEMETRY_CRON_INSTALL_PATH`) are validated for single-quote-free
+  via a loop instead of three near-identical if-statements (small
+  refactor, identical behavior).
+
+### Fixed (slop-review fixups)
+- **Help text 5-step list was missing the size-guard step** between
+  curl and bash -n. Now correctly enumerates 7 stages: splay → mktemp
+  → curl (GH→CDN failover) → size guard → bash -n → atomic install →
+  timeout-exec.
+
+- **`Test now:` echo wrote curl directly to install path with no
+  tempfile**, which doesn't match the cron line's atomic-install
+  pattern and could leave a partial file on mid-curl crash. Updated
+  to use the canonical GitHub URL with a `&&`-chained `timeout 300`
+  exec for symmetry. Operators wanting the full failover behavior
+  for a manual test can copy the cron line out of
+  `/etc/cron.d/sessionscribe-telemetry`.
+
+- **v2.7.17 CHANGELOG entry overstated "no version-skew between
+  hosts."** Corrected to clarify that fleet version-skew during a
+  rolling propagation is bounded by one interval + splay window
+  (deterministic, operator-controllable via interval choice), not
+  zero. v2.7.18's GitHub-canonical promotion reduces this window to
+  ~5 min for the source freshness component.
+
+### Floor
+bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved. No new
+external commands beyond v2.7.17. The new GitHub raw URL is HTTPS,
+served by the same `curl` invocation pattern (`-f -s -S --max-time 60`)
+already used for the CDN — supported on curl 7.10+ (CL6 ships 7.19.7).
+
 ## sessionscribe-ioc-scan.sh v2.7.17 — 2026-05-04
 
 ### Changed
@@ -446,9 +515,14 @@ versioned per the affected component.
 
   **Always-current fleet.** Every cron tick pulls the latest CDN
   release. A future `git push` + `sync_local-remote` propagates to
-  every fleet host within the next interval boundary (default 6h, max
-  24h on the slowest schedule). No operator-side push for routine
-  updates, no fleet drift, no version-skew between hosts.
+  every fleet host within the next interval boundary (default 6h,
+  max 24h on the slowest schedule). Fleet version-skew is bounded by
+  one interval + splay window — at any given moment some hosts may
+  be on the prior release and others on the new release during the
+  rolling propagation, but the convergence window is deterministic
+  and operator-controllable via the `--telemetry-cron` interval
+  choice. v2.7.18 (next entry) tightens this further by promoting
+  GitHub raw as the canonical source.
 
 - **Constants for self-fetch source + destination:**
 
