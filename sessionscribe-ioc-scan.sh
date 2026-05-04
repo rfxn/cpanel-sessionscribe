@@ -2156,19 +2156,12 @@ suspect_ip_correlation() {
     fi
     (( ${#cp_logs[@]} > 0 )) || return
 
-    # Drop RFC1918 + loopback before the sort — these are WHM admin
-    # operators on the customer's internal network, not remote attackers.
-    # Mirrors the canonical is_internal classifier used by Pattern E
-    # (line ~7084) so suspect_ip_correlation and Pattern E agree on what
-    # "external" means.
+    # Drop RFC1918 + loopback (WHM admin); mirrors Pattern E is_internal at line ~7084.
     local suspect_ips
     suspect_ips=$(
         for lg in "${cp_logs[@]}"; do cat_log "$lg"; done \
             | grep -E '"GET /cpsess[0-9]+/(websocket/Shell|json-api/(createacct|setupreseller|setacls))' 2>/dev/null \
-            | awk '$1 !~ /^10\./ \
-                && $1 !~ /^127\./ \
-                && $1 !~ /^192\.168\./ \
-                && $1 !~ /^172\.(1[6-9]|2[0-9]|3[01])\./ {print $1}' \
+            | awk '$1 !~ /^10\./ && $1 !~ /^127\./ && $1 !~ /^192\.168\./ && $1 !~ /^172\.(1[6-9]|2[0-9]|3[01])\./ {print $1}' \
             | sort -u | head -50
     )
     if [[ -n "$suspect_ips" ]]; then
