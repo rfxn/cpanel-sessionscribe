@@ -402,6 +402,55 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.13 — 2026-05-04
+
+### Changed
+- **Demote `alg_length_optrec_bug` from `bug`-kind to `marker`-kind.**
+  Fleet observation across the records.jsonl pipeline showed this as the
+  single most-firing signal — every host on tiers 110/118/126/132 carries
+  the unfixed OIDC operator-precedence bug, and that's most of the fleet.
+  The bug is real (`if !length $algorithm > 2` parses as
+  `(!length $algorithm) > 2`, always false) but it's a **pre-existing
+  post-auth defense-in-depth issue, NOT the SessionScribe primitive**.
+  Per the EXPLAIN string in STATIC_EXPLAINS[0]: "fixed on the 134-line
+  and not backported to 110/118/126/132. Resolves on tier upgrade."
+
+  Net impact on signal shape:
+
+  | Tier        | Pre-v2.7.13                                   | Post-v2.7.13                              |
+  |-------------|------------------------------------------------|-------------------------------------------|
+  | 110-132     | `severity=advisory key=ancillary_bug_unpatched` | `severity=info key=patch_marker_absent`  |
+  | 134+        | `severity=info key=ancillary_bug_fixed`        | `severity=info key=patch_marker_present` |
+  | both forms  | `severity=warning key=pattern_both`           | `severity=info key=patch_marker_present` |
+  | neither     | `severity=warning key=pattern_neither`        | `severity=info key=patch_marker_absent`  |
+
+  Per-host detection is preserved (queryable via
+  `area==static && id==alg_length_optrec_bug` in records.jsonl), just
+  reclassified from advisory-tier to info-tier. The host's
+  `code_verdict` and `host_verdict` are unaffected (advisory-tier
+  signals don't move either axis), but `summary.advisories` count drops
+  by ~1 per legacy-tier host across the fleet — fleet-rollup
+  spreadsheets pivoting on advisory_count will show the corresponding
+  decrease.
+
+  **Downstream consumer note for forge `records.jsonl` queries:** any
+  filter on `severity=="advisory"` for `alg_length_optrec_bug` should
+  switch to `severity=="info"`. Filters on `key=="ancillary_bug_*"`
+  for this entry should switch to `key=="patch_marker_*"`. The rich
+  EXPLAIN string ("operator-precedence trap...") still accompanies the
+  marker-present case via the `note` field; the marker-absent case
+  carries the generic "Marker not present (older Perl line; expected
+  on 110/118/126/132 backport tiers)" note since the marker emit path
+  uses the existing hardcoded message — operators wanting the bug
+  detail can grep STATIC_EXPLAINS in the script source or filter on
+  the static_id.
+
+  **Twin entry left untouched:** `start_authorize_in_die` (STATIC_IDS
+  index 1) is the same shape (same OIDC file, same "fixed on 134-line
+  and not backported" story) and would benefit from the same demotion
+  if fleet data shows the same noise profile. Not flipped in this
+  release pending operator confirmation that it's similarly noisy.
+
 ## sessionscribe-ioc-scan.sh v2.7.12 — 2026-05-03
 
 ### Security

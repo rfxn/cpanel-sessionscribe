@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.12
+# sessionscribe-ioc-scan.sh v2.7.13
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.12"
+VERSION="2.7.13"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -4390,7 +4390,17 @@ STATIC_FIXED_PATS=(
 # patched cpsrvd binary's compiled logic. The cve_41940_set_pass_crlf_strip
 # marker IS the CVE-2026-41940 fix in source: set_pass() / saveSession() now
 # strips \r and \n in addition to NUL.
-STATIC_KINDS=(bug bug marker marker marker marker marker marker)
+#
+# alg_length_optrec_bug demoted from 'bug' to 'marker' in v2.7.13 — fleet
+# observation showed it as the single most-firing signal (one row per host
+# on tiers 110/118/126/132, which is most of the fleet) with zero
+# SessionScribe verdict impact. The pre-existing OIDC operator-precedence
+# bug is real but unrelated to CVE-2026-41940; demoting silences the
+# advisory while preserving the per-host detection (queryable via
+# severity=info / key=patch_marker_absent in records.jsonl). The twin
+# start_authorize_in_die (index 1) remains 'bug'-class for now — flip it
+# too if fleet data shows the same noise profile.
+STATIC_KINDS=(marker bug marker marker marker marker marker marker)
 STATIC_EXPLAINS=(
     'OpenIdConnectBase.pm:795 operator-precedence trap (`if !length $algorithm > 2` is always false). Pre-existing OIDC bug, NOT the SessionScribe primitive; post-auth defense-in-depth, fixed on the 134-line and not backported to 110/118/126/132. Resolves on tier upgrade.'
     'OpenIdConnectBase.pm start_authorize() invoked inside a die() arg list mutates session-state on the error path. Pre-existing OIDC bug, NOT the SessionScribe primitive; post-auth oracle, fixed on the 134-line and not backported. Resolves on tier upgrade.'
