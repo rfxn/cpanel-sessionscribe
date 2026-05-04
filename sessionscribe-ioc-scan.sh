@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.13"
+VERSION="2.7.14"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -4601,7 +4601,7 @@ check_logs() {
                  "log_file" "$logdir/$src_log" "ts_epoch" "${ts:-0}" \
                  "line" "$trim" \
                  "note" "$ip → $st  ${req}"
-        done < <(head -5 "$tmp")
+        done < <(head -1 "$tmp")
     else
         emit "logs" "ioc_scan" "info" "no_ioc_hits" 0 \
              "note" "no IOC-pattern hits in access logs${window_note}."
@@ -4850,7 +4850,7 @@ check_attacker_ips() {
                  "ts_epoch_first" "$ts_first" \
                  "note" "$h2xx_recon hit(s) from IC-5790 IPs returned 2xx on non-cpsess paths - reconnaissance only (REVIEW)."
         elif (( total > 0 )); then
-            emit "logs" "ioc_attacker_ip_probes_only" "warning" \
+            emit "logs" "ioc_attacker_ip_probes_only" "advisory" \
                  "ioc_attacker_ip_in_access_log_probes_only" 3 \
                  "count" "$total" "hits_4xx" "$h4xx" "hits_3xx" "$h3xx" \
                  "hits_other" "$hother" \
@@ -5459,7 +5459,7 @@ check_sessions() {
             emit_session "session_shape_sample" "info" "anomalous_session_path" 0 \
                  "path" "$path" \
                  "note" "${reason:-anomalous root-named session}"
-        done < <(head -10 "$atmp")
+        done < <(head -1 "$atmp")
     fi
     rm -f "$atmp"
 
@@ -7100,7 +7100,7 @@ check_destruction_iocs() {
                  "note" "$_gate_note"
             ((hits++))
         elif (( ext_2xx_unknown > 0 )); then
-            emit "destruction" "ioc_pattern_e_websocket" "warning" \
+            emit "destruction" "ioc_pattern_e_websocket" "advisory" \
                  "ioc_pattern_e_websocket_shell_unknown_dim_only" 4 \
                  "count" "$ext_2xx_unknown" "external_total" "$ext_total" \
                  "internal_2xx" "$int_2xx" \
@@ -7111,7 +7111,7 @@ check_destruction_iocs() {
                  "note" "$ext_2xx_unknown external IP(s) reached /cpsess*/websocket/Shell with 2xx, but ALL dimensions ($unknown_csv) are outside the IC-5790 attacker fingerprint - likely legitimate WHM Terminal admin sessions from non-canonical browsers. Confirm via the parallel ioc_pattern_e_unknown_dimension review (REVIEW)."
             ((hits++))
         elif (( ext_total > 0 )); then
-            emit "destruction" "ioc_pattern_e_websocket" "warning" \
+            emit "destruction" "ioc_pattern_e_websocket" "advisory" \
                  "ioc_pattern_e_websocket_shell_probes" 3 \
                  "count" "$ext_total" "internal_2xx" "$int_2xx" \
                  "ts_epoch_first" "$ts_first_ext" \
@@ -7139,7 +7139,7 @@ check_destruction_iocs() {
         # Unknown dimension warning - new operator fingerprint not yet in
         # PATTERN_E_KNOWN_DIMS. Triage prompt: confirm and update dossier.
         if [[ -n "$unknown_csv" ]]; then
-            emit "destruction" "ioc_pattern_e_unknown_dimension" "warning" \
+            emit "destruction" "ioc_pattern_e_unknown_dimension" "advisory" \
                  "ioc_pattern_e_dimension_unknown" 5 \
                  "dimensions" "$unknown_csv" \
                  "sample" "${unknown_dim_sample:0:200}" \

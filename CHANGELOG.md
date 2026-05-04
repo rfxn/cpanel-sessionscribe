@@ -402,6 +402,82 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.14 — 2026-05-04
+
+### Changed
+- **Determinism pass: drop `ioc_*` warning-tier emits that the emitter
+  itself labels benign down to `advisory`.** Fleet observation across
+  the 2026-05-04 records.jsonl pull (15K hosts) showed three signals
+  driving the bulk of false-SUSPICIOUS verdicts despite their own note
+  strings flagging the activity as legitimate or attempt-only:
+
+  | Signal | Old sev | New sev | Hosts (warning-tier) | Emitter's own note |
+  |--------|---------|---------|----------------------|--------------------|
+  | `ioc_pattern_e_websocket` (`_unknown_dim_only`) | warning | advisory | ~3,500 | "likely legitimate WHM Terminal admin sessions from non-canonical browsers" |
+  | `ioc_pattern_e_websocket` (`_probes`)           | warning | advisory | (subset of above) | "all rejected, no 2xx (REVIEW)" |
+  | `ioc_pattern_e_unknown_dimension`               | warning | advisory | ~3,400 | "possible new operator (REVIEW)" |
+  | `ioc_attacker_ip_probes_only`                   | warning | advisory | ~3,500 | "all rejected (probing only, no successful response)" |
+
+  Per the verdict-ladder convention (memory:
+  `feedback_compromise_confidence`): only post-attack residue
+  (Pattern A/B/C/F/H/D destructive markers + token_used_2xx) =
+  COMPROMISED; attempt signals (X stack, T1-origin attacker IPs,
+  unsuccessful probes) = ATTEMPT. Probes-only and unknown-dim-only
+  fall on the ATTEMPT side, which routes to advisory not warning.
+  At `warning ioc_*` they tick `ioc_review++` in `aggregate_verdict`
+  (line 7762) and route the host to SUSPICIOUS; at `advisory` they do
+  not. The signal is preserved (still surfaced in REASONS via the
+  advisory_count summary, still queryable in records.jsonl) — only
+  the host_verdict ladder placement changes.
+
+  Net fleet impact projected on the next pull: SUSPICIOUS host count
+  drops from ~7K to ~500 (host-level overlap heavy across the four
+  flips, so the unique-host drop is ~4-4.5K not the additive 10.4K).
+  COMPROMISED count is unchanged — `strong destruction.ioc_pattern_*`
+  still gates COMPROMISED via `ioc_critical++` (line 7752), and none
+  of these flips touch the strong-tier branches.
+
+  **Downstream consumer note for forge `records.jsonl` queries:**
+  filters on `severity=="warning" && id=="ioc_pattern_e_*"` or
+  `severity=="warning" && id=="ioc_attacker_ip_probes_only"` should
+  switch to `severity=="advisory"` for these four key paths. The
+  strong-tier counterparts (`ioc_pattern_e_websocket_shell_hits`,
+  `_pre_compromise`, `_orphan`) are unchanged and remain at strong.
+  Fleet-rollup spreadsheets pivoting on `summary.inconclusive` will
+  show a corresponding drop, with the offset appearing in
+  `summary.advisories`.
+
+- **Cap diagnostic sample emits to 1 per host.** `ioc_sample` (line
+  4604) and `session_shape_sample` (line 5462) previously emitted up
+  to 5 and 10 sample rows per host respectively, producing 14,767 and
+  111,277 rows across the fleet. Both are already excluded from
+  envelope reconcile (line 1881 skip-list) and carry weight=0 — they
+  exist for triage context, not verdict math. Cap reduced to `head -1`
+  in both call sites.
+
+  Net fleet impact: records.jsonl shrinks by ~110K rows (~73% of
+  total `info`-tier sample volume). Per-host queryability preserved —
+  the first sample row per host still carries the same field shape
+  (ip/status/path/log_file/ts_epoch/line/note). Operators wanting
+  exhaustive sample listings should drop to envelope-level forensic
+  output, which is unaffected.
+
+  **Downstream consumer note:** any forge query relying on multiple
+  sample rows per host (e.g. `count(ioc_sample) > 1` as a
+  high-volume-attacker heuristic) must shift to the underlying
+  `ioc_scan` count field (`hits_2xx`, `count`, `unique_src_ips`),
+  which carries the authoritative tally without the per-row
+  expansion.
+
+### Rationale
+This release prioritizes deterministic CLEAN/COMPROMISED separation
+over evidence-rich SUSPICIOUS bins. The pre-v2.7.14 noise floor was
+making fleet-rollup spreadsheets unreadable: 7K SUSPICIOUS hosts
+where ~500 were genuinely worth review, and records.jsonl was 60%+
+diagnostic samples by row count. Strong-tier verdict math is
+deliberately untouched — every flip lands on signals the emitter
+already documents as benign or attempt-only.
+
 ## sessionscribe-ioc-scan.sh v2.7.13 — 2026-05-04
 
 ### Changed
