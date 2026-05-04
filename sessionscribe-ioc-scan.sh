@@ -781,7 +781,7 @@ manage_telemetry_cron() {
         exit 2
     fi
 
-    # Map interval to cron schedule. Allowlist enforced — only these four
+    # Map interval to cron schedule. Allowlist enforced — only these five
     # values reach this case statement (parser regex gate at the CLI layer).
     local schedule=""
     case "$TELEMETRY_CRON_INTERVAL" in
@@ -829,9 +829,16 @@ manage_telemetry_cron() {
     # The scan itself is wrapped in `timeout 300 …` so a stuck run cannot
     # bleed into the next cycle. timeout(1) is GNU coreutils ≥ 7.0 (2008);
     # the project floor is coreutils 8.4 (CL6/EL6) so it's always present.
-    # On timeout, timeout(1) sends SIGTERM and exits 124 — cron will email
-    # MAILTO if set; the stdout/stderr redirect to /dev/null suppresses the
-    # normal scan output but the non-zero exit is preserved for visibility.
+    # On timeout, timeout(1) sends SIGTERM and exits 124. Both vixie-cron
+    # (CL6) and cronie (CL7+) email MAILTO based on command OUTPUT, not on
+    # exit code — the `>/dev/null 2>&1` redirect suppresses output, so no
+    # MAILTO email fires even on timeout. To track timeouts, operators must
+    # grep /var/log/cron for the entry (cron logs the exit status), or
+    # remove the redirect for an interactive debugging run. timeout(1)
+    # signals only the directly-spawned bash; descendants (curl uploads,
+    # awk pipelines) become orphans of init and finish or get reaped on
+    # their own — acceptable here because the scan does not hold long-
+    # lived locks or shared resources across cycles.
     local tmp
     tmp=$(mktemp /tmp/telemetry-cron.XXXXXX) || {
         echo "Error: mktemp failed" >&2; exit 2; }

@@ -439,10 +439,22 @@ versioned per the affected component.
   A stuck scan (network hang on intake POST, fork-bomb on a corrupted
   bundle, runaway find on a host with millions of session files) can
   no longer accumulate a backlog of overlapping cron runs across
-  cycles. On timeout, `timeout(1)` sends SIGTERM and exits 124 — cron
-  emails MAILTO if set; the stdout/stderr `>/dev/null 2>&1` redirect
-  suppresses normal scan output but the non-zero exit is preserved
-  for cron-log visibility.
+  cycles. On timeout, `timeout(1)` sends SIGTERM and exits 124. Both
+  vixie-cron (CL6) and cronie (CL7+) trigger MAILTO email based on
+  command **output**, not on exit code — the `>/dev/null 2>&1` redirect
+  suppresses output, so no email fires even on timeout. The non-zero
+  exit IS recorded in `/var/log/cron`, which is how operators tracking
+  timeouts surface them (no per-host email alert without removing the
+  redirect for a debugging run).
+
+  **Descendant-signal caveat:** `timeout(1)` signals only the directly-
+  spawned bash. Child processes (curl uploads, awk pipelines, find
+  walks) become orphans of init when bash dies and finish or get
+  reaped on their own. Acceptable here because the scan holds no
+  long-lived locks or shared resources across cycles; if a future
+  release adds inter-cycle state (a lockfile, a partial-bundle
+  manifest), revisit and consider `setsid` + process-group signaling
+  or in-script `trap` handlers.
 
   **Floor:** `timeout(1)` is GNU coreutils ≥ 7.0 (Oct 2008). The
   project floor is coreutils 8.4 (CL6/EL6, Feb 2010), so `timeout` is
