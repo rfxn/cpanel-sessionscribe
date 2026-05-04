@@ -764,6 +764,15 @@ manage_telemetry_cron() {
         echo "Error: cannot resolve script path for cron (got: $0 → $self_path)" >&2
         exit 2
     fi
+    # Reject single-quote in the resolved path. We single-quote the path
+    # in the generated cron line so spaces/specials are passed through to
+    # the shell as literal data; an embedded single-quote would close our
+    # outer quoting and turn the rest of the line into shell tokens. The
+    # symmetric check exists for --upload-url / --upload-token below.
+    if [[ "$self_path" == *"'"* ]]; then
+        echo "Error: script path contains single-quote (\"'\") — cannot embed in cron line: $self_path" >&2
+        exit 2
+    fi
 
     # Map interval to cron schedule. Allowlist enforced — only these four
     # values reach this case statement (parser regex gate at the CLI layer).
@@ -824,7 +833,7 @@ manage_telemetry_cron() {
 # intake at minute 0 distributes across ~3 minutes (~6 hosts/sec average).
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
-${schedule} root sleep \$((5 + RANDOM % 176)); ${self_path} --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args} >/dev/null 2>&1
+${schedule} root sleep \$((5 + RANDOM % 176)); '${self_path}' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args} >/dev/null 2>&1
 CRONEOF
 
     if [[ ! -s "$tmp" ]]; then
@@ -850,13 +859,16 @@ CRONEOF
         restorecon -F "$TELEMETRY_CRON_FILE" 2>/dev/null || true
     fi
 
+    # Display the script path single-quoted — symmetric with how it lands
+    # in the cron file. For paths without spaces/specials this is harmless
+    # noise; for paths with spaces it's the only correct copy-paste form.
     echo "Installed: $TELEMETRY_CRON_FILE"
     echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-180s)"
-    echo "Command:   $self_path --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Command:   '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
     echo
     echo "Inspect:   cat $TELEMETRY_CRON_FILE"
-    echo "Test now:  $self_path --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
-    echo "Remove:    $self_path --telemetry-cron remove"
+    echo "Test now:  '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Remove:    '$self_path' --telemetry-cron remove"
     exit 0
 }
 
@@ -910,18 +922,22 @@ while [[ $# -gt 0 ]]; do
         --telemetry-timeout)  TELEMETRY_TIMEOUT="$2"; shift 2 ;;
         --telemetry-retry)    TELEMETRY_RETRY="$2"; shift 2 ;;
         --telemetry-max-bytes) TELEMETRY_MAX_BYTES="$2"; shift 2 ;;
-        # --telemetry-cron <add|remove> [INTERVAL]: optional positional
-        # interval is consumed only if it matches the allowlist (1h/6h/12h/
-        # 24h). The action arg is required; the optional interval defaults
-        # to TELEMETRY_CRON_INTERVAL (6h). On 'remove' the interval is
-        # ignored (no-op since action arg already consumed it via shift 2).
+        # --telemetry-cron <add|remove> [INTERVAL]: action arg is required;
+        # for 'add', the optional positional INTERVAL is consumed if it
+        # doesn't look like another flag (i.e., doesn't start with '--').
+        # The function validates the interval value at run time so a bad
+        # value like '99h' produces a clear "invalid interval" error
+        # instead of falling through to the parser's "Unknown option"
+        # branch. For 'remove', no interval is meaningful — leave the
+        # next token alone so it can be parsed normally.
         --telemetry-cron)
             if [[ -z "${2:-}" ]]; then
                 echo "Error: --telemetry-cron requires <add|remove>" >&2
                 exit 2
             fi
             TELEMETRY_CRON_ACTION="$2"; shift 2
-            if [[ "${1:-}" =~ ^(1h|6h|12h|24h)$ ]]; then
+            if [[ "$TELEMETRY_CRON_ACTION" == "add" ]] \
+               && [[ -n "${1:-}" && "$1" != --* ]]; then
                 TELEMETRY_CRON_INTERVAL="$1"; shift
             fi
             ;;
