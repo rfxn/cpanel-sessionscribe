@@ -402,6 +402,56 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.21 — 2026-05-04
+
+### Reverted (FP — shipped in v2.7.20, withdrawn here)
+
+`ioc_pattern_j_payload_string_present` (J3b) reverted in full. The emit
+greped for the OVH S3 host (`s3-screenshots.s3.eu-west-par.io.cloud.ovh.net`)
+and object key (`G7t7gnXGGms6Ki6AW9lte6WkQ`) across `/root/.bash_history`,
+`/etc/crontab`, `/etc/cron.d/*`, `/etc/profile.d/*`, `/var/spool/cron/*`.
+
+**Why FP:** the OVH bucket is **internal** Nexcess Engineering / IR-team
+sharing infrastructure, not attacker infrastructure. The bucket is the
+transport mechanism by which IR analysts share captured artifacts; the
+hostname appears in `.bash_history` on every triage workstation that has
+ever curl'd a captured binary for analysis. Detecting on it would FP on
+every IR triage host. (This was caught after v2.7.0 added the same
+detection; v2.7.1 reverted it. v2.7.20 inadvertently re-introduced it
+during the dossier-driven gap-close because the audit looked at the
+dossier's "IOC fingerprints" section without cross-referencing prior
+tooling decisions.)
+
+**The actual IOC is the payload file**, not the URL. J3a (literal-path
+existence check on `/usr/lib/udev/cdrom-id-helper`,
+`/usr/share/dbus-1/dbus-broker-helper`, etc.) IS the payload-file
+detection — those filenames have no legitimate use on a stock cPanel
+host and the file's presence on disk is the dossier-documented IOC.
+J3c process-name detection and J3d at-job enumeration cover the
+runtime + scheduled-execution surfaces.
+
+When the captured binary's SHA256 is published (dossier action item
+pending VT submission), it can be added as a hash-match check against
+the J3a literal paths. Hash-match has no FP risk; URL-string match does.
+
+### Net coverage state after revert
+v2.7.20 J3 series, surviving in v2.7.21:
+
+| Signal | Tier | Detection mechanism | FP risk |
+|--------|------|---------------------|---------|
+| `ioc_pattern_j_known_path_present` (J3a) | strong/10 | `[[ -e ]]` on 5 dossier-documented paths | zero (`-helper` suffix has no legit use) |
+| `ioc_pattern_j_process_active` (J3c) | strong/10 | `pgrep -x cdrom-id-helper` / `pgrep -x dbus-broker-helper` | zero (exact match) |
+| `ioc_pattern_j_atjob_payload_referenced` (J3d) | strong/10 | `atq` + `at -c <jobid>` content match | zero (helper filenames in at-job body) |
+| `ioc_pattern_j_payload_string_present` (J3b) | — | **REVERTED — would FP on IR triage hosts** | — |
+
+K3 dropper-shape and quarantine tier-promotion from v2.7.20 are unaffected
+and ship as-released.
+
+### Floor + smoke
+shellcheck error-level clean, syntax OK, all 5 cron intervals generate
+correct shape (no impact from this revert), `--telemetry-cron remove`
+cycle clean.
+
 ## sessionscribe-ioc-scan.sh v2.7.20 — 2026-05-04
 
 ### Theme

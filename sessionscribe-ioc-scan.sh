@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.20"
+VERSION="2.7.21"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -288,13 +288,10 @@ PATTERN_J_KNOWN_PATHS=(
     "/usr/lib/systemd/system/dbus-broker-helper.service"
     "/usr/share/dbus-1/dbus-broker-helper"
 )
-# Pattern J payload host + object key (OVH S3 abuse). Host is do-NOT-block
-# at edge (legitimate OVH commodity bucket); the IOC is the object key
-# embedded in the payload-fetch URL. Both serve as triage signals when
-# referenced in bash_history, cron.d/*, profile.d/*, etc.
-PATTERN_J_PAYLOAD_HOST="s3-screenshots.s3.eu-west-par.io.cloud.ovh.net"
-PATTERN_J_PAYLOAD_KEY="G7t7gnXGGms6Ki6AW9lte6WkQ"
 # Pattern J process names — exact matches via pgrep -x (no substring FP).
+# (Note: payload-fetch URL/hostname is NOT an IOC — the OVH bucket is
+# legitimate IR sharing infra; payload-file presence is captured by J3a
+# literal-path check below. See INTERNAL-NOTES.md "v2.7.20/v2.7.21".)
 PATTERN_J_PROCESS_NAMES=(cdrom-id-helper dbus-broker-helper)
 
 # Pattern K - Cloudflare-fronted /Update second-stage backdoor. Hostname
@@ -5896,39 +5893,6 @@ check_pattern_j_persistence() {
             ((hits++))
         fi
     done
-
-    # Payload host / object-key string grep across high-value config files.
-    # Strings are dossier-published OVH S3 IOCs; legitimate ops don't
-    # reference them. Scope is narrow (history + cron.d + profile.d) so the
-    # walk is bounded; the existence of these strings anywhere is the IOC.
-    local _j_payload_files=()
-    local _g
-    for _g in /root/.bash_history /root/.zsh_history /etc/crontab; do
-        local _gf="${prefix}${_g}"
-        [[ -f "$_gf" ]] && _j_payload_files+=("$_gf")
-    done
-    for _g in "${prefix}/etc/cron.d" "${prefix}/etc/profile.d" "${prefix}/var/spool/cron"; do
-        [[ -d "$_g" ]] || continue
-        while IFS= read -r f; do
-            _j_payload_files+=("$f")
-        done < <(find "$_g" -maxdepth 1 -type f 2>/dev/null)
-    done
-    if (( ${#_j_payload_files[@]} > 0 )); then
-        local _payload_hit
-        _payload_hit=$(grep -lF -e "$PATTERN_J_PAYLOAD_HOST" -e "$PATTERN_J_PAYLOAD_KEY" \
-                            "${_j_payload_files[@]}" 2>/dev/null | head -1)
-        if [[ -n "$_payload_hit" ]]; then
-            local _which=""
-            grep -qF "$PATTERN_J_PAYLOAD_KEY" "$_payload_hit" 2>/dev/null && _which="object_key"
-            grep -qF "$PATTERN_J_PAYLOAD_HOST" "$_payload_hit" 2>/dev/null && _which="${_which:+$_which+}host"
-            emit "destruction" "ioc_pattern_j_payload_referenced" "strong" \
-                 "ioc_pattern_j_payload_string_present" 8 \
-                 "path" "$_payload_hit" \
-                 "marker" "$_which" \
-                 "note" "Pattern J payload reference (${_which:-unknown}) at $_payload_hit — OVH S3 IOC string from dossier (do NOT blackhole the host at edge; coordinate with OVH abuse for object takedown)."
-            ((hits++))
-        fi
-    fi
 
     # Process detection — exact-match via pgrep -x (no substring FP).
     # Skipped in snapshot mode (no live process list).
