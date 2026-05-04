@@ -4,6 +4,79 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.7.3 — 2026-05-03
+
+### Security
+- **SHOULD-FIX (defense-in-depth): consume-time path re-validation in
+  `prune_ssh_keys_from_manifest`.** v0.7.2's MUST-FIX closed the
+  trap-injection vector at the manifest-build emit-site
+  (`kill_sshkey_canonical_paths` filters every emitted path through
+  `kill_sshkey_path_safe`). The manifest-consume site
+  (`prune_ssh_keys_from_manifest`) still trusted the manifest's `path`
+  field verbatim and passed it directly to `ssh_keys_prune`, which
+  installs the SIGINT/SIGTERM trap at line 1066/1068 with `$path`
+  embedded. Threat model:
+
+    1. Operator runs `--check` under v0.7.0 mitigate (pre-fix).
+       Manifest is emitted with a hostile path baked in.
+    2. Operator upgrades mitigate to v0.7.2.
+    3. Operator runs `--apply --kill` against the same stale manifest
+       (manifests are persisted to `$BACKUP_DIR/kill-manifest.json` and
+       can legitimately be re-applied days later).
+    4. `prune_ssh_keys_from_manifest` reads the hostile path from the
+       v0.7.0 manifest, calls `ssh_keys_prune`, and the trap-string
+       expansion fires on SIGINT during the 10s lock-retry window.
+
+  Low-probability but operator-realistic — closes the only remaining
+  reachability path for the v0.7.2 trap-injection vector.
+
+  Fix: re-validate the manifest path against `kill_sshkey_path_safe`
+  immediately after extraction in `prune_ssh_keys_from_manifest`,
+  before any call to `ssh_keys_prune`. Refused rows record a new
+  `refused_hostile_path` action with a diagnostic detail noting the
+  likely stale-pre-v0.7.2 origin, then `continue` to the next item.
+  No `ssh_keys_prune` call → no trap installed → no expansion vector.
+
+### Added
+- **Result vocabulary: `refused_hostile_path`.** New apply-only sshkey
+  result, emitted by `prune_ssh_keys_from_manifest` when a manifest
+  row's path fails the consume-time `kill_sshkey_path_safe` filter.
+  Wired into `kill_compute_verdict` (sidecar branch + manifest
+  fallback) as total_skip with WARN-promote (mirrors
+  `kept_unlabeled_warned` semantics — operator must hand-investigate
+  the stale manifest). Also wired into `finalize_manifest`'s awk
+  classifier (sshkey-clean bucket).
+
+- **Cross-reference comment between the two path-validation
+  primitives.** `kill_path_in_allowlist` (lighter cntrl-byte +
+  traversal filter for IOC-quarantine allowlist gating) now carries
+  a one-line pointer to `kill_sshkey_path_safe` (stricter shell-
+  context filter for paths that flow into trap strings, eval
+  contexts, or operator-paste recovery hints). Drift-prevention so
+  future call-sites pick the right primitive on first read.
+
+### Verification
+- 49/49 → 50/50 P1+P2+P3+v0.7.1+v0.7.2+v0.7.3 unit tests pass under
+  `MITIGATE_LIBRARY_ONLY=1 MITIGATE_RUN_P1_TESTS=1`. One regression
+  test added: 50 ('kill_sshkey_path_safe runtime trap-injection PoC
+  blocked by consume-time gate'). Test 50 synthesizes a stale-pre-
+  v0.7.2 manifest carrying a hostile path (`/home/x";touch
+  $T/INJECTION_PROOF;"y/.ssh/authorized_keys`), drives
+  `prune_ssh_keys_from_manifest` against it under MODE=apply, and
+  asserts: (1) sidecar contains `"result":"refused_hostile_path"`,
+  (2) sidecar contains zero `"result":"pruned_ok"` rows,
+  (3) no INJECTION_PROOF file was created during the call,
+  (4) `kill_compute_verdict` returns WARN. This test is deeper than
+  test 47 (which exercises the build-time gate) — it bypasses the
+  build-time filter by handing a hostile path directly to the apply-
+  path consumer, the only place a stale manifest could re-introduce
+  the v0.7.2 trap-injection vector.
+- `bash -n`, `shellcheck -S error`, `shellcheck` (delta = 0 new
+  findings vs v0.7.2 baseline; same SC code coverage, only line
+  numbers shifted by the +40-line additions).
+- bash 4.1.2 / gawk 3.1.7 floor preserved (no new `{n}` intervals,
+  no 3-arg `match`, no `flock -w`).
+
 ## sessionscribe-mitigate.sh v0.7.2 — 2026-05-03
 
 ### Security

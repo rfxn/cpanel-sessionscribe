@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.7.2
+# sessionscribe-mitigate.sh v0.7.3
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -92,7 +92,7 @@
 
 set -u
 
-VERSION="0.7.2"
+VERSION="0.7.3"
 
 ###############################################################################
 # Constants
@@ -1622,6 +1622,15 @@ kill_normalize_abs_path() {
 # coreutils 8.15+; the EL6 floor (coreutils 8.4) may have realpath
 # without `-m` OR no realpath at all - probe before relying on -m so
 # we don't fail-open on every path with a misleading "invalid option".
+#
+# Sibling primitive: `kill_sshkey_path_safe` (line ~1245) is the
+# stricter shell-context filter — it refuses any path containing
+# shell metacharacters (`"`, `;`, `$`, `` ` ``, `\`, `&`, `|`, `<`,
+# `>`, `*`, `?`, `!`, `'`, parens/braces/brackets) or whitespace
+# control bytes. Use that one for paths that flow into trap strings,
+# eval contexts, or operator-paste recovery hints. This one is the
+# lighter cntrl-byte + traversal filter used for IOC-quarantine
+# allowlist gating where the path never reaches a shell context.
 kill_path_in_allowlist() {
     local path="$1" resolved=""
     [[ -n "$path" ]] || return 1
@@ -2067,6 +2076,24 @@ prune_ssh_keys_from_manifest() {
         path=$(kill_json_str_field "$line" path)
         [[ -z "$path" ]] && continue
 
+        # v0.7.3 defense-in-depth: re-validate the manifest path against
+        # the shell-metachar filter at consume-time. The build-time gate
+        # in kill_sshkey_canonical_paths (v0.7.2) is the primary defense,
+        # but a manifest emitted by a pre-v0.7.2 mitigate run could be
+        # replayed under v0.7.3+ with a hostile path baked in, reaching
+        # ssh_keys_prune's trap-string expansion at step 7. Refuse here
+        # so a stale-manifest replay cannot rebuild the trap-injection
+        # vector. Sibling primitive: kill_path_in_allowlist (line ~1625)
+        # is the lighter cntrl-byte filter for non-shell-context paths.
+        if ! kill_sshkey_path_safe "$path"; then
+            say_warn "refusing manifest sshkey item with hostile shell-metachar path: $path"
+            kill_sshkey_action_record "$sidecar" "$path" \
+                "refused_hostile_path" \
+                "manifest path failed kill_sshkey_path_safe filter (likely stale pre-v0.7.2 manifest)" \
+                "0" "0" "" "" "" ""
+            continue
+        fi
+
         # Pull the manifest's pre-baked backup paths so the apply-path
         # writes to the same locations the manifest's recovery_hint
         # field promised the operator. Falls back to the canonical
@@ -2262,6 +2289,12 @@ kill_compute_verdict() {
                         (lock_contended|concurrent_modification)
                             sshkeys_skip=$((sshkeys_skip+1))
                             sshkeys_warn_promote=1 ;;
+                        (refused_hostile_path)
+                            # v0.7.3: stale-manifest replay of a hostile
+                            # path. Treat as total_skip + WARN-promote
+                            # (mirrors kept_unlabeled_warned semantics).
+                            sshkeys_skip=$((sshkeys_skip+1))
+                            sshkeys_warn_promote=1 ;;
                         (prune_failed|refused_unparseable|clobbered_post_mv)
                             sshkeys_fail=$((sshkeys_fail+1)) ;;
                     esac
@@ -2299,6 +2332,13 @@ kill_compute_verdict() {
                     sshkeys_pending=$((sshkeys_pending+1))
                     sshkeys_warn_promote=1 ;;
                 (lock_contended|concurrent_modification)
+                    sshkeys_skip=$((sshkeys_skip+1))
+                    sshkeys_warn_promote=1 ;;
+                (refused_hostile_path)
+                    # v0.7.3: only emitted apply-side by
+                    # prune_ssh_keys_from_manifest, but recognize here
+                    # for forward-compat if a future emitter ever bakes
+                    # the bare primary into a planned_ row.
                     sshkeys_skip=$((sshkeys_skip+1))
                     sshkeys_warn_promote=1 ;;
                 (prune_failed|refused_unparseable|clobbered_post_mv)
@@ -2407,7 +2447,7 @@ finalize_manifest() {
                     else if (v == "csf_failed") ips_fail++
                 } else if (p[1] == "sshkey") {
                     if (v == "pruned_ok" || v == "forced_full_prune") sshkeys_files_pruned++
-                    else if (v == "nothing_to_prune" || v == "gone" || v == "refused_symlink") sshkeys_files_clean++
+                    else if (v == "nothing_to_prune" || v == "gone" || v == "refused_symlink" || v == "refused_hostile_path") sshkeys_files_clean++
                     else if (v == "kept_unlabeled_warned") sshkeys_files_kept_unlabeled++
                     else if (v == "would_lock_out") sshkeys_files_lock_out++
                     else if (v == "concurrent_modification") sshkeys_files_concurrent_mod++
@@ -4565,13 +4605,15 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         exit 0
     fi
     if [[ "${MITIGATE_RUN_P1_TESTS:-0}" == "1" ]]; then
-        # P1+P2+P3 test harness — 49 cases from PLAN-sshkey-prune.md
-        # plus v0.7.1 / v0.7.2 sentinel-fix regressions.
+        # P1+P2+P3 test harness — 50 cases from PLAN-sshkey-prune.md
+        # plus v0.7.1 / v0.7.2 / v0.7.3 sentinel-fix regressions.
         # P1 = 29 (helpers + drift gate), P2 = 6 (manifest sweep + apply
         # consumer), P3 = 9 (CLI flags + phase_kill drift gate),
         # v0.7.1 = 2 (45-46 sidecar JSONL escape + leading-whitespace),
         # v0.7.2 = 3 (47 trap-injection metachar gate, 48 recovery_hint
-        # shell-quote, 49 finalize_manifest sshkey detail+sha256_pre patch).
+        # shell-quote, 49 finalize_manifest sshkey detail+sha256_pre patch),
+        # v0.7.3 = 1 (50 deeper trap-time test — consume-time gate
+        # blocks stale-manifest-replay PoC).
         # Each test prints OK(<n> <description>) or FAIL(<n> <description>:
         # <diagnostic>) on stdout. Exits 0 on all-OK, 1 on any FAIL.
         _t_pass=0
@@ -5585,6 +5627,89 @@ sys.exit(0 if ok else 1)
         else
             _t_fail 49 "finalize_manifest patch result_detail + sha256_pre" \
                 "det_null=$_det49_null pre_null=$_pre49_null post_null=$_post49_null result_ok=$_result49_ok det_substr=$_det49_substr pre_hex=$_pre49_hex row='$_row49'"
+        fi
+
+        # Test 50 (v0.7.3 SHOULD-FIX): kill_sshkey_path_safe runtime
+        # trap-injection PoC blocked by consume-time gate. Simulates a
+        # stale pre-v0.7.2 manifest replay: the manifest carries a
+        # hostile path that bypassed the build-time canonical-paths
+        # filter (because it was emitted before that filter shipped).
+        # prune_ssh_keys_from_manifest must refuse the row at
+        # consume-time (before ssh_keys_prune installs its trap), record
+        # `refused_hostile_path`, and leave no INJECTION_PROOF file.
+        #
+        # Why this is a deeper test than 47: test 47 exercises the
+        # build-time gate by overriding `find` so a hostile dir reaches
+        # kill_sshkey_canonical_paths. Test 50 hands a hostile path
+        # directly to the apply-path consumer — the only place left
+        # where a stale manifest could re-introduce the trap-injection
+        # vector after v0.7.2 closed the build-time hole.
+        MODE="apply"
+        BACKUP_DIR="$_t_dir/50-bdir"
+        mkdir -p "$BACKUP_DIR"
+        rm -f "$_t_dir/INJECTION_PROOF"
+        # Hostile path: shell-metachar payload that, if expanded inside
+        # a trap-string, would touch INJECTION_PROOF. The path itself
+        # need not exist on disk — the consume-time gate fires before
+        # any I/O.
+        _hostile50="/home/x\";touch $_t_dir/INJECTION_PROOF;\"y/.ssh/authorized_keys"
+        _m50="$_t_dir/50-manifest.json"
+        _bd50="$BACKUP_DIR/quarantine/${_hostile50#/}"
+        # Synthesize a stale-pre-v0.7.2 manifest carrying the hostile
+        # path. Single-item, minimal but finalize-compatible shape.
+        {
+            printf '{\n'
+            printf '  "ts_applied":null,\n'
+            printf '  "items":[\n'
+            printf '    {"kind":"sshkey","path":"%s","action":"prune",' "$(printf '%s' "$_hostile50" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+            printf '"trust_re":"%s","trust_re_effective":"%s",' "$KILL_SSH_TRUST_RE" "$KILL_SSH_TRUST_RE"
+            printf '"keys_total":1,"keys_kept":0,"keys_kept_unlabeled":0,"keys_pruned":1,'
+            printf '"pruned_keys":[],'
+            printf '"result":"planned_pruned_ok","result_detail":null,"sha256_pre":null,"sha256_post":null,'
+            printf '"original_backup_path":"%s.original-pre-prune","removed_keys_sidecar_path":"%s.removed-keys",' \
+                "$(printf '%s' "$_bd50" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+                "$(printf '%s' "$_bd50" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+            printf '"recovery_hint":"cp -a ..."}\n'
+            printf '  ],\n'
+            printf '  "csf":{\n'
+            printf '    "blocklist_url":null,\n'
+            printf '    "blocklist_name":null,\n'
+            printf '    "registered":null,\n'
+            printf '    "lf_ipset":null,\n'
+            printf '    "lf_ipset_maxelem":null,\n'
+            printf '    "config_changed":null\n'
+            printf '  },\n'
+            printf '  "summary":{\n'
+            printf '    "files_planned":0,\n'
+            printf '    "ips_planned":0,\n'
+            printf '    "files_refused":0\n'
+            printf '  }\n'
+            printf '}\n'
+        } > "$_m50"
+        : > "${_m50%.json}.actions.jsonl"
+        # Drive the apply-path consumer. It must:
+        #   1. extract the hostile path via kill_json_str_field,
+        #   2. fail kill_sshkey_path_safe at the consume-time gate,
+        #   3. record `refused_hostile_path` in the sidecar,
+        #   4. NOT call ssh_keys_prune (so no trap is set, no
+        #      INJECTION_PROOF file is created).
+        prune_ssh_keys_from_manifest "$_m50" >/dev/null 2>&1
+        _sidecar50="${_m50%.json}.actions.jsonl"
+        _refused50=$(grep -c '"result":"refused_hostile_path"' "$_sidecar50" 2>/dev/null)
+        _pruned50=$(grep -c '"result":"pruned_ok"' "$_sidecar50" 2>/dev/null)
+        _injected50=0
+        [[ -e "$_t_dir/INJECTION_PROOF" ]] && _injected50=1
+        # Belt-and-suspenders: drive kill_compute_verdict over the
+        # synthesized sidecar to confirm refused_hostile_path is wired
+        # into the verdict vocabulary (skip + WARN-promote).
+        kill_compute_verdict "$_m50" >/dev/null 2>&1
+        _verdict50="${LAST_KILL_VERDICT:-}"
+        if [[ "$_refused50" == "1" && "$_pruned50" == "0" \
+              && "$_injected50" == "0" && "$_verdict50" == "WARN" ]]; then
+            _t_ok 50 "kill_sshkey_path_safe runtime trap-injection PoC blocked by consume-time gate"
+        else
+            _t_fail 50 "kill_sshkey_path_safe runtime trap-injection PoC blocked by consume-time gate" \
+                "refused=$_refused50 pruned=$_pruned50 injected=$_injected50 verdict=$_verdict50"
         fi
 
         rm -rf "$_t_dir"
