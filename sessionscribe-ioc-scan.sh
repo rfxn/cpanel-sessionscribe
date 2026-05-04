@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.10
+# sessionscribe-ioc-scan.sh v2.7.11
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.10"
+VERSION="2.7.11"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -486,6 +486,15 @@ TELEMETRY_RETRY=2
 # KB; the cap is a defense-in-depth ceiling against pathological cases.
 TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 
+# --telemetry-cron <add|remove> [1h|6h|12h|24h]: install or remove a system
+# cron entry under /etc/cron.d/ that runs the telemetry path on a fixed
+# interval (default 6h). The generated cron prepends a 5s-180s sleep jitter
+# so a fleet of N hosts doesn't all hit the intake collector at the same
+# minute mark. Empty = no cron management requested.
+TELEMETRY_CRON_ACTION=""
+TELEMETRY_CRON_INTERVAL="6h"
+TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
+
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
 # Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
@@ -638,6 +647,24 @@ Telemetry (low-disk-usage fleet collection):
                              5MB / 5242880). Larger envelopes skip the POST
                              and emit a warning signal; the lite bundle on
                              disk is unaffected.
+      --telemetry-cron add [INTERVAL]
+                             Install a system cron entry at
+                             /etc/cron.d/sessionscribe-telemetry that runs
+                             '--telemetry --chain-on-all --chain-upload
+                             --quiet --jsonl >/dev/null 2>&1' on the given
+                             INTERVAL. Allowed: 1h | 6h | 12h | 24h.
+                             Default: 6h. Each invocation prepends a
+                             random 5s-180s sleep so a fleet of hosts
+                             doesn't synchronize on the minute mark.
+                             Requires root (writes /etc/cron.d/). If
+                             --upload-url and/or --upload-token are also
+                             passed on this command line, they're embedded
+                             in the generated cron entry so the cron run
+                             ships to your custom intake. Idempotent —
+                             running 'add' again overwrites the file.
+      --telemetry-cron remove
+                             Remove /etc/cron.d/sessionscribe-telemetry.
+                             No-op if not installed. Requires root.
 
 Back-compat aliases (deprecated; set full-mode + the relevant gate):
       --chain-forensic       equivalent to full mode (no host-verdict gate)
@@ -667,6 +694,169 @@ Exit codes:
                          from T1 IPs, session-side injection markers;
                          overrides all lower exit codes)
 EOF
+    exit 0
+}
+
+###############################################################################
+# Telemetry cron management — install / remove /etc/cron.d/<name> entry that
+# runs the telemetry path on a fixed interval (1h/6h/12h/24h). Generated cron
+# prepends a 5s-180s random-sleep jitter so a fleet of N hosts doesn't all
+# hit the intake collector at the same minute mark.
+#
+# Cron file format chosen: /etc/cron.d/<name>. Reasons:
+#   - System cron (works under cronie / vixie-cron / EL9 systemd-cron-shim);
+#     no per-user crontab dependency
+#   - SHELL=/bin/bash declared in-file so $((RANDOM % N)) works at run time
+#     (cron's default /bin/sh on Debian-derivatives is dash, no $RANDOM)
+#   - Easy to inspect / disable (cat / rm); no `crontab -l | { …; } | crontab`
+#     race window when re-running 'add'
+#   - install(1) preserves perms; restorecon(1) best-effort fixes SELinux
+#     context if the binary is present (cPanel hosts typically permissive
+#     selinux but the call is harmless either way)
+#
+# Defined here (early in the script, immediately after usage()) so the
+# dispatch site at the end of arg parsing can call it before any scan-mode
+# validation runs. Cron management is its own operational mode and exits
+# cleanly without attempting detection.
+###############################################################################
+
+manage_telemetry_cron() {
+    local action="$TELEMETRY_CRON_ACTION"
+    case "$action" in
+        add|remove) ;;
+        *) echo "Error: --telemetry-cron action must be 'add' or 'remove' (got: $action)" >&2
+           exit 2 ;;
+    esac
+
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        echo "Error: --telemetry-cron requires root (writes $TELEMETRY_CRON_FILE)" >&2
+        exit 2
+    fi
+
+    if [[ "$action" == "remove" ]]; then
+        if [[ -f "$TELEMETRY_CRON_FILE" ]]; then
+            rm -f "$TELEMETRY_CRON_FILE"
+            echo "Removed: $TELEMETRY_CRON_FILE"
+        else
+            echo "Not installed: $TELEMETRY_CRON_FILE (no-op)"
+        fi
+        exit 0
+    fi
+
+    # === add ===
+    if [[ ! -d /etc/cron.d ]]; then
+        echo "Error: /etc/cron.d does not exist; install cronie/vixie-cron first" >&2
+        exit 2
+    fi
+
+    # Resolve script's own absolute path so the cron entry has a stable
+    # invocation target regardless of cwd at run time. readlink -f follows
+    # symlinks; fall back to cd-pwd resolution if readlink is missing
+    # (rare, but stripped containers exist).
+    local self_path=""
+    if command -v readlink >/dev/null 2>&1; then
+        self_path=$(readlink -f "$0" 2>/dev/null)
+    fi
+    if [[ -z "$self_path" ]]; then
+        self_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    fi
+    if [[ ! -f "$self_path" ]]; then
+        echo "Error: cannot resolve script path for cron (got: $0 → $self_path)" >&2
+        exit 2
+    fi
+
+    # Map interval to cron schedule. Allowlist enforced — only these four
+    # values reach this case statement (parser regex gate at the CLI layer).
+    local schedule=""
+    case "$TELEMETRY_CRON_INTERVAL" in
+        1h)  schedule="0 * * * *"    ;;
+        6h)  schedule="0 */6 * * *"  ;;
+        12h) schedule="0 */12 * * *" ;;
+        24h) schedule="0 0 * * *"    ;;
+        *)   echo "Error: invalid --telemetry-cron interval (got: $TELEMETRY_CRON_INTERVAL; use 1h|6h|12h|24h)" >&2
+             exit 2 ;;
+    esac
+
+    # Pass through --upload-url and --upload-token if the operator set them
+    # on this command line — embed in the generated cron so the scheduled
+    # run ships to their custom intake without manual file edits. Single-
+    # quoted in the cron line so values containing spaces or special chars
+    # don't break shell parsing at run time. Operators can rotate the
+    # token by re-running '--telemetry-cron add ... --upload-token NEW'.
+    local extra_args=""
+    if [[ -n "${CHAIN_UPLOAD_URL:-}" ]]; then
+        # Reject embedded single-quotes — would break the cron line shell
+        # parsing. Operators with weird URL chars get a clear error.
+        if [[ "$CHAIN_UPLOAD_URL" == *"'"* ]]; then
+            echo "Error: --upload-url cannot contain single-quote (\"'\") for cron embedding" >&2
+            exit 2
+        fi
+        extra_args+=" --upload-url '${CHAIN_UPLOAD_URL}'"
+    fi
+    if [[ -n "${CHAIN_UPLOAD_TOKEN:-}" ]]; then
+        if [[ "$CHAIN_UPLOAD_TOKEN" == *"'"* ]]; then
+            echo "Error: --upload-token cannot contain single-quote (\"'\") for cron embedding" >&2
+            exit 2
+        fi
+        extra_args+=" --upload-token '${CHAIN_UPLOAD_TOKEN}'"
+    fi
+
+    # Build the cron file contents in a tempfile, then atomic-install. The
+    # 5s-180s sleep is computed in the cron-shell at run time via $RANDOM
+    # arithmetic — `5 + RANDOM % 176` produces an integer in [5, 180]. The
+    # SHELL=/bin/bash header at the top of the cron.d file ensures cron
+    # uses bash (which has $RANDOM), not /bin/sh (dash on some derivatives,
+    # no $RANDOM). $((…)) is escaped to \$((…)) so heredoc expansion happens
+    # at write-time only for variable references, not for the arithmetic.
+    local tmp
+    tmp=$(mktemp /tmp/telemetry-cron.XXXXXX) || {
+        echo "Error: mktemp failed" >&2; exit 2; }
+    cat > "$tmp" <<CRONEOF
+# /etc/cron.d/sessionscribe-telemetry
+# Managed by sessionscribe-ioc-scan.sh --telemetry-cron
+# Generated $(date -u +%FT%TZ) at interval=${TELEMETRY_CRON_INTERVAL}
+#
+# DO NOT EDIT DIRECTLY — re-running '--telemetry-cron add' overwrites this
+# file. Use '--telemetry-cron remove' to uninstall, or re-run 'add' with
+# different flags to update.
+#
+# The 5-180s sleep prefix spreads fleet load: a 1000-host fleet hitting
+# intake at minute 0 distributes across ~3 minutes (~6 hosts/sec average).
+SHELL=/bin/bash
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+${schedule} root sleep \$((5 + RANDOM % 176)); ${self_path} --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args} >/dev/null 2>&1
+CRONEOF
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo "Error: cron file build failed (tempfile empty)" >&2
+        exit 2
+    fi
+
+    # install(1) atomically replaces the target with correct perms/owner.
+    # Mode 0644 is the cron.d standard (cron daemon reads as root, world-
+    # readable for inspection; not world-writable).
+    if ! install -m 0644 -o root -g root "$tmp" "$TELEMETRY_CRON_FILE" 2>/dev/null; then
+        rm -f "$tmp"
+        echo "Error: install failed (cannot write $TELEMETRY_CRON_FILE)" >&2
+        exit 2
+    fi
+    rm -f "$tmp"
+
+    # Best-effort SELinux context restore. cron.d files want
+    # system_cron_spool_t; install(1) doesn't restore contexts. Silent skip
+    # if SELinux is disabled or restorecon is missing — both are common.
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -F "$TELEMETRY_CRON_FILE" 2>/dev/null || true
+    fi
+
+    echo "Installed: $TELEMETRY_CRON_FILE"
+    echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-180s)"
+    echo "Command:   $self_path --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo
+    echo "Inspect:   cat $TELEMETRY_CRON_FILE"
+    echo "Test now:  $self_path --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Remove:    $self_path --telemetry-cron remove"
     exit 0
 }
 
@@ -720,6 +910,21 @@ while [[ $# -gt 0 ]]; do
         --telemetry-timeout)  TELEMETRY_TIMEOUT="$2"; shift 2 ;;
         --telemetry-retry)    TELEMETRY_RETRY="$2"; shift 2 ;;
         --telemetry-max-bytes) TELEMETRY_MAX_BYTES="$2"; shift 2 ;;
+        # --telemetry-cron <add|remove> [INTERVAL]: optional positional
+        # interval is consumed only if it matches the allowlist (1h/6h/12h/
+        # 24h). The action arg is required; the optional interval defaults
+        # to TELEMETRY_CRON_INTERVAL (6h). On 'remove' the interval is
+        # ignored (no-op since action arg already consumed it via shift 2).
+        --telemetry-cron)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --telemetry-cron requires <add|remove>" >&2
+                exit 2
+            fi
+            TELEMETRY_CRON_ACTION="$2"; shift 2
+            if [[ "${1:-}" =~ ^(1h|6h|12h|24h)$ ]]; then
+                TELEMETRY_CRON_INTERVAL="$1"; shift
+            fi
+            ;;
         # Back-compat aliases -- set --full + the legacy gate flags so the
         # main-flow gating logic (Phase 5) honors the original semantics.
         --chain-forensic)     FULL_MODE=1; CHAIN_FORENSIC=1; shift ;;
@@ -739,6 +944,18 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; echo "Try --help" >&2; exit 2 ;;
     esac
 done
+
+# Telemetry-cron management runs before any scan-mode validation or the
+# cPanel host gate. Cron management is its own operational mode — install
+# or remove the /etc/cron.d/ entry and exit. Operators don't need a live
+# cPanel host to manage the cron entry; they need root and /etc/cron.d/.
+if [[ -n "$TELEMETRY_CRON_ACTION" ]]; then
+    manage_telemetry_cron
+    # manage_telemetry_cron always exits; this `exit 0` is dead code but
+    # documents the contract for readers and protects against a future
+    # refactor that drops the function-internal exits.
+    exit 0
+fi
 
 # --csv and --jsonl both want stdout - mutual exclusion.
 if (( CSV && JSONL )); then

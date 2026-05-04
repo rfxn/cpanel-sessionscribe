@@ -402,6 +402,82 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.11 — 2026-05-03
+
+### Added
+- **`--telemetry-cron <add|remove> [INTERVAL]`** — install or remove a
+  system cron entry that runs the telemetry path (`--telemetry
+  --chain-on-all --chain-upload --quiet --jsonl >/dev/null 2>&1`) on a
+  fixed interval. Generated cron prepends a 5s-180s random-sleep
+  jitter so a fleet of N hosts doesn't synchronize on the minute mark
+  and overwhelm the intake collector with a single burst.
+
+  CLI surface:
+  - `--telemetry-cron add` — install with default 6h interval
+  - `--telemetry-cron add 1h|6h|12h|24h` — install with specified
+    interval; allowlist enforced at parse time
+  - `--telemetry-cron remove` — uninstall (idempotent — no-op if not
+    installed)
+
+  Pass-through of `--upload-url` and `--upload-token` if the operator
+  sets them on the same command line — those values get embedded
+  (single-quote-wrapped) in the generated cron entry so the scheduled
+  run ships to a custom intake without manual file edits. Single-
+  quotes in the values themselves are rejected at install time with
+  a clear error (would break shell parsing of the cron line at run
+  time).
+
+  Cron file: `/etc/cron.d/sessionscribe-telemetry`. Reasons:
+  - System cron format (works under cronie/vixie-cron/EL9 systemd-cron)
+  - `SHELL=/bin/bash` declared in-file so `$((RANDOM % N))` arithmetic
+    works at run time (cron's default `/bin/sh` is dash on Debian-
+    derivatives; no `$RANDOM` there)
+  - Inspect via `cat`, disable via `rm`; no `crontab -l | { …; } |
+    crontab` race window when re-running 'add'
+  - `install -m 0644 -o root -g root` for atomic replace; best-effort
+    `restorecon` for SELinux context restoration
+
+  Schedule mapping:
+  | Interval | Cron expression |
+  |----------|----------------|
+  | 1h       | `0 * * * *`    |
+  | 6h       | `0 */6 * * *`  |
+  | 12h      | `0 */12 * * *` |
+  | 24h      | `0 0 * * *`    |
+
+  Jitter math: `5 + RANDOM % 176` produces a uniform integer in
+  `[5, 180]` — 176 distinct values. A 1000-host fleet hitting intake
+  at minute 0 distributes across ~3 minutes (~6 hosts/sec average).
+
+  Dispatch order: cron management runs immediately after CLI parsing,
+  BEFORE scan-mode validations (no `--no-ledger` / cPanel-host gate
+  fires during cron mgmt). Operators don't need a live cPanel host
+  to install/remove the cron entry — only root + `/etc/cron.d/`.
+
+  Self-path resolution: `readlink -f "$0"` with `cd "$(dirname …)"`
+  fallback for stripped containers without readlink. The resolved
+  absolute path goes into the cron entry so the scheduled run is
+  immune to the operator's cwd at install time.
+
+  Validation:
+  - Action must be `add` or `remove` (rejected at parse time)
+  - Interval must be `1h|6h|12h|24h` (regex-gated at CLI; case
+    statement re-validates inside the function for defense-in-depth)
+  - EUID 0 required (writes /etc/cron.d/)
+  - `/etc/cron.d/` must exist (cronie/vixie-cron must be installed)
+  - `--upload-url` / `--upload-token` must not contain single-quote
+    (would break the cron line's shell-parse at run time)
+
+  Verification: bash -n clean, shellcheck `-S warning` clean (12
+  warnings, all baseline). Live tested on this Fedora 40 host: add
+  with default 6h, add with 1h/24h, add with custom upload-url +
+  upload-token (correctly single-quoted), idempotent remove,
+  hostile single-quote injection rejected, missing-action rejected,
+  invalid-action rejected. Cron line itself executed under
+  `bash -c` produced 3 distinct sleep durations (89s, 98s, 50s) all
+  within [5, 180] — `$RANDOM` arithmetic works correctly via the
+  in-file `SHELL=/bin/bash` declaration.
+
 ## sessionscribe-ioc-scan.sh v2.7.10 — 2026-05-03
 
 ### Added
