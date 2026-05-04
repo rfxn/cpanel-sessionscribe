@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.22"
+VERSION="2.7.23"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -2019,19 +2019,12 @@ pattern_g_deep_checks() {
         ak_files+=("$h/.ssh/authorized_keys" "$h/.ssh/authorized_keys2")
     done < <(find /home -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
 
-    local ak mtime_pre atime_pre ctime_pre mt_utc mt_local
+    local ak mtime_pre ctime_pre mt_utc mt_local
     for ak in "${ak_files[@]}"; do
         [[ -f "$ak" ]] || continue
         mtime_pre=$(stat -c %Y "$ak" 2>/dev/null)
-        atime_pre=$(stat -c %X "$ak" 2>/dev/null)
         ctime_pre=$(stat -c %Z "$ak" 2>/dev/null)
-        # _g_high_conf gates the per-file rollup OFFENSE_EVENTS push.
-        # Set when forged-mtime stamp matches OR a key comment matches
-        # PATTERN_G_BAD_KEY_LABELS. Unrecognized-comment-only files emit
-        # per-key warn into the JSONL ladder but do NOT push a kill-chain
-        # row — eliminates UNDEFENDED noise on hosts with tenant/deploy
-        # keys that don't match LW provisioning patterns.
-        local _g_high_conf=0
+        local _g_known_bad=0
         # `touch -d` interprets in local timezone, so the resulting epoch
         # depends on the host's UTC offset. Compare the wall-clock string
         # under both UTC and localtime - either match is the IC-5790 stamp.
@@ -2045,7 +2038,6 @@ pattern_g_deep_checks() {
                     "$ak mtime matches IC-5790 backdate stamp" \
                     file "$ak" forged_mtime_wall "$PATTERN_G_FORGED_MTIME_WALL" \
                     actual_mtime_utc "$mt_utc" actual_mtime_local "$mt_local"
-                _g_high_conf=1
                 if [[ -n "$ctime_pre" ]]; then
                     OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_forged_mtime|backdated ssh key|patch,modsec")
                     IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "" "" "" "" "mtime forged to $PATTERN_G_FORGED_MTIME_WALL")")
@@ -2073,7 +2065,7 @@ pattern_g_deep_checks() {
             done
             if (( is_known_bad )); then
                 susp_count=$((susp_count+1))
-                _g_high_conf=1
+                _g_known_bad=1
                 emit_signal offense fail pattern_g_known_bad_key \
                     "known-bad ssh key label in $ak: $comment matches $bad_label" \
                     file "$ak" comment "$comment" matches "$bad_label"
@@ -2086,9 +2078,10 @@ pattern_g_deep_checks() {
         done < "$ak"
         if (( susp_count > 0 )); then
             say_ioc "PATTERN-G: $susp_count non-standard ssh key(s) in $ak"
-            if (( _g_high_conf )) && [[ -n "$ctime_pre" ]]; then
-                OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|known-bad ssh key (ctime)|patch,modsec")
-                IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "$susp_count" "" "" "" "known-bad ssh key (ctime)")")
+            # Gate on _g_known_bad only — forged_mtime emits its own row above.
+            if (( _g_known_bad )) && [[ -n "$ctime_pre" ]]; then
+                OFFENSE_EVENTS+=("$ctime_pre|G|pattern_g_sshkey|known-bad ssh key label|patch,modsec")
+                IOC_PRIMITIVES+=("$(ioc_primitive_row destruction "" "$ak" "$susp_count" "" "" "" "known-bad ssh key label")")
                 IOC_ANNOTATIONS+=("")
             fi
         fi

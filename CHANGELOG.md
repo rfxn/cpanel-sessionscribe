@@ -402,6 +402,33 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.23 — 2026-05-04
+
+### Fixed (FP — shipped in v2.7.22, corrected here)
+
+v2.7.22 used a single `_g_high_conf` flag set by both forged-mtime and
+known-bad-comment matches. Two FPs followed:
+
+- **Duplicate kill-chain row.** A file with forged mtime AND any
+  unrecognized comment pushed both `pattern_g_forged_mtime` (line 2050)
+  and `pattern_g_sshkey` (line 2090) into `OFFENSE_EVENTS[]`. Two rows
+  for the same authorized_keys file.
+- **Misleading note "known-bad ssh key (ctime)"** on the rollup row when
+  the only high-conf trigger was forged-mtime — implying a known-bad
+  comment match that didn't actually occur.
+
+Fix: split the gate. `_g_known_bad` is now set only inside the
+`is_known_bad` branch. Forged-mtime keeps its own dedicated kill-chain
+emit above; the rollup fires only when a comment actually matched
+`PATTERN_G_BAD_KEY_LABELS`. Note label updated to "known-bad ssh key
+label" so it cannot mislead.
+
+### Slop pruned
+
+- Removed unused `atime_pre` (SC2034).
+- Compressed v2.7.22's 6-line `_g_high_conf` rationale block to one
+  line per the global commenting-discipline rule.
+
 ## sessionscribe-ioc-scan.sh v2.7.22 — 2026-05-04
 
 ### Changed (kill-chain noise reduction)
