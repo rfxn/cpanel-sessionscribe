@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.23"
+VERSION="2.7.24"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -1242,6 +1242,10 @@ DEF_CPSRVD_RESTART=""   # cpsrvd PID start time (epoch)
 DEF_MITIGATE_FIRST=""   # earliest sessionscribe-mitigate.sh run dir
 DEF_MITIGATE_LAST=""    # most recent sessionscribe-mitigate.sh run dir
 DEF_MODSEC_TIME=""      # mtime of modsec2.user.conf if it contains 1500030
+DEF_CSF_TIME=""         # mtime of /etc/csf/csf.conf if cpsrvd ports stripped
+DEF_APF_TIME=""         # mtime of /etc/apf/conf.apf if cpsrvd ports stripped
+DEF_PROXYSUB_TIME=""    # mtime of cpanel.config when proxysubdomains enabled
+DEF_UPCP_LATEST_TIME="" # epoch of last successful upcp run
 PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 
 # Bundle output paths (set by phase_bundle, read by phase_upload).

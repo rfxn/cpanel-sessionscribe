@@ -402,7 +402,40 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
-## sessionscribe-ioc-scan.sh v2.7.23 — 2026-05-04
+## sessionscribe-ioc-scan.sh v2.7.24 — 2026-05-04
+
+### Fixed (regression: kill-chain render aborts on dirty-defense hosts)
+
+`render_kill_chain` (line 8492) trips `unbound variable` under `set -u`
+when the host's defense state didn't reach the conditional setters for
+`DEF_CSF_TIME`, `DEF_APF_TIME`, `DEF_PROXYSUB_TIME`, or
+`DEF_UPCP_LATEST_TIME`. Symptom on cloudvpsserver fleet run:
+
+```
+[WARN]     defense_late ...
+sessionscribe-ioc-scan.sh: line 3187: DEF_CSF_TIME: unbound variable
+```
+
+The function aborts before printing the boxed visual kill-chain (the
+`│ TS  ⚡ pattern X    key   detail` timeline). `phase_reconcile`'s
+plain `[UNDEFENDED] pattern=X ...` rows still print because they emit
+before `render_kill_chain` is called, but the operator-facing summary
+view is missing — exactly the row layout the IR triage workflow relies
+on.
+
+Fix: initialize the four conditionally-set DEF_* globals to empty
+string at top level alongside the existing `DEF_PATCH_TIME`,
+`DEF_MODSEC_TIME`, `DEF_CPSRVD_RESTART`, `DEF_MITIGATE_FIRST`,
+`DEF_MITIGATE_LAST`. Empty = "defense state unknown" per the existing
+contract for the initialized siblings.
+
+Trigger profile: any host where CSF still has cpsrvd ports in TCP_IN
+(i.e., mitigate hasn't been run, or csf-clean detection failed).
+Affected verdicts are unchanged — exit code, host_verdict, and the
+JSONL ladder all came through cleanly; only the visual render path
+was broken.
+
+
 
 ### Fixed (FP — shipped in v2.7.22, corrected here)
 
