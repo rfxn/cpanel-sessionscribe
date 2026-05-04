@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.25
+# sessionscribe-ioc-scan.sh v2.7.26
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.25"
+VERSION="2.7.26"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -8152,11 +8152,19 @@ print_verdict() {
 
     case "$VERDICT" in
         VULNERABLE)
+            # ${BASH_SOURCE[0]} is the file path when run as a script. $0 can
+            # be the literal "bash" (cat | bash, bash -c "$(...)", bash <(...))
+            # which prints "bash bash" — fall back to the script's own
+            # filename so the recommendation is always actionable.
+            local _self="${BASH_SOURCE[0]:-}"
+            case "${_self##*/}" in
+                ""|bash|main|sh) _self="sessionscribe-ioc-scan.sh" ;;
+            esac
             say ""
             say "   Recommended action:"
             say "     /usr/local/cpanel/scripts/upcp --force"
             say "     /usr/local/cpanel/scripts/restartsrv_cpsrvd"
-            say "     bash $0                                # confirm verdict flips to PATCHED"
+            say "     bash $_self                                # confirm verdict flips to PATCHED"
             say "   If on an unpatched tier (no in-place patch available), restrict cpsrvd"
             say "   ports 2082/2083/2086/2087/2095/2096 to a management CIDR until upgrade."
             ;;

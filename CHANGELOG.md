@@ -4,6 +4,48 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.7.4 — 2026-05-04
+
+### Fixed (broken MariaDB 10.x repos block epel-release install on CentOS 6/7)
+
+`phase_preflight` step 2b ran `yum install -y epel-release` (or
+`dnf install -y epel-release`) without disabling the cPanel-bundled
+MariaDB repo. On a substantial slice of the CentOS 6/7 fleet the
+MariaDB 10.x repo URL has rotted and the metadata fetch fails fast,
+which in yum's strict mode aborts the entire transaction before it
+ever reaches the epel-release package. Net effect: epel installs
+silently fail, mitigate reports `could not install epel-release`,
+and the operator has no obvious next step.
+
+Fix: add `--disablerepo=Maria\*` to both the dnf and yum install
+calls. The pattern matches `MariaDB10*`, `MariaDB103`, `MariaDB106`,
+and the bare `MariaDB` cPanel-bundle name. EPEL itself doesn't depend
+on MariaDB repos, so disabling them for this transaction has no side
+effects on the install. Hosts whose MariaDB repos are fine see no
+behavior change; broken-repo hosts now succeed.
+
+## sessionscribe-ioc-scan.sh v2.7.26 — 2026-05-04
+
+### Fixed (cosmetic: "bash bash" rendering when $0 isn't a path)
+
+The VULNERABLE recommended-action block printed `bash $0` verbatim,
+which renders as `bash bash` when the script is invoked via stdin pipe
+(`cat … | bash`), heredoc (`bash -c "$(…)"`), or process substitution
+(`bash <(curl …)`) — all valid invocation patterns. Symptom from the
+fleet:
+
+```
+   Recommended action:
+     /usr/local/cpanel/scripts/upcp --force
+     /usr/local/cpanel/scripts/restartsrv_cpsrvd
+     bash bash                                # confirm verdict flips to PATCHED
+```
+
+Fix: prefer `${BASH_SOURCE[0]}` and fall back to the script's literal
+filename when `${var##*/}` resolves to `bash`/`main`/`sh`/empty. The
+recommendation is now always actionable regardless of how the script
+was launched.
+
 ## sessionscribe-mitigate.sh v0.7.3 — 2026-05-03
 
 ### Security

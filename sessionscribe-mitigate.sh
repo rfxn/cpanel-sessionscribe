@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.7.3
+# sessionscribe-mitigate.sh v0.7.4
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -92,7 +92,7 @@
 
 set -u
 
-VERSION="0.7.3"
+VERSION="0.7.4"
 
 ###############################################################################
 # Constants
@@ -3289,10 +3289,14 @@ phase_preflight() {
     else
         if [[ "$MODE" == "apply" ]]; then
             local pkg_ok=0
+            # --disablerepo=Maria* skips broken MariaDB 10.x repos seen on
+            # CentOS 6/7 fleets where the cPanel-bundled MariaDB repo URL
+            # has rotted — yum/dnf would otherwise fail-fast on the metadata
+            # fetch and never reach the epel-release transaction.
             if have_cmd dnf; then
-                timeout 5m dnf install -y epel-release >/dev/null 2>&1 && pkg_ok=1
+                timeout 5m dnf install -y epel-release --disablerepo=Maria\* >/dev/null 2>&1 && pkg_ok=1
             elif have_cmd yum; then
-                timeout 5m yum install -y epel-release >/dev/null 2>&1 && pkg_ok=1
+                timeout 5m yum install -y epel-release --disablerepo=Maria\* >/dev/null 2>&1 && pkg_ok=1
             fi
             if (( pkg_ok )); then
                 say_action "installed epel-release"
