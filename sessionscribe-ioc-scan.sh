@@ -2156,7 +2156,7 @@ suspect_ip_correlation() {
     fi
     (( ${#cp_logs[@]} > 0 )) || return
 
-    # Drop RFC1918 + loopback (WHM admin); mirrors Pattern E is_internal at line ~7084.
+    # Drop RFC1918 + loopback (WHM admin); same regex shape as Pattern E is_internal.
     local suspect_ips
     suspect_ips=$(
         for lg in "${cp_logs[@]}"; do cat_log "$lg"; done \
