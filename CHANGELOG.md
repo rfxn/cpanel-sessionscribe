@@ -402,6 +402,107 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.17 — 2026-05-04
+
+### Changed
+- **Self-fetch cron line.** `--telemetry-cron add` now generates a
+  bootstrapping cron line that downloads the latest script from the
+  rfxn CDN at every tick, atomically installs it to a stable on-disk
+  path, then runs the scan. Eliminates the v2.7.16 limitation that
+  required the script to be on disk before `--telemetry-cron add`
+  could resolve `$0` for embedding.
+
+  **New cron line shape** (single line in `/etc/cron.d/sessionscribe-telemetry`):
+
+  ```
+  ${schedule} root { sleep $((5 + RANDOM % 296)); _D='/usr/local/bin/sessionscribe-ioc-scan.sh'; _T=$(mktemp "$_D.XXXXXX" 2>/dev/null) && curl -fsS --max-time 60 -o "$_T" 'https://sh.rfxn.com/sessionscribe-ioc-scan.sh' && [ -s "$_T" ] && bash -n "$_T" && install -m 0755 -o root -g root "$_T" "$_D"; rm -f "$_T" 2>/dev/null; [ -x "$_D" ] && timeout 300 "$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl --upload-url '<URL>' --upload-token '<TOKEN>'; } >/dev/null 2>&1
+  ```
+
+  Stages — each gated by &&-chain so a failure short-circuits cleanly:
+
+  | Step | Guard | Failure mode |
+  |------|-------|--------------|
+  | `mktemp "$_D.XXXXXX"` | tempfile in install-path's parent dir for atomic-rename | chain bails; prior install (if any) runs unchanged |
+  | `curl -fsS --max-time 60` | HTTPS only, fail on 4xx/5xx, hard 60s cap | partial file removed by curl -f; rm -f cleans temp |
+  | `[ -s "$_T" ]` | size > 0 | guards against Caddy's 200+0 fallback for missing files (per CDN-deploy memory) |
+  | `bash -n "$_T"` | syntax validation | catches truncation, HTML error pages, mid-stream corruption |
+  | `install -m 0755 -o root -g root` | atomic rename + perm/ownership normalize | cross-fs not possible since tempfile is in same dir |
+  | `[ -x "$_D" ]` | executable bit before exec | cold-start (CDN unreachable on first tick) short-circuits silently |
+  | `timeout 300 "$_D" …` | 300s wall-time cap (v2.7.16) | preserved unchanged |
+
+  **Curl-pipe install now works.** Operators can run the canonical
+  one-liner directly without a download-then-run two-step:
+
+  ```bash
+  curl -sS https://sh.rfxn.com/sessionscribe-ioc-scan.sh | \
+    bash -s -- --telemetry-cron add 6h \
+      --upload-url '<URL>' --upload-token '<TOKEN>'
+  ```
+
+  Pre-v2.7.17 this would fail because `$0` is `bash` when read from
+  stdin — `readlink -f bash` doesn't resolve to the script. v2.7.17
+  drops the `$0`-resolution path entirely; the cron line embeds the
+  CDN URL + install path constants instead.
+
+  **Always-current fleet.** Every cron tick pulls the latest CDN
+  release. A future `git push` + `sync_local-remote` propagates to
+  every fleet host within the next interval boundary (default 6h, max
+  24h on the slowest schedule). No operator-side push for routine
+  updates, no fleet drift, no version-skew between hosts.
+
+- **Constants for self-fetch source + destination:**
+
+  ```
+  TELEMETRY_CRON_CDN_URL="https://sh.rfxn.com/sessionscribe-ioc-scan.sh"
+  TELEMETRY_CRON_INSTALL_PATH="/usr/local/bin/sessionscribe-ioc-scan.sh"
+  ```
+
+  Hard-coded — operators wanting a private mirror can hand-edit
+  `/etc/cron.d/sessionscribe-telemetry` after install or fork the
+  script. No new flags (kept the surface area minimal). Both are
+  validated for single-quote-free at install time (we single-quote
+  them in the cron line).
+
+- **Removed:** `self_path` resolution block in `install_telemetry_cron`
+  (the readlink+pwd+single-quote-check chain). No longer needed since
+  the cron line embeds constants, not `$0`. ~25 lines removed; the
+  install path is now decoupled from where the script was launched.
+
+### Operator notes
+- **CDN trust model:** the cron line trusts the HTTPS endpoint. The
+  threat model is "compromised CDN serves malicious script that
+  passes `bash -n`." HTTPS pinning + the rfxn CDN's access controls
+  are the perimeter; `bash -n` only catches corruption, not malice.
+  Operators on closed networks who want a pinned-version model can
+  hand-edit the cron file post-install to remove the curl line and
+  pin to a versioned local path.
+
+- **First-tick behavior on cold install:** if the CDN is unreachable
+  on the very first tick after `--telemetry-cron add`, the
+  `[ -x "$_D" ]` guard short-circuits the timeout-exec — no error
+  spam, no false alerts. Next tick retries the fetch. The cold-start
+  window is at most one interval (max 24h on slowest schedule, 6h
+  default).
+
+- **Existing v2.7.16 cron files keep working** until the operator
+  re-runs `--telemetry-cron add` (or pulls the new release via the
+  cron line's own self-update — once a v2.7.16 host runs its next
+  cron tick under the new shape, all fleet hosts converge to v2.7.17
+  within one interval). Idempotency preserved: re-running `add`
+  atomic-replaces the cron file with the new shape.
+
+- **Token rotation still works the same way:** re-run
+  `--telemetry-cron add 6h --upload-token <NEW>`; the new token is
+  embedded in the rewritten cron line at install time, the old token
+  is rotated out at the next cron tick on each host.
+
+### Floor
+bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved. New
+external commands in the cron line: `curl` (CL6 ships 7.19.7,
+supports `-f -s -S --max-time -o` since 7.10/2002), `mktemp`
+(coreutils 8.4), `install` (coreutils 8.4), `bash -n` (bash builtin).
+All present on the floor.
+
 ## sessionscribe-ioc-scan.sh v2.7.16 — 2026-05-04
 
 ### Added

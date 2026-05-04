@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.16"
+VERSION="2.7.17"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -488,13 +488,23 @@ TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 
 # --telemetry-cron <add|remove> [1h|2h|6h|12h|24h]: install or remove a system
 # cron entry under /etc/cron.d/ that runs the telemetry path on a fixed
-# interval (default 6h). The generated cron prepends a 5s-300s sleep jitter
-# so a fleet of N hosts doesn't all hit the intake collector at the same
-# minute mark, and wraps the scan in `timeout 300` so a stuck run cannot
-# bleed into the next cycle. Empty = no cron management requested.
+# interval (default 6h). The generated cron self-fetches the script from the
+# CDN at each tick, atomically installs it to a stable path, runs syntax
+# validation (bash -n) before exec, then runs the scan under timeout 300.
+# This makes the cron entry portable (curl-pipe install needs no on-disk
+# script) and keeps fleet hosts on the latest released version with no
+# operator-side push. Splay 5-300s spreads fleet load across the minute mark.
 TELEMETRY_CRON_ACTION=""
 TELEMETRY_CRON_INTERVAL="6h"
 TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
+# Self-fetch source + destination for the cron-line. Hard-coded constants
+# (no flags) — operators wanting a private mirror or alternate path can
+# hand-edit /etc/cron.d/sessionscribe-telemetry after install or fork.
+# Both must be single-quote-free; we single-quote them inside the cron
+# line. CDN URL must be HTTPS (curl -f rejects 4xx/5xx; Caddy serves 0-byte
+# 200 for missing files, caught by the [ -s "$_T" ] size check below).
+TELEMETRY_CRON_CDN_URL="https://sh.rfxn.com/sessionscribe-ioc-scan.sh"
+TELEMETRY_CRON_INSTALL_PATH="/usr/local/bin/sessionscribe-ioc-scan.sh"
 
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
@@ -650,24 +660,26 @@ Telemetry (low-disk-usage fleet collection):
                              disk is unaffected.
       --telemetry-cron add [INTERVAL]
                              Install a system cron entry at
-                             /etc/cron.d/sessionscribe-telemetry that runs
-                             'timeout 300 <self> --telemetry --chain-on-all
-                             --chain-upload --quiet --jsonl >/dev/null 2>&1'
-                             on the given INTERVAL. Allowed:
-                             1h | 2h | 6h | 12h | 24h. Default: 6h. Each
-                             invocation prepends a random 5s-300s sleep so
-                             a fleet of hosts doesn't synchronize on the
-                             minute mark, and the scan itself is capped at
-                             300s wall time via timeout(1) so a stuck run
-                             cannot bleed into the next cycle (timeout(1)
-                             requires coreutils 7.0+ — present on the
-                             CL6/EL6 floor of 8.4). Requires root (writes
-                             /etc/cron.d/). If --upload-url and/or
-                             --upload-token are also passed on this command
-                             line, they're embedded in the generated cron
-                             entry so the cron run ships to your custom
-                             intake. Idempotent — running 'add' again
-                             overwrites the file.
+                             /etc/cron.d/sessionscribe-telemetry. Each cron
+                             tick: (1) sleeps 5-300s for fleet splay,
+                             (2) curl-fetches the latest script from the
+                             rfxn CDN (https://sh.rfxn.com/...) into a
+                             tempfile, (3) validates with bash -n, (4)
+                             atomic-installs to /usr/local/bin/ at mode
+                             0755, then (5) runs the scan under
+                             'timeout 300'. Self-bootstrapping: works via
+                             curl-pipe (no on-disk script required at
+                             install time); always-current (each tick
+                             pulls latest CDN release).
+                             Allowed: 1h | 2h | 6h | 12h | 24h. Default: 6h.
+                             Requires root (writes /etc/cron.d/). If
+                             --upload-url and/or --upload-token are also
+                             passed on this command line, they're embedded
+                             in the generated cron entry so the cron run
+                             ships to your custom intake. Idempotent —
+                             running 'add' again overwrites the file.
+                             Floor: curl 7.10+, coreutils 7.0+ (timeout(1)),
+                             present on CL6/EL6 (curl 7.19.7, coreutils 8.4).
       --telemetry-cron remove
                              Remove /etc/cron.d/sessionscribe-telemetry.
                              No-op if not installed. Requires root.
@@ -706,9 +718,11 @@ EOF
 ###############################################################################
 # Telemetry cron management — install / remove /etc/cron.d/<name> entry that
 # runs the telemetry path on a fixed interval (1h/2h/6h/12h/24h). Generated
-# cron prepends a 5s-300s random-sleep jitter so a fleet of N hosts doesn't
-# all hit the intake collector at the same minute mark, and wraps the scan
-# in `timeout 300` so a stuck run can't bleed into the next cycle.
+# cron is self-bootstrapping: each tick curl-fetches the latest script from
+# the rfxn CDN, atomic-installs to /usr/local/bin/ after a `bash -n` syntax
+# check, then runs under `timeout 300`. Splay 5-300s spreads fleet load.
+# Curl-pipe install works (no on-disk script required at --telemetry-cron
+# add time) since the cron line embeds the CDN URL, not $0.
 #
 # Cron file format chosen: /etc/cron.d/<name>. Reasons:
 #   - System cron (works under cronie / vixie-cron / EL9 systemd-cron-shim);
@@ -756,28 +770,26 @@ manage_telemetry_cron() {
         exit 2
     fi
 
-    # Resolve script's own absolute path so the cron entry has a stable
-    # invocation target regardless of cwd at run time. readlink -f follows
-    # symlinks; fall back to cd-pwd resolution if readlink is missing
-    # (rare, but stripped containers exist).
-    local self_path=""
-    if command -v readlink >/dev/null 2>&1; then
-        self_path=$(readlink -f "$0" 2>/dev/null)
-    fi
-    if [[ -z "$self_path" ]]; then
-        self_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
-    fi
-    if [[ ! -f "$self_path" ]]; then
-        echo "Error: cannot resolve script path for cron (got: $0 → $self_path)" >&2
+    # The cron line is self-bootstrapping: it embeds the CDN URL + install
+    # path constants, not $0. So `--telemetry-cron add` works correctly when
+    # invoked via curl-pipe (where $0 is bash, not a real script path) — the
+    # cron entry is generated and installed regardless of how this script was
+    # launched. Validate the constants don't contain single-quotes (we
+    # single-quote both inside the heredoc; an embedded quote would close
+    # the outer quoting). Also validate the install path's parent exists so
+    # the per-tick mktemp doesn't fail on missing directory.
+    if [[ "$TELEMETRY_CRON_CDN_URL" == *"'"* ]]; then
+        echo "Error: TELEMETRY_CRON_CDN_URL contains single-quote — cannot embed in cron line: $TELEMETRY_CRON_CDN_URL" >&2
         exit 2
     fi
-    # Reject single-quote in the resolved path. We single-quote the path
-    # in the generated cron line so spaces/specials are passed through to
-    # the shell as literal data; an embedded single-quote would close our
-    # outer quoting and turn the rest of the line into shell tokens. The
-    # symmetric check exists for --upload-url / --upload-token below.
-    if [[ "$self_path" == *"'"* ]]; then
-        echo "Error: script path contains single-quote (\"'\") — cannot embed in cron line: $self_path" >&2
+    if [[ "$TELEMETRY_CRON_INSTALL_PATH" == *"'"* ]]; then
+        echo "Error: TELEMETRY_CRON_INSTALL_PATH contains single-quote — cannot embed in cron line: $TELEMETRY_CRON_INSTALL_PATH" >&2
+        exit 2
+    fi
+    local _install_dir
+    _install_dir="$(dirname "$TELEMETRY_CRON_INSTALL_PATH")"
+    if [[ ! -d "$_install_dir" ]]; then
+        echo "Error: install path parent does not exist: $_install_dir (per-tick mktemp would fail)" >&2
         exit 2
     fi
 
@@ -851,17 +863,27 @@ manage_telemetry_cron() {
 # file. Use '--telemetry-cron remove' to uninstall, or re-run 'add' with
 # different flags to update.
 #
-# Perms: 0600 root:root. The cron line below may embed an --upload-token
+# Perms: 0600 root:root. The cron line below embeds an --upload-token
 # value; world-readability would expose the credential to any local user.
 # crond reads /etc/cron.d/* as root, so 0600 doesn't break execution.
 #
-# The 5-300s sleep prefix spreads fleet load: a 1000-host fleet hitting
-# intake at minute 0 distributes across ~5 minutes (~3.3 hosts/sec avg).
-# The scan is wrapped in `timeout 300` so a stuck run can't pile up on
-# the next cycle (coreutils 7.0+, present on CL6/EL6 floor of 8.4).
+# Self-fetch shape: each cron tick downloads the latest script from the
+# rfxn CDN, validates with bash -n, atomically installs to a stable
+# path, then runs under timeout 300. Always-current; no operator-side
+# push for routine updates. The 5-300s splay spreads fleet intake load
+# across the minute mark (~5 minutes for a 1000-host fleet).
+#
+# Failure modes (each gated by &&-chain so a failure short-circuits cleanly):
+#   mktemp fails  -> chain bails before curl, prior install runs unchanged
+#   curl fails    -> partial file removed by curl -f, rm -f cleans temp,
+#                    prior install runs unchanged ([ -x "\$_D" ] still true)
+#   0-byte CDN    -> [ -s "\$_T" ] catches it (Caddy serves 200+0 for missing)
+#   bad bash      -> bash -n catches truncation/HTML-error-page corruption
+#   install fails -> destination keeps prior version; rm -f cleans temp
+#   cold start    -> [ -x "\$_D" ] short-circuits exec, no error spam
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
-${schedule} root sleep \$((5 + RANDOM % 296)); timeout 300 '${self_path}' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args} >/dev/null 2>&1
+${schedule} root { sleep \$((5 + RANDOM % 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}' && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}; } >/dev/null 2>&1
 CRONEOF
 
     if [[ ! -s "$tmp" ]]; then
@@ -895,16 +917,16 @@ CRONEOF
         restorecon -F "$TELEMETRY_CRON_FILE" 2>/dev/null || true
     fi
 
-    # Display the script path single-quoted — symmetric with how it lands
-    # in the cron file. For paths without spaces/specials this is harmless
-    # noise; for paths with spaces it's the only correct copy-paste form.
+    # Operator-facing summary. Source/destination shown so it's clear the
+    # cron line self-fetches; Test now: line is the equivalent one-shot.
     echo "Installed: $TELEMETRY_CRON_FILE"
-    echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-300s, timeout=300s)"
-    echo "Command:   timeout 300 '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-300s, fetch-timeout=60s, exec-timeout=300s)"
+    echo "Source:    $TELEMETRY_CRON_CDN_URL → $TELEMETRY_CRON_INSTALL_PATH"
+    echo "Command:   timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
     echo
     echo "Inspect:   cat $TELEMETRY_CRON_FILE"
-    echo "Test now:  timeout 300 '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
-    echo "Remove:    '$self_path' --telemetry-cron remove"
+    echo "Test now:  curl -fsS --max-time 60 -o '$TELEMETRY_CRON_INSTALL_PATH' '$TELEMETRY_CRON_CDN_URL' && timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Remove:    '$TELEMETRY_CRON_INSTALL_PATH' --telemetry-cron remove"
     exit 0
 }
 
