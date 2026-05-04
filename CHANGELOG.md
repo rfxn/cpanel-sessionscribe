@@ -435,7 +435,7 @@ Affected verdicts are unchanged — exit code, host_verdict, and the
 JSONL ladder all came through cleanly; only the visual render path
 was broken.
 
-
+## sessionscribe-ioc-scan.sh v2.7.23 — 2026-05-04
 
 ### Fixed (FP — shipped in v2.7.22, corrected here)
 
