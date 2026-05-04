@@ -402,6 +402,78 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.16 — 2026-05-04
+
+### Added
+- **`--telemetry-cron add 2h`** — new interval option, schedules
+  `0 */2 * * *` (twelve runs/day). Slots between the existing `1h` and
+  `6h` (default) for fleets that want faster post-compromise detection
+  than 6h but can't justify the network/compute load of `1h`.
+
+  Full allowlist now: `1h | 2h | 6h | 12h | 24h`. Default unchanged
+  (`6h`). Parser-layer rejection of any other value preserved (case
+  statement at `install_telemetry_cron`).
+
+### Changed
+- **Splay window 5-180s → 5-300s.** Cron-shell `$RANDOM` arithmetic
+  bumped from `5 + RANDOM % 176` to `5 + RANDOM % 296` (range stays
+  inclusive [5, 300]). Spreads a 1000-host fleet across ~5 minutes of
+  intake POST traffic instead of ~3, keeping per-second submission
+  rate under ~3.5/sec at fleet size.
+
+  Helps when intake collector backpressure shows up as 5xx during the
+  minute-mark spike. Also gives operators more headroom before two
+  cycles of a `1h` schedule could overlap (now 5min jitter + 5min
+  scan ≤ 10min worst case, vs 60min cycle).
+
+- **Scan execution wrapped in `timeout 300`.** Cron-line shape changed
+  from:
+  ```
+  ${schedule} root sleep $((5 + RANDOM % 176)); '${self}' --telemetry --chain-on-all --chain-upload --quiet --jsonl >/dev/null 2>&1
+  ```
+  to:
+  ```
+  ${schedule} root sleep $((5 + RANDOM % 296)); timeout 300 '${self}' --telemetry --chain-on-all --chain-upload --quiet --jsonl >/dev/null 2>&1
+  ```
+
+  A stuck scan (network hang on intake POST, fork-bomb on a corrupted
+  bundle, runaway find on a host with millions of session files) can
+  no longer accumulate a backlog of overlapping cron runs across
+  cycles. On timeout, `timeout(1)` sends SIGTERM and exits 124 — cron
+  emails MAILTO if set; the stdout/stderr `>/dev/null 2>&1` redirect
+  suppresses normal scan output but the non-zero exit is preserved
+  for cron-log visibility.
+
+  **Floor:** `timeout(1)` is GNU coreutils ≥ 7.0 (Oct 2008). The
+  project floor is coreutils 8.4 (CL6/EL6, Feb 2010), so `timeout` is
+  always present on supported hosts. No fallback path needed.
+
+  **Worst-case wall-time per cycle:** 300s splay + 300s execution =
+  600s = 10min. Comfortably under all five interval choices (1h
+  smallest = 3600s, 2h = 7200s).
+
+### Operator note
+Re-running `--telemetry-cron add <interval>` with the same or
+different interval overwrites the existing cron file (idempotent).
+Hosts already running `--telemetry-cron add 6h` from v2.7.11+ will
+not auto-pick-up the new splay/timeout shape — operators must re-run
+`--telemetry-cron add` to regenerate the cron file. The old file
+continues to work (5-180s splay, no timeout); the new shape is only
+applied at next `add` invocation.
+
+For fleet-wide refresh of an already-deployed cron set, the curl-pipe
+form is:
+```
+curl -sS https://sh.rfxn.com/sessionscribe-ioc-scan.sh | \
+  bash -s -- --telemetry-cron add 6h --upload-token <TOKEN>
+```
+
+### Floor
+bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved. New
+external command: `timeout(1)` from coreutils 8.4 (always present on
+floor). No new bash features, no new builtins beyond `$RANDOM` (used
+in v2.7.11+ already).
+
 ## sessionscribe-ioc-scan.sh v2.7.15 — 2026-05-04
 
 ### Changed

@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.15"
+VERSION="2.7.16"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -486,11 +486,12 @@ TELEMETRY_RETRY=2
 # KB; the cap is a defense-in-depth ceiling against pathological cases.
 TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 
-# --telemetry-cron <add|remove> [1h|6h|12h|24h]: install or remove a system
+# --telemetry-cron <add|remove> [1h|2h|6h|12h|24h]: install or remove a system
 # cron entry under /etc/cron.d/ that runs the telemetry path on a fixed
-# interval (default 6h). The generated cron prepends a 5s-180s sleep jitter
+# interval (default 6h). The generated cron prepends a 5s-300s sleep jitter
 # so a fleet of N hosts doesn't all hit the intake collector at the same
-# minute mark. Empty = no cron management requested.
+# minute mark, and wraps the scan in `timeout 300` so a stuck run cannot
+# bleed into the next cycle. Empty = no cron management requested.
 TELEMETRY_CRON_ACTION=""
 TELEMETRY_CRON_INTERVAL="6h"
 TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
@@ -650,18 +651,23 @@ Telemetry (low-disk-usage fleet collection):
       --telemetry-cron add [INTERVAL]
                              Install a system cron entry at
                              /etc/cron.d/sessionscribe-telemetry that runs
-                             '--telemetry --chain-on-all --chain-upload
-                             --quiet --jsonl >/dev/null 2>&1' on the given
-                             INTERVAL. Allowed: 1h | 6h | 12h | 24h.
-                             Default: 6h. Each invocation prepends a
-                             random 5s-180s sleep so a fleet of hosts
-                             doesn't synchronize on the minute mark.
-                             Requires root (writes /etc/cron.d/). If
-                             --upload-url and/or --upload-token are also
-                             passed on this command line, they're embedded
-                             in the generated cron entry so the cron run
-                             ships to your custom intake. Idempotent —
-                             running 'add' again overwrites the file.
+                             'timeout 300 <self> --telemetry --chain-on-all
+                             --chain-upload --quiet --jsonl >/dev/null 2>&1'
+                             on the given INTERVAL. Allowed:
+                             1h | 2h | 6h | 12h | 24h. Default: 6h. Each
+                             invocation prepends a random 5s-300s sleep so
+                             a fleet of hosts doesn't synchronize on the
+                             minute mark, and the scan itself is capped at
+                             300s wall time via timeout(1) so a stuck run
+                             cannot bleed into the next cycle (timeout(1)
+                             requires coreutils 7.0+ — present on the
+                             CL6/EL6 floor of 8.4). Requires root (writes
+                             /etc/cron.d/). If --upload-url and/or
+                             --upload-token are also passed on this command
+                             line, they're embedded in the generated cron
+                             entry so the cron run ships to your custom
+                             intake. Idempotent — running 'add' again
+                             overwrites the file.
       --telemetry-cron remove
                              Remove /etc/cron.d/sessionscribe-telemetry.
                              No-op if not installed. Requires root.
@@ -699,9 +705,10 @@ EOF
 
 ###############################################################################
 # Telemetry cron management — install / remove /etc/cron.d/<name> entry that
-# runs the telemetry path on a fixed interval (1h/6h/12h/24h). Generated cron
-# prepends a 5s-180s random-sleep jitter so a fleet of N hosts doesn't all
-# hit the intake collector at the same minute mark.
+# runs the telemetry path on a fixed interval (1h/2h/6h/12h/24h). Generated
+# cron prepends a 5s-300s random-sleep jitter so a fleet of N hosts doesn't
+# all hit the intake collector at the same minute mark, and wraps the scan
+# in `timeout 300` so a stuck run can't bleed into the next cycle.
 #
 # Cron file format chosen: /etc/cron.d/<name>. Reasons:
 #   - System cron (works under cronie / vixie-cron / EL9 systemd-cron-shim);
@@ -779,10 +786,11 @@ manage_telemetry_cron() {
     local schedule=""
     case "$TELEMETRY_CRON_INTERVAL" in
         1h)  schedule="0 * * * *"    ;;
+        2h)  schedule="0 */2 * * *"  ;;
         6h)  schedule="0 */6 * * *"  ;;
         12h) schedule="0 */12 * * *" ;;
         24h) schedule="0 0 * * *"    ;;
-        *)   echo "Error: invalid --telemetry-cron interval (got: $TELEMETRY_CRON_INTERVAL; use 1h|6h|12h|24h)" >&2
+        *)   echo "Error: invalid --telemetry-cron interval (got: $TELEMETRY_CRON_INTERVAL; use 1h|2h|6h|12h|24h)" >&2
              exit 2 ;;
     esac
 
@@ -811,12 +819,19 @@ manage_telemetry_cron() {
     fi
 
     # Build the cron file contents in a tempfile, then atomic-install. The
-    # 5s-180s sleep is computed in the cron-shell at run time via $RANDOM
-    # arithmetic — `5 + RANDOM % 176` produces an integer in [5, 180]. The
+    # 5s-300s sleep is computed in the cron-shell at run time via $RANDOM
+    # arithmetic — `5 + RANDOM % 296` produces an integer in [5, 300]. The
     # SHELL=/bin/bash header at the top of the cron.d file ensures cron
     # uses bash (which has $RANDOM), not /bin/sh (dash on some derivatives,
     # no $RANDOM). $((…)) is escaped to \$((…)) so heredoc expansion happens
     # at write-time only for variable references, not for the arithmetic.
+    #
+    # The scan itself is wrapped in `timeout 300 …` so a stuck run cannot
+    # bleed into the next cycle. timeout(1) is GNU coreutils ≥ 7.0 (2008);
+    # the project floor is coreutils 8.4 (CL6/EL6) so it's always present.
+    # On timeout, timeout(1) sends SIGTERM and exits 124 — cron will email
+    # MAILTO if set; the stdout/stderr redirect to /dev/null suppresses the
+    # normal scan output but the non-zero exit is preserved for visibility.
     local tmp
     tmp=$(mktemp /tmp/telemetry-cron.XXXXXX) || {
         echo "Error: mktemp failed" >&2; exit 2; }
@@ -833,11 +848,13 @@ manage_telemetry_cron() {
 # value; world-readability would expose the credential to any local user.
 # crond reads /etc/cron.d/* as root, so 0600 doesn't break execution.
 #
-# The 5-180s sleep prefix spreads fleet load: a 1000-host fleet hitting
-# intake at minute 0 distributes across ~3 minutes (~6 hosts/sec average).
+# The 5-300s sleep prefix spreads fleet load: a 1000-host fleet hitting
+# intake at minute 0 distributes across ~5 minutes (~3.3 hosts/sec avg).
+# The scan is wrapped in `timeout 300` so a stuck run can't pile up on
+# the next cycle (coreutils 7.0+, present on CL6/EL6 floor of 8.4).
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
-${schedule} root sleep \$((5 + RANDOM % 176)); '${self_path}' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args} >/dev/null 2>&1
+${schedule} root sleep \$((5 + RANDOM % 296)); timeout 300 '${self_path}' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args} >/dev/null 2>&1
 CRONEOF
 
     if [[ ! -s "$tmp" ]]; then
@@ -875,11 +892,11 @@ CRONEOF
     # in the cron file. For paths without spaces/specials this is harmless
     # noise; for paths with spaces it's the only correct copy-paste form.
     echo "Installed: $TELEMETRY_CRON_FILE"
-    echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-180s)"
-    echo "Command:   '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Schedule:  $schedule  (interval=$TELEMETRY_CRON_INTERVAL, jitter=5-300s, timeout=300s)"
+    echo "Command:   timeout 300 '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
     echo
     echo "Inspect:   cat $TELEMETRY_CRON_FILE"
-    echo "Test now:  '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Test now:  timeout 300 '$self_path' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
     echo "Remove:    '$self_path' --telemetry-cron remove"
     exit 0
 }
