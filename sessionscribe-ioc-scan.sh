@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.14"
+VERSION="2.7.15"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -4928,13 +4928,28 @@ check_crlf_access_primitive() {
     crlf_hits="${crlf_hits:-0}"
     crlf_ts_first="${crlf_ts_first:-0}"
     if (( crlf_hits > 0 )); then
-        emit "logs" "ioc_cve_2026_41940_access_primitive" "strong" \
-             "ioc_cve_2026_41940_crlf_access_chain" 10 \
+        # Severity tier: warning ioc_*. Per PATTERNS_UPDATED.md kill-chain
+        # summary, the CRLF access primitive is step 1 (initial access /
+        # exploitation ATTEMPT), not compromise evidence. PATTERNS_UPDATED.md
+        # line 420: "Only escalate to rooted-restore if BOTH the rfxn scan
+        # AND any one of Pattern A/B/C/D/E/F/G/H/I/J/K/L IOCs land" - the
+        # X stack is the rfxn scan input, the A-L pattern is the gate.
+        # warning ioc_* routes the host to SUSPICIOUS via ioc_review++
+        # (line 7762) which is the correct ATTEMPT-tier disposition.
+        # Hosts with X stack AND any A-L destruction/persistence pattern
+        # land COMPROMISED via the destruction-pattern strong-tier emits;
+        # hosts with X stack AND session-file forensics (token_inject,
+        # token_used, hasroot, cve41940_combo) land COMPROMISED via the
+        # session-file strong-tier emits. Only X-stack-only hosts demote.
+        # LOGS_CRLF_CHAIN_FIRST_EPOCH side-effect (line below) is unchanged
+        # so Pattern E + 2xx_on_cpsess gates stay anchored to this hit.
+        emit "logs" "ioc_cve_2026_41940_access_primitive" "warning" \
+             "ioc_cve_2026_41940_crlf_access_chain" 4 \
              "count" "$crlf_hits" \
              "ts_epoch_first" "$crlf_ts_first" \
              "log_file" "$log" \
              "line" "${crlf_sample:0:240}" \
-             "note" "$crlf_hits CRLF-bypass chain(s) in $log: POST /login → 401 then GET /cpsess<N>/* → 2xx as root within 2s. Deterministic CVE-2026-41940 exploitation evidence (CRITICAL)."
+             "note" "$crlf_hits CRLF-bypass chain(s) in $log: POST /login → 401 then GET /cpsess<N>/* → 2xx as root within 2s. CVE-2026-41940 exploitation ATTEMPT — confirm compromise via Pattern A-L residue or session-file forensics (REVIEW)."
         # Record CRLF first epoch globally so downstream second-order
         # signals (ioc_attacker_ip_2xx_on_cpsess,
         # ioc_pattern_e_websocket_shell_hits) can demote pre-compromise

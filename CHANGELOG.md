@@ -402,6 +402,104 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.15 — 2026-05-04
+
+### Changed
+- **Demote `ioc_cve_2026_41940_access_primitive` (the watchTowr X stack) from
+  `strong` → `warning`.** Single-emit-site change at `check_crlf_access_primitive`
+  (line 4931). Aligns the verdict-math ladder with the documented compromise
+  taxonomy in `PATTERNS_UPDATED.md`:
+
+  - **PATTERNS_UPDATED.md line 386-408 (kill-chain summary)** classifies the
+    CVE-2026-41940 CRLF Authorization: Basic exploit as **step 1 of 8**:
+    initial access. Steps 2-8 are JSON-API recon, reseller persistence,
+    persistence layer (G/I/J), websocket Shell RCE (E), automated harvester
+    (F), second-stage backdoor (K), and destruction (A/B/C/H/L). The X stack
+    is the *entry condition* of the chain, not the chain itself.
+  - **PATTERNS_UPDATED.md line 420 (verification workflow)** is the canonical
+    rule: *"Only escalate to rooted-restore if BOTH the rfxn scan AND any
+    one of Pattern A/B/C/D/E/F/G/H/I/J/K/L IOCs land."* The X stack is the
+    rfxn scan input; the A-L pattern is the gate. Pre-v2.7.15 the X stack
+    was both input and gate, which collapses the two-AND-clause requirement
+    into a single OR clause and inflates COMPROMISED counts.
+
+  At `warning ioc_*` the signal still ticks `ioc_review++` (aggregate_verdict
+  line 7762) and routes the host to SUSPICIOUS — the correct ATTEMPT-tier
+  disposition per the user-facing v3 verdict ladder ("only post-attack
+  activity = COMPROMISED; X stack / watchTowr / T1-origin = ATTEMPT").
+  It just stops ticking `ioc_critical++` (line 7752), so it no longer
+  auto-escalates to COMPROMISED when fired in isolation.
+
+  **Compound-evidence hosts retain their COMPROMISED verdict via the other
+  strong-tier paths**, untouched by this release:
+
+  | X stack co-fires with | COMPROMISED carrier (unchanged) |
+  |-----------------------|----------------------------------|
+  | Any of Pattern A/B/C/D/F/G/H/I/J/K/L destruction or persistence | 22 strong destruction emits at line 6024-7325 |
+  | Pattern E (full chain: CRLF anchor + post-CRLF + 2xx-proximity) | strong emit at line 7086 (gate logic 7050-7090) |
+  | Pattern E handoff burst (≥2 IPs, 15min window) | strong emit at line 7154 |
+  | Session-file forensics (token_inject, token_used_2xx, hasroot, cve41940_combo) | 4 strong emits at line 5151-5325 |
+  | `ioc_attacker_ip_2xx_on_cpsess` post-CRLF (token consumption) | strong emit at line 4833 (gate logic 4814-4828) |
+
+  Net: only **X-stack-only hosts** (CRLF chain detected in access_log,
+  no destruction residue, no session-file evidence, no successful token
+  consumption observed) demote from COMPROMISED to SUSPICIOUS. These are
+  the canonical *attempted but not corroborated* hosts — the host was
+  exploited at the access primitive, but no follow-up activity tied to
+  the chain has been detected. Per the verification workflow, those hosts
+  now correctly route to "needs investigation" rather than "rooted-restore."
+
+  **Side-effect preserved:** `LOGS_CRLF_CHAIN_FIRST_EPOCH` is set
+  unconditionally on `crlf_hits > 0` (line 4944) — the global anchor
+  used by downstream Pattern E + 2xx_on_cpsess gates is set regardless
+  of the access_primitive emit's severity. The chain-corroboration logic
+  for the strong-tier promotion of those signals is unchanged.
+
+  **Weight reduction 10 → 4:** at warning tier, weight does not increment
+  `score` (aggregate_verdict only adds weight on `strong` and 2 on
+  `evidence`), so the numeric weight is informational. Reduced to 4 for
+  consistency with other warning ioc_* weights (Pattern E
+  `_unknown_dim_only` was 4, `_probes` 3 prior to v2.7.14 demotion).
+
+  **Note text rewritten:** pre-v2.7.15 read *"Deterministic
+  CVE-2026-41940 exploitation evidence (CRITICAL)"* — operator-misleading
+  at warning tier. Now reads *"CVE-2026-41940 exploitation ATTEMPT —
+  confirm compromise via Pattern A-L residue or session-file forensics
+  (REVIEW)"*. Routes operator attention correctly to the corroboration
+  step instead of immediate destructive action.
+
+  **Downstream consumer note for forge `records.jsonl` queries:**
+  filters on `severity=="strong" && id=="ioc_cve_2026_41940_access_primitive"`
+  must shift to `severity=="warning"`. The `key` field
+  (`ioc_cve_2026_41940_crlf_access_chain`) is unchanged. Filters on
+  `ioc_critical >= 1` will see ~300-400 fewer hosts; filters on
+  `ioc_review >= 1` will see ~300-400 more. The strong-tier
+  `ioc_attacker_ip_2xx_on_cpsess` is the right signal for "successful
+  token consumption" queries — that's the chain-corroborated equivalent.
+
+### Rationale
+v2.7.14 cleared the warning-tier noise floor. v2.7.15 closes the
+strong-tier inflation: the watchTowr access primitive was the single
+largest source of false-COMPROMISED verdicts in the fleet (~418 hosts
+in the 2026-05-04 pull). Demoting to warning ioc_* preserves the
+forensic value of the signal (still in REASONS, still routes to
+SUSPICIOUS, still anchors Pattern E + 2xx_on_cpsess gates) while
+correctly placing it on the ATTEMPT side of the verdict ladder
+documented in `PATTERNS_UPDATED.md` and the user-facing v3 ladder.
+
+Together with v2.7.14, this completes the deterministic
+CLEAN/SUSPICIOUS/COMPROMISED separation: COMPROMISED requires
+post-attack residue (Pattern A-L strong, session-file forensics, or
+multi-gate Pattern E/2xx_on_cpsess); SUSPICIOUS captures attempt
+evidence (X stack, warning-tier ioc_* artifacts); CLEAN captures
+hosts with at most probing/recon activity (advisory + info tier).
+
+### Floor
+bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved. Change
+is a string literal swap (`"strong"` → `"warning"`) + numeric literal
+swap (`10` → `4`) + comment block additions + note text rewrite.
+Zero new bash features, zero new builtins, zero new external commands.
+
 ## sessionscribe-ioc-scan.sh v2.7.14 — 2026-05-04
 
 ### Changed
