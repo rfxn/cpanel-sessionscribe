@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-mitigate.sh v0.7.1
+# sessionscribe-mitigate.sh v0.7.2
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -92,7 +92,7 @@
 
 set -u
 
-VERSION="0.7.1"
+VERSION="0.7.2"
 
 ###############################################################################
 # Constants
@@ -1200,7 +1200,7 @@ ssh_keys_prune() {
     # colon only, but pass them through jesc() defensively.
     local removed_sidecar="${backup_dest}.removed-keys"
     {
-        printf '# sessionscribe v0.7.1 ssh-key prune — removed keys for %s\n' "$path"
+        printf '# sessionscribe v0.7.2 ssh-key prune — removed keys for %s\n' "$path"
         printf '# run_id=%s ts=%s sha256_pre=%s sha256_post=%s\n' \
             "${RUN_ID:-unknown}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sha_pre" "$sha_post"
         awk -F'\t' '
@@ -1230,15 +1230,43 @@ ssh_keys_prune() {
     return 0
 }
 
+# kill_sshkey_path_safe PATH — rc=0 if PATH contains zero shell
+# metacharacters, newlines, tabs, or control bytes. v0.7.2 sentinel-fix:
+# Linux directory names CAN legally contain `"`, `;`, `$()`, `\`, `&`,
+# `|`, `<`, `>`, `*`, `?`, `!`. A SessionScribe-compromised WHM can
+# create cPanel users with hostile names; that name flows into a
+# canonical authorized_keys path, then into a `trap "rm -f \"$tmp\" ..."`
+# expansion at trap-set time (line 1066/1068), executing the injected
+# command on SIGINT/SIGTERM during the 10s lock-wait window. Refusing
+# hostile paths at the canonical-paths emit-site stops every downstream
+# consumer (trap-string expansion, recovery_hint, sidecar headers) from
+# absorbing attacker-controlled bytes. Operators must rename the dir to
+# prune those keys.
+kill_sshkey_path_safe() {
+    case "$1" in
+        (*[\"\;\$\`\\\&\|\<\>\*\?\!\'\(\)\{\}\[\]]*) return 1 ;;
+        (*[$'\n\t']*)                                return 1 ;;
+        (*[[:cntrl:]]*)                              return 1 ;;
+    esac
+    return 0
+}
+
 # kill_sshkey_canonical_paths — emit canonical authorized_keys paths one
 # per line. Used by both the orphan-tmp sweep and the P2 manifest
 # enumerator. Root home discovered via getent passwd; /root fallback.
+# v0.7.2: filters paths through kill_sshkey_path_safe so a hostile
+# user-home name (created by a compromised WHM) cannot reach trap
+# strings or recovery_hint shell strings downstream.
 kill_sshkey_canonical_paths() {
     local root_home
     root_home=$(getent passwd root 2>/dev/null | cut -d: -f6)
     [[ -z "$root_home" || "$root_home" == "/" ]] && root_home="/root"
-    printf '%s/.ssh/authorized_keys\n'  "$root_home"
-    printf '%s/.ssh/authorized_keys2\n' "$root_home"
+    if kill_sshkey_path_safe "$root_home"; then
+        printf '%s/.ssh/authorized_keys\n'  "$root_home"
+        printf '%s/.ssh/authorized_keys2\n' "$root_home"
+    else
+        say_warn "refusing root home with hostile shell-metachar path: $root_home"
+    fi
     if [[ -d /home ]]; then
         # -maxdepth 1 (NOT 2): canonical paths are at depth-1 only
         # (/home/<user>/.ssh/authorized_keys). With -maxdepth 2, find
@@ -1248,8 +1276,12 @@ kill_sshkey_canonical_paths() {
         # triggered build-time misses.
         local h
         while IFS= read -r -d '' h; do
-            printf '%s/.ssh/authorized_keys\n'  "$h"
-            printf '%s/.ssh/authorized_keys2\n' "$h"
+            if kill_sshkey_path_safe "$h"; then
+                printf '%s/.ssh/authorized_keys\n'  "$h"
+                printf '%s/.ssh/authorized_keys2\n' "$h"
+            else
+                say_warn "refusing /home dir with hostile shell-metachar path: $h"
+            fi
         done < <(find /home -maxdepth 1 -mindepth 1 -type d -print0 2>/dev/null)
     fi
 }
@@ -1370,11 +1402,19 @@ kill_sshkey_path_canonical() {
 # co-located with the audit trail so a paged-out 3am operator can grep
 # for it without reading source. quarantine layout mirrors the logic in
 # kill_quarantine_one ($BACKUP_DIR/quarantine/${path#/}).
+#
+# v0.7.2: shell-quote both paths with single-quotes (with `'\''`
+# escape for embedded single-quotes). Defense-in-depth — even if a
+# future change bypasses the canonical-paths metacharacter filter
+# (kill_sshkey_path_safe), the recovery_hint cannot become an injection
+# vector for an operator pasting it verbatim under incident stress.
 kill_sshkey_recovery_hint() {
     local path="$1" backup_dir="$2"
     local mirror="${backup_dir}/quarantine/${path#/}.original-pre-prune"
-    printf 'cp -a %s %s && restorecon -F %s 2>/dev/null && systemctl reload sshd' \
-        "$mirror" "$path" "$path"
+    local q_path="${path//\'/\'\\\'\'}"
+    local q_mirror="${mirror//\'/\'\\\'\'}"
+    printf "cp -a '%s' '%s' && restorecon -F '%s' 2>/dev/null && systemctl reload sshd" \
+        "$q_mirror" "$q_path" "$q_path"
 }
 
 # kill_sshkey_emit_manifest_item PATH TRUST_RE TRUST_RE_EFFECTIVE BACKUP_DIR
@@ -2111,17 +2151,25 @@ kill_sidecar_to_lookup() {
                 # primaries (pruned_ok, forced_full_prune, ...). Path is
                 # the lookup key. keys_pruned + keys_kept feed the
                 # finalize_manifest summary aggregates.
+                # v0.7.2: also emit sha256_pre and result_detail so the
+                # awk patcher can fill the manifest's "sha256_pre":null
+                # and "result_detail":null placeholders that K1 wrote in
+                # apply mode. Without these, an apply-mode manifest's
+                # kind:sshkey rows kept null result_detail/sha256_pre
+                # forever, gapping the audit trail.
                 path=$(kill_json_str_field "$line" path)
-                local kp_v kk_v sha_pre_v sha_post_v
+                local kp_v kk_v sha_pre_v sha_post_v detail_v
                 kp_v=$(kill_json_num_field "$line" keys_pruned)
                 kk_v=$(kill_json_num_field "$line" keys_kept)
                 sha_pre_v=$(kill_json_str_field "$line" sha256_pre)
                 sha_post_v=$(kill_json_str_field "$line" sha256_post)
-                printf 'sshkey\t%s\tresult\t%s\n'      "$path" "$result"
-                printf 'sshkey\t%s\tkeys_pruned\t%s\n' "$path" "${kp_v:-0}"
-                printf 'sshkey\t%s\tkeys_kept\t%s\n'   "$path" "${kk_v:-0}"
-                printf 'sshkey\t%s\tsha256_pre\t%s\n'  "$path" "$sha_pre_v"
-                printf 'sshkey\t%s\tsha256_post\t%s\n' "$path" "$sha_post_v"
+                detail_v=$(kill_json_str_field "$line" result_detail)
+                printf 'sshkey\t%s\tresult\t%s\n'         "$path" "$result"
+                printf 'sshkey\t%s\tkeys_pruned\t%s\n'    "$path" "${kp_v:-0}"
+                printf 'sshkey\t%s\tkeys_kept\t%s\n'      "$path" "${kk_v:-0}"
+                printf 'sshkey\t%s\tsha256_pre\t%s\n'     "$path" "$sha_pre_v"
+                printf 'sshkey\t%s\tsha256_post\t%s\n'    "$path" "$sha_post_v"
+                printf 'sshkey\t%s\tresult_detail\t%s\n'  "$path" "$detail_v"
                 ;;
         esac
     done < "$sidecar"
@@ -2474,14 +2522,24 @@ finalize_manifest() {
         # record with BARE primary results; the K1 manifest "result" field
         # is null and gets patched here (or stays null in --check, where
         # the K1 emit already wrote "planned_<primary>").
+        # v0.7.2: also patch sha256_pre + result_detail. K1 in apply
+        # mode writes null for all three; the sidecar carries real
+        # values from KILL_LAST_PRUNE_*. Without these patches the
+        # apply-mode manifest kind:sshkey rows showed null
+        # result_detail / sha256_pre after the prune actually ran —
+        # audit-completeness gap.
         in_items == 1 && /\{"kind":"sshkey"/ {
             line = $0
             path = json_str(line, "path")
             r = store["sshkey", path, "result"]
             if (r == "") { print; next }
+            sha_pre  = store["sshkey", path, "sha256_pre"]
             sha_post = store["sshkey", path, "sha256_post"]
-            line = patch_field(line, "sha256_post", quoted(sha_post))
-            line = patch_field(line, "result", quoted(r))
+            detail   = store["sshkey", path, "result_detail"]
+            line = patch_field(line, "sha256_pre",    quoted(sha_pre))
+            line = patch_field(line, "sha256_post",   quoted(sha_post))
+            line = patch_field(line, "result_detail", quoted(detail))
+            line = patch_field(line, "result",        quoted(r))
             print line
             next
         }
@@ -4507,9 +4565,13 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         exit 0
     fi
     if [[ "${MITIGATE_RUN_P1_TESTS:-0}" == "1" ]]; then
-        # P1+P2+P3 test harness — 44 cases from PLAN-sshkey-prune.md.
+        # P1+P2+P3 test harness — 49 cases from PLAN-sshkey-prune.md
+        # plus v0.7.1 / v0.7.2 sentinel-fix regressions.
         # P1 = 29 (helpers + drift gate), P2 = 6 (manifest sweep + apply
-        # consumer), P3 = 9 (CLI flags + phase_kill drift gate).
+        # consumer), P3 = 9 (CLI flags + phase_kill drift gate),
+        # v0.7.1 = 2 (45-46 sidecar JSONL escape + leading-whitespace),
+        # v0.7.2 = 3 (47 trap-injection metachar gate, 48 recovery_hint
+        # shell-quote, 49 finalize_manifest sshkey detail+sha256_pre patch).
         # Each test prints OK(<n> <description>) or FAIL(<n> <description>:
         # <diagnostic>) on stdout. Exits 0 on all-OK, 1 on any FAIL.
         _t_pass=0
@@ -5361,6 +5423,168 @@ sys.exit(0 if ok else 1)
         else
             _t_fail 46 "prune leading-whitespace key kept; attacker key removed" \
                 "result=$KILL_LAST_PRUNE_RESULT detail='$KILL_LAST_PRUNE_DETAIL' kept=$_kept46 pruned=$_pruned46"
+        fi
+
+        # Test 47 (v0.7.2 sentinel-fix MUST-FIX): kill_sshkey_path_safe
+        # refuses paths containing shell metacharacters that would
+        # otherwise reach the SIGINT/SIGTERM trap-string expansion at
+        # ssh_keys_prune line 1066/1068, allowing a hostile cPanel user
+        # name (e.g. `x"; touch /tmp/X; "y` from a SessionScribe-
+        # compromised WHM) to inject commands when the lock-wait window
+        # gets killed. Probes BOTH the helper directly and the canonical
+        # path emitter via getent override.
+        _safe47_dq=0; _safe47_semi=0; _safe47_dollar=0; _safe47_bt=0
+        _safe47_bs=0; _safe47_amp=0; _safe47_pipe=0; _safe47_lt=0
+        _safe47_gt=0; _safe47_star=0; _safe47_q=0; _safe47_bang=0
+        _safe47_sq=0; _safe47_paren=0; _safe47_brace=0; _safe47_bracket=0
+        _safe47_nl=0; _safe47_tab=0; _safe47_clean=0
+        kill_sshkey_path_safe '/home/x"y'                || _safe47_dq=1
+        kill_sshkey_path_safe '/home/x;y'                || _safe47_semi=1
+        # shellcheck disable=SC2016  # literal $ in test fixture
+        kill_sshkey_path_safe '/home/x$y'                || _safe47_dollar=1
+        kill_sshkey_path_safe '/home/x`y'                || _safe47_bt=1
+        kill_sshkey_path_safe '/home/x\y'                || _safe47_bs=1
+        kill_sshkey_path_safe '/home/x&y'                || _safe47_amp=1
+        kill_sshkey_path_safe '/home/x|y'                || _safe47_pipe=1
+        kill_sshkey_path_safe '/home/x<y'                || _safe47_lt=1
+        kill_sshkey_path_safe '/home/x>y'                || _safe47_gt=1
+        kill_sshkey_path_safe '/home/x*y'                || _safe47_star=1
+        kill_sshkey_path_safe '/home/x?y'                || _safe47_q=1
+        kill_sshkey_path_safe '/home/x!y'                || _safe47_bang=1
+        kill_sshkey_path_safe "/home/x'y"                || _safe47_sq=1
+        kill_sshkey_path_safe '/home/x(y'                || _safe47_paren=1
+        kill_sshkey_path_safe '/home/x{y'                || _safe47_brace=1
+        kill_sshkey_path_safe '/home/x[y'                || _safe47_bracket=1
+        kill_sshkey_path_safe $'/home/x\ny'              || _safe47_nl=1
+        kill_sshkey_path_safe $'/home/x\ty'              || _safe47_tab=1
+        kill_sshkey_path_safe '/home/cpaneluser'         && _safe47_clean=1
+        # End-to-end: synthesize a canonical-paths emit by overriding
+        # `find` to print one safe + one hostile dir, override `getent`
+        # to return a safe root home. Hostile dir must be filtered.
+        _t47_root="$_t_dir/47-poc"
+        mkdir -p "$_t47_root"
+        # shellcheck disable=SC2317  # function-override invoked indirectly via kill_sshkey_canonical_paths
+        find() {
+            if [[ "$1" == "/home" ]]; then
+                printf '%s/cpaneluser\0%s/x";touch %s/INJECTION;"y\0' \
+                    "$_t47_root" "$_t47_root" "$_t47_root"
+            else
+                command find "$@"
+            fi
+        }
+        # shellcheck disable=SC2317  # function-override invoked indirectly via kill_sshkey_canonical_paths
+        getent() {
+            if [[ "$1" == "passwd" && "$2" == "root" ]]; then
+                printf 'root:x:0:0:root:/root:/bin/bash\n'
+            else
+                command getent "$@"
+            fi
+        }
+        rm -f "$_t47_root/INJECTION"
+        _emit47=$(kill_sshkey_canonical_paths 2>/dev/null)
+        _hit47_clean=$(printf '%s\n' "$_emit47" \
+            | grep -c "$_t47_root/cpaneluser/.ssh/authorized_keys$" 2>/dev/null)
+        _hit47_hostile=$(printf '%s\n' "$_emit47" | grep -c '";touch ' 2>/dev/null)
+        _hit47_inject=0
+        [[ -e "$_t47_root/INJECTION" ]] && _hit47_inject=1
+        unset -f find getent
+        if (( _safe47_dq && _safe47_semi && _safe47_dollar && _safe47_bt \
+              && _safe47_bs && _safe47_amp && _safe47_pipe && _safe47_lt \
+              && _safe47_gt && _safe47_star && _safe47_q && _safe47_bang \
+              && _safe47_sq && _safe47_paren && _safe47_brace \
+              && _safe47_bracket && _safe47_nl && _safe47_tab \
+              && _safe47_clean )) \
+              && [[ "$_hit47_clean" == "1" && "$_hit47_hostile" == "0" \
+                    && "$_hit47_inject" == "0" ]]; then
+            _t_ok 47 "kill_sshkey_path_safe refuses shell-metachars; canonical-paths drops hostile dir (trap-injection blocked)"
+        else
+            _t_fail 47 "kill_sshkey_path_safe + canonical-paths metachar gate" \
+                "dq=$_safe47_dq semi=$_safe47_semi dollar=$_safe47_dollar bt=$_safe47_bt bs=$_safe47_bs amp=$_safe47_amp pipe=$_safe47_pipe lt=$_safe47_lt gt=$_safe47_gt star=$_safe47_star q=$_safe47_q bang=$_safe47_bang sq=$_safe47_sq paren=$_safe47_paren brace=$_safe47_brace bracket=$_safe47_bracket nl=$_safe47_nl tab=$_safe47_tab clean=$_safe47_clean clean_hit=$_hit47_clean hostile_hit=$_hit47_hostile inject=$_hit47_inject"
+        fi
+
+        # Test 48 (v0.7.2 sentinel-fix SHOULD-FIX-1): kill_sshkey_recovery_hint
+        # shell-quotes both paths with single-quotes (defense-in-depth
+        # against operator paste-execute under incident stress). Embedded
+        # single-quotes must round-trip via the `'\''` escape.
+        _hint48=$(kill_sshkey_recovery_hint "/root/.ssh/authorized_keys" "/var/cpanel/sessionscribe-mitigation/run")
+        _expect48="cp -a '/var/cpanel/sessionscribe-mitigation/run/quarantine/root/.ssh/authorized_keys.original-pre-prune' '/root/.ssh/authorized_keys' && restorecon -F '/root/.ssh/authorized_keys' 2>/dev/null && systemctl reload sshd"
+        # Embedded single-quote case: `/home/o'malley/.ssh/authorized_keys`
+        _hint48b=$(kill_sshkey_recovery_hint "/home/o'malley/.ssh/authorized_keys" "/bdir")
+        _expect48b="cp -a '/bdir/quarantine/home/o'\\''malley/.ssh/authorized_keys.original-pre-prune' '/home/o'\\''malley/.ssh/authorized_keys' && restorecon -F '/home/o'\\''malley/.ssh/authorized_keys' 2>/dev/null && systemctl reload sshd"
+        if [[ "$_hint48" == "$_expect48" && "$_hint48b" == "$_expect48b" ]]; then
+            _t_ok 48 "recovery_hint shell-quotes paths (incl. embedded single-quote round-trip)"
+        else
+            _t_fail 48 "recovery_hint shell-quote" \
+                "got1='$_hint48' want1='$_expect48' got2='$_hint48b' want2='$_expect48b'"
+        fi
+
+        # Test 49 (v0.7.2 sentinel-fix SHOULD-FIX-2): finalize_manifest
+        # patches result_detail + sha256_pre on apply-mode kind:sshkey
+        # rows. K1 wrote null for all three (result, result_detail,
+        # sha256_pre); the sidecar carries real values; the awk pass
+        # must merge them, otherwise audit-completeness is broken.
+        MODE="apply"
+        BACKUP_DIR="$_t_dir/49-bdir"
+        mkdir -p "$BACKUP_DIR"
+        _f49="$_t_dir/49.keys"
+        {
+            printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
+            printf 'ssh-rsa BBBB evil@host\n'
+        } > "$_f49"
+        _m49="$_t_dir/49-manifest.json"
+        _bd49="$BACKUP_DIR/quarantine/${_f49#/}"
+        # Synthesize a minimal but finalize-compatible manifest. Must
+        # contain the items[] block boundaries, a csf:{} block, and a
+        # summary:{} block (finalize_manifest's awk re-emits both).
+        {
+            printf '{\n'
+            printf '  "ts_applied":null,\n'
+            printf '  "items":[\n'
+            printf '    {"kind":"sshkey","path":"%s","action":"prune",' "$_f49"
+            printf '"trust_re":"%s","trust_re_effective":"%s",' "$KILL_SSH_TRUST_RE" "$KILL_SSH_TRUST_RE"
+            printf '"keys_total":2,"keys_kept":1,"keys_kept_unlabeled":0,"keys_pruned":1,'
+            printf '"pruned_keys":[{"line_no":2,"type":"ssh-rsa","comment":"evil@host","fingerprint":"","base64_first_24":"BBBB"}],'
+            printf '"result":null,"result_detail":null,"sha256_pre":null,"sha256_post":null,'
+            printf '"original_backup_path":"%s.original-pre-prune","removed_keys_sidecar_path":"%s.removed-keys",' "$_bd49" "$_bd49"
+            printf '"recovery_hint":"cp -a ..."}\n'
+            printf '  ],\n'
+            printf '  "csf":{\n'
+            printf '    "blocklist_url":null,\n'
+            printf '    "blocklist_name":null,\n'
+            printf '    "registered":null,\n'
+            printf '    "lf_ipset":null,\n'
+            printf '    "lf_ipset_maxelem":null,\n'
+            printf '    "config_changed":null\n'
+            printf '  },\n'
+            printf '  "summary":{\n'
+            printf '    "files_planned":0,\n'
+            printf '    "ips_planned":0,\n'
+            printf '    "files_refused":0\n'
+            printf '  }\n'
+            printf '}\n'
+        } > "$_m49"
+        : > "${_m49%.json}.actions.jsonl"
+        prune_ssh_keys_from_manifest "$_m49" >/dev/null 2>&1
+        finalize_manifest "$_m49" >/dev/null 2>&1
+        # Pull the kind:sshkey row from the patched manifest.
+        _row49=$(grep '"kind":"sshkey"' "$_m49" 2>/dev/null | head -1)
+        # Assert: result_detail is not null AND sha256_pre is not null
+        # AND result is "pruned_ok".
+        _det49_null=$(printf '%s' "$_row49" | grep -c '"result_detail":null' 2>/dev/null)
+        _pre49_null=$(printf '%s' "$_row49" | grep -c '"sha256_pre":null' 2>/dev/null)
+        _post49_null=$(printf '%s' "$_row49" | grep -c '"sha256_post":null' 2>/dev/null)
+        _result49_ok=$(printf '%s' "$_row49" | grep -c '"result":"pruned_ok"' 2>/dev/null)
+        # Strict: detail string must contain "1 key(s) pruned" (from
+        # KILL_LAST_PRUNE_DETAIL); sha256_pre must look like 64-hex.
+        _det49_substr=$(printf '%s' "$_row49" | grep -cE '"result_detail":"[^"]*key\(s\) pruned[^"]*"' 2>/dev/null)
+        _pre49_hex=$(printf '%s' "$_row49" | grep -cE '"sha256_pre":"[0-9a-f]{64}"' 2>/dev/null)
+        if [[ "$_det49_null" == "0" && "$_pre49_null" == "0" \
+              && "$_post49_null" == "0" && "$_result49_ok" == "1" \
+              && "$_det49_substr" == "1" && "$_pre49_hex" == "1" ]]; then
+            _t_ok 49 "finalize_manifest patches kind:sshkey result_detail + sha256_pre + sha256_post"
+        else
+            _t_fail 49 "finalize_manifest patch result_detail + sha256_pre" \
+                "det_null=$_det49_null pre_null=$_pre49_null post_null=$_post49_null result_ok=$_result49_ok det_substr=$_det49_substr pre_hex=$_pre49_hex row='$_row49'"
         fi
 
         rm -rf "$_t_dir"

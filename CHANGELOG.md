@@ -4,6 +4,112 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-mitigate.sh v0.7.2 — 2026-05-03
+
+### Security
+- **MUST-FIX: `ssh_keys_prune` SIGINT/SIGTERM trap-string command
+  injection.** Lines 1066/1068 set `trap "rm -f \"$tmp\" \"$class_tmp\"
+  2>/dev/null; exit 130" INT` (and 143 for TERM) where `$tmp` =
+  `"$path.kill-prune-tmp.$$"` and `$path` flows from
+  `kill_sshkey_canonical_paths` (root home from `getent passwd root |
+  cut -d: -f6` and `/home/<user>` from `find /home -maxdepth 1`).
+  Linux directory names CAN legally contain `"`, `;`, `$`, `` ` ``,
+  `\`, `&`, `|`, `<`, `>`, `*`, `?`, `!`, `'`, parens/braces/brackets.
+  A SessionScribe-compromised WHM (the very threat this script
+  defends against) can create a cPanel user `x"; touch
+  /tmp/INJECTION; "y` whose home `/home/x"; touch /tmp/INJECTION;
+  "y` flows through canonical-paths into the trap string. At
+  trap-set time bash expands `$tmp`, producing a trap body that —
+  on SIGINT during the 10s `flock -x -n` retry loop — executes
+  the injected command. PoC verified live: hostile path expansion
+  followed by `kill -INT $$` creates `/tmp/INJECTION_PROOF`. The
+  v0.6.1 `kill_path_in_allowlist` gate (line 1589) only refuses
+  `[[:cntrl:]]`, NOT shell metacharacters, so the path passes the
+  allowlist and reaches `ssh_keys_prune` intact.
+
+  Fix: new `kill_sshkey_path_safe` helper rejects paths containing
+  any of `" ; $ \` `` ` `` `\ & | < > * ? ! ' ( ) { } [ ]`, newline,
+  tab, or any `[[:cntrl:]]` byte. `kill_sshkey_canonical_paths`
+  now filters both the root-home path and every `/home/<user>`
+  directory through this helper before emission; refused paths
+  emit a `say_warn` (operator must rename the dir to prune those
+  keys). All downstream consumers (trap-string expansion at 1066
+  /1068, recovery_hint, sidecar header, manifest path field)
+  inherit the filtered set.
+
+  Regression: test 47 ('kill_sshkey_path_safe refuses
+  shell-metachars; canonical-paths drops hostile dir
+  (trap-injection blocked)') under `MITIGATE_LIBRARY_ONLY=1
+  MITIGATE_RUN_P1_TESTS=1`. Probes the helper against 18
+  metacharacter classes individually + one clean-path control,
+  then synthesizes an end-to-end emit by overriding `find` to
+  return one safe `/home/cpaneluser` + one hostile `x";touch
+  $T/INJECTION;"y` path and `getent` to return a safe root
+  home, asserts the hostile path is filtered out of
+  `kill_sshkey_canonical_paths` output AND no `INJECTION` file
+  is created during the synthesis.
+
+### Fixed
+- **SHOULD-FIX-1: `kill_sshkey_recovery_hint` shell-quotes both paths
+  (defense-in-depth).** Line 1376 emitted `cp -a %s %s &&
+  restorecon -F %s` with bare `$path` substitutions. Even after
+  the canonical-paths metacharacter filter (security fix above)
+  blocks hostile paths from being emitted in normal flow, an
+  operator-pasted recovery_hint under incident stress remains a
+  second-line target if a future code path bypasses the filter
+  (e.g., manual envelope with attacker-controlled path in the
+  manifest).
+
+  Fix: wrap each path argument in single-quotes with
+  `'\''`-escape for embedded single-quotes. The output now reads
+  `cp -a '<mirror>' '<path>' && restorecon -F '<path>' 2>/dev/null
+  && systemctl reload sshd`. Operator paste-execute is now
+  injection-safe regardless of upstream filter state.
+
+  Regression: test 48 ('recovery_hint shell-quotes paths (incl.
+  embedded single-quote round-trip)') asserts the byte-exact
+  output for a normal path AND for `/home/o'malley/.ssh/
+  authorized_keys` round-tripping through the `'\''` escape.
+
+- **SHOULD-FIX-2: `finalize_manifest` patches `result_detail` and
+  `sha256_pre` on apply-mode kind:sshkey rows.**
+  `kill_sshkey_emit_manifest_item` writes `"result_detail":null,
+  "sha256_pre":null,"sha256_post":null` in apply mode (the K1
+  emit path; sidecar carries the real values). The v0.7.0
+  `kill_sidecar_to_lookup` sshkey case only emitted `result` +
+  `sha256_post` rows; the `finalize_manifest` awk pass only
+  patched those two fields. Result: an apply-mode manifest's
+  kind:sshkey items kept `result_detail` and `sha256_pre` as
+  `null` after the prune ran successfully — audit-completeness
+  gap on every successful prune.
+
+  Fix: `kill_sidecar_to_lookup` now also emits `sha256_pre` and
+  `result_detail` rows; the `finalize_manifest` awk patcher's
+  `kind:sshkey` branch now patches both alongside the existing
+  `sha256_post` and `result` patches.
+
+  Regression: test 49 ('finalize_manifest patches kind:sshkey
+  result_detail + sha256_pre + sha256_post') drives
+  `prune_ssh_keys_from_manifest` against a planted file with one
+  attacker key in --apply mode, calls `finalize_manifest` against
+  a synthesized minimal manifest, then asserts the kind:sshkey
+  row contains `"result":"pruned_ok"`, a non-null
+  `result_detail` matching `[^"]*key\(s\) pruned[^"]*`, and a
+  non-null `sha256_pre` matching `[0-9a-f]{64}`.
+
+### Verification
+- 46/46 → 49/49 P1+P2+P3+v0.7.1+v0.7.2 unit tests pass under
+  `MITIGATE_LIBRARY_ONLY=1 MITIGATE_RUN_P1_TESTS=1`. Three
+  regression tests added: 47 (MUST-FIX trap-injection metachar
+  gate), 48 (SHOULD-FIX-1 recovery_hint shell-quote), 49
+  (SHOULD-FIX-2 finalize_manifest sshkey detail+sha256_pre patch).
+- `bash -n`, `shellcheck -S error`, `shellcheck` (delta = 0 new
+  findings vs v0.7.1 baseline; SC2317/SC2016 in test 47 scaffold
+  suppressed via inline `# shellcheck disable=` directives that
+  acknowledge the function-override-via-indirect-call pattern).
+- bash 4.1.2 / gawk 3.1.7 floor preserved (no new `{n}` intervals,
+  no 3-arg `match`, no `flock -w`).
+
 ## sessionscribe-mitigate.sh v0.7.1 — 2026-05-03
 
 ### Fixed
