@@ -402,7 +402,34 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
-## sessionscribe-ioc-scan.sh v2.7.21 — 2026-05-04
+## sessionscribe-ioc-scan.sh v2.7.22 — 2026-05-04
+
+### Changed (kill-chain noise reduction)
+
+`pattern_g_deep_checks` rollup now gates the per-file `OFFENSE_EVENTS`
+push on `_g_high_conf`, set only when the file's mtime matches the
+IC-5790 forged stamp (`2019-12-13 12:59:16` UTC or local) OR a key
+comment matches `PATTERN_G_BAD_KEY_LABELS`. Files whose only Pattern G
+trip is an unrecognized comment that doesn't match `SSH_KNOWN_GOOD_RE`
+no longer paint a kill-chain UNDEFENDED row; the per-key warn-tier
+emit (`pattern_g_ssh_key`) still records every unrecognized key in
+the JSONL ladder so the audit trail is preserved.
+
+Motivation: hosts with tenant deploy keys, customer admin keys, or
+vendor automation comments that don't match the LW provisioning
+allowlist (`lwadmin|lw-admin|liquidweb|nexcess|Parent Child key for …`)
+were rolling up to a single CRITICAL `pattern_g_sshkey` row per
+authorized_keys file, painting the host UNDEFENDED on signal that's
+really advisory. The high-conf gate matches Ladder B's posture
+(`check_destruction_iocs` lines 6671-6707), where the strong tier
+already requires forged-mtime + IP-labeled co-occurrence.
+
+Net effect: kill-chain Pattern G rows now correspond 1:1 with
+attacker-pattern evidence (forged stamp or known-bad label match);
+unrecognized-but-clean keys remain in the ladder JSONL but stay out
+of the host verdict.
+
+
 
 ### Reverted (FP — shipped in v2.7.20, withdrawn here)
 
