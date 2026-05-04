@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.9
+# sessionscribe-ioc-scan.sh v2.7.10
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.9"
+VERSION="2.7.10"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -462,6 +462,30 @@ DO_UPLOAD=0
 INTAKE_URL="$INTAKE_DEFAULT_URL"
 INTAKE_TOKEN=""
 
+# Telemetry mode — lite bundle (no heavy tarballs) + optional envelope POST.
+# Designed for high-frequency fleet polling: ~50-100 KB on-disk per host vs
+# ~50 MB for full bundles. Lite bundle keeps envelope.json + kill-chain.{tsv,
+# jsonl,md} + manifest.txt + KB-scale forensic snapshots (ps/connections/
+# iptables + Pattern A/H/I attacker-binary metadata). Skips heavy tarballs
+# (sessions, access-logs, system-logs, cpanel-state, cpanel-users,
+# persistence, defense-state) and per-user bash histories.
+#
+# Transport ladder for --telemetry-url POST: curl > wget > bash native.
+# bash native uses /dev/tcp for HTTP and openssl s_client for HTTPS;
+# bash on RHEL/CL6+ is built --enable-net-redirections so the /dev/tcp
+# pseudo-path works without any external HTTP client. openssl is
+# universally present on cPanel hosts (cpsrvd uses libssl), so HTTPS
+# stays covered even on minimal installs that strip curl/wget.
+TELEMETRY_MODE=0
+TELEMETRY_URL=""
+TELEMETRY_TOKEN=""
+TELEMETRY_TIMEOUT=15
+TELEMETRY_RETRY=2
+# 5 MB cap. Envelopes rarely exceed 50 KB on a clean host, but a destruction-
+# heavy host with hundreds of A/B/C/H pattern hits can grow into double-digit
+# KB; the cap is a defense-in-depth ceiling against pathological cases.
+TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
+
 # --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
 # operator scan boxes / known-good IR sources.
 # Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
@@ -579,6 +603,42 @@ Upload (off by default):
                              flag > $RFXN_INTAKE_TOKEN env > built-in token
                              (1000-PUT cap; proj@rfxn.com for fleet token).
 
+Telemetry (low-disk-usage fleet collection):
+      --telemetry            Lite bundle: envelope.json + kill-chain.{tsv,
+                             jsonl,md} + manifest.txt + KB-scale forensic
+                             snapshots (ps/connections/iptables + Pattern
+                             A/H/I attacker-binary metadata). Skips heavy
+                             tarballs (sessions, access-logs, system-logs,
+                             cpanel-state, persistence, defense-state) and
+                             per-user histories. Implies --full
+                             --chain-on-all --bundle. ~50-100 KB on-disk
+                             per host vs ~50 MB for --full bundles. Pair
+                             with --telemetry-url to POST the envelope to
+                             a fleet collector. Compatible with --upload
+                             (ships the lite bundle to intake).
+      --telemetry-url URL    POST envelope JSON to URL after lite bundle
+                             writes. Implies --telemetry. Transport ladder:
+                             curl > wget > bash native (/dev/tcp for HTTP,
+                             openssl s_client for HTTPS). Bash on RHEL/CL6+
+                             is built --enable-net-redirections so the
+                             /dev/tcp pseudo-path works without any
+                             external HTTP client. Must be http:// or
+                             https://; HTTPS requires curl, wget with SSL,
+                             or openssl(1).
+      --telemetry-token TOK  Bearer token sent as 'Authorization: Bearer'
+                             header on telemetry POST. Optional; omit for
+                             unauthenticated endpoints.
+      --telemetry-timeout N  Per-attempt HTTP timeout in seconds (default
+                             15). Applies to each retry attempt
+                             individually, not to the cumulative wall.
+      --telemetry-retry N    Retry count on transient failure (default 2;
+                             total attempts = 1 + N). Exponential backoff:
+                             2s after attempt 1, 4s after attempt 2.
+      --telemetry-max-bytes B Cap envelope size for transmission (default
+                             5MB / 5242880). Larger envelopes skip the POST
+                             and emit a warning signal; the lite bundle on
+                             disk is unaffected.
+
 Back-compat aliases (deprecated; set full-mode + the relevant gate):
       --chain-forensic       equivalent to full mode (no host-verdict gate)
       --chain-on-critical    full mode only if host_verdict == COMPROMISED
@@ -644,6 +704,22 @@ while [[ $# -gt 0 ]]; do
         --extra-logs)         EXTRA_LOGS_DIR="$2"; shift 2 ;;
         --no-history)         INCLUDE_HOMEDIR_HISTORY=0; shift ;;
         --upload)             DO_UPLOAD=1; shift ;;
+        # Telemetry mode — lite bundle (no heavy tarballs) for high-frequency
+        # fleet polling. Implies --full --chain-on-all --bundle so the
+        # forensic phases run on every host and the bundle dir gets the
+        # envelope + kill-chain primitives written. The lite-mode skip
+        # logic lives inside phase_bundle (gated on TELEMETRY_MODE).
+        --telemetry)
+            TELEMETRY_MODE=1; FULL_MODE=1; CHAIN_ON_ALL=1
+            CHAIN_FORENSIC=1; DO_BUNDLE=1; shift ;;
+        --telemetry-url)
+            TELEMETRY_URL="$2"
+            TELEMETRY_MODE=1; FULL_MODE=1; CHAIN_ON_ALL=1
+            CHAIN_FORENSIC=1; DO_BUNDLE=1; shift 2 ;;
+        --telemetry-token)    TELEMETRY_TOKEN="$2"; shift 2 ;;
+        --telemetry-timeout)  TELEMETRY_TIMEOUT="$2"; shift 2 ;;
+        --telemetry-retry)    TELEMETRY_RETRY="$2"; shift 2 ;;
+        --telemetry-max-bytes) TELEMETRY_MAX_BYTES="$2"; shift 2 ;;
         # Back-compat aliases -- set --full + the legacy gate flags so the
         # main-flow gating logic (Phase 5) honors the original semantics.
         --chain-forensic)     FULL_MODE=1; CHAIN_FORENSIC=1; shift ;;
@@ -698,6 +774,38 @@ fi
 if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
     echo "Error: --max-bundle-mb requires a non-negative integer (MB)" >&2
     exit 2
+fi
+
+# Telemetry validation. URL must be http(s)://. Timeout/retry/max-bytes
+# must be sane integers. Transport availability is checked at POST time
+# (not at parse time) so a host with no curl/wget/bash-with-net-redirs
+# can still produce the lite bundle on disk for out-of-band collection.
+if (( TELEMETRY_MODE )); then
+    if [[ -n "$TELEMETRY_URL" ]] && [[ ! "$TELEMETRY_URL" =~ ^https?:// ]]; then
+        echo "Error: --telemetry-url must start with http:// or https://" >&2
+        exit 2
+    fi
+    if ! [[ "$TELEMETRY_TIMEOUT" =~ ^[0-9]+$ ]] || (( TELEMETRY_TIMEOUT < 1 )); then
+        echo "Error: --telemetry-timeout requires a positive integer (seconds)" >&2
+        exit 2
+    fi
+    if ! [[ "$TELEMETRY_RETRY" =~ ^[0-9]+$ ]]; then
+        echo "Error: --telemetry-retry requires a non-negative integer" >&2
+        exit 2
+    fi
+    if ! [[ "$TELEMETRY_MAX_BYTES" =~ ^[0-9]+$ ]] || (( TELEMETRY_MAX_BYTES < 1024 )); then
+        echo "Error: --telemetry-max-bytes requires an integer >= 1024 (bytes)" >&2
+        exit 2
+    fi
+    # --telemetry is incompatible with --no-ledger for the same reason --full
+    # is — phase_telemetry_post and the kill-chain primitives both need the
+    # envelope on disk. The earlier --full + --no-ledger gate covers this
+    # transitively (TELEMETRY_MODE implies FULL_MODE) but we restate it for
+    # clarity in the error message.
+    if (( NO_LEDGER )); then
+        echo "Error: --telemetry is incompatible with --no-ledger (lite bundle requires the envelope on disk)" >&2
+        exit 2
+    fi
 fi
 
 # Compute --since cutoff from days-back if requested.
@@ -3075,7 +3183,11 @@ prune_old_bundles() {
 }
 
 phase_bundle() {
-    hdr_section "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
+    if (( TELEMETRY_MODE )); then
+        hdr_section "bundle" "lite mode (envelope + kill-chain + KB snapshots; no tarballs)"
+    else
+        hdr_section "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
+    fi
 
     if (( ! DO_BUNDLE )); then
         say_info "--no-bundle: skipping artifact capture"
@@ -3139,13 +3251,24 @@ phase_bundle() {
     # sessions/cache + tmpcache are the bulk of session-dir size on busy
     # hosts and carry no forensic value (encoder cache, not forged-session
     # artifacts). raw/ + preauth/ are where the IOCs live.
-    local sess_list; sess_list=$(mktemp /tmp/forensic-sess.XXXXXX)
-    {
-        collect_recent /var/cpanel/sessions/raw
-        collect_recent /var/cpanel/sessions/preauth
-    } > "$sess_list" 2>/dev/null
-    bundle_tar "sessions.tgz" "sessions (raw+preauth)" filtered "$sess_list"
-    rm -f "$sess_list"
+    # TELEMETRY: skipped — sessions are MB-scale and per-host PII; the
+    # envelope + kill-chain already carry the IOC summary.
+    if (( ! TELEMETRY_MODE )); then
+        local sess_list; sess_list=$(mktemp /tmp/forensic-sess.XXXXXX)
+        {
+            collect_recent /var/cpanel/sessions/raw
+            collect_recent /var/cpanel/sessions/preauth
+        } > "$sess_list" 2>/dev/null
+        bundle_tar "sessions.tgz" "sessions (raw+preauth)" filtered "$sess_list"
+        rm -f "$sess_list"
+    fi
+
+    # TELEMETRY: skip sections 2-5 (heavy tarballs). The access-log /
+    # system-log / cpanel-state / persistence / defense-state subtrees
+    # are MB-scale per host; the envelope's signals[] already carries
+    # the IOC findings derived from these sources. Operators who need
+    # the raw artifacts can re-run on flagged hosts without --telemetry.
+    if (( ! TELEMETRY_MODE )); then
 
     # 2. Apache + cPanel access logs + cpsrvd incoming/error logs, filtered
     # to within the window. incoming_http_requests.log carries the raw
@@ -3285,6 +3408,8 @@ phase_bundle() {
     bundle_tar "defense-state.tgz" "defense state" filtered "$def_list"
     rm -f "$def_list"
 
+    fi  # TELEMETRY_MODE skip — end of heavy-tarball block
+
     # 6. Process + network snapshot.
     ps auxfww > "$bdir/ps.txt" 2>&1 || true
     if have_cmd ss; then
@@ -3403,7 +3528,10 @@ phase_bundle() {
     fi
 
     # 8. Per-user bash histories (optional, gated on --no-history).
-    if (( INCLUDE_HOMEDIR_HISTORY )); then
+    # TELEMETRY: skipped — per-account histories can be MB-scale on shared
+    # hosts; the IOC engine's history-pattern findings are already in
+    # signals[].
+    if (( INCLUDE_HOMEDIR_HISTORY )) && (( ! TELEMETRY_MODE )); then
         mkdir -p "$bdir/user-histories"
         local found=0
         while IFS= read -r -d '' h; do
@@ -3428,7 +3556,11 @@ phase_bundle() {
 
 phase_upload() {
     (( DO_UPLOAD )) || return 0
-    hdr_section "upload" "submitting bundle to $INTAKE_URL"
+    if (( TELEMETRY_MODE )); then
+        hdr_section "upload" "submitting LITE bundle to $INTAKE_URL (telemetry mode; no heavy tarballs)"
+    else
+        hdr_section "upload" "submitting bundle to $INTAKE_URL"
+    fi
 
     if (( ! DO_BUNDLE )); then
         say_warn "--no-bundle precludes upload (nothing was captured)"
@@ -3454,7 +3586,10 @@ phase_upload() {
     # Re-archive the bundle directory into a single outer tarball. The
     # individual tarballs inside are already gzipped; tar -cz over them
     # yields very little extra compression but produces one upload artifact
-    # per host with valid gzip magic on the outer wrapper.
+    # per host with valid gzip magic on the outer wrapper. In TELEMETRY_MODE
+    # there are NO inner tarballs — just the envelope/kill-chain/manifest/
+    # snapshot files — so the outer tarball is itself the primary
+    # compression layer (and the upload is KB-scale, not MB-scale).
     local outer="${BUNDLE_BDIR}.upload.tgz"
     if ! tar -C "$BUNDLE_DIR_ROOT" -czf "$outer" "$(basename "$BUNDLE_BDIR")" 2>/dev/null; then
         say_fail "outer tarball build failed: $outer"
@@ -3497,11 +3632,367 @@ phase_upload() {
     [[ -n "$body" ]] && say_info "  $body"
     emit_signal upload info upload_complete \
         "http=201 url=$INTAKE_URL" \
-        url "$INTAKE_URL" body "$body" outer "$outer"
+        url "$INTAKE_URL" body "$body" outer "$outer" \
+        telemetry_mode "$TELEMETRY_MODE"
 
     # Success: drop the outer tarball; the bundle dir itself is kept for
     # local IR review.
     rm -f "$outer"
+}
+
+###############################################################################
+# Telemetry POST — ships envelope JSON to a fleet collector.
+#
+# Distinct from phase_upload (which PUTs the outer tarball to intake): this
+# only sends the envelope.json (KB-scale), gated on --telemetry-url. Designed
+# for high-frequency fleet polling where you want every host's signals[]
+# stream into a central database without the per-host tarball overhead.
+#
+# Transport ladder (best-first):
+#   1. curl   — preferred; --data-binary @file avoids ARG_MAX, -w embeds
+#               http_code in stdout, --max-time per attempt
+#   2. wget   — --post-file=, --server-response captures HTTP/x.x line for
+#               status extraction; --tries=1 because we manage retry here
+#   3. bash   — bash-native fallback. /dev/tcp socket for HTTP; openssl
+#               s_client wraps the same request payload for HTTPS. No
+#               external HTTP client required — relies only on bash
+#               (built --enable-net-redirections, the RHEL/CL6+ default)
+#               and openssl (universally present on cPanel hosts; cpsrvd
+#               itself uses it). The whole transaction is wrapped in
+#               `timeout` so a hung connect or stalled read can't outlive
+#               TELEMETRY_TIMEOUT.
+#
+# Retry: up to (1 + TELEMETRY_RETRY) attempts with exponential backoff
+# (2^attempt seconds: 2, 4, 8, ...). Each attempt has its own timeout via
+# TELEMETRY_TIMEOUT — the cumulative wall is bounded but generous enough
+# that a slow link doesn't fail spuriously.
+#
+# Failure mode: emits a warning signal (`telemetry_post_failed`) but does
+# NOT change EXIT_CODE — telemetry shipping is operationally reportable
+# but should not fail the scan; the lite bundle on disk is the durable
+# artifact.
+###############################################################################
+
+phase_telemetry_post() {
+    (( TELEMETRY_MODE )) || return 0
+    [[ -z "$TELEMETRY_URL" ]] && return 0
+    hdr_section "telemetry" "POST envelope to $TELEMETRY_URL"
+
+    # Locate envelope. Bundle copy is preferred (it lives next to the
+    # kill-chain primitives the operator may also want to ship out-of-band)
+    # but ENVELOPE_PATH is the canonical ledger record and always exists
+    # in --full mode (the --no-ledger gate at parse time guarantees this).
+    local env_src=""
+    if [[ -n "${BUNDLE_BDIR:-}" && -f "${BUNDLE_BDIR}/ioc-scan-envelope.json" ]]; then
+        env_src="${BUNDLE_BDIR}/ioc-scan-envelope.json"
+    elif [[ -n "${ENVELOPE_PATH:-}" && -f "$ENVELOPE_PATH" ]]; then
+        env_src="$ENVELOPE_PATH"
+    fi
+    if [[ -z "$env_src" ]]; then
+        say_warn "no envelope on disk to POST (BUNDLE_BDIR + ENVELOPE_PATH both empty)"
+        # warn (not fail): telemetry-internal errors are operational, not
+        # security findings. emit_signal "fail" maps to severity=strong
+        # which would render as [IOC] in the section matrix and could mask
+        # genuine exploit signals. warn → severity=warning is correct.
+        emit_signal telemetry warn telemetry_no_envelope \
+            "no envelope on disk to POST"
+        return
+    fi
+
+    # Size gate: protect the endpoint from pathological envelopes.
+    local env_size=0
+    env_size=$(stat -c %s "$env_src" 2>/dev/null)
+    env_size="${env_size:-0}"
+    if (( env_size == 0 )); then
+        say_warn "envelope is empty: $env_src"
+        emit_signal telemetry warn telemetry_envelope_empty \
+            "envelope file is zero bytes" path "$env_src"
+        return
+    fi
+    if (( env_size > TELEMETRY_MAX_BYTES )); then
+        say_warn "envelope size ${env_size} > cap ${TELEMETRY_MAX_BYTES}; skipping POST"
+        emit_signal telemetry warn telemetry_envelope_too_large \
+            "envelope_size=${env_size} cap=${TELEMETRY_MAX_BYTES}" \
+            bytes "$env_size" cap "$TELEMETRY_MAX_BYTES" path "$env_src"
+        return
+    fi
+
+    # Probe transport ladder. bash-native is the floor: /dev/tcp covers
+    # HTTP, openssl s_client covers HTTPS. We probe in best-first order
+    # and stop at the first viable transport. HTTPS adds an SSL
+    # requirement (curl/wget compiled with SSL OR openssl binary); we
+    # surface that as a separate diagnostic so the operator knows why a
+    # transport was rejected.
+    local _xport=""
+    local _is_https=0
+    [[ "$TELEMETRY_URL" =~ ^https:// ]] && _is_https=1
+
+    if have_cmd curl; then
+        _xport="curl"
+    elif have_cmd wget; then
+        # wget WITHOUT SSL support exists on stripped CL6 (gnu wget 1.12);
+        # for HTTPS we need to verify SSL is compiled in. `wget --version`
+        # lists +ssl/-ssl in the feature list.
+        if (( _is_https )); then
+            if wget --version 2>/dev/null | grep -qE '\+(ssl|https)'; then
+                _xport="wget"
+            fi
+        else
+            _xport="wget"
+        fi
+    fi
+    # bash-native fallback: /dev/tcp for HTTP, openssl s_client for HTTPS.
+    # bash on RHEL/CL6+ is built with --enable-net-redirections; the
+    # /dev/tcp/<host>/<port> pseudo-path opens a TCP socket via the
+    # built-in. For HTTPS we require an openssl binary — cPanel hosts
+    # always have one (cpsrvd uses libssl) but verify before declaring
+    # the transport viable.
+    if [[ -z "$_xport" ]]; then
+        if (( _is_https )); then
+            have_cmd openssl && _xport="bash"
+        else
+            _xport="bash"
+        fi
+    fi
+
+    if [[ -z "$_xport" ]]; then
+        local _need_msg="curl, wget, or bash + openssl"
+        (( _is_https )) && _need_msg="curl, wget(+ssl), or bash + openssl s_client"
+        say_warn "no HTTP transport available (need: $_need_msg)"
+        emit_signal telemetry warn telemetry_no_transport \
+            "need: $_need_msg" \
+            url "$TELEMETRY_URL" is_https "$_is_https"
+        say_info "lite bundle preserved at ${BUNDLE_BDIR:-(not created)} for out-of-band collection"
+        return
+    fi
+    say_info "transport: $_xport (envelope=${env_size}B)"
+
+    # Retry loop. Backoff is 2^attempt seconds (2, 4, 8, …). Each attempt
+    # uses TELEMETRY_TIMEOUT as the per-call ceiling. TELEMETRY_RETRY is
+    # capped at 10 here as a defense-in-depth bound — the parse-time
+    # validator allows any non-negative int, but at attempt=10 the
+    # backoff is 1024s (~17min) and at attempt=20 it would be 12 days.
+    local attempt=0 max_attempts=$((TELEMETRY_RETRY + 1))
+    if (( max_attempts > 11 )); then max_attempts=11; fi
+    # Hoist all per-attempt locals to the function scope (vs re-declaring
+    # inside the case branches each loop iteration). The mktemp-issued
+    # tempfiles are recreated per attempt; the names are reused as
+    # variables.
+    local rc=0 http_code="" body="" t_start t_end duration_ms last_err=""
+    local _resp_file="" _hdr_file="" _err_file="" _req_file=""
+    local _curl_args _wget_args
+    local _scheme="" _rest="" _hp="" _path="" _host="" _port="" _host_hdr=""
+    local _status_line=""
+    t_start=$(date -u +%s)
+    while (( attempt < max_attempts )); do
+        attempt=$((attempt + 1))
+        rc=0; http_code=""; body=""; last_err=""
+        case "$_xport" in
+            curl)
+                _resp_file=$(mktemp /tmp/telemetry-resp.XXXXXX)
+                _err_file=$(mktemp /tmp/telemetry-err.XXXXXX)
+                _curl_args=(
+                    --silent --show-error
+                    --max-time "$TELEMETRY_TIMEOUT"
+                    -X POST
+                    -H "Content-Type: application/json"
+                    -H "User-Agent: sessionscribe-ioc-scan/${VERSION}"
+                    --data-binary "@${env_src}"
+                    -o "$_resp_file"
+                    -w '%{http_code}'
+                )
+                [[ -n "$TELEMETRY_TOKEN" ]] && \
+                    _curl_args+=(-H "Authorization: Bearer ${TELEMETRY_TOKEN}")
+                http_code=$(curl "${_curl_args[@]}" "$TELEMETRY_URL" 2>"$_err_file") || rc=$?
+                body=$(head -c 2048 "$_resp_file" 2>/dev/null)
+                last_err=$(head -c 512 "$_err_file" 2>/dev/null)
+                rm -f "$_resp_file" "$_err_file"
+                ;;
+            wget)
+                # NOTE: --quiet AND --no-verbose both silence --server-
+                # response in wget2 (Fedora/EL9+) — we need the HTTP/x.x
+                # status line to extract the response code. Default-noise
+                # wget without quiet flags is the only portable way; the
+                # 2>FILE redirect captures everything to a scratch file we
+                # then grep. Classic CL6 wget 1.12 prints the same
+                # `HTTP/1.1 NNN` line shape, so the regex matches both.
+                _resp_file=$(mktemp /tmp/telemetry-resp.XXXXXX)
+                _hdr_file=$(mktemp /tmp/telemetry-hdr.XXXXXX)
+                _wget_args=(
+                    --tries=1
+                    --timeout="$TELEMETRY_TIMEOUT"
+                    --header="Content-Type: application/json"
+                    --header="User-Agent: sessionscribe-ioc-scan/${VERSION}"
+                    --post-file="$env_src"
+                    --server-response
+                    -O "$_resp_file"
+                )
+                [[ -n "$TELEMETRY_TOKEN" ]] && \
+                    _wget_args+=(--header="Authorization: Bearer ${TELEMETRY_TOKEN}")
+                # Capture stdout + stderr both — wget2 (Fedora/EL9+) writes
+                # --server-response output to stdout; classic wget 1.12
+                # (CL6) writes it to stderr. -O FILE has already taken
+                # ownership of the response body, so combining stdout+
+                # stderr into the header trace is safe.
+                wget "${_wget_args[@]}" "$TELEMETRY_URL" >"$_hdr_file" 2>&1 || rc=$?
+                # Last "HTTP/x.x NNN" line. Both wget1 and wget2 print the
+                # status line either bare or 2-space-indented; match both.
+                http_code=$(grep -E '^[[:space:]]*HTTP/' "$_hdr_file" 2>/dev/null \
+                    | tail -1 | awk '{print $2}')
+                body=$(head -c 2048 "$_resp_file" 2>/dev/null)
+                last_err=$(head -c 512 "$_hdr_file" 2>/dev/null)
+                rm -f "$_resp_file" "$_hdr_file"
+                ;;
+            bash)
+                # Bash-native HTTP. Parse URL into host/port/path, build the
+                # full request to a tempfile (so request body and headers
+                # are atomic on the wire), then deliver via /dev/tcp (HTTP)
+                # or openssl s_client (HTTPS). The whole operation is
+                # wrapped in `timeout` so a hung connect or stalled read
+                # is bounded by TELEMETRY_TIMEOUT.
+                _scheme="${TELEMETRY_URL%%://*}"
+                _rest="${TELEMETRY_URL#*://}"
+                _hp="${_rest%%/*}"
+                if [[ "$_rest" == "$_hp" ]]; then
+                    _path="/"
+                else
+                    _path="/${_rest#*/}"
+                fi
+                _host="${_hp%%:*}"
+                _port=""
+                [[ "$_hp" == *":"* ]] && _port="${_hp##*:}"
+                if [[ -z "$_port" ]]; then
+                    case "$_scheme" in
+                        https) _port=443 ;;
+                        *)     _port=80  ;;
+                    esac
+                fi
+                # Host header includes :port only when non-default.
+                _host_hdr="$_host"
+                case "$_scheme" in
+                    https) [[ "$_port" != "443" ]] && _host_hdr="${_host}:${_port}" ;;
+                    *)     [[ "$_port" != "80"  ]] && _host_hdr="${_host}:${_port}" ;;
+                esac
+
+                _req_file=$(mktemp /tmp/telemetry-req.XXXXXX)
+                _resp_file=$(mktemp /tmp/telemetry-resp.XXXXXX)
+                # Build request: line-endings MUST be \r\n per RFC 7230.
+                # printf '\r\n' is reliable across bash 4.1+.
+                {
+                    printf 'POST %s HTTP/1.1\r\n' "$_path"
+                    printf 'Host: %s\r\n' "$_host_hdr"
+                    printf 'User-Agent: sessionscribe-ioc-scan/%s\r\n' "$VERSION"
+                    printf 'Content-Type: application/json\r\n'
+                    [[ -n "$TELEMETRY_TOKEN" ]] && \
+                        printf 'Authorization: Bearer %s\r\n' "$TELEMETRY_TOKEN"
+                    printf 'Content-Length: %d\r\n' "$env_size"
+                    printf 'Connection: close\r\n'
+                    printf '\r\n'
+                    cat "$env_src"
+                } > "$_req_file"
+
+                if [[ "$_scheme" == "https" ]]; then
+                    # openssl s_client: -quiet suppresses cert dump; -ign_eof
+                    # keeps reading after the server's TLS close-notify so
+                    # we don't truncate the response body. -servername sends
+                    # SNI for vhost-routed endpoints. Args are passed via
+                    # the argv (not interpolated into a shell string), so
+                    # no quote-injection surface for hostile URL values.
+                    timeout "$TELEMETRY_TIMEOUT" openssl s_client \
+                        -connect "${_host}:${_port}" \
+                        -servername "$_host" \
+                        -quiet -ign_eof \
+                        < "$_req_file" \
+                        > "$_resp_file" 2>/dev/null
+                    rc=$?
+                else
+                    # Plain HTTP via bash /dev/tcp. We spawn a child bash
+                    # with `timeout` wrapping it — this gives us a bound
+                    # on both connect-time AND read-time without bash
+                    # builtin gymnastics. The child opens FD 9 (avoiding
+                    # 3-collision with our own redirection space if any),
+                    # writes the request, then `cat <&9` reads everything
+                    # the server sends until close.
+                    #
+                    # SAFETY: pass _host/_port/_req_file via the env, NOT
+                    # via shell-string interpolation. URL host/port come
+                    # from the operator's --telemetry-url; if the value
+                    # contained a single-quote (e.g. "x';rm -rf /'") the
+                    # interpolated form ('...'"$_host"'...') would break
+                    # quote nesting and execute the injected command in
+                    # the child shell. Env passthrough makes the values
+                    # data, not code.
+                    _SS_H="$_host" _SS_P="$_port" _SS_R="$_req_file" \
+                    timeout "$TELEMETRY_TIMEOUT" bash -c '
+                        exec 9<>/dev/tcp/"$_SS_H"/"$_SS_P" || exit 1
+                        cat "$_SS_R" >&9
+                        cat <&9
+                        exec 9>&-
+                    ' > "$_resp_file" 2>/dev/null
+                    rc=$?
+                fi
+
+                # Parse status line: first non-empty line is "HTTP/x.x NNN ...".
+                # Body is whatever follows the first blank header-terminator.
+                if [[ -s "$_resp_file" ]]; then
+                    _status_line=$(grep -m1 -E '^HTTP/[0-9.]+[[:space:]]+[0-9]+' \
+                        "$_resp_file" 2>/dev/null)
+                    http_code=$(printf '%s' "$_status_line" | awk '{print $2}')
+                    # awk: skip header block (everything up to first blank
+                    # line, where blank = optional \r), then print body.
+                    # Cap at 2048 bytes for the JSON envelope.
+                    body=$(awk 'BEGIN{p=0} \
+                                /^\r?$/ {if (!p) {p=1; next}} \
+                                p {print}' "$_resp_file" 2>/dev/null \
+                           | head -c 2048)
+                    if [[ -z "$_status_line" ]]; then
+                        # Response received but no recognizable HTTP/x.x
+                        # status line — endpoint isn't speaking HTTP, or
+                        # TLS handshake failed and we got cleartext junk.
+                        # head -c 200 keeps the diagnostic short.
+                        last_err="malformed response (no HTTP status line): $(head -c 200 "$_resp_file")"
+                    fi
+                else
+                    last_err="empty response (rc=$rc)"
+                fi
+                rm -f "$_req_file" "$_resp_file"
+                ;;
+        esac
+
+        if (( rc == 0 )) && [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            t_end=$(date -u +%s)
+            duration_ms=$(( (t_end - t_start) * 1000 ))
+            say_pass "POST ok: http=$http_code attempt=$attempt duration=${duration_ms}ms"
+            emit_signal telemetry info telemetry_post_complete \
+                "http=$http_code attempt=$attempt duration_ms=$duration_ms transport=$_xport" \
+                http_code "$http_code" attempt "$attempt" \
+                duration_ms "$duration_ms" transport "$_xport" \
+                bytes "$env_size" url "$TELEMETRY_URL"
+            return
+        fi
+
+        # Non-2xx OR transport error — record and (maybe) retry.
+        say_warn "POST attempt $attempt/$max_attempts failed (rc=$rc http=${http_code:-?})"
+        if (( attempt < max_attempts )); then
+            local backoff=$(( 1 << attempt ))
+            say_info "retry in ${backoff}s"
+            sleep "$backoff"
+        fi
+    done
+
+    t_end=$(date -u +%s)
+    duration_ms=$(( (t_end - t_start) * 1000 ))
+    say_fail "POST failed after $max_attempts attempts (rc=$rc http=${http_code:-?})"
+    [[ -n "$body" ]] && say_fail "  response: $(printf '%s' "$body" | head -c 256)"
+    [[ -n "$last_err" ]] && say_fail "  err: $(printf '%s' "$last_err" | head -c 256)"
+    emit_signal telemetry warn telemetry_post_failed \
+        "attempts=$max_attempts rc=$rc http=${http_code:-?} transport=$_xport" \
+        attempts "$max_attempts" rc "$rc" http_code "${http_code:-}" \
+        transport "$_xport" duration_ms "$duration_ms" \
+        body "$(printf '%s' "$body" | head -c 256)" \
+        err "$(printf '%s' "$last_err" | head -c 256)" \
+        url "$TELEMETRY_URL"
+    say_info "lite bundle preserved at ${BUNDLE_BDIR:-(not created)} for retry"
 }
 
 ###############################################################################
@@ -7566,6 +8057,10 @@ if (( RUN_FORENSIC )); then
     render_kill_chain
     if (( DO_BUNDLE )); then
         phase_bundle
+        # Telemetry POST runs after the bundle so it can read the in-bundle
+        # envelope copy. Independent of --upload (which ships the outer
+        # tarball to intake); both can fire in the same run.
+        (( TELEMETRY_MODE )) && [[ -n "$TELEMETRY_URL" ]] && phase_telemetry_post
         (( DO_UPLOAD )) && phase_upload
     fi
 

@@ -402,6 +402,124 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.10 — 2026-05-03
+
+### Added
+- **`--telemetry` mode for high-frequency fleet polling.** Lite bundle that
+  drops the heavy MB-scale tarballs but keeps every KB-scale forensic
+  artifact, designed for `~50–100 KB` per-host disk footprint vs `~50 MB`
+  for `--full` bundles.
+
+  Lite-bundle contents (kept):
+  - `manifest.txt` — host metadata
+  - `ioc-scan-envelope.json` — the canonical `signals[]` envelope
+  - `kill-chain.{tsv,jsonl,md}` — reconciled DEF↔IOC timeline primitives
+  - `ps.txt` / `connections.txt` / `iptables.txt` — process + network
+    snapshot (KB-scale)
+  - `pattern-a-binary-metadata.txt` / `pattern-h-seobot-metadata.txt` /
+    `pattern-i-system-service-metadata.txt` — attacker-binary stat +
+    sha256 + hex-head fingerprints (binaries themselves NOT bundled,
+    same safety policy as `--full`)
+
+  Heavy-tarball contents (skipped under `--telemetry`):
+  - `sessions.tgz`, `access-logs.tgz`, `system-logs.tgz`,
+    `cpanel-state.tgz`, `cpanel-users.tgz`, `persistence.tgz`,
+    `defense-state.tgz`, per-user bash histories
+
+  Implies `--full --chain-on-all --bundle` so every host gets forensic
+  reconciliation regardless of `host_verdict`. Compatible with `--upload`
+  (ships the lite bundle to intake unchanged) and orthogonal to the new
+  envelope POST below.
+
+- **`--telemetry-url URL` envelope-only HTTP POST.** Single `Content-Type:
+  application/json` POST of the envelope (NOT the bundle tarball) to a
+  fleet collector. Decouples high-frequency telemetry from the existing
+  `--upload` intake path so operators can split traffic: telemetry POST
+  on every host (cheap), bundle upload only on `host_verdict ==
+  COMPROMISED` via `--chain-on-critical --upload`.
+
+  Three-transport fallback ladder, best-first (bash-native floor — no
+  Perl, Python, or other interpreter dependency):
+  1. **curl** — preferred; `--data-binary @file` avoids ARG_MAX,
+     `-w '%{http_code}'` extracts status without a second call,
+     `--max-time` bounds each attempt
+  2. **wget** — `--post-file=`, `--server-response` for status; HTTPS
+     gated on `wget --version | grep '+ssl'` so SSL-stripped wget
+     binaries don't get picked for HTTPS endpoints. Captures both
+     stdout + stderr (wget2 on Fedora/EL9+ writes the status line to
+     stdout; classic wget 1.12 on CL6 writes it to stderr — same
+     regex `^[[:space:]]*HTTP/` matches both)
+  3. **bash native** — `/dev/tcp` for HTTP, `openssl s_client` for
+     HTTPS. bash on RHEL/CL6+ is built `--enable-net-redirections`
+     so the `/dev/tcp/<host>/<port>` pseudo-path works without any
+     external HTTP client. openssl is universally present on cPanel
+     hosts (cpsrvd uses libssl). The whole transaction is wrapped
+     in `timeout(1)` so a hung connect or stalled read can't outlive
+     `TELEMETRY_TIMEOUT`. URL parsing is done in pure bash parameter
+     expansion; Host header includes `:port` only when non-default.
+
+  Hosts with no curl/wget AND no openssl (HTTPS endpoints) emit a
+  `posture`-class warning signal and the lite bundle on disk remains
+  the operator's fallback for out-of-band collection. HTTP-only
+  endpoints work even on a stripped container with nothing but bash.
+
+- **Telemetry knobs:**
+  - `--telemetry-token TOK` — Bearer token in `Authorization` header
+  - `--telemetry-timeout N` — per-attempt HTTP timeout (default 15s)
+  - `--telemetry-retry N` — retry count on transient failure (default
+    2; total attempts = 1 + N). Exponential backoff: 2s after attempt
+    1, 4s after attempt 2
+  - `--telemetry-max-bytes B` — cap envelope size (default 5MB);
+    oversize envelopes skip the POST and emit
+    `telemetry_envelope_too_large`. Lite bundle on disk is unaffected
+
+- **Telemetry signal vocabulary** (all `posture_*` discipline:
+  `telemetry_*` keys, never `ioc_*`, so failures are operationally
+  reportable but do NOT flip `host_verdict`):
+  - `telemetry_post_complete` — info, with `http_code`, `attempt`,
+    `duration_ms`, `transport`, `bytes`
+  - `telemetry_post_failed` — warning, after exhausting retries; carries
+    the truncated response body + last error string for triage
+  - `telemetry_envelope_too_large` — warning, size-cap exceeded
+  - `telemetry_envelope_empty` — warning, envelope is zero bytes
+  - `telemetry_no_envelope` — warning, ENVELOPE_PATH + BUNDLE_BDIR both
+    missing
+  - `telemetry_no_transport` — warning, none of curl/wget/perl-LWP
+    available (or no SSL-capable transport for HTTPS endpoint)
+
+- **Validation discipline:** `--telemetry-url` must be `http://` or
+  `https://` (rejects ftp/file/etc). `--telemetry-timeout >= 1`,
+  `--telemetry-retry >= 0`, `--telemetry-max-bytes >= 1024`. Telemetry
+  is incompatible with `--no-ledger` for the same reason `--full` is
+  (the lite bundle requires the envelope on disk).
+
+- **CL6 / bash 4.1 floor maintained:** transport probes are conditional
+  (no required dependency on any one transport); `have_cmd` uses
+  `command -v`; bash-native fallback requires only `bash`,
+  `timeout(1)`, and (for HTTPS) `openssl(1)`. URL parsing uses pure
+  parameter expansion (no awk/sed regex) so it works on the bash 4.1
+  floor without surprises on busybox-shaped environments.
+
+- **Verification:** bash -n clean, shellcheck `-S warning` clean (no
+  new warnings in added range). End-to-end tested via netcat HTTP
+  listener AND `openssl s_server` HTTPS listener: curl path (200 OK,
+  full POST shape with User-Agent, Authorization, Content-Type,
+  Content-Length verified), wget path (curl hidden via PATH override,
+  wget2 stdout vs classic stderr both captured), bash `/dev/tcp` path
+  (curl + wget hidden, full POST shape verified end-to-end), bash
+  `openssl s_client` path (curl + wget hidden, TLS handshake completes
+  against self-signed s_server, http_code parsed correctly),
+  connection-refused retry+backoff, oversize envelope cap,
+  empty-envelope guard. CLI validation gates exercised: ftp scheme,
+  non-integer timeout, no-ledger conflict, sub-1024 max-bytes — all
+  rejected with clear error messages.
+
+  Driver: continuation of CSF-posture (v2.7.9) telemetry trajectory —
+  fleet operators want to know *every* host's defensive + IOC posture
+  without paying the bundle-tarball cost. records.jsonl extractor on
+  forge consumes only the envelope's `signals[]` already, so this
+  matches existing pipeline shape with zero downstream change.
+
 ## sessionscribe-ioc-scan.sh v2.7.9 — 2026-05-03
 
 ### Added
