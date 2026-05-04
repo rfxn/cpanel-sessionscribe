@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.18"
+VERSION="2.7.20"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -275,6 +275,27 @@ PATTERN_J_RECENT_DAYS=90
 # Cap on systemd units walked per scan (perf bound). EL7+ stock fleet has
 # ~30-50 units in /etc/systemd/system/ - 200 is a generous cap.
 PATTERN_J_MAX_UNITS=200
+# Pattern J known-IOC paths (v2.7.20 — direct dossier strings). The
+# `-helper` suffix is the discriminator vs legitimate counterparts:
+# - real cpanel/upstream uses `cdrom_id` (underscore), not `cdrom-id-helper`
+# - real dbus-broker is `dbus-broker.service`, not `dbus-broker-helper.service`
+# - /usr/share/dbus-1/ never contains a `-helper` binary on a stock system
+# Direct existence check is zero-FP — these strings have no legitimate use.
+PATTERN_J_KNOWN_PATHS=(
+    "/etc/udev/rules.d/89-cdrom-id-helper.rules"
+    "/usr/lib/udev/cdrom-id-helper"
+    "/etc/systemd/system/dbus-broker-helper.service"
+    "/usr/lib/systemd/system/dbus-broker-helper.service"
+    "/usr/share/dbus-1/dbus-broker-helper"
+)
+# Pattern J payload host + object key (OVH S3 abuse). Host is do-NOT-block
+# at edge (legitimate OVH commodity bucket); the IOC is the object key
+# embedded in the payload-fetch URL. Both serve as triage signals when
+# referenced in bash_history, cron.d/*, profile.d/*, etc.
+PATTERN_J_PAYLOAD_HOST="s3-screenshots.s3.eu-west-par.io.cloud.ovh.net"
+PATTERN_J_PAYLOAD_KEY="G7t7gnXGGms6Ki6AW9lte6WkQ"
+# Pattern J process names — exact matches via pgrep -x (no substring FP).
+PATTERN_J_PROCESS_NAMES=(cdrom-id-helper dbus-broker-helper)
 
 # Pattern K - Cloudflare-fronted /Update second-stage backdoor. Hostname
 # is Cloudflare shared anycast - do NOT blocklist at edge (coordinate
@@ -282,6 +303,12 @@ PATTERN_J_MAX_UNITS=200
 # both literal `$$` (as-typed) and `[0-9]+` (echo-expanded) forms.
 PATTERN_K_BACKDOOR_HOST="cp.dene.de.com"
 PATTERN_K_TMP_RE='F=/tmp/\.u([$][$]|[0-9]+)'
+# Pattern K dropper paranoid-cleanup shape (v2.7.20 — survives C2 rotation).
+# Per dossier: "Combination of `wget -q -O ... && chmod 755 ... && ... -s; rm -f`
+# on a single line — paranoid-cleanup pattern that rarely appears in legitimate
+# sysadmin work." Catches Pattern K from a renamed/rotated C2 host where the
+# cp.dene.de.com literal no longer applies.
+PATTERN_K_DROPPER_SHAPE_RE='wget[[:space:]]+-q[[:space:]]+-O[[:space:]].*&&[[:space:]]*chmod[[:space:]]+755.*&&.*-s[[:space:]]*;[[:space:]]*rm[[:space:]]+-f'
 
 # Pattern L - filesystem-nuke (rm -rf --no-preserve-root /). The
 # --no-preserve-root flag is the load-bearing IOC; GNU coreutils
@@ -5660,17 +5687,39 @@ check_quarantined_sessions() {
             local sname _key
             sname=$(basename -- "$f")
             _key="ioc_quarantined_session_${sname}"
-            emit "sessions" "$_key" "warning" \
-                 "ioc_quarantined_session_present" 4 \
+
+            # v2.7.20: tier promotion based on reasons_ioc. Sidecar reasons
+            # encode WHICH live-IOC pattern triggered the quarantine. The
+            # high-confidence patterns (CVE-2026-41940 4-way combo, hasroot,
+            # token_used_2xx, token_inject + badpass-origin) are zero-FP by
+            # construction in the live ladder — promoting their quarantine
+            # echoes to strong correctly classifies the host as COMPROMISED
+            # (past-confirmed) instead of SUSPICIOUS (past-suspicious).
+            # Without this, a host whose access_log evidence has rotated
+            # away but whose mitigate quarantine still holds the forged
+            # session would scan SUSPICIOUS — but we KNOW that host was
+            # compromised because mitigate quarantined a forged session.
+            # Lower-confidence reasons (e.g. shape-only matches) stay at
+            # warning. Missing sidecar always stays at warning regardless.
+            local _q_sev=warning _q_wt=4
+            if (( _has_sidecar )) && [[ -n "$q_reasons" ]] \
+                && [[ "$q_reasons" =~ (cve_2026_41940_combo|hasroot_in_session|injected_token_used_with_2xx|token_denied_with_badpass_origin) ]]; then
+                _q_sev=strong; _q_wt=10
+            fi
+
+            emit "sessions" "$_key" "$_q_sev" \
+                 "ioc_quarantined_session_present" "$_q_wt" \
                  "path" "$f" \
                  "original_path" "${q_orig:-}" \
                  "quarantine_run_dir" "$run_dir" \
                  "quarantine_ts" "${q_run_ts:-}" \
                  "mtime_epoch" "${q_mtime:-0}" \
+                 "ts_epoch_first" "${q_mtime:-0}" \
                  "reasons_ioc" "${q_reasons:-unknown}" \
                  "sha256" "${q_sha:-}" \
                  "low_confidence_no_sidecar" "$([[ $_has_sidecar -eq 0 ]] && echo 1 || echo 0)" \
-                 "note" "Forged session in mitigate quarantine (reasons=${q_reasons:-unknown}); host had IOC-positive sessions before mitigation purged them - past compromise (REVIEW)."
+                 "tier_promoted_high_conf" "$([[ "$_q_sev" == "strong" ]] && echo 1 || echo 0)" \
+                 "note" "Forged session in mitigate quarantine (reasons=${q_reasons:-unknown}); host had IOC-positive sessions before mitigation purged them — past compromise ($([[ "$_q_sev" == "strong" ]] && echo "CRITICAL: high-confidence reasons" || echo "REVIEW"))."
             ((hits++))
         done
     done < <(find "$root" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
@@ -5869,7 +5918,16 @@ check_pattern_j_persistence() {
                         _sev=strong; _wt=10
                         _key="ioc_pattern_j_systemd_unit_present"
                     else
-                        _sev=warning; _wt=4
+                        # v2.7.20: was warning/4. Demoted to advisory because
+                        # _candidate fires on any non-allowlist + unowned unit
+                        # without the shadow-shape match — fleet observation
+                        # 2026-05-04 showed warning at 1,290 hosts vs strong at
+                        # 114 (11x spread), most warning-tier hits were benign
+                        # operator-deployed services with custom paths. Advisory
+                        # routes hosts to ATTEMPT/REVIEW (not SUSPICIOUS) until
+                        # corroborated by a shadow-shape match or the new
+                        # literal-path / process / atjob signals (J3 below).
+                        _sev=advisory; _wt=2
                         _key="ioc_pattern_j_systemd_unit_candidate"
                     fi
                     emit "destruction" "ioc_pattern_j_systemd_unit" "$_sev" \
@@ -5884,6 +5942,104 @@ check_pattern_j_persistence() {
                     ((hits++))
                 done
             fi
+        fi
+    fi
+
+    # ---- J3: literal IOC paths + payload references + processes + at-jobs --
+    # v2.7.20 — direct dossier IOC checks. Each emits at strong because the
+    # markers have no legitimate use on a stock cPanel host (see PATTERN_J_*
+    # constant comments). All are tightly scoped — no shape inference, just
+    # exact-match filename / process-name / string presence. Snapshot mode
+    # demotes to info+degraded_confidence (no live ps; at-jobs cannot fire).
+    local _path _full _mtime
+    for _path in "${PATTERN_J_KNOWN_PATHS[@]}"; do
+        _full="${prefix}${_path}"
+        if [[ -e "$_full" ]]; then
+            _mtime=$(stat -c %Y "$_full" 2>/dev/null)
+            local _sev=strong _wt=10 _conf=""
+            if (( snapshot_mode )); then
+                _sev=info; _wt=2; _conf="degraded_confidence_snapshot=1; "
+            fi
+            emit "destruction" "ioc_pattern_j_known_path" "$_sev" \
+                 "ioc_pattern_j_known_path_present" "$_wt" \
+                 "path" "$_path" \
+                 "mtime_epoch" "${_mtime:-0}" \
+                 "note" "${_conf}Pattern J known IOC path present at $_path (dossier-documented persistence artifact; -helper suffix has no legitimate use on stock cPanel)."
+            ((hits++))
+        fi
+    done
+
+    # Payload host / object-key string grep across high-value config files.
+    # Strings are dossier-published OVH S3 IOCs; legitimate ops don't
+    # reference them. Scope is narrow (history + cron.d + profile.d) so the
+    # walk is bounded; the existence of these strings anywhere is the IOC.
+    local _j_payload_files=()
+    local _g
+    for _g in /root/.bash_history /root/.zsh_history /etc/crontab; do
+        local _gf="${prefix}${_g}"
+        [[ -f "$_gf" ]] && _j_payload_files+=("$_gf")
+    done
+    for _g in "${prefix}/etc/cron.d" "${prefix}/etc/profile.d" "${prefix}/var/spool/cron"; do
+        [[ -d "$_g" ]] || continue
+        while IFS= read -r f; do
+            _j_payload_files+=("$f")
+        done < <(find "$_g" -maxdepth 1 -type f 2>/dev/null)
+    done
+    if (( ${#_j_payload_files[@]} > 0 )); then
+        local _payload_hit
+        _payload_hit=$(grep -lF -e "$PATTERN_J_PAYLOAD_HOST" -e "$PATTERN_J_PAYLOAD_KEY" \
+                            "${_j_payload_files[@]}" 2>/dev/null | head -1)
+        if [[ -n "$_payload_hit" ]]; then
+            local _which=""
+            grep -qF "$PATTERN_J_PAYLOAD_KEY" "$_payload_hit" 2>/dev/null && _which="object_key"
+            grep -qF "$PATTERN_J_PAYLOAD_HOST" "$_payload_hit" 2>/dev/null && _which="${_which:+$_which+}host"
+            emit "destruction" "ioc_pattern_j_payload_referenced" "strong" \
+                 "ioc_pattern_j_payload_string_present" 8 \
+                 "path" "$_payload_hit" \
+                 "marker" "$_which" \
+                 "note" "Pattern J payload reference (${_which:-unknown}) at $_payload_hit — OVH S3 IOC string from dossier (do NOT blackhole the host at edge; coordinate with OVH abuse for object takedown)."
+            ((hits++))
+        fi
+    fi
+
+    # Process detection — exact-match via pgrep -x (no substring FP).
+    # Skipped in snapshot mode (no live process list).
+    if (( ! snapshot_mode )) && command -v pgrep >/dev/null 2>&1; then
+        local _proc
+        for _proc in "${PATTERN_J_PROCESS_NAMES[@]}"; do
+            if pgrep -x "$_proc" >/dev/null 2>&1; then
+                local _pids
+                _pids=$(pgrep -x "$_proc" 2>/dev/null | head -5 | tr '\n' ',' | sed 's/,$//')
+                emit "destruction" "ioc_pattern_j_process_running" "strong" \
+                     "ioc_pattern_j_process_active" 10 \
+                     "process" "$_proc" \
+                     "pids" "$_pids" \
+                     "note" "Pattern J process $_proc actively running (PIDs: $_pids) — OS-level persistence binary executing now."
+                ((hits++))
+            fi
+        done
+    fi
+
+    # At-job enumeration — atq lists pending jobs; at -c <jobid> dumps
+    # body. Catches the dossier-documented `echo /usr/lib/udev/cdrom-id-helper
+    # | at now` branch even when udev rule has been removed but pending job
+    # remains. Skipped in snapshot mode.
+    if (( ! snapshot_mode )) && command -v atq >/dev/null 2>&1 && command -v at >/dev/null 2>&1; then
+        local _atq_jobs _jobid
+        _atq_jobs=$(atq 2>/dev/null)
+        if [[ -n "$_atq_jobs" ]]; then
+            while read -r _jobid _; do
+                [[ -z "$_jobid" ]] && continue
+                if at -c "$_jobid" 2>/dev/null \
+                    | grep -qE 'cdrom-id-helper|dbus-broker-helper'; then
+                    emit "destruction" "ioc_pattern_j_atjob_pending" "strong" \
+                         "ioc_pattern_j_atjob_payload_referenced" 10 \
+                         "jobid" "$_jobid" \
+                         "note" "Pattern J pending at-job $_jobid references the helper binary — udev/systemd trigger has queued execution (run atq + at -c $_jobid to inspect)."
+                    ((hits++))
+                    break  # one emit suffices; operator inspects atq for full list
+                fi
+            done <<< "$_atq_jobs"
         fi
     fi
 
@@ -7335,6 +7491,44 @@ check_destruction_iocs() {
              "mtime_epoch" "${_k2_mtime:-0}" \
              "note" "Pattern K paranoid-cleanup F=/tmp/.u<pid> tempfile shape in $_k2_sample without $PATTERN_K_BACKDOOR_HOST corroboration - manual review (low-confidence shape signal alone)."
         ((hits++))
+    fi
+
+    # K3 dropper-shape grep (v2.7.20): catches Pattern K from a renamed/rotated
+    # C2 host where cp.dene.de.com no longer applies. Per dossier the chain
+    # `wget -q -O ... && chmod 755 ... && ... -s; rm -f` on a single line is a
+    # paranoid-cleanup pattern that rarely appears in legitimate sysadmin work.
+    # Routed through _classify_history_match so responder greps for the
+    # PATTERN_K_DROPPER_SHAPE_RE itself don't FP. Strong-tier hostile match
+    # because the four-element chain is the IOC; warning if only diagnostic-
+    # shape (defender showed the pattern in a write-up); skipped if no match.
+    local _k3_files=()
+    local _k3f
+    while IFS= read -r _k3f; do
+        [[ -n "$_k3f" ]] && _k3_files+=("$_k3f")
+    done < <(grep -lE "$PATTERN_K_DROPPER_SHAPE_RE" "${HISTORY_FILES_GLOB[@]}" 2>/dev/null)
+    if (( ${#_k3_files[@]} > 0 && _k1_emit_real == 0 )); then
+        local _k3_class _k3h _k3d _k3u _k3fhe _k3file_h
+        _k3_class=$(_classify_history_match regex "$PATTERN_K_DROPPER_SHAPE_RE" "${_k3_files[@]}")
+        _k3h=$(_classify_field h "$_k3_class")
+        _k3d=$(_classify_field d "$_k3_class")
+        _k3u=$(_classify_field u "$_k3_class")
+        _k3fhe=$(_classify_field fhe "$_k3_class")
+        _k3file_h=$(_classify_field file_h "$_k3_class")
+        local _k3_sample="${_k3file_h:-${_k3_files[0]}}"
+        local _k3_mtime
+        _k3_mtime=$(stat -c %Y "$_k3_sample" 2>/dev/null)
+        if (( ${_k3h:-0} > 0 )); then
+            emit "destruction" "ioc_pattern_k_dropper_shape" "strong" \
+                 "ioc_pattern_k_dropper_paranoid_chain" 8 \
+                 "sample_path" "$_k3_sample" \
+                 "ts_epoch_first" "${_k3fhe:-0}" \
+                 "mtime_epoch" "${_k3_mtime:-0}" \
+                 "hostile_lines" "${_k3h:-0}" \
+                 "diagnostic_lines" "${_k3d:-0}" \
+                 "unknown_lines" "${_k3u:-0}" \
+                 "note" "Pattern K dropper paranoid-chain (wget -q -O … && chmod 755 … && … -s; rm -f) in $_k3_sample — same toolchain as cp.dene.de.com but possibly rotated C2 host (capture URL from sample for IOC update)."
+            ((hits++))
+        fi
     fi
 
     # ---- Pattern L: filesystem-nuke (rm -rf --no-preserve-root /) -------

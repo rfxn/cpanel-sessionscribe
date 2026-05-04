@@ -402,6 +402,89 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
+## sessionscribe-ioc-scan.sh v2.7.20 — 2026-05-04
+
+### Theme
+**FP-tight gap-close against the IC-5790 dossier (rev 5).** Audit identified
+two patterns relying on shape inference where literal IOC strings would be
+both tighter (lower FP) and more aligned with documented dossier markers.
+Plus a quarantine-replay tier promotion that fixes a real misclassification
+(forged session in mitigate quarantine + access_log rotated away → was
+SUSPICIOUS, should be COMPROMISED). All additions are zero-FP by
+construction (literal dossier strings, exact process matches, sidecar-
+authoritative reasons).
+
+### Added (5 new strong emits, 1 promoted)
+
+| Pattern | Signal | Emit | Coverage |
+|---------|--------|------|----------|
+| **J3a** | `ioc_pattern_j_known_path_present` | strong/10 | Direct existence check on the 5 dossier-documented paths (`/etc/udev/rules.d/89-cdrom-id-helper.rules`, `/usr/lib/udev/cdrom-id-helper`, `/etc/systemd/system/dbus-broker-helper.service`, `/usr/lib/systemd/system/dbus-broker-helper.service`, `/usr/share/dbus-1/dbus-broker-helper`). The `-helper` suffix has no legitimate use on stock cPanel — zero-FP. |
+| **J3b** | `ioc_pattern_j_payload_string_present` | strong/8 | Grep for `s3-screenshots.s3.eu-west-par.io.cloud.ovh.net` and `G7t7gnXGGms6Ki6AW9lte6WkQ` (OVH S3 payload host + object key) across `/root/.bash_history`, `/root/.zsh_history`, `/etc/crontab`, `/etc/cron.d/*`, `/etc/profile.d/*`, `/var/spool/cron/*`. Strings have no legitimate use; the host is do-NOT-block at edge but presence as text is a definitive triage IOC. |
+| **J3c** | `ioc_pattern_j_process_active` | strong/10 | `pgrep -x cdrom-id-helper` / `pgrep -x dbus-broker-helper` — exact match (no substring FP), skipped in snapshot mode. |
+| **J3d** | `ioc_pattern_j_atjob_payload_referenced` | strong/10 | `atq` enumerate + `at -c <jobid>` content match for the helper binaries. Catches the dossier-documented `echo /usr/lib/udev/cdrom-id-helper \| at now` chain even after udev-rule cleanup. |
+| **K3** | `ioc_pattern_k_dropper_paranoid_chain` | strong/8 | Regex grep for the dossier-documented `wget -q -O … && chmod 755 … && … -s; rm -f` paranoid-cleanup chain. Routed through `_classify_history_match` so responder greps don't FP. Catches Pattern K from a renamed/rotated C2 host where the `cp.dene.de.com` literal no longer applies. |
+| **Q-promote** | `ioc_quarantined_session_present` | warning→strong (conditional) | Quarantined-session signals now promote to strong/10 when sidecar `reasons_ioc` indicates one of the high-confidence patterns (`cve_2026_41940_combo`, `hasroot_in_session`, `injected_token_used_with_2xx`, `token_denied_with_badpass_origin`). All four are zero-FP in the live ladder; their quarantine echoes deserve the same verdict. Also adds `ts_epoch_first` field (uses sidecar `mtime_epoch`) so kill-chain renderers anchor to the original session-forge time, not the quarantine time. |
+
+### Changed (FP reduction)
+
+- **Pattern J `_candidate` warning → advisory.** Fleet observation
+  2026-05-04: warning fired on 1,290 hosts vs strong on 114 — 11×
+  spread, most warning-tier hits were benign operator-deployed services
+  with custom paths that happened to match the non-allowlist + unowned
+  branches without the shadow-shape Description match. Demoting to
+  advisory routes those hosts to ATTEMPT/REVIEW (not SUSPICIOUS) until
+  corroborated by the new J3 literal-path / process / atjob / payload
+  signals. Net: ~1,180 hosts cleared from SUSPICIOUS, zero new FPs
+  (J3 strong-tier picks up the actual Pattern J cohort by direct IOC
+  match).
+
+### Audited (no change needed — verified correct)
+
+- **Hostile/diagnostic classifier consolidation.** Patterns C, F (×2),
+  K, L (×2) all share `_classify_history_match` (extracted in v2.7.5).
+  Pattern H uses purpose-built `_classify_kill_prelude_context` (multi-
+  line context required for the kill-prelude heuristic — different shape
+  than the single-line classifier). Patterns A, B don't use either —
+  their signal surface is on-disk artifacts (binary, .sorry files, mysql
+  dir, BTC note in index.html), not bash_history strings. No further
+  consolidation needed.
+
+- **Quarantine timestamp surfacing.** Verified `check_quarantined_sessions`
+  reads sidecar fields `mtime_epoch` (original session creation time
+  pre-quarantine), `quarantine_ts` (mitigate run time), `original_path`,
+  `sha256`, and `reasons_ioc`. Falls back to live mtime via `stat -c %Y`
+  when sidecar missing (cp -a from mitigate preserves mtime), flagged
+  with `low_confidence_no_sidecar=1`. v2.7.20 adds `ts_epoch_first`
+  field exposing the original mtime so the kill-chain timeline plots
+  when the attacker forged the session, not when we quarantined it.
+
+### Verification
+
+End-to-end smoke against current source: syntax OK, shellcheck error-level
+clean, all 5 cron intervals generate correct shape (GitHub canonical +
+CDN fallback preserved from v2.7.18), `--telemetry-cron remove` cycle
+clean, reject path on `3h` preserved.
+
+Failure-mode coverage of the new J3/K3 emits:
+- J3a literal-path: `[[ -e ]]` exact, no FP possible (filenames have no legit use)
+- J3b payload-string: `grep -lF` literal-string fixed match, no regex FP
+- J3c process: `pgrep -x` exact-name (no substring FP), skipped in snapshot mode
+- J3d at-job: `atq` + `at -c` exact-content grep, skipped if `atq` missing or no jobs
+- K3 dropper-shape: routed through `_classify_history_match` so responder greps for the regex itself don't FP
+
+Net projected fleet impact:
+- COMPROMISED: ~10-15 hosts added (the actual Pattern J/K cohort the dossier describes — currently misclassified SUSPICIOUS or CLEAN due to shape-only detection)
+- SUSPICIOUS: ~1,180 hosts removed (Pattern J `_candidate` demote) PLUS the ~10-15 promoted to COMPROMISED
+- CLEAN: unchanged (no advisory→info shifts)
+- Quarantine-replay hosts with high-confidence reasons: warning→strong (small cohort, ~5-20 hosts depending on mitigate-history depth)
+
+### Floor
+bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved. New
+external commands: `pgrep` (procps-ng, present on all CL6+), `atq`/`at`
+(at(1) package, optional — gracefully skipped when absent). All grep
+patterns use `-F` literal or basic ERE — no PCRE, no `{n}` interval
+quantifiers (gawk 3.1 floor).
+
 ## sessionscribe-ioc-scan.sh v2.7.18 — 2026-05-04
 
 ### Changed
