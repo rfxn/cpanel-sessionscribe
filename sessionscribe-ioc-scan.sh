@@ -525,23 +525,8 @@ TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 TELEMETRY_CRON_ACTION=""
 TELEMETRY_CRON_INTERVAL="6h"
 TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
-# Self-fetch sources + destination for the cron-line. Hard-coded constants
-# (no flags) — operators wanting a private mirror or alternate path can
-# hand-edit /etc/cron.d/sessionscribe-telemetry after install or fork.
-#
-# Two-tier source order at each cron tick (canonical → fallback):
-#   1. GitHub raw — canonical, updated within ~5min of every `git push`
-#                   to https://github.com/rfxn/cpanel-sessionscribe
-#   2. sh.rfxn.com CDN — fallback, updated by the freedom-syncs publish
-#                   workflow (manual `/root/bin/sync_local-remote` or
-#                   hourly cron); resilient against GitHub outages
-# The `(curl github || curl cdn)` chain in the cron line tries primary
-# first and falls back on any curl failure (HTTP error, network timeout,
-# rate limit, DNS).
-#
-# All three must be single-quote-free; they're single-quoted inside the
-# cron line. URLs must be HTTPS (curl -f rejects 4xx/5xx; Caddy serves
-# 0-byte 200 for missing files on the CDN tree, caught by [ -s "$_T" ]).
+# Cron self-fetch sources (GitHub canonical, CDN fallback) + install dest.
+# See INTERNAL-NOTES.md "v2.7.17/v2.7.18" for failover + drift-window detail.
 TELEMETRY_CRON_GITHUB_URL="https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh"
 TELEMETRY_CRON_CDN_URL="https://sh.rfxn.com/sessionscribe-ioc-scan.sh"
 TELEMETRY_CRON_INSTALL_PATH="/usr/local/bin/sessionscribe-ioc-scan.sh"
@@ -885,27 +870,8 @@ manage_telemetry_cron() {
         extra_args+=" --upload-token '${CHAIN_UPLOAD_TOKEN}'"
     fi
 
-    # Build the cron file contents in a tempfile, then atomic-install. The
-    # 5s-300s sleep is computed in the cron-shell at run time via $RANDOM
-    # arithmetic — `5 + RANDOM % 296` produces an integer in [5, 300]. The
-    # SHELL=/bin/bash header at the top of the cron.d file ensures cron
-    # uses bash (which has $RANDOM), not /bin/sh (dash on some derivatives,
-    # no $RANDOM). $((…)) is escaped to \$((…)) so heredoc expansion happens
-    # at write-time only for variable references, not for the arithmetic.
-    #
-    # The scan itself is wrapped in `timeout 300 …` so a stuck run cannot
-    # bleed into the next cycle. timeout(1) is GNU coreutils ≥ 7.0 (2008);
-    # the project floor is coreutils 8.4 (CL6/EL6) so it's always present.
-    # On timeout, timeout(1) sends SIGTERM and exits 124. Both vixie-cron
-    # (CL6) and cronie (CL7+) email MAILTO based on command OUTPUT, not on
-    # exit code — the `>/dev/null 2>&1` redirect suppresses output, so no
-    # MAILTO email fires even on timeout. To track timeouts, operators must
-    # grep /var/log/cron for the entry (cron logs the exit status), or
-    # remove the redirect for an interactive debugging run. timeout(1)
-    # signals only the directly-spawned bash; descendants (curl uploads,
-    # awk pipelines) become orphans of init and finish or get reaped on
-    # their own — acceptable here because the scan does not hold long-
-    # lived locks or shared resources across cycles.
+    # Heredoc preserves \$((…)) for cron-shell evaluation per tick.
+    # See INTERNAL-NOTES.md "v2.7.16/v2.7.17" for timeout + splay rationale.
     local tmp
     tmp=$(mktemp /tmp/telemetry-cron.XXXXXX) || {
         echo "Error: mktemp failed" >&2; exit 2; }
@@ -5039,21 +5005,7 @@ check_crlf_access_primitive() {
     crlf_hits="${crlf_hits:-0}"
     crlf_ts_first="${crlf_ts_first:-0}"
     if (( crlf_hits > 0 )); then
-        # Severity tier: warning ioc_*. Per PATTERNS_UPDATED.md kill-chain
-        # summary, the CRLF access primitive is step 1 (initial access /
-        # exploitation ATTEMPT), not compromise evidence. PATTERNS_UPDATED.md
-        # line 420: "Only escalate to rooted-restore if BOTH the rfxn scan
-        # AND any one of Pattern A/B/C/D/E/F/G/H/I/J/K/L IOCs land" - the
-        # X stack is the rfxn scan input, the A-L pattern is the gate.
-        # warning ioc_* routes the host to SUSPICIOUS via ioc_review++
-        # (line 7762) which is the correct ATTEMPT-tier disposition.
-        # Hosts with X stack AND any A-L destruction/persistence pattern
-        # land COMPROMISED via the destruction-pattern strong-tier emits;
-        # hosts with X stack AND session-file forensics (token_inject,
-        # token_used, hasroot, cve41940_combo) land COMPROMISED via the
-        # session-file strong-tier emits. Only X-stack-only hosts demote.
-        # LOGS_CRLF_CHAIN_FIRST_EPOCH side-effect (line below) is unchanged
-        # so Pattern E + 2xx_on_cpsess gates stay anchored to this hit.
+        # X-stack = ATTEMPT, not compromise; see INTERNAL-NOTES.md "v2.7.15".
         emit "logs" "ioc_cve_2026_41940_access_primitive" "warning" \
              "ioc_cve_2026_41940_crlf_access_chain" 4 \
              "count" "$crlf_hits" \
@@ -5688,19 +5640,7 @@ check_quarantined_sessions() {
             sname=$(basename -- "$f")
             _key="ioc_quarantined_session_${sname}"
 
-            # v2.7.20: tier promotion based on reasons_ioc. Sidecar reasons
-            # encode WHICH live-IOC pattern triggered the quarantine. The
-            # high-confidence patterns (CVE-2026-41940 4-way combo, hasroot,
-            # token_used_2xx, token_inject + badpass-origin) are zero-FP by
-            # construction in the live ladder — promoting their quarantine
-            # echoes to strong correctly classifies the host as COMPROMISED
-            # (past-confirmed) instead of SUSPICIOUS (past-suspicious).
-            # Without this, a host whose access_log evidence has rotated
-            # away but whose mitigate quarantine still holds the forged
-            # session would scan SUSPICIOUS — but we KNOW that host was
-            # compromised because mitigate quarantined a forged session.
-            # Lower-confidence reasons (e.g. shape-only matches) stay at
-            # warning. Missing sidecar always stays at warning regardless.
+            # High-confidence reasons → strong; see INTERNAL-NOTES.md "v2.7.20".
             local _q_sev=warning _q_wt=4
             if (( _has_sidecar )) && [[ -n "$q_reasons" ]] \
                 && [[ "$q_reasons" =~ (cve_2026_41940_combo|hasroot_in_session|injected_token_used_with_2xx|token_denied_with_badpass_origin) ]]; then
@@ -5918,15 +5858,7 @@ check_pattern_j_persistence() {
                         _sev=strong; _wt=10
                         _key="ioc_pattern_j_systemd_unit_present"
                     else
-                        # v2.7.20: was warning/4. Demoted to advisory because
-                        # _candidate fires on any non-allowlist + unowned unit
-                        # without the shadow-shape match — fleet observation
-                        # 2026-05-04 showed warning at 1,290 hosts vs strong at
-                        # 114 (11x spread), most warning-tier hits were benign
-                        # operator-deployed services with custom paths. Advisory
-                        # routes hosts to ATTEMPT/REVIEW (not SUSPICIOUS) until
-                        # corroborated by a shadow-shape match or the new
-                        # literal-path / process / atjob signals (J3 below).
+                        # _candidate is too FP-prone alone; see INTERNAL-NOTES.md "v2.7.20".
                         _sev=advisory; _wt=2
                         _key="ioc_pattern_j_systemd_unit_candidate"
                     fi
@@ -5946,11 +5878,7 @@ check_pattern_j_persistence() {
     fi
 
     # ---- J3: literal IOC paths + payload references + processes + at-jobs --
-    # v2.7.20 — direct dossier IOC checks. Each emits at strong because the
-    # markers have no legitimate use on a stock cPanel host (see PATTERN_J_*
-    # constant comments). All are tightly scoped — no shape inference, just
-    # exact-match filename / process-name / string presence. Snapshot mode
-    # demotes to info+degraded_confidence (no live ps; at-jobs cannot fire).
+    # Dossier-string checks (zero-FP); see INTERNAL-NOTES.md "v2.7.20".
     local _path _full _mtime
     for _path in "${PATTERN_J_KNOWN_PATHS[@]}"; do
         _full="${prefix}${_path}"
@@ -7493,14 +7421,7 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # K3 dropper-shape grep (v2.7.20): catches Pattern K from a renamed/rotated
-    # C2 host where cp.dene.de.com no longer applies. Per dossier the chain
-    # `wget -q -O ... && chmod 755 ... && ... -s; rm -f` on a single line is a
-    # paranoid-cleanup pattern that rarely appears in legitimate sysadmin work.
-    # Routed through _classify_history_match so responder greps for the
-    # PATTERN_K_DROPPER_SHAPE_RE itself don't FP. Strong-tier hostile match
-    # because the four-element chain is the IOC; warning if only diagnostic-
-    # shape (defender showed the pattern in a write-up); skipped if no match.
+    # K3 dropper-shape — survives C2 rotation; see INTERNAL-NOTES.md "v2.7.20".
     local _k3_files=()
     local _k3f
     while IFS= read -r _k3f; do
