@@ -402,7 +402,32 @@ versioned per the affected component.
   refusal, and failure-mode rehearsal (cross-fs mv, CDN unreachable,
   malformed IP, traversal).
 
-## sessionscribe-ioc-scan.sh v2.7.24 — 2026-05-04
+## sessionscribe-ioc-scan.sh v2.7.25 — 2026-05-04
+
+### Changed (FP — RFC1918 admin sessions in suspect_ips)
+
+`suspect_ip_correlation` was emitting RFC1918 + loopback IPs as
+"suspect attacker IPs (websocket/createacct hits)" — the source IPs
+on those hits are WHM admin operators on the customer's internal
+network, not remote attackers. Symptom on cloudvpsserver scan:
+
+```
+[IOC] suspect attacker IPs (websocket/createacct hits):
+      10.20.7.178,10.20.7.215,10.20.7.234,10.20.7.35
+```
+
+Pattern E already classifies these correctly via the canonical
+`is_internal` awk regex at line ~7084 (`/^10\./ || /^127\./ ||
+/^192\.168\./ || /^172\.(1[6-9]|2[0-9]|3[01])\./`) and emits them as
+`websocket_shell_internal_admin` info-tier with the note "WHM Terminal
+admin sessions, benign". The `suspect_ip_correlation` walker just
+didn't apply the same filter.
+
+Fix: mirror the Pattern E `is_internal` regex inline in the awk that
+collects `$1` from the cpsess-endpoint hits, dropping all RFC1918 +
+loopback before the `sort -u | head -50`. External IPs are unchanged.
+
+
 
 ### Fixed (regression: kill-chain render aborts on dirty-defense hosts)
 
