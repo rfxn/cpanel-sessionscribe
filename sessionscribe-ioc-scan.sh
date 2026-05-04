@@ -3780,9 +3780,9 @@ phase_telemetry_post() {
     # variables.
     local rc=0 http_code="" body="" t_start t_end duration_ms last_err=""
     local _resp_file="" _hdr_file="" _err_file="" _req_file=""
-    local _curl_args _wget_args
+    local _curl_args=() _wget_args=()
     local _scheme="" _rest="" _hp="" _path="" _host="" _port="" _host_hdr=""
-    local _status_line=""
+    local _status_line="" backoff=0
     t_start=$(date -u +%s)
     while (( attempt < max_attempts )); do
         attempt=$((attempt + 1))
@@ -3974,7 +3974,7 @@ phase_telemetry_post() {
         # Non-2xx OR transport error — record and (maybe) retry.
         say_warn "POST attempt $attempt/$max_attempts failed (rc=$rc http=${http_code:-?})"
         if (( attempt < max_attempts )); then
-            local backoff=$(( 1 << attempt ))
+            backoff=$(( 1 << attempt ))
             say_info "retry in ${backoff}s"
             sleep "$backoff"
         fi
