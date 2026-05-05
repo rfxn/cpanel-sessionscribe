@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.29
+# sessionscribe-ioc-scan.sh v2.7.30
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.29"
+VERSION="2.7.30"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -7683,11 +7683,14 @@ aggregate_verdict() {
     # discriminate vuln from patched on 134+ tier.
     local version_says_vuln=0 version_says_patched=0
     local row area id sev key weight kv
-    # Persistence cluster tracking. PERSIST_PATTERNS dedupes by pattern letter
-    # (G/J/I/F/D/H) so multiple G keys on one host count as ONE persistence
-    # pattern; the cluster multiplier rewards distinct patterns, not key count.
+    # Persistence cluster tracking. Dedupes by pattern letter (G/J/I/F/D/H);
+    # multiplier rewards distinct patterns, not key count.
     local -A PERSIST_PATTERNS=()
     local persist_weight_sum=0
+    # Per-session score dedup. Live and quarantined emits credit ONE base
+    # contribution per session_id; reason count drives the confidence tier.
+    # See INTERNAL-NOTES.md "v2.7.30" for the cross-state dedup rationale.
+    local -A SESSION_REASONS=()
     # Reset (don't redeclare) - the arrays are top-level globals; using
     # `declare -ga` here would require bash 4.2. Reassigning to () clears
     # the array contents while preserving the global binding.
@@ -7785,12 +7788,33 @@ aggregate_verdict() {
             esac
             case "$sev" in
                 strong)
-                    score=$((score + (weight > 0 ? weight : 5)))
+                    # Per-session score dedup. First strong emit per session_id
+                    # credits base score; subsequent emits bump reason count
+                    # only. Quarantined emit's reasons_ioc kv (one-shot) sets
+                    # the count from the .info sidecar's comma list.
+                    local _sid="" _rcnt_pre=0
+                    if [[ "$id" =~ ^ioc_(token_used|token_inject|preauth_extauth|short_pass|multiline_pass|badpass_authmarkers|cve41940|hasroot|malformed_line|forged_timestamp|quarantined_session)_(.+)$ ]]; then
+                        _sid="${BASH_REMATCH[2]}"
+                    fi
+                    if [[ -n "$_sid" ]]; then
+                        _rcnt_pre="${SESSION_REASONS[$_sid]:-0}"
+                        if [[ "$id" == ioc_quarantined_session_* ]] && [[ "$kv" == *'"reasons_ioc":"'* ]]; then
+                            local _ri="${kv#*\"reasons_ioc\":\"}"
+                            _ri="${_ri%%\"*}"
+                            local _ri_n=1 _c
+                            for (( _c=0; _c<${#_ri}; _c++ )); do
+                                [[ "${_ri:$_c:1}" == "," ]] && ((_ri_n++))
+                            done
+                            SESSION_REASONS["$_sid"]=$_ri_n
+                        else
+                            SESSION_REASONS["$_sid"]=$((_rcnt_pre + 1))
+                        fi
+                    fi
+                    if [[ -z "$_sid" ]] || (( _rcnt_pre == 0 )); then
+                        score=$((score + (weight > 0 ? weight : 5)))
+                    fi
                     ((strong_count++))
                     REASONS+=("$key")
-                    # Host-state axis: IOC-prefixed strong signals are exploitation
-                    # evidence, not code-state evidence. compromise_critical is the
-                    # subset that's post-attack residue (drives COMPROMISED gate).
                     if [[ "$key" == ioc_* ]]; then
                         ((ioc_critical++))
                         IOC_KEYS+=("$key")
@@ -7842,6 +7866,26 @@ aggregate_verdict() {
         done
     fi
 
+    # Per-session confidence tier: sessions with multi-reason co-occurrence
+    # (canonical CVE-2026-41940 shape) score above single-trace sessions.
+    # Bounded bonus tiers; same math for live (per-reason emit count) and
+    # quarantined (reasons_ioc comma count). See CHANGELOG v2.7.30.
+    local _sid _rcnt _bonus
+    local session_tiered_count=0 session_max_reasons=0
+    if (( ${#SESSION_REASONS[@]} > 0 )); then
+        for _sid in "${!SESSION_REASONS[@]}"; do
+            _rcnt="${SESSION_REASONS[$_sid]}"
+            ((session_tiered_count++))
+            (( _rcnt > session_max_reasons )) && session_max_reasons=$_rcnt
+            _bonus=0
+            if   (( _rcnt >= 6 )); then _bonus=10
+            elif (( _rcnt >= 4 )); then _bonus=5
+            elif (( _rcnt >= 2 )); then _bonus=2
+            fi
+            score=$((score + _bonus))
+        done
+    fi
+
     # Persistence cluster scoring. Distinct persistence patterns multiply
     # their weight contribution to score — multi-pattern persistence is the
     # loud signal we want to surface above single-pattern hosts in fleet
@@ -7870,6 +7914,8 @@ aggregate_verdict() {
     PERSIST_WEIGHT_SUM="$persist_weight_sum"
     PERSIST_MULTIPLIER="$persist_mult"
     PERSIST_PATTERNS_LIST=$(printf '%s,' "${!PERSIST_PATTERNS[@]}" | sed 's/,$//')
+    SESSION_TIERED_COUNT="$session_tiered_count"
+    SESSION_MAX_REASONS="$session_max_reasons"
 
     # Code-state axis. Version is authoritative: on 134+ tier, vulnerable
     # and patched cpsrvd binaries share ACL/token-reader strings, so the
@@ -8099,9 +8145,10 @@ write_json() {
         printf '  "host_verdict": "%s",\n' "$HOST_VERDICT"
         printf '  "score": %d,\n' "$SCORE"
         printf '  "exit_code": %d,\n' "$EXIT_CODE"
-        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"compromise_critical":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s"},\n' \
+        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"compromise_critical":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s","session_tiered_count":%d,"session_max_reasons":%d},\n' \
             "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${COMPROMISE_CRITICAL:-0}" "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}" \
-            "${PERSIST_COUNT:-0}" "${PERSIST_WEIGHT_SUM:-0}" "${PERSIST_MULTIPLIER:-1}" "$(json_esc "${PERSIST_PATTERNS_LIST:-}")"
+            "${PERSIST_COUNT:-0}" "${PERSIST_WEIGHT_SUM:-0}" "${PERSIST_MULTIPLIER:-1}" "$(json_esc "${PERSIST_PATTERNS_LIST:-}")" \
+            "${SESSION_TIERED_COUNT:-0}" "${SESSION_MAX_REASONS:-0}"
         printf '  "advisories": [\n'
         first=1
         local entry adv_id adv_key adv_note
@@ -8160,10 +8207,9 @@ write_csv() {
     done
     {
         # Column order: existing columns 1-17 unchanged for back-compat with
-        # fleet aggregators that index positionally (cut -f17, awk -F, '$NF',
-        # etc). New persist_* + compromise_critical columns appended at end.
-        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns,compromise_critical\n'
-        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%d\n' \
+        # fleet aggregators that index positionally. New columns appended.
+        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns,compromise_critical,session_tiered_count,session_max_reasons\n'
+        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%d,%d,%d\n' \
             "$(csv_field "$HOSTNAME_FQDN")" \
             "$(csv_field "$RUN_ID")" \
             "$(csv_field "$TS_ISO")" \
@@ -8185,7 +8231,9 @@ write_csv() {
             "${PERSIST_WEIGHT_SUM:-0}" \
             "${PERSIST_MULTIPLIER:-1}" \
             "$(csv_field "${PERSIST_PATTERNS_LIST:-}")" \
-            "${COMPROMISE_CRITICAL:-0}"
+            "${COMPROMISE_CRITICAL:-0}" \
+            "${SESSION_TIERED_COUNT:-0}" \
+            "${SESSION_MAX_REASONS:-0}"
     } > "$out"
 }
 

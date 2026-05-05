@@ -24,6 +24,90 @@ on MariaDB repos, so disabling them for this transaction has no side
 effects on the install. Hosts whose MariaDB repos are fine see no
 behavior change; broken-repo hosts now succeed.
 
+## sessionscribe-ioc-scan.sh v2.7.30 — 2026-05-05
+
+### Fixed (per-session score inflation, pre-mit ↔ post-mit divergence)
+
+Live on-disk session emits and quarantined session emits used different
+score shapes, producing a 4.71× aggregate inflation in pre-mitigation
+fleet scoring vs the same incident post-mitigation:
+
+- **Live** (`/var/cpanel/sessions/raw/*`): per-reason emit shape. A canonical
+  CVE-2026-41940 forged session fires 5-6 strong emits with the same
+  session_name suffix (`ioc_hasroot_:abc123`, `ioc_badpass_authmarkers_:abc123`,
+  `ioc_short_pass_:abc123`, `ioc_cve41940_:abc123`, `ioc_token_inject_:abc123`,
+  `ioc_forged_timestamp_:abc123`). Each emit added +10 to score → one forged
+  session contributed +50-60.
+- **Quarantined** (`<MITIGATE_BACKUP_ROOT>/quarantined-sessions/raw/*`): one
+  emit per file, with `reasons_ioc` listed comma-separated in kv. Same
+  forged session post-mit contributes +10 (or +4 warning).
+
+Real-world inflation across a 5000-bundle quench sample:
+
+| Metric | Live-only COMPROMISED hosts (n=562) |
+|---|---|
+| p50 inflation factor | 1.0× (single-reason sessions) |
+| p99 | 6.25× |
+| max | 7.0× |
+| Aggregate fleet score | 91,279 (current) vs 19,390 (normalized) — **4.71× total** |
+
+Worst observed: `69.16.239.134` — 81 sessions × 5-6 reasons = 445 strong
+emits, score 4454. Same incident post-mit ≈ 810 score. Fleet ranking
+shifted dramatically based on whether mitigation had run.
+
+### Per-session dedup + confidence tier
+
+`aggregate_verdict()` now tracks per-session reason counts in
+`SESSION_REASONS` (associative array keyed on extracted session_id):
+
+1. **Score dedup**: first strong emit per session_id credits base score
+   (+10); subsequent emits for the same session bump reason count only.
+   Kill-chain narrative preserved in `signals[]` (every per-reason emit
+   still recorded with full kv); score side normalized.
+2. **Confidence tier bonus** (added once per session after the loop):
+   - 1 reason: +0 (base 10 only)
+   - 2-3 reasons: +2
+   - 4-5 reasons: +5
+   - 6+ reasons: +10 (canonical forgery shape)
+3. **Quarantined parity**: reasons_ioc kv field (e.g. `"A,C,E,F,H"`) is
+   parsed as comma-count and applied as the session's reason count, so
+   a 5-reason quarantined session scores identically to a 5-reason live
+   session.
+4. **session_id extraction** matches the actual emit_session prefixes
+   (token_used / token_inject / preauth_extauth / short_pass / multiline_pass
+   / badpass_authmarkers / cve41940 / hasroot / malformed_line /
+   forged_timestamp / quarantined_session). Per-session evidence-tier
+   warnings (`ioc_tfa_*`, `ioc_failed_exploit_attempt_*`) intentionally
+   excluded from the tier since they don't add to score anyway.
+
+### Added
+
+- `summary.session_tiered_count` — distinct sessions with strong reasons
+  on this host
+- `summary.session_max_reasons` — peak reason count on a single session
+  (depth-of-compromise indicator for fleet ranking)
+- CSV columns appended: `session_tiered_count`, `session_max_reasons`
+
+### Behavior on the worst-case host
+
+Pre-v2.7.30:
+- 81 sessions × 5-6 reasons × 10 = 4050+ score from sessions
+
+Post-v2.7.30:
+- 81 sessions × (10 base + 5 tier-3 bonus) = **1215 score from sessions**
+- Same incident post-mit (81 quarantined emits): 1215 score (parity)
+- ~3.7× score reduction for the worst host; pre/post-mit converge
+
+### Verification
+
+- 80/80 unit tests pass (`bash tests/run-verdict-tests.sh`). 10 new cases:
+  live 1/2/4/6 reasons, multi-session, quarantined 1/5/6 reasons,
+  non-session pattern E unaffected, mixed live+quar parity at 5 reasons.
+- 6/6 existing session-IOC tests pass.
+- bash -n syntax-clean. Sentinel review (rdf-reviewer): 0 MUST-FIX,
+  3 SHOULD-FIX addressed (empty-array guard, comment compression,
+  cross-state collision documented as intentional).
+
 ## sessionscribe-ioc-scan.sh v2.7.29 — 2026-05-04
 
 ### Changed (comment slop pruning — no behavior changes)
