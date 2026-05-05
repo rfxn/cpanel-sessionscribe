@@ -24,6 +24,105 @@ on MariaDB repos, so disabling them for this transaction has no side
 effects on the install. Hosts whose MariaDB repos are fine see no
 behavior change; broken-repo hosts now succeed.
 
+## sessionscribe-ioc-scan.sh v2.7.31 — 2026-05-05
+
+### Changed (Pattern J — heuristic shape-scanning replaced by dossier-only)
+
+300-bundle audit on the 2026-05-05 fleet sample showed Pattern J
+heuristic detection (`ioc_pattern_j_udev_run_at_now`,
+`ioc_pattern_j_systemd_unit_present`, `_candidate`, `_async_run`,
+`_snapshot`) was the dominant FP source for COMPROMISED verdicts.
+The shape probes (`RUN+=...sh -c | at now` regex; ExecStart-allowlist
++ description-shadow + RPM-ownership filter) tripped on operator-deployed
+udev rules and unowned operator units. Three of the six "true compromise"
+hosts in the audit were J-heuristic single-emit hits we couldn't confirm
+against any dossier IOC.
+
+Removed:
+
+- J1 udev shape probe (~95 lines): walked `/etc/udev/rules.d` +
+  `/run/udev/rules.d` for `RUN+=...sh -c.*at now` and
+  `nohup/setsid/disown` shapes, RPM-filtered, emitted
+  `ioc_pattern_j_udev_run_at_now` (strong) /
+  `ioc_pattern_j_udev_async_run` (warning).
+- J2 systemd unit shape probe (~99 lines): walked
+  `/etc/systemd/system/*.service`, allowlist-filtered ExecStart paths,
+  RPM-filtered, emitted `ioc_pattern_j_systemd_unit_present` (strong) /
+  `_candidate` (advisory) / `_snapshot` (info).
+- Six unused config knobs: `PATTERN_J_UDEV_DIRS`,
+  `PATTERN_J_SYSTEMD_UNIT_DIRS`, `PATTERN_J_EXECSTART_ALLOWED_RE`,
+  `PATTERN_J_DESC_SHADOW_RE`, `PATTERN_J_RECENT_DAYS`,
+  `PATTERN_J_MAX_UNITS`.
+- Dead helper `bulk_rpm_owned_filter()` (~37 lines) — Pattern J was
+  its only caller.
+
+Kept (dossier-only Pattern J):
+
+- `PATTERN_J_KNOWN_PATHS` literal-existence check (5 paths;
+  `/etc/udev/rules.d/89-cdrom-id-helper.rules`,
+  `/usr/lib/udev/cdrom-id-helper`, `dbus-broker-helper.service` in 2
+  locations, `/usr/share/dbus-1/dbus-broker-helper`). The `-helper`
+  suffix has no legitimate use on stock cPanel — zero-FP.
+- `PATTERN_J_PROCESS_NAMES` exact-match via `pgrep -x` (no substring FP).
+- At-job grep for `cdrom-id-helper|dbus-broker-helper` references.
+
+Trade-off: any future udev/systemd persistence not in
+`PATTERN_J_KNOWN_PATHS` / `PATTERN_J_PROCESS_NAMES` is silently missed.
+Next dossier rev needs a new IOC path; alternative is a J3-extension
+hook at the operator level. Sample-validated to flip the 8 v2.7.10/26
+heuristic-J COMPROMISED FPs in the 300-host fleet sample to SUSPICIOUS,
+with no real compromise demoted (none of the 6 audit-confirmed
+compromises depend on the heuristic — Patterns C/F/D drive them).
+
+### Added (soft-variant suffix gate — defense-in-depth)
+
+`ioc_key_is_soft_variant()` is called from `ioc_key_to_persist_pattern`
+and `ioc_compromise_class` BEFORE the `ioc_pattern_X_*` prefix match.
+Suffixes filtered: `_review`, `_review_*`, `_diagnostic`,
+`_diagnostic_only`, `_candidate`, `_undetermined`, `_orphan`,
+`_pre_compromise`, `_probes_only`, `_unknown_dim_only`, `_unknown_hash`.
+
+Most soft variants already emit at info/advisory/warning severity in
+v2.7.30 (`ioc_pattern_j_systemd_unit_candidate` advisory since
+v2.7.20; `ioc_pattern_e_*_pre_compromise` advisory; `_diagnostic`
+keys at info). The strong-only `compromise_critical` gate already
+filters them. The soft-variant guard is defense-in-depth: if a future
+emit raises severity for one of these keys, the prefix match alone
+won't escalate to COMPROMISED.
+
+### Fixed (cleanup — write-only state, dead vars, dead helper)
+
+- `CHAIN_FORENSIC` and `CHAIN_UPLOAD` were write-only after argument
+  parse — set in 6 places, read in zero. Replaced with the
+  already-consumed `FULL_MODE` / `DO_UPLOAD` flags. No behavior change;
+  the `--chain-forensic` / `--chain-upload` aliases still parse and set
+  the right downstream flags.
+- Dead-var pruning per shellcheck SC2034: `RECONCILED_EVENTS` (shadow
+  of `RECONCILED`), `N_DEF`/`N_OFF` (replaced by `N_PRE`/`N_POST`
+  earlier and never finished), `CODE_VERDICT` (replaced by
+  per-axis `VERDICT`/`HOST_VERDICT`), `PATTERN_LABEL` (15-entry
+  declaration with zero readers), `GLYPH_BOX_TR`/`GLYPH_BOX_BR`
+  (declared in both UTF-8 and ASCII glyph branches, never used —
+  TL/BL/H/V are the only glyphs the kill-chain renderer reads), local
+  `row_i`/`r_ts`/`r_zone` in render loops.
+- `bulk_rpm_owned_filter()` deleted (orphaned by the J1/J2 removal).
+
+### Verification
+
+- 86/86 unit tests pass (`bash tests/run-verdict-tests.sh`).
+  Test-harness updated to extract `ioc_key_is_soft_variant`. New cases:
+  `ioc_pattern_j_known_path_present` / `_process_active` /
+  `_atjob_payload_referenced` classify as J persistence; soft variants
+  (`_review`, `_diagnostic`, `_candidate`) DO NOT classify (defense-
+  in-depth check). Replaced 3 references to deleted
+  `ioc_pattern_j_systemd_unit_present` / `_udev_run_at_now` test keys
+  with the new dossier-keys.
+- 6/6 session tests pass (`bash tests/run-session-tests.sh`).
+- `shellcheck -S warning` exit 0 (down from 12 warnings).
+- Script line count: 8324 → 8230 (94 lines removed; net of comment
+  compression + dead-code excision; new soft-variant helper + test
+  cases offset by header-comment shrinks on the modified blocks).
+
 ## sessionscribe-ioc-scan.sh v2.7.30 — 2026-05-05
 
 ### Fixed (per-session score inflation, pre-mit ↔ post-mit divergence)

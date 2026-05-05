@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.30
+# sessionscribe-ioc-scan.sh v2.7.31
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.30"
+VERSION="2.7.31"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -235,36 +235,9 @@ PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 PATTERN_I_BINARY="/root/.local/bin/system-service"
 PATTERN_I_PROCNAME="system-service"
 
-# Pattern J - persistence via Linux init facilities (udev + systemd).
-#   J1: udev rule with `RUN+=...sh -c | at now`. Strong; nohup/setsid demote.
-#   J2: systemd unit with ExecStart outside legit binary roots, not
-#       RPM-owned, Description shadows a known service. /usr/share/<x>
-#       ExecStart is the strongest discriminator (FHS: data, not exec).
-PATTERN_J_UDEV_DIRS=(/etc/udev/rules.d /run/udev/rules.d)
-PATTERN_J_SYSTEMD_UNIT_DIRS=(/etc/systemd/system)
-# ExecStart-allowed binary roots. Legit cPanel/LSWS/Plesk extras included
-# so a stock control-panel host doesn't FP. /usr/lib/systemd/ covers
-# upstream systemd's own service binaries. /usr/local/lp/ covers Liquid
-# Web management infra (Prometheus exporters under
-# /usr/local/lp/opt/exporters/, etc.) - LW-managed binaries are
-# RPM-unowned by design but operator-deployed and not attacker-planted.
-PATTERN_J_EXECSTART_ALLOWED_RE='^(/usr/(bin|sbin|lib/systemd|lib(64)?/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|local/(bin|sbin|cpanel|lsws|directadmin|lp))|/opt/|/var/(cpanel|lib/dovecot|lib/mysql)|/bin/|/sbin/)'
-# Description shadow list - legit systemd/cPanel service names an attacker
-# might mimic with a `<name>-helper` / `<name>-cleanup` / `<name>2` suffix.
-PATTERN_J_DESC_SHADOW_RE='\b(dbus-broker|systemd-(resolved|networkd|timesyncd|logind|udevd)|cpsrvd|cphulkd|queueprocd|exim-altport|chkservd|tailwatchd|cpanel-dovecot)\b'
-# Pattern J incident-window cutoff (90 days) for promoting from warning to
-# strong on the soft-shape branch. Files older than this are still emitted
-# at warning weight=4 but don't reach strong unless an extra signal hits.
-PATTERN_J_RECENT_DAYS=90
-# Cap on systemd units walked per scan (perf bound). EL7+ stock fleet has
-# ~30-50 units in /etc/systemd/system/ - 200 is a generous cap.
-PATTERN_J_MAX_UNITS=200
-# Pattern J known-IOC paths (v2.7.20 — direct dossier strings). The
-# `-helper` suffix is the discriminator vs legitimate counterparts:
-# - real cpanel/upstream uses `cdrom_id` (underscore), not `cdrom-id-helper`
-# - real dbus-broker is `dbus-broker.service`, not `dbus-broker-helper.service`
-# - /usr/share/dbus-1/ never contains a `-helper` binary on a stock system
-# Direct existence check is zero-FP — these strings have no legitimate use.
+# Pattern J — dossier-only persistence IOCs (paths/processes/at-jobs).
+# `-helper` suffix is the discriminator vs legitimate counterparts on
+# stock cPanel; see CHANGELOG v2.7.31 for the heuristic-removal rationale.
 PATTERN_J_KNOWN_PATHS=(
     "/etc/udev/rules.d/89-cdrom-id-helper.rules"
     "/usr/lib/udev/cdrom-id-helper"
@@ -273,9 +246,6 @@ PATTERN_J_KNOWN_PATHS=(
     "/usr/share/dbus-1/dbus-broker-helper"
 )
 # Pattern J process names — exact matches via pgrep -x (no substring FP).
-# (Note: payload-fetch URL/hostname is NOT an IOC — the OVH bucket is
-# legitimate IR sharing infra; payload-file presence is captured by J3a
-# literal-path check below. See INTERNAL-NOTES.md "v2.7.20/v2.7.21".)
 PATTERN_J_PROCESS_NAMES=(cdrom-id-helper dbus-broker-helper)
 
 # Pattern K - Cloudflare-fronted /Update second-stage backdoor. Hostname
@@ -433,19 +403,9 @@ CPSRVD_PORTS=(2082 2083 2086 2087 2095 2096)
 # Optional syslog one-liner for SIEM ingestion. Off by default.
 SYSLOG=0
 
-# --chain-forensic: v1.x back-compat alias — equivalent to --full (no
-# host-verdict gate). The forensic phases are now inline; the alias
-# remains so deployed v1.x curl one-liners keep working.
-CHAIN_FORENSIC=0
-
-# --chain-upload: forward --upload to the chained forensic so its bundle is
-# PUT to the R-fx intake (default https://intake.rfxn.com/, overridable).
-# Implies --chain-forensic. CLEAN hosts still skip the entire chain (and
-# thus the upload) - we don't ship empty bundles.
-# --upload-url / --upload-token: pass-through for forensic's --upload-url /
-# --upload-token. Empty defaults => forensic uses its own built-in defaults
-# and RFXN_INTAKE_TOKEN env resolution.
-CHAIN_UPLOAD=0
+# --chain-upload pass-through: --upload-url / --upload-token populate
+# CHAIN_UPLOAD_URL / CHAIN_UPLOAD_TOKEN, consumed by the upload helper.
+# Empty defaults => upload uses RFXN_INTAKE_TOKEN env resolution.
 CHAIN_UPLOAD_URL=""
 CHAIN_UPLOAD_TOKEN=""
 
@@ -932,11 +892,11 @@ while [[ $# -gt 0 ]]; do
         # logic lives inside phase_bundle (gated on TELEMETRY_MODE).
         --telemetry)
             TELEMETRY_MODE=1; FULL_MODE=1; CHAIN_ON_ALL=1
-            CHAIN_FORENSIC=1; DO_BUNDLE=1; shift ;;
+            DO_BUNDLE=1; shift ;;
         --telemetry-url)
             TELEMETRY_URL="$2"
             TELEMETRY_MODE=1; FULL_MODE=1; CHAIN_ON_ALL=1
-            CHAIN_FORENSIC=1; DO_BUNDLE=1; shift 2 ;;
+            DO_BUNDLE=1; shift 2 ;;
         --telemetry-token)    TELEMETRY_TOKEN="$2"; shift 2 ;;
         --telemetry-timeout)  TELEMETRY_TIMEOUT="$2"; shift 2 ;;
         --telemetry-retry)    TELEMETRY_RETRY="$2"; shift 2 ;;
@@ -960,17 +920,17 @@ while [[ $# -gt 0 ]]; do
                 TELEMETRY_CRON_INTERVAL="$1"; shift
             fi
             ;;
-        # Back-compat aliases -- set --full + the legacy gate flags so the
+        # Back-compat aliases — set --full + the legacy gate flags so the
         # main-flow gating logic (Phase 5) honors the original semantics.
-        --chain-forensic)     FULL_MODE=1; CHAIN_FORENSIC=1; shift ;;
-        --chain-upload)       FULL_MODE=1; DO_UPLOAD=1; CHAIN_UPLOAD=1; CHAIN_FORENSIC=1; shift ;;
+        --chain-forensic)     FULL_MODE=1; shift ;;
+        --chain-upload)       FULL_MODE=1; DO_UPLOAD=1; shift ;;
         --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
         --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
-        --chain-on-critical)  FULL_MODE=1; CHAIN_ON_CRITICAL=1; CHAIN_FORENSIC=1; shift ;;
-        # chain-on-all override — runs forensic phases for EVERY
-        # host (including CLEAN). Pair with --upload for unconditional
-        # bundle submission across the fleet. Implies --full.
-        --chain-on-all|--chain-always) FULL_MODE=1; CHAIN_ON_ALL=1; CHAIN_FORENSIC=1; shift ;;
+        --chain-on-critical)  FULL_MODE=1; CHAIN_ON_CRITICAL=1; shift ;;
+        # chain-on-all override — runs forensic phases for EVERY host
+        # (including CLEAN). Pair with --upload for unconditional bundle
+        # submission across the fleet. Implies --full.
+        --chain-on-all|--chain-always) FULL_MODE=1; CHAIN_ON_ALL=1; shift ;;
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
@@ -1092,7 +1052,6 @@ DEFENSE_EVENTS=()       # "epoch|kind|note" strings, sorted at render time
 OFFENSE_EVENTS=()       # "epoch|pattern|key|note|defenses_required" strings
 IOC_PRIMITIVES=()       # parallel-indexed with OFFENSE_EVENTS; TSV row per IOC
 IOC_ANNOTATIONS=()      # parallel-indexed; renderer-side annotations (Pattern E dim)
-RECONCILED_EVENTS=()    # "epoch|pattern|key|verdict|delta|note" strings
 
 # PRIM_SEP: ASCII Unit Separator (0x1f) used to join ioc_primitive_row fields.
 # Non-whitespace so consecutive empty fields survive IFS-based read.
@@ -1111,8 +1070,6 @@ ENV_IOC_RUN_ID=""
 ENV_IOC_TS=""
 N_PRE=0                 # PRE-DEFENSE event count (set in phase_reconcile)
 N_POST=0                # POST-DEFENSE event count (set in phase_reconcile)
-N_DEF=0                 # defense-event count (informational, set at render time)
-N_OFF=0                 # offense-event count (informational, set at render time)
 RECONCILED=()           # "verdict|delta|epoch|pattern|key|note" strings (phase_reconcile output)
 KILL_CHAIN_RENDERED=""  # ANSI-stripped kill-chain copy for bundle kill-chain.md
 
@@ -1128,7 +1085,6 @@ IOC_REVIEW=0
 ADVISORY_COUNT=0
 PROBE_ARTIFACT_COUNT=0
 HOST_VERDICT="UNKNOWN"
-CODE_VERDICT="UNKNOWN"
 VERDICT="UNKNOWN"
 EXIT_CODE=0
 
@@ -1235,7 +1191,7 @@ fi
 # Glyph table — Unicode for UTF-8 TTYs, ASCII fallback
 # otherwise. Forensic renderers and the kill-chain markdown depend on these.
 if [[ -t 2 ]] && [[ "${LC_ALL:-}${LANG:-}${LC_CTYPE:-}" =~ [Uu][Tt][Ff]-?8 ]]; then
-GLYPH_BOX_TL='┌'; GLYPH_BOX_TR='┐'; GLYPH_BOX_BL='└'; GLYPH_BOX_BR='┘'
+GLYPH_BOX_TL='┌'; GLYPH_BOX_BL='└'
 GLYPH_BOX_H='─'; GLYPH_BOX_V='│'
 GLYPH_OFFENSE='⚡'; GLYPH_DEFENSE='✓'; GLYPH_ARROW='↳'
 GLYPH_OK='✓';     GLYPH_BAD='✗';     GLYPH_WARN='⚠'
@@ -1249,7 +1205,7 @@ C_BLD="$BOLD"
 C_DIM="$DIM"
 C_NC="$NC"
 else
-GLYPH_BOX_TL='+'; GLYPH_BOX_TR='+'; GLYPH_BOX_BL='+'; GLYPH_BOX_BR='+'
+GLYPH_BOX_TL='+'; GLYPH_BOX_BL='+'
 GLYPH_BOX_H='-'; GLYPH_BOX_V='|'
 GLYPH_OFFENSE='!'; GLYPH_DEFENSE='+'; GLYPH_ARROW='->'
 GLYPH_OK='+';     GLYPH_BAD='x';     GLYPH_WARN='!'
@@ -1576,46 +1532,6 @@ emit_signal() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Package-ownership probe for Pattern J FP gating. Returns one TSV line
-# per input path: <rc>\t<path> where rc is 0=owned, 1=not_owned, 2=no_probe.
-bulk_rpm_owned_filter() {
-    (( $# > 0 )) || return 0
-    local _f
-    if have_cmd rpm; then
-        # rpm -qf <p1> <p2> ... emits one line per input, in input order.
-        # Owned lines: "<package-NVR>". Not-owned: "file <p> is not owned...".
-        # Pair input order with output via paste-style awk.
-        local _out
-        _out=$(rpm -qf -- "$@" 2>&1 || true)
-        local _i=0
-        while IFS= read -r _line; do
-            _f="${@:$((_i+1)):1}"
-            if [[ "$_line" == *"not owned by any package"* \
-                  || "$_line" == *"No such file"* ]]; then
-                printf '1\t%s\n' "$_f"
-            else
-                printf '0\t%s\n' "$_f"
-            fi
-            _i=$((_i+1))
-        done <<< "$_out"
-        return
-    fi
-    # dpkg has no bulk equivalent; loop. Set -u safe.
-    if have_cmd dpkg; then
-        for _f in "$@"; do
-            if dpkg -S -- "$_f" >/dev/null 2>&1; then
-                printf '0\t%s\n' "$_f"
-            else
-                printf '1\t%s\n' "$_f"
-            fi
-        done
-        return
-    fi
-    for _f in "$@"; do
-        printf '2\t%s\n' "$_f"
-    done
-}
-
 mtime_of() {
     local f="$1"
     [[ -e "$f" ]] || { echo ""; return; }
@@ -1710,6 +1626,16 @@ ioc_key_to_pattern() {
     esac
 }
 
+# Soft-variant suffix gate — explicit low-confidence emits don't escalate
+# via prefix-match in the persist/compromise classifiers below.
+ioc_key_is_soft_variant() {
+    case "$1" in
+        *_review|*_review_*|*_diagnostic|*_diagnostic_only|*_candidate|*_undetermined \
+        |*_orphan|*_pre_compromise|*_probes_only|*_unknown_dim_only|*_unknown_hash) return 0 ;;
+    esac
+    return 1
+}
+
 # Map a signal key to a persistence-class pattern letter for cluster
 # scoring. Returns empty string for non-persistence keys. Persistence
 # patterns: D-reseller (WHM token), F-harvester (cmd_done / s_mark / harvester
@@ -1718,6 +1644,7 @@ ioc_key_to_pattern() {
 # Pattern A/B/C/E/H-non-seobot/K/L/X are NOT persistence (destruction, RCE,
 # recon, exploit-prep, forged-session evidence).
 ioc_key_to_persist_pattern() {
+    ioc_key_is_soft_variant "$1" && { echo ""; return; }
     case "$1" in
         (ioc_pattern_g_*)                       echo G ;;
         (ioc_pattern_j_*)                       echo J ;;
@@ -1738,6 +1665,7 @@ ioc_key_to_persist_pattern() {
 # the attacker reached the host but not that they took action.
 # Aligned with the v3 incident ladder principle: attempted ≠ compromised.
 ioc_compromise_class() {
+    ioc_key_is_soft_variant "$1" && { echo ""; return; }
     case "$1" in
         # Persistence — mirrors ioc_key_to_persist_pattern().
         (ioc_pattern_g_*|ioc_pattern_j_*|ioc_pattern_i_*) echo persistence ;;
@@ -2590,21 +2518,6 @@ phase_reconcile() {
 # session evidence that doesn't fit a destruction pattern; ? is anything
 # unmapped (a runtime ioc_key_to_pattern gap).
 PATTERN_ORDER=(init A B C D E F G H I J X "?")
-declare -A PATTERN_LABEL=(
-    [init]="recon / harvest"
-    [A]="ransom / encryptor"
-    [B]="data destruction"
-    [C]="malware deploy"
-    [D]="persistence (reseller token)"
-    [E]="websocket / fileman harvest"
-    [F]="harvester shell"
-    [G]="persistence (ssh key)"
-    [H]="seobot defacement / SEO spam"
-    [I]="persistence (profile.d backdoor)"
-    [J]="persistence (udev / systemd unit)"
-    [X]="forged session"
-    ["?"]="unmapped"
-)
 
 # Strip CSI sequences from a string. Used to capture an ANSI-free copy of
 # the rendered kill chain for kill-chain.md inside the bundle. Bash 4.1
@@ -2930,8 +2843,7 @@ render_kill_chain() {
             # Second pass: emit zone headers + rows. Each zone starts with a
             # "── ZONE-LABEL (N events) ──" separator; rows render compactly.
             local zone_rec z_id z_first z_last z_count
-            local r_str r_ts r_kind r_idx r_zone
-            local row_i=0
+            local r_str r_kind r_idx
 
             (( ${#zones[@]} > 0 )) && for zone_rec in "${zones[@]}"; do
                 IFS='|' read -r z_id z_first z_last z_count <<< "$zone_rec"
@@ -2965,7 +2877,7 @@ render_kill_chain() {
                 local r
                 for (( r=z_first; r<=z_last; r++ )); do
                     r_str="${rows[$r]}"
-                    IFS='|' read -r r_ts r_kind r_idx r_zone <<< "$r_str"
+                    IFS='|' read -r _ r_kind r_idx _ <<< "$r_str"
                     if [[ "$r_kind" == "DEF" ]]; then
                         local _de="${DEFENSE_EVENTS[$r_idx]}"
                         local de_epoch de_key de_note
@@ -5542,12 +5454,8 @@ check_quarantined_sessions() {
     QUARANTINED_HITS="$hits"
 }
 
-# Pattern J detection - init-facility persistence (udev + systemd unit).
-# Writes hit count to global PATTERN_J_HITS (not stdout) - emit() mutates
-# the SIGNALS[] array, which would be lost in a `$( … )` subshell.
-# Snapshot-aware: when ROOT_OVERRIDE is set, walks $ROOT_OVERRIDE-prefixed
-# paths and demotes severity to info+degraded_confidence_snapshot=1 (no
-# live rpmdb to cross-check). FP gates documented inline.
+# Pattern J detection — dossier paths/processes/at-jobs only. Snapshot-aware
+# via ROOT_OVERRIDE (severity demoted to info+degraded_confidence_snapshot=1).
 check_pattern_j_persistence() {
     PATTERN_J_HITS=0
     local hits=0
@@ -5556,203 +5464,7 @@ check_pattern_j_persistence() {
     local snapshot_mode=0
     [[ -n "$prefix" ]] && snapshot_mode=1
 
-    # ---- J1: udev rules with backgrounded RUN ----------------------------
-    # Strong tier requires the pipe-to-`at now` shape (dossier-observed,
-    # vanishingly rare in benign automation). nohup/setsid/disown forms
-    # demote to warning - those are common in legit ad-hoc tooling.
-    local d _udev_files=()
-    for d in "${PATTERN_J_UDEV_DIRS[@]}"; do
-        local _d="${prefix}${d}"
-        [[ -d "$_d" ]] || continue
-        # Find rule files modified in the last PATTERN_J_RECENT_DAYS days OR
-        # all rule files (we want full coverage here - the FP gate is the
-        # shape match below, not file age).
-        while IFS= read -r f; do
-            _udev_files+=("$f")
-        done < <(find "$_d" -maxdepth 1 -type f -name '*.rules' 2>/dev/null)
-    done
-
-    if (( ${#_udev_files[@]} > 0 )); then
-        # Shape probe: scan bodies once with grep, then RPM-filter only the hits.
-        local _hit_shape_strong=()  _hit_shape_warn=()
-        local f
-        for f in "${_udev_files[@]}"; do
-            # Strong: `| at now` (or `| at[[:space:]]+now`) inside a RUN value.
-            if grep -qE 'RUN[+=]+=.*sh -c.*\|[[:space:]]*at[[:space:]]+now\b' "$f" 2>/dev/null; then
-                _hit_shape_strong+=("$f")
-            elif grep -qE 'RUN[+=]+=.*sh -c.*\b(nohup|setsid|disown)\b' "$f" 2>/dev/null; then
-                _hit_shape_warn+=("$f")
-            fi
-        done
-
-        # FP gate: not RPM-owned. In snapshot mode skip ownership check
-        # (no rpmdb) and always demote tier by one notch.
-        # bash 4.1 (CL6/EL6) + set -u trips 'unbound variable' on
-        # ${arr[@]} for any declared-but-empty array; guard each
-        # dereference with a length check.
-        local _strong_unowned=() _warn_unowned=()
-        if (( snapshot_mode )); then
-            (( ${#_hit_shape_strong[@]} > 0 )) && _strong_unowned=("${_hit_shape_strong[@]}")
-            (( ${#_hit_shape_warn[@]}   > 0 )) && _warn_unowned=("${_hit_shape_warn[@]}")
-        else
-            local _all=()
-            (( ${#_hit_shape_strong[@]} > 0 )) && _all+=("${_hit_shape_strong[@]}")
-            (( ${#_hit_shape_warn[@]}   > 0 )) && _all+=("${_hit_shape_warn[@]}")
-            local _own_lines=""
-            if (( ${#_all[@]} > 0 )); then
-                _own_lines=$(bulk_rpm_owned_filter "${_all[@]}")
-            fi
-            local _rc _path
-            while IFS=$'\t' read -r _rc _path; do
-                [[ -z "$_path" ]] && continue
-                # rc=0 owned, rc=1 not_owned, rc=2 no_probe (treat as warn)
-                if [[ "$_rc" == "1" || "$_rc" == "2" ]]; then
-                    local _is_strong=0
-                    if (( ${#_hit_shape_strong[@]} > 0 )) \
-                       && printf '%s\n' "${_hit_shape_strong[@]}" | grep -qxF "$_path"; then
-                        _is_strong=1
-                    fi
-                    if (( _is_strong )); then
-                        _strong_unowned+=("$_path")
-                    else
-                        _warn_unowned+=("$_path")
-                    fi
-                fi
-            done <<< "$_own_lines"
-        fi
-
-        if (( ${#_strong_unowned[@]} > 0 )); then
-            for f in "${_strong_unowned[@]}"; do
-                local _mtime _run_line
-                _mtime=$(stat -c %Y "$f" 2>/dev/null)
-                _run_line=$(grep -m1 -E 'RUN[+=]+=.*sh -c.*\|[[:space:]]*at[[:space:]]+now\b' "$f" 2>/dev/null)
-                local _sev=strong _wt=10 _conf=""
-                if (( snapshot_mode )); then
-                    _sev=info; _wt=2; _conf="degraded_confidence_snapshot=1; "
-                fi
-                emit "destruction" "ioc_pattern_j_udev_run" "$_sev" \
-                     "ioc_pattern_j_udev_run_at_now" "$_wt" \
-                     "path" "$f" "mtime_epoch" "${_mtime:-0}" \
-                     "sample" "${_run_line:0:300}" \
-                     "note" "${_conf}Pattern J1 udev rule at $f backgrounds shell via 'at now' and is not package-owned (CRITICAL)."
-                ((hits++))
-            done
-        fi
-        if (( ${#_warn_unowned[@]} > 0 )); then
-            for f in "${_warn_unowned[@]}"; do
-                local _mtime
-                _mtime=$(stat -c %Y "$f" 2>/dev/null)
-                emit "destruction" "ioc_pattern_j_udev_async" "warning" \
-                     "ioc_pattern_j_udev_async_run" 4 \
-                     "path" "$f" "mtime_epoch" "${_mtime:-0}" \
-                     "note" "Pattern J1 candidate: udev rule at $f backgrounds shell (nohup/setsid/disown) and is not package-owned (REVIEW)."
-                ((hits++))
-            done
-        fi
-    fi
-
-    # ---- J2: systemd units with non-allowlisted ExecStart ----------------
-    # Walk /etc/systemd/system only (operator-customizable tree). Cap at
-    # PATTERN_J_MAX_UNITS to bound walk-time on hosts with many units.
-    local _unit_files=()
-    for d in "${PATTERN_J_SYSTEMD_UNIT_DIRS[@]}"; do
-        local _d="${prefix}${d}"
-        [[ -d "$_d" ]] || continue
-        while IFS= read -r f; do
-            _unit_files+=("$f")
-            (( ${#_unit_files[@]} >= PATTERN_J_MAX_UNITS )) && break
-        done < <(find "$_d" -maxdepth 1 -type f -name '*.service' 2>/dev/null)
-    done
-
-    if (( ${#_unit_files[@]} > 0 )); then
-        # Shape probe: extract ExecStart and Description per unit.
-        local _suspicious_units=()
-        local f
-        for f in "${_unit_files[@]}"; do
-            local _exec _desc _exec_path
-            _exec=$(grep -m1 -E '^[[:space:]]*ExecStart[[:space:]]*=' "$f" 2>/dev/null \
-                | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[+!@-]*//' \
-                | awk '{print $1}')
-            [[ -z "$_exec" ]] && continue
-            _exec_path="$_exec"
-            # ExecStart shape: outside allowlist OR /usr/share/ root.
-            if [[ "$_exec_path" =~ ^/usr/share/ ]] \
-               || ! [[ "$_exec_path" =~ $PATTERN_J_EXECSTART_ALLOWED_RE ]]; then
-                _suspicious_units+=("$f")
-            fi
-        done
-
-        # RPM-filter both unit files AND their ExecStart binaries; both
-        # must be not-RPM-owned to qualify as Pattern J (an unowned unit
-        # pointing at an RPM-owned binary is a sysadmin custom unit;
-        # an owned unit with an unowned binary is broken-but-benign).
-        if (( ${#_suspicious_units[@]} > 0 )); then
-            local _unit_unowned=()
-            if (( snapshot_mode )); then
-                _unit_unowned=("${_suspicious_units[@]}")
-            else
-                local _own_lines _rc _path
-                _own_lines=$(bulk_rpm_owned_filter "${_suspicious_units[@]}")
-                while IFS=$'\t' read -r _rc _path; do
-                    [[ -z "$_path" ]] && continue
-                    if [[ "$_rc" == "1" || "$_rc" == "2" ]]; then
-                        _unit_unowned+=("$_path")
-                    fi
-                done <<< "$_own_lines"
-            fi
-
-            local f
-            if (( ${#_unit_unowned[@]} > 0 )); then
-                for f in "${_unit_unowned[@]}"; do
-                    local _mtime _exec_path _desc _now _age _is_recent=0
-                    _mtime=$(stat -c %Y "$f" 2>/dev/null)
-                    _now=$(date -u +%s 2>/dev/null || echo 0)
-                    _age=$(( _now - ${_mtime:-0} ))
-                    (( _age < PATTERN_J_RECENT_DAYS * 86400 )) && _is_recent=1
-                    _exec_path=$(grep -m1 -E '^[[:space:]]*ExecStart[[:space:]]*=' "$f" 2>/dev/null \
-                        | sed -E 's/^[[:space:]]*ExecStart[[:space:]]*=[+!@-]*//' \
-                        | awk '{print $1}')
-                    _desc=$(grep -m1 -E '^[[:space:]]*Description[[:space:]]*=' "$f" 2>/dev/null \
-                        | sed -E 's/^[[:space:]]*Description[[:space:]]*=//')
-
-                    # Strong-tier conjunction: /usr/share/ ExecStart AND Description
-                    # shadows known service AND mtime recent. Otherwise warning/4.
-                    local _strong_match=0
-                    if [[ "$_exec_path" =~ ^/usr/share/ ]] \
-                       && [[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] \
-                       && (( _is_recent )); then
-                        _strong_match=1
-                    fi
-
-                    local _sev _wt _key
-                    if (( snapshot_mode )); then
-                        _sev=info; _wt=2
-                        _key="ioc_pattern_j_systemd_unit_snapshot"
-                    elif (( _strong_match )); then
-                        _sev=strong; _wt=10
-                        _key="ioc_pattern_j_systemd_unit_present"
-                    else
-                        # _candidate is too FP-prone alone; see INTERNAL-NOTES.md "v2.7.20".
-                        _sev=advisory; _wt=2
-                        _key="ioc_pattern_j_systemd_unit_candidate"
-                    fi
-                    emit "destruction" "ioc_pattern_j_systemd_unit" "$_sev" \
-                         "$_key" "$_wt" \
-                         "path" "$f" "mtime_epoch" "${_mtime:-0}" \
-                         "exec_start" "${_exec_path:-}" \
-                         "description" "${_desc:0:120}" \
-                         "shadow_match" "$([[ "$_desc" =~ $PATTERN_J_DESC_SHADOW_RE ]] && echo 1 || echo 0)" \
-                         "is_recent" "$_is_recent" \
-                         "snapshot" "$snapshot_mode" \
-                         "note" "Pattern J2 systemd unit at $f - non-allowlist ExecStart=$_exec_path and not package-owned."
-                    ((hits++))
-                done
-            fi
-        fi
-    fi
-
-    # ---- J3: literal IOC paths + payload references + processes + at-jobs --
-    # Dossier-string checks (zero-FP); see INTERNAL-NOTES.md "v2.7.20".
+    # Literal IOC paths + payload references + processes + at-jobs.
     local _path _full _mtime
     for _path in "${PATTERN_J_KNOWN_PATHS[@]}"; do
         _full="${prefix}${_path}"
@@ -6852,15 +6564,8 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # ---- Pattern J: init-facility persistence (udev + systemd) ----------
-    # Co-stage with Patterns G/I (post-RCE persistence). Walks udev rules
-    # and /etc/systemd/system/ (operator-customizable tree only - skip
-    # /usr/lib/systemd/ which is RPM territory). FP gates: (1) RPM ownership
-    # via bulk_rpm_owned_filter (one rpmdb open per scan), (2) attacker-
-    # specific shape match (`| at now` for J1; /usr/share/ ExecStart +
-    # description-shadow for J2), (3) mtime within incident window for the
-    # soft-shape branch. Direct call (not `$( … )`) - subshell would discard
-    # SIGNALS[] mutations from emit().
+    # Pattern J: init-facility persistence (dossier-only). Direct call —
+    # subshell would discard SIGNALS[] mutations from emit().
     check_pattern_j_persistence
     hits=$((hits + PATTERN_J_HITS))
 
