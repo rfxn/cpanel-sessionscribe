@@ -24,6 +24,85 @@ on MariaDB repos, so disabling them for this transaction has no side
 effects on the install. Hosts whose MariaDB repos are fine see no
 behavior change; broken-repo hosts now succeed.
 
+## sessionscribe-ioc-scan.sh v2.7.27 — 2026-05-04
+
+### Added (host-state elevation: persistence cluster scoring)
+
+Persistence is by definition post-compromise evidence — a single forged
+SSH key, a systemd persistence unit, or a `__CMD_DONE_<nanos>__` harvester
+marker is sufficient to escalate the host_verdict to COMPROMISED on its
+own. Prior to v2.7.27 the host_verdict gate was `ioc_critical > 0` only,
+which left strong-tier persistence patterns (Pattern G/J/I) requiring a
+co-occurring strong cPanel-side IOC (Pattern E websocket Shell, Pattern F
+__CMD_DONE_, Pattern X CRLF chains) to escalate. On `centos6-reason.cyberly.net`
+(IC-5790, host_verdict=COMPROMISED via Pattern E) the live `/root/.cp`
+binary still SYN-SENT to `111.223.247.226:21` post-mitigation went to
+score 28 — the persistence narrative was visible to ioc-scan but didn't
+produce a loud-enough score signature for fleet ranking to surface above
+single-Pattern-E hosts.
+
+Three new behaviors:
+
+1. **Persistence-class signal classification**
+   (`ioc_key_to_persist_pattern`). Maps signal keys to a pattern letter
+   (G/J/I/F-harvester/D-reseller/H-seobot) for cluster scoring. The
+   classifier is conservative — only pattern keys whose existence
+   implies post-compromise host state are tagged. Pattern A
+   (ransom/encryptor), Pattern B (data destruction), Pattern C
+   (nuclear.x86 dropper), Pattern E (websocket Shell RCE),
+   Pattern H non-seobot variants (kill_prelude/competitor_kill/zip_dropper/
+   dropper_archive — destruction-class), Pattern K (backdoor fetch shape),
+   Pattern L (filesystem nuke), Pattern X (forged-session evidence) are
+   NOT persistence and don't participate in the cluster.
+
+2. **Cluster multiplier**: when two or more distinct persistence
+   patterns fire on a host (deduped by pattern letter — three Pattern G
+   sub-keys count as one), the cumulative persistence weight contribution
+   to score is multiplied:
+
+   - count=1 → multiplier ×1 (no cluster bonus, but COMPROMISED gate fires)
+   - count=2 → multiplier ×2
+   - count=3 → multiplier ×3 + emit `ioc_persistence_cluster_critical` advisory
+   - count=4+ → multiplier capped at ×4
+
+   Centos6-reason today has Pattern F=8 (count=1, no bonus) → score
+   floored to 25 minimum; future re-scan with the planned `pattern_n_*`
+   active-persistence analyzers (next PR) takes count to 4-5 and pushes
+   score above 100, which is what fleet sorting needs to surface
+   multi-pattern hosts above single-Pattern-E hosts.
+
+3. **COMPROMISED gate on persistence**: the host_verdict block now reads
+
+   ```
+   if ((ioc_critical > 0)) || ((persist_count >= 1)); then
+       HOST_VERDICT=COMPROMISED
+   ```
+
+   A warning-tier persistence signal (e.g. a single `ioc_pattern_g_ssh_key`
+   without forged_mtime) now escalates to COMPROMISED on its own. This
+   closes the gap where a host with persistence evidence but no strong
+   exploitation signal landed at SUSPICIOUS and got buried in fleet
+   triage queues.
+
+4. **Score floor**: `persist_count >= 1` floors `score >= 25` so any
+   persistence at all ranks above a clean host in CSV/JSON aggregation.
+
+5. **JSON envelope + CSV fields**: `summary.persist_count`,
+   `summary.persist_score`, `summary.persist_multiplier`,
+   `summary.persist_patterns` (CSV columns: same names). Existing
+   columns unchanged for back-compat with fleet aggregators that
+   read positionally.
+
+### Verification
+
+- 37/37 unit tests pass: `bash tests/run-verdict-tests.sh`. Covers
+  classifier mapping (14 positive + 12 negative cases), cluster
+  multiplier at count 1/2/3/5, score floor, COMPROMISED gate via
+  persistence alone (no ioc_critical), Pattern G key dedup-by-letter,
+  centos6-reason replay, non-persistence pattern isolation
+  (A/H-non-seobot/L don't trigger cluster).
+- 6/6 existing session-IOC tests pass: `bash tests/run-session-tests.sh`.
+
 ## sessionscribe-ioc-scan.sh v2.7.26 — 2026-05-04
 
 ### Fixed (cosmetic: "bash bash" rendering when $0 isn't a path)

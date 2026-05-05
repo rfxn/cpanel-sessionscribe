@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.26
+# sessionscribe-ioc-scan.sh v2.7.27
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.26"
+VERSION="2.7.27"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -1830,6 +1830,25 @@ ioc_key_to_pattern() {
         (ioc_token_*|ioc_preauth_*|ioc_short_pass*|ioc_multiline_*|ioc_badpass*|ioc_cve_2026_41940*|ioc_hasroot*|ioc_malformed*|ioc_forged_*|ioc_tfa*|anomalous_root_sessions)
                                                 echo X ;;
         (*)                                     echo ? ;;
+    esac
+}
+
+# Map a signal key to a persistence-class pattern letter for cluster
+# scoring. Returns empty string for non-persistence keys. Persistence
+# patterns: D-reseller (WHM token), F-harvester (cmd_done / s_mark / harvester
+# shell artifacts), G (ssh keys), H-seobot (defacement webshell on disk),
+# I (profile.d backdoor), J (systemd unit / udev / atjob).
+# Pattern A/B/C/E/H-non-seobot/K/L/X are NOT persistence (destruction, RCE,
+# recon, exploit-prep, forged-session evidence).
+ioc_key_to_persist_pattern() {
+    case "$1" in
+        (ioc_pattern_g_*)                       echo G ;;
+        (ioc_pattern_j_*)                       echo J ;;
+        (ioc_pattern_i_*)                       echo I ;;
+        (ioc_pattern_f_cmd_done*|ioc_pattern_f_smark*|ioc_pattern_f_harvester) echo F ;;
+        (ioc_pattern_d_reseller*|ioc_pattern_d_token*|ioc_pattern_d_whm_fullroot*) echo D ;;
+        (ioc_pattern_h_seobot*|ioc_pattern_h_alldone*) echo H ;;
+        (*)                                     echo "" ;;
     esac
 }
 
@@ -7852,6 +7871,11 @@ aggregate_verdict() {
     # discriminate vuln from patched on 134+ tier.
     local version_says_vuln=0 version_says_patched=0
     local row area id sev key weight kv
+    # Persistence cluster tracking. PERSIST_PATTERNS dedupes by pattern letter
+    # (G/J/I/F/D/H) so multiple G keys on one host count as ONE persistence
+    # pattern; the cluster multiplier rewards distinct patterns, not key count.
+    local -A PERSIST_PATTERNS=()
+    local persist_weight_sum=0
     # Reset (don't redeclare) - the arrays are top-level globals; using
     # `declare -ga` here would require bash 4.2. Reassigning to () clears
     # the array contents while preserving the global binding.
@@ -7927,6 +7951,26 @@ aggregate_verdict() {
                 SECTION_KEYS[$area]="${SECTION_KEYS[$area]:-} $key"
             fi
             weight="${weight:-0}"
+            # Persistence-class accumulation. Tracked at strong/evidence/warning
+            # severity (info/advisory excluded — info is too low-confidence,
+            # advisories are explicitly non-verdict-affecting). Uses pattern
+            # letter so multiple keys per pattern dedupe to one cluster slot.
+            case "$sev" in
+                strong|evidence|warning)
+                    local _pp
+                    _pp=$(ioc_key_to_persist_pattern "$key")
+                    if [[ -n "$_pp" ]]; then
+                        PERSIST_PATTERNS["$_pp"]=1
+                        local _pw
+                        case "$sev" in
+                            strong)   _pw=$((weight > 0 ? weight : 5)) ;;
+                            evidence) _pw=2 ;;
+                            warning)  _pw=$((weight > 0 ? weight : 4)) ;;
+                        esac
+                        persist_weight_sum=$((persist_weight_sum + _pw))
+                    fi
+                    ;;
+            esac
             case "$sev" in
                 strong)
                     score=$((score + (weight > 0 ? weight : 5)))
@@ -7982,6 +8026,21 @@ aggregate_verdict() {
         done
     fi
 
+    # Persistence cluster scoring. Distinct persistence patterns multiply
+    # their weight contribution to score — multi-pattern persistence is the
+    # loud signal we want to surface above single-pattern hosts in fleet
+    # ranking. Floor at 25 ensures any persistence (even a single warn-tier
+    # signal) ranks above a score=0 clean host in CSV/JSON aggregation.
+    local persist_count=${#PERSIST_PATTERNS[@]}
+    local persist_mult=1
+    (( persist_count >= 2 )) && persist_mult=2
+    (( persist_count >= 3 )) && persist_mult=3
+    (( persist_count >= 4 )) && persist_mult=4
+    if (( persist_count >= 1 )); then
+        score=$((score + persist_weight_sum * (persist_mult - 1)))
+        (( score < 25 )) && score=25
+    fi
+
     SCORE="$score"
     STRONG_COUNT="$strong_count"
     FIXED_COUNT="$fixed_count"
@@ -7990,6 +8049,10 @@ aggregate_verdict() {
     IOC_CRITICAL="$ioc_critical"
     IOC_REVIEW="$ioc_review"
     PROBE_ARTIFACT_COUNT="$probe_artifact_count"
+    PERSIST_COUNT="$persist_count"
+    PERSIST_WEIGHT_SUM="$persist_weight_sum"
+    PERSIST_MULTIPLIER="$persist_mult"
+    PERSIST_PATTERNS_LIST=$(printf '%s,' "${!PERSIST_PATTERNS[@]}" | sed 's/,$//')
 
     # Code-state axis. Version is authoritative: on 134+ tier, vulnerable
     # and patched cpsrvd binaries share ACL/token-reader strings, so the
@@ -8024,7 +8087,10 @@ aggregate_verdict() {
     # exploitation, and we want fleet-aggregation to triage these first.
     # SUSPICIOUS now exits 3 unconditionally (in all modes, including --ioc-only).
     # This disambiguates from code-state INCONCLUSIVE which keeps exit 2.
-    if (( ioc_critical > 0 )); then
+    # Persistence gate: any class=persistence signal (G/J/I/F-harvester/D-reseller/
+    # H-seobot) at strong+ severity escalates to COMPROMISED independently of
+    # ioc_critical — persistence is by definition post-compromise evidence.
+    if (( ioc_critical > 0 )) || (( persist_count >= 1 )); then
         HOST_VERDICT="COMPROMISED"
         EXIT_CODE=4
     elif (( ioc_review > 0 )); then
@@ -8032,6 +8098,22 @@ aggregate_verdict() {
         EXIT_CODE=3
     else
         HOST_VERDICT="CLEAN"
+    fi
+
+    # Cluster advisory: surface multi-pattern persistence as a distinct
+    # advisory entry so fleet aggregators / CSV consumers can rank these
+    # above single-pattern hosts. Emit only at count >= 3 to keep the
+    # advisory channel high-signal.
+    if (( persist_count >= 3 )); then
+        local _plist="$PERSIST_PATTERNS_LIST"
+        emit advisory ioc_persistence_cluster_critical advisory \
+            ioc_persistence_cluster_critical 0 \
+            note "$persist_count distinct persistence patterns detected (${_plist}) — cluster_score=$persist_weight_sum, multiplier=${persist_mult}x" \
+            persist_count "$persist_count" persist_score "$persist_weight_sum" \
+            multiplier "$persist_mult" patterns "$_plist"
+        ADVISORIES+=("ioc_persistence_cluster_critical|ioc_persistence_cluster_critical|$persist_count distinct persistence patterns detected (${_plist}) - cluster_score=$persist_weight_sum, multiplier=${persist_mult}x")
+        ((advisory_count++))
+        ADVISORY_COUNT="$advisory_count"
     fi
 }
 
@@ -8123,6 +8205,12 @@ print_verdict() {
     sayf ' %sCode verdict:%s %s%s%s    score=%+d\n' "$BOLD" "$NC" "$code_color" "$VERDICT" "$NC" "$SCORE"
     sayf ' %sHost verdict:%s %s%s%s\n' "$BOLD" "$NC" "$host_color" "$HOST_VERDICT" "$NC"
 
+    if (( ${PERSIST_COUNT:-0} >= 1 )); then
+        sayf '   persistence: %s%d distinct pattern(s) (%s) — cluster_score=%d ×%d%s\n' \
+            "$YELLOW" "${PERSIST_COUNT:-0}" "${PERSIST_PATTERNS_LIST:-}" \
+            "${PERSIST_WEIGHT_SUM:-0}" "${PERSIST_MULTIPLIER:-1}" "$NC"
+    fi
+
     if (( ${#REASONS[@]} > 0 )); then
         local uniq_reasons; uniq_reasons=$(printf '%s\n' "${REASONS[@]}" | sort -u | tr '\n' ',' | sed 's/,$//')
         sayf '   reasons: %s%s%s\n' "$DIM" "$uniq_reasons" "$NC"
@@ -8197,8 +8285,9 @@ write_json() {
         printf '  "host_verdict": "%s",\n' "$HOST_VERDICT"
         printf '  "score": %d,\n' "$SCORE"
         printf '  "exit_code": %d,\n' "$EXIT_CODE"
-        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"advisories":%d,"probe_artifacts":%d},\n' \
-            "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}"
+        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s"},\n' \
+            "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}" \
+            "${PERSIST_COUNT:-0}" "${PERSIST_WEIGHT_SUM:-0}" "${PERSIST_MULTIPLIER:-1}" "$(json_esc "${PERSIST_PATTERNS_LIST:-}")"
         printf '  "advisories": [\n'
         first=1
         local entry adv_id adv_key adv_note
@@ -8256,8 +8345,11 @@ write_csv() {
         adv_ids="${adv_ids:+${adv_ids};}${adv_id}"
     done
     {
-        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids\n'
-        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s\n' \
+        # Column order: existing columns 1-17 unchanged for back-compat with
+        # fleet aggregators that index positionally (cut -f17, awk -F, '$NF',
+        # etc). New persist_* columns appended at end as columns 18-21.
+        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns\n'
+        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s\n' \
             "$(csv_field "$HOSTNAME_FQDN")" \
             "$(csv_field "$RUN_ID")" \
             "$(csv_field "$TS_ISO")" \
@@ -8274,7 +8366,11 @@ write_csv() {
             "${ADVISORY_COUNT:-0}" \
             "${PROBE_ARTIFACT_COUNT:-0}" \
             "$(csv_field "$reasons")" \
-            "$(csv_field "$adv_ids")"
+            "$(csv_field "$adv_ids")" \
+            "${PERSIST_COUNT:-0}" \
+            "${PERSIST_WEIGHT_SUM:-0}" \
+            "${PERSIST_MULTIPLIER:-1}" \
+            "$(csv_field "${PERSIST_PATTERNS_LIST:-}")"
     } > "$out"
 }
 
