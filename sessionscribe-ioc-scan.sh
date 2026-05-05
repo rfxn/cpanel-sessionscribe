@@ -3501,14 +3501,7 @@ phase_bundle() {
         bundle_tar "cpanel-users.tgz" "cpanel per-account state" raw /var/cpanel/users
     fi
 
-    # 4. Persistence artifacts - SSH keys, cron (all variants), systemd
-    # units, init scripts, profile.d (login-time persistence vector),
-    # root shell histories (all flavors), passwd/group, sudoers + drop-in.
-    # /etc/shadow is NOT bundled (hash material; no Pattern depends on it).
-    # Most paths are small; systemd unit + init.d trees can be a few MB on
-    # hosts with many services. Worth bundling whole - Pattern C only greps
-    # for nuclear.x86 so a hand-crafted backdoor unit (or NOPASSWD sudo
-    # rule) would be invisible without the raw files.
+    # 4. Persistence artifacts - ssh/cron/systemd/init/profile.d/histories/passwd/sudoers (no shadow).
     local persist=()
     [[ -d /root/.ssh ]] && persist+=(/root/.ssh)
     [[ -d /var/spool/cron ]] && persist+=(/var/spool/cron)
@@ -5330,11 +5323,6 @@ check_sessions() {
              "note" "$probe_artifacts session(s) tagged with sessionscribe-remote-probe canary - clear with: sessionscribe-remote-probe.sh --cleanup | ssh root@host"
     fi
 
-    # Gap 10: section-level mtime-anomaly summary. Surfaced even when no
-    # other IOCs fired so a host with quietly-backdated sessions doesn't
-    # get a "no_session_iocs" all-clear. The count lets fleet aggregators
-    # distinguish single-session forgery (likely real) from fleet-wide
-    # restore artifacts (mass cp -p / tar xp - many sessions affected).
     if (( mtime_anomalies > 0 )); then
         emit "sessions" "session_mtime_anomaly_summary" "advisory" \
              "session_mtime_vs_ctime_anomaly_count" 0 \
@@ -5361,14 +5349,7 @@ check_sessions() {
     fi
 }
 
-# Walk $MITIGATE_BACKUP_ROOT/*/quarantined-sessions/raw/ and emit one
-# synthetic signal per quarantined session, derived from the .info sidecar
-# (no re-run of the live IOC ladder, which is coupled to current host
-# state). Writes hit count to global QUARANTINED_HITS - emit() mutates
-# SIGNALS[] which would be lost in a `$( … )` subshell. Honors snapshot
-# mode by reading from $ROOT_OVERRIDE when set. Capped at
-# PATTERN_J_MAX_QUARANTINE total sessions to bound runtime on hosts with
-# bulk-quarantine history.
+# Direct call (not subshell): emit() mutates SIGNALS[].
 check_quarantined_sessions() {
     QUARANTINED_HITS=0
     local hits=0
@@ -5869,9 +5850,7 @@ check_destruction_iocs() {
         if (( fe_count < 10 && fe_acct == 1 )); then
             fe_sev="warning"; fe_weight=5
         fi
-        # v2.7.32 P1: count escalator applied at score-time (aggregate_verdict)
-        # so old envelopes replayed under v2.7.32 score correctly. fe_weight=10
-        # base is the unmutated emit weight; the score function reads count.
+        # P1 count escalator applied at score-time (CHANGELOG v2.7.32).
         [[ -n "$fe_sample" ]] && fe_mtime=$(stat -c %Y "$fe_sample" 2>/dev/null)
         emit "destruction" "ioc_pattern_a_evidence_destruction" "$fe_sev" \
              "ioc_pattern_a_evidence_targeted" "$fe_weight" \
@@ -5904,13 +5883,7 @@ check_destruction_iocs() {
             ((hits++))
         fi
     fi
-    # BTC index.html drops across /home users. Cohort observation:
-    # nested drops appear at /home/<user>/public_html/<subdir>/index.html
-    # (multiple sibling subdirs per user). -maxdepth 4 bounds the walk;
-    # -name index.html filters before reading. -print0 + xargs -0
-    # keeps a malicious user
-    # dir name from breaking the pipeline. find errors quiet via 2>/dev/null
-    # when /home/*/public_html glob is empty.
+    # BTC index.html drops nested under /home/*/public_html (cohort).
     local btc_hit=""
     btc_hit=$(find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
                 | xargs -0 grep -lF "$PATTERN_B_BTC_ADDR" 2>/dev/null | head -1)
@@ -6752,14 +6725,7 @@ check_destruction_iocs() {
             if [[ "$_e_path" =~ /cpsess([0-9]{10})/ ]]; then
                 _e_token="${BASH_REMATCH[1]}"
             fi
-            # Pre-compromise gate. Pattern E is post-RCE toolchain, so
-            # only count it as compromise evidence when (1) CRLF anchor
-            # fired (ioc_cve_2026_41940_crlf_access_chain), AND (2) Pattern E
-            # first epoch is within PATTERN_E_2XX_PROXIMITY_SEC of a
-            # successful 2xx_on_cpsess. Otherwise demote to advisory: an
-            # orphan Pattern E is most likely shared-infra coincidence or
-            # pre-disclosure recon. Advisory still surfaces in signals[]
-            # so ss-aggregate.py can discount it from cluster-onset.
+            # Pattern E gate: requires CRLF anchor + 2xx-proximity, else demote to advisory.
             local _gate_sev="strong" _gate_key="ioc_pattern_e_websocket_shell_hits" _gate_weight=10
             local _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
             if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
@@ -7383,8 +7349,7 @@ aggregate_verdict() {
     # multiplier rewards distinct patterns, not key count.
     local -A PERSIST_PATTERNS=()
     local persist_weight_sum=0
-    # v2.7.32: on-disk Pattern A subtype set + cross-pattern compromise letter
-    # set + attempt-class evidence aggregator. See INTERNAL-NOTES.md "v2.7.32".
+    # P1b/P1c/P5 aggregators (CHANGELOG v2.7.32).
     local -A PATTERN_A_SUBTYPES=()
     local -A COMPROMISE_LETTERS=()
     local attempt_evidence_count=0
@@ -7392,13 +7357,12 @@ aggregate_verdict() {
     # excluding E + soft variants) gates Pattern E websocket re-credit.
     local pre_compromise_present=0
     if (( ${#SIGNALS[@]} > 0 )); then
-        local _row _area _id _sev _key _wt _kv _letter
+        local _row _area _id _sev _key _wt _kv
         for _row in "${SIGNALS[@]}"; do
             IFS=$'\t' read -r _area _id _sev _key _wt _kv <<< "$_row"
             [[ "$_sev" == "strong" ]] || continue
             ioc_key_is_soft_variant "$_key" && continue
             if [[ "$_id" =~ ^ioc_pattern_([abcdfghijkl])_ ]]; then
-                _letter="${BASH_REMATCH[1]}"
                 pre_compromise_present=1
                 break
             fi
@@ -7425,14 +7389,12 @@ aggregate_verdict() {
         for row in "${SIGNALS[@]}"; do
             IFS=$'\t' read -r area id sev key weight kv <<< "$row"
             weight="${weight:-0}"
-            # v2.7.32 P3: re-credit Pattern E websocket pre-compromise gate
-            # when on-disk compromise letter is present elsewhere on the host.
+            # P3 Pattern E pre-compromise re-credit when on-disk letter present (CHANGELOG v2.7.32).
             if [[ "$id" == "ioc_pattern_e_websocket" ]] && (( pre_compromise_present )) \
-               && [[ "$weight" == "0" || "$weight" == "" ]]; then
+               && [[ "$weight" == "0" ]]; then
                 sev="strong"; weight=10
             fi
-            # v2.7.32 P4: CRLF chain — warning → evidence with capped per-chain
-            # bonus credited once via _crlf_bonus (the evidence branch reads it).
+            # P4 CRLF chain warning→evidence with capped per-chain bonus (CHANGELOG v2.7.32).
             local _crlf_bonus=0
             if [[ "$id" == "ioc_cve_2026_41940_access_primitive" ]] && [[ "$sev" == "warning" ]]; then
                 local _cnt=0
@@ -7448,8 +7410,7 @@ aggregate_verdict() {
                     _crlf_bonus=2
                 fi
             fi
-            # v2.7.32 P2: quarantine reasons-aware promotion at score-time
-            # (matches emit-site logic; defensive for old-envelope replay).
+            # P2 quarantine reasons-aware promotion (CHANGELOG v2.7.32).
             if [[ "$id" == ioc_quarantined_session_* ]] && [[ "$sev" == "warning" ]] \
                && [[ "$kv" == *'"reasons_ioc":"'* ]]; then
                 local _ri="${kv#*\"reasons_ioc\":\"}"; _ri="${_ri%%\"*}"
@@ -7472,13 +7433,7 @@ aggregate_verdict() {
                 probe_canary_session|probe_artifact_count)
                     ((probe_artifact_count++)) ;;
             esac
-            # Per-section verdict: track worst tag observed per area.
-            # Worst-wins ladder: [IOC] > [VULN] > [WARN] > [ADVISORY] > [OK].
-            # local _tag="" re-initializes on each loop iteration (local is
-            # function-scoped in bash, not loop-scoped; the declaration is
-            # idempotent after the first pass). The per-iteration reset
-            # prevents a high-tier tag from bleeding into the next SIGNALS[]
-            # row when a later row's severity has no tag mapping.
+            # Per-section worst-wins tag: [IOC] > [VULN] > [WARN] > [ADVISORY] > [OK].
             local _tag=""
             case "$sev" in
                 strong)
@@ -7519,7 +7474,6 @@ aggregate_verdict() {
             if [[ "$sev" == "strong" || "$sev" == "warning" || "$sev" == "evidence" || "$sev" == "advisory" ]]; then
                 SECTION_KEYS[$area]="${SECTION_KEYS[$area]:-} $key"
             fi
-            weight="${weight:-0}"
             # Persistence-class accumulation. Tracked at strong/warning
             # severity (info/advisory/evidence excluded — info too low-confidence,
             # advisories explicitly non-verdict-affecting, no persistence-class
@@ -7542,8 +7496,7 @@ aggregate_verdict() {
             esac
             case "$sev" in
                 strong)
-                    # v2.7.32 P1: Pattern A evidence_destruction count escalator.
-                    # Stepped: 10..99→15, 100..999→30, 1k..9999→50, 10k+→80.
+                    # P1 Pattern A evidence_destruction count escalator (CHANGELOG v2.7.32).
                     if [[ "$id" == "ioc_pattern_a_evidence_destruction" ]]; then
                         local _fe_cnt=0
                         if [[ "$kv" == *'"count":"'* ]]; then
@@ -7556,8 +7509,7 @@ aggregate_verdict() {
                         elif (( _fe_cnt >= 10 ));    then weight=15
                         fi
                     fi
-                    # v2.7.32 P1b/P1c: track on-disk Pattern A subtype set +
-                    # cross-pattern compromise letters (excl E + soft variants).
+                    # P1b/P1c subtype + compromise-letter tracking (CHANGELOG v2.7.32).
                     if ! ioc_key_is_soft_variant "$key"; then
                         case "$id" in
                             ioc_pattern_a_sorry|ioc_pattern_a_readme|ioc_pattern_a_evidence_destruction|ioc_pattern_a_c2_live|ioc_pattern_a_encryptor)
@@ -7604,14 +7556,10 @@ aggregate_verdict() {
                     fi
                     ;;
                 evidence)
-                    # v2.7.32 P5: token_attempt + attempt-tier quarantine
-                    # evidence emits are aggregated and capped at +20 total
-                    # via the post-loop attempt_evidence_count contribution.
+                    # P5 attempt-class aggregator (CHANGELOG v2.7.32).
                     if [[ "$id" == ioc_token_attempt_* ]] || [[ "$id" == ioc_quarantined_session_* ]]; then
                         ((attempt_evidence_count++))
                     elif (( _crlf_bonus > 0 )); then
-                        # v2.7.32 P4: CRLF chain credits its capped per-chain
-                        # bonus instead of the flat +2 evidence weight.
                         score=$((score + _crlf_bonus))
                     else
                         score=$((score + 2))
@@ -7677,18 +7625,14 @@ aggregate_verdict() {
         done
     fi
 
-    # v2.7.32 P1b: Pattern A on-disk subtype cluster bonus. Distinct strong-
-    # tier subtypes (sorry/readme/evidence_destruction/c2/binary/encryptor)
-    # rewarded together — multi-vector destruction is the loud signal.
+    # P1b Pattern A on-disk subtype cluster bonus (CHANGELOG v2.7.32).
     local _pa_subs=${#PATTERN_A_SUBTYPES[@]}
     if   (( _pa_subs >= 4 )); then score=$((score + 100))
     elif (( _pa_subs >= 3 )); then score=$((score + 50))
     elif (( _pa_subs >= 2 )); then score=$((score + 25))
     fi
 
-    # v2.7.32 P1c: cross-pattern compromise letter cluster bonus. Distinct
-    # on-disk pattern letters at strong (A/B/C/D/F/G/H/I/J/K/L; excludes E
-    # since Pattern E is recon-shape even at strong tier).
+    # P1c cross-pattern compromise-letter cluster bonus, excludes E (CHANGELOG v2.7.32).
     local _comp_letters=${#COMPROMISE_LETTERS[@]}
     if   (( _comp_letters >= 5 )); then score=$((score + 250))
     elif (( _comp_letters >= 4 )); then score=$((score + 150))
@@ -7696,17 +7640,14 @@ aggregate_verdict() {
     elif (( _comp_letters >= 2 )); then score=$((score + 30))
     fi
 
-    # v2.7.32 P5: aggregate cap on attempt-class evidence. Cap +20 regardless
-    # of count — recon-flood (700+ token_attempts, 200+ A/D2 quarantines) gets
-    # one bounded contribution instead of unbounded +2-per-emit inflation.
+    # P5 attempt-class evidence cap +20 (CHANGELOG v2.7.32).
     if (( attempt_evidence_count > 0 )); then
         local _att=$(( attempt_evidence_count * 2 ))
         (( _att > 20 )) && _att=20
         score=$((score + _att))
     fi
 
-    # v2.7.32 P6: persistence cluster — boosted multipliers (3/5/8 vs prior
-    # 2/3/4). Multi-pattern persistence dominates fleet rank.
+    # P6 persistence cluster multipliers (CHANGELOG v2.7.32).
     local persist_count=${#PERSIST_PATTERNS[@]}
     local persist_mult=1
     (( persist_count >= 2 )) && persist_mult=3
@@ -7716,8 +7657,7 @@ aggregate_verdict() {
         score=$((score + persist_weight_sum * (persist_mult - 1)))
     fi
 
-    # v2.7.32 P7: compromise floor — confirmed-compromise hosts always rank
-    # above recon-only attempt-flood hosts (which cap at <70 via P5).
+    # P7 compromise floor (CHANGELOG v2.7.32).
     local _comp_floor=0
     if (( _pa_subs > 0 )) || (( _comp_letters > 0 )) || (( persist_count >= 1 )); then
         _comp_floor=100
@@ -8260,13 +8200,6 @@ RUN_FORENSIC=0
 if (( REPLAY_MODE )); then
     RUN_FORENSIC=1
 elif (( FULL_MODE )); then
-    # Gate priority (highest first):
-    #   --chain-on-all       run forensic for EVERY host_verdict (overrides
-    #                        --chain-on-critical AND the default CLEAN-skip).
-    #                        Operator's explicit "I want everything" override.
-    #   --chain-on-critical  run forensic only for COMPROMISED.
-    #   (default --full)     run forensic for SUSPICIOUS / COMPROMISED;
-    #                        skip CLEAN (we don't ship empty bundles by default).
     if (( CHAIN_ON_ALL )); then
         emit "summary" "forensic_run" "info" "forensic_chain_on_all" 0 \
              "host_verdict" "$HOST_VERDICT" \
