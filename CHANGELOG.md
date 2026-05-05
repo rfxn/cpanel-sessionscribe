@@ -24,6 +24,178 @@ on MariaDB repos, so disabling them for this transaction has no side
 effects on the install. Hosts whose MariaDB repos are fine see no
 behavior change; broken-repo hosts now succeed.
 
+## sessionscribe-ioc-scan.sh v2.7.32 — 2026-05-05
+
+### Changed (scoring rebalance — destruction/payload/persistence amplified, recon flattened)
+
+Fleet-sim audit on 300 envelopes showed bidirectional rank inversion:
+recon-flood hosts (700+ `ioc_token_attempt`, 200+ attempt-shape
+quarantines) were scoring 1657–1839 while confirmed-destruction hosts
+with 16,141 `.sorry` files were scoring 23–137. Per memory
+`feedback_compromise_confidence` (v3 ladder: A/B/C/D/F/H +
+`token_used_2xx` = COMPROMISED; X-class CRLF / `token_attempt` =
+ATTEMPT) and `feedback_noise_does_not_gate` (quarantined-only floods
+stay CLEAN), the scoring weights were misaligned with the verdict
+ladder. Six rules tighten the alignment:
+
+P1 — Pattern A `evidence_destruction` count escalator (stepped at
+score-time so old envelopes replay correctly):
+
+```
+count<10  + acct_log_only → warning w=5    (existing)
+count 10..99               → strong  w=15
+count 100..999             → strong  w=30
+count 1000..9999           → strong  w=50
+count 10000+               → strong  w=80
+```
+
+A host with 16,141 encrypted forensic files (`a-marketingsolutions`)
+moves from `evidence_destruction` w=10 → w=80. Catastrophic-scale
+destruction now dominates fleet rank.
+
+P1b — Pattern A on-disk subtype cluster bonus. Distinct strong-tier
+subtypes (`sorry`, `readme`, `evidence_destruction`, `c2_live`,
+`binary`, `encryptor`):
+
+```
+≥2 distinct subtypes → +25
+≥3                   → +50
+≥4                   → +100
+```
+
+A multi-vector destruction host (sixcentpress: 1 sorry + 11 readme +
+1 evidence_destruction = 3 subtypes) gains +50 cluster bonus on top
+of P1.
+
+P1c — cross-pattern compromise-letter cluster bonus. Distinct on-disk
+pattern letters at strong tier (A/B/C/D/F/G/H/I/J/K/L; **excludes E**
+since Pattern E is recon-shape even at strong):
+
+```
+≥2 letters → +30
+≥3         → +75
+≥4         → +150
+≥5         → +250
+```
+
+P2 — quarantine reasons-aware promotion (replaces v2.7.20 multi-word-
+only check). The `.info` sidecar's `reasons_ioc` letter codes encode
+session-shape detection class. Promotion is gated on letter class:
+
+```
+E2 OR legacy multi-word strings           → strong w=10
+B / E / F / H                             → strong w=5
+A / C / D / D2 / I / 2 (CRLF residue)     → evidence (capped via P5)
+no reasons / unknown                      → warning (no scoring)
+```
+
+A quarantined session that emit-time would have scored as a live IOC-
+positive session at the same severity. The mitigate-quarantine
+discount (sev=warning regardless of reasons) is removed. Applied at
+both emit-site and score-time so old envelopes replay consistently.
+
+P3 — Pattern E `ioc_pattern_e_websocket` pre-compromise gate dropped
+when on-disk compromise letter (A/B/C/D/F/G/H/I/J/K/L, non-E) is
+present. Re-credits `weight=0` advisory back to strong w=10. Logic:
+when destruction or persistence is confirmed, the same operator's
+pre-disclosure websocket-Shell recon is part of the same incident,
+not unrelated noise.
+
+P4 — CRLF chain `ioc_cve_2026_41940_access_primitive` warning →
+evidence with capped per-chain credit:
+
+```
+score += min(20, count * 2)
+```
+
+26 chains on a-marketingsolutions: +20 (capped). Single-chain hosts:
++2. Confirms CRLF capability without inflating recon-flood ranks.
+
+P5 — aggregate cap on attempt-class evidence. `ioc_token_attempt_*`
++ attempt-tier quarantine evidence are summed and credited at
++min(20, n*2) — regardless of count. Recon flood (700+ token_attempts,
+200+ attempt-shape quarantines) gets ONE bounded contribution
+instead of unbounded +2-per-emit inflation.
+
+P6 — persistence cluster multipliers boosted from 2x/3x/4x to
+3x/5x/8x. Multi-pattern persistence (G + I + J + F + D-reseller +
+H-seobot) dominates fleet rank. Score floor of 25 (existing) preserved.
+
+P7 — compromise floor. Confirmed-compromise hosts always rank above
+recon-only hosts (which cap at <70 via P5):
+
+```
+1 compromise letter OR persist_count≥1: floor 100
+2+ compromise letters OR persist_count≥2: floor 200
+```
+
+### Fleet-sim impact (300-bundle even-stride sample)
+
+Score distribution:
+
+```
+metric        v2.7.31     v2.7.32
+median        56          14
+max           1839        996
+stdev         199         61
+```
+
+Bucket migration (counts):
+
+```
+band         v2.7.31  v2.7.32
+≤0           39       25
+1..25        38       242
+26..50       61       22
+51..100      77       9
+101..250     58       3
+251..500     22       2
+501..1000    7        1
+1001+        3        0
+```
+
+Verdict migration matrix (no host moves COMPROMISED → CLEAN; 204
+recon-only hosts move SUSPICIOUS → CLEAN per
+`feedback_noise_does_not_gate`):
+
+```
+                v32_CLEAN  v32_SUSPICIOUS  v32_COMPROMISED
+v31_CLEAN        29        0               0
+v31_SUSPICIOUS   204       62              0
+v31_COMPROMISED  0         0               5
+```
+
+Concrete envelope projections under v2.7.32:
+
+```
+host                          v31  v32   verdict     letters  notes
+sixcentpress                  137  1238  COMPROMISED A        1 sorry + 11 readme + 337 .sorry + 73 high-conf q
+storm.host.hippiedeathcult    25   966   COMPROMISED DE       Pattern D + persist=D + 32 CRLF + 65 q
+mylineage                     194  255   COMPROMISED A        Pattern A + 2527 .sorry, 0 q
+a-marketingsolutions          23   164   COMPROMISED A        Pattern A + 16141 .sorry, 21 attempt-q
+storm.host2.agprobookit       144  225   COMPROMISED CDEF     multi-letter + persistence DF + 7 CRLF
+elliottpowerserver            243  100   COMPROMISED J        single Pattern J persistence
+alabamagamblinglaws           1839 39    SUSPICIOUS  -        recon-flood (200 attempt-q + 915 token_att)
+dus100.ragesw                 1657 29    CLEAN       -        recon-flood (200 attempt-q + 824 token_att)
+```
+
+Per-host floor of 100 for any on-disk compromise letter ensures
+single-pattern persistence (elliottpowerserver: J only) ranks above
+recon-flood ceiling of <70.
+
+### Notes
+
+- Verdict gate (`compromise_critical > 0 OR persist_count >= 1`) is
+  unchanged. v2.7.32 affects scoring weights and quarantine emit
+  severity only.
+- P1 / P2 are applied at score-time (not just emit-time) so old
+  v2.7.x envelopes can be re-scored under v2.7.32 logic without
+  re-running the live host. P2 is also applied at emit-site for
+  fresh envelope correctness.
+- Pre-existing test suite (`tests/run-verdict-tests.sh`) baseline:
+  79 passed, 54 failed (all 54 failures are v3.0.0 PATTERNS_v6
+  tests on `patterns-v6-adapt` branch; not regressions).
+
 ## sessionscribe-ioc-scan.sh v2.7.31 — 2026-05-05
 
 ### Changed (Pattern J — heuristic shape-scanning replaced by dossier-only)

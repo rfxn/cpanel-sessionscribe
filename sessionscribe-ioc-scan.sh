@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.31
+# sessionscribe-ioc-scan.sh v2.7.32
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.31"
+VERSION="2.7.32"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -5416,11 +5416,17 @@ check_quarantined_sessions() {
             sname=$(basename -- "$f")
             _key="ioc_quarantined_session_${sname}"
 
-            # High-confidence reasons → strong; see INTERNAL-NOTES.md "v2.7.20".
+            # Reasons-aware tier — see INTERNAL-NOTES.md "v2.7.32".
             local _q_sev=warning _q_wt=4
-            if (( _has_sidecar )) && [[ -n "$q_reasons" ]] \
-                && [[ "$q_reasons" =~ (cve_2026_41940_combo|hasroot_in_session|injected_token_used_with_2xx|token_denied_with_badpass_origin) ]]; then
-                _q_sev=strong; _q_wt=10
+            if (( _has_sidecar )) && [[ -n "$q_reasons" ]]; then
+                if [[ "$q_reasons" =~ (cve_2026_41940_combo|hasroot_in_session|injected_token_used_with_2xx|token_denied_with_badpass_origin) ]] \
+                   || [[ "$q_reasons" =~ (^|,)E2(,|$) ]]; then
+                    _q_sev=strong; _q_wt=10
+                elif [[ "$q_reasons" =~ (^|,)(B|E|F|H)(,|$) ]]; then
+                    _q_sev=strong; _q_wt=5
+                elif [[ "$q_reasons" =~ (^|,)(A|C|D|D2|I|2)(,|$) ]]; then
+                    _q_sev=evidence; _q_wt=0
+                fi
             fi
 
             emit "sessions" "$_key" "$_q_sev" \
@@ -5863,6 +5869,9 @@ check_destruction_iocs() {
         if (( fe_count < 10 && fe_acct == 1 )); then
             fe_sev="warning"; fe_weight=5
         fi
+        # v2.7.32 P1: count escalator applied at score-time (aggregate_verdict)
+        # so old envelopes replayed under v2.7.32 score correctly. fe_weight=10
+        # base is the unmutated emit weight; the score function reads count.
         [[ -n "$fe_sample" ]] && fe_mtime=$(stat -c %Y "$fe_sample" 2>/dev/null)
         emit "destruction" "ioc_pattern_a_evidence_destruction" "$fe_sev" \
              "ioc_pattern_a_evidence_targeted" "$fe_weight" \
@@ -7367,24 +7376,36 @@ check_localhost_probe() {
 aggregate_verdict() {
     local score=0 strong_count=0 fixed_count=0 inconclusive_count=0
     local ioc_critical=0 ioc_review=0 advisory_count=0 probe_artifact_count=0
-    # compromise_critical = strong-tier ioc_* signals that are post-attack
-    # residue (destruction/persistence/token_used). Drives the COMPROMISED
-    # gate independently of ioc_critical so attempt-class strong signals
-    # (Pattern E entry, X CRLF chain) on their own land at SUSPICIOUS.
     local compromise_critical=0
-    # Version-string authority flags. Set when check_version emits one of the
-    # build-comparison signals - these are the single load-bearing signal for
-    # patch-state determination because the binary fingerprint can't
-    # discriminate vuln from patched on 134+ tier.
     local version_says_vuln=0 version_says_patched=0
     local row area id sev key weight kv
     # Persistence cluster tracking. Dedupes by pattern letter (G/J/I/F/D/H);
     # multiplier rewards distinct patterns, not key count.
     local -A PERSIST_PATTERNS=()
     local persist_weight_sum=0
+    # v2.7.32: on-disk Pattern A subtype set + cross-pattern compromise letter
+    # set + attempt-class evidence aggregator. See INTERNAL-NOTES.md "v2.7.32".
+    local -A PATTERN_A_SUBTYPES=()
+    local -A COMPROMISE_LETTERS=()
+    local attempt_evidence_count=0
+    # P3 pre-pass: any strong-tier on-disk compromise letter (A/B/C/D/F/G/H/I/J/K/L,
+    # excluding E + soft variants) gates Pattern E websocket re-credit.
+    local pre_compromise_present=0
+    if (( ${#SIGNALS[@]} > 0 )); then
+        local _row _area _id _sev _key _wt _kv _letter
+        for _row in "${SIGNALS[@]}"; do
+            IFS=$'\t' read -r _area _id _sev _key _wt _kv <<< "$_row"
+            [[ "$_sev" == "strong" ]] || continue
+            ioc_key_is_soft_variant "$_key" && continue
+            if [[ "$_id" =~ ^ioc_pattern_([abcdfghijkl])_ ]]; then
+                _letter="${BASH_REMATCH[1]}"
+                pre_compromise_present=1
+                break
+            fi
+        done
+    fi
     # Per-session score dedup. Live and quarantined emits credit ONE base
     # contribution per session_id; reason count drives the confidence tier.
-    # See INTERNAL-NOTES.md "v2.7.30" for the cross-state dedup rationale.
     local -A SESSION_REASONS=()
     # Reset (don't redeclare) - the arrays are top-level globals; using
     # `declare -ga` here would require bash 4.2. Reassigning to () clears
@@ -7403,6 +7424,44 @@ aggregate_verdict() {
     if (( ${#SIGNALS[@]} > 0 )); then
         for row in "${SIGNALS[@]}"; do
             IFS=$'\t' read -r area id sev key weight kv <<< "$row"
+            weight="${weight:-0}"
+            # v2.7.32 P3: re-credit Pattern E websocket pre-compromise gate
+            # when on-disk compromise letter is present elsewhere on the host.
+            if [[ "$id" == "ioc_pattern_e_websocket" ]] && (( pre_compromise_present )) \
+               && [[ "$weight" == "0" || "$weight" == "" ]]; then
+                sev="strong"; weight=10
+            fi
+            # v2.7.32 P4: CRLF chain — warning → evidence with capped per-chain
+            # bonus credited once via _crlf_bonus (the evidence branch reads it).
+            local _crlf_bonus=0
+            if [[ "$id" == "ioc_cve_2026_41940_access_primitive" ]] && [[ "$sev" == "warning" ]]; then
+                local _cnt=0
+                if [[ "$kv" == *'"count":"'* ]]; then
+                    _cnt="${kv#*\"count\":\"}"; _cnt="${_cnt%%\"*}"
+                fi
+                [[ "$_cnt" =~ ^[0-9]+$ ]] || _cnt=0
+                sev="evidence"
+                if (( _cnt > 0 )); then
+                    _crlf_bonus=$(( _cnt * 2 ))
+                    (( _crlf_bonus > 20 )) && _crlf_bonus=20
+                else
+                    _crlf_bonus=2
+                fi
+            fi
+            # v2.7.32 P2: quarantine reasons-aware promotion at score-time
+            # (matches emit-site logic; defensive for old-envelope replay).
+            if [[ "$id" == ioc_quarantined_session_* ]] && [[ "$sev" == "warning" ]] \
+               && [[ "$kv" == *'"reasons_ioc":"'* ]]; then
+                local _ri="${kv#*\"reasons_ioc\":\"}"; _ri="${_ri%%\"*}"
+                if [[ "$_ri" =~ (cve_2026_41940_combo|hasroot_in_session|injected_token_used_with_2xx|token_denied_with_badpass_origin) ]] \
+                   || [[ "$_ri" =~ (^|,)E2(,|$) ]]; then
+                    sev="strong"; weight=10
+                elif [[ "$_ri" =~ (^|,)(B|E|F|H)(,|$) ]]; then
+                    sev="strong"; weight=5
+                elif [[ "$_ri" =~ (^|,)(A|C|D|D2|I|2)(,|$) ]]; then
+                    sev="evidence"; weight=0
+                fi
+            fi
             # Authoritative version-string check - record presence regardless of
             # severity. These keys come from check_version's tier_class emit.
             case "$key" in
@@ -7483,6 +7542,32 @@ aggregate_verdict() {
             esac
             case "$sev" in
                 strong)
+                    # v2.7.32 P1: Pattern A evidence_destruction count escalator.
+                    # Stepped: 10..99→15, 100..999→30, 1k..9999→50, 10k+→80.
+                    if [[ "$id" == "ioc_pattern_a_evidence_destruction" ]]; then
+                        local _fe_cnt=0
+                        if [[ "$kv" == *'"count":"'* ]]; then
+                            _fe_cnt="${kv#*\"count\":\"}"; _fe_cnt="${_fe_cnt%%\"*}"
+                        fi
+                        [[ "$_fe_cnt" =~ ^[0-9]+$ ]] || _fe_cnt=0
+                        if   (( _fe_cnt >= 10000 )); then weight=80
+                        elif (( _fe_cnt >= 1000 ));  then weight=50
+                        elif (( _fe_cnt >= 100 ));   then weight=30
+                        elif (( _fe_cnt >= 10 ));    then weight=15
+                        fi
+                    fi
+                    # v2.7.32 P1b/P1c: track on-disk Pattern A subtype set +
+                    # cross-pattern compromise letters (excl E + soft variants).
+                    if ! ioc_key_is_soft_variant "$key"; then
+                        case "$id" in
+                            ioc_pattern_a_sorry|ioc_pattern_a_readme|ioc_pattern_a_evidence_destruction|ioc_pattern_a_c2_live|ioc_pattern_a_encryptor)
+                                PATTERN_A_SUBTYPES["${id#ioc_pattern_a_}"]=1
+                                ;;
+                        esac
+                        if [[ "$id" =~ ^ioc_pattern_([abcdfghijkl])_ ]]; then
+                            COMPROMISE_LETTERS["${BASH_REMATCH[1]}"]=1
+                        fi
+                    fi
                     # Per-session score dedup. First strong emit per session_id
                     # credits base score; subsequent emits bump reason count
                     # only. Quarantined emit's reasons_ioc kv (one-shot) sets
@@ -7519,7 +7604,18 @@ aggregate_verdict() {
                     fi
                     ;;
                 evidence)
-                    score=$((score + 2))
+                    # v2.7.32 P5: token_attempt + attempt-tier quarantine
+                    # evidence emits are aggregated and capped at +20 total
+                    # via the post-loop attempt_evidence_count contribution.
+                    if [[ "$id" == ioc_token_attempt_* ]] || [[ "$id" == ioc_quarantined_session_* ]]; then
+                        ((attempt_evidence_count++))
+                    elif (( _crlf_bonus > 0 )); then
+                        # v2.7.32 P4: CRLF chain credits its capped per-chain
+                        # bonus instead of the flat +2 evidence weight.
+                        score=$((score + _crlf_bonus))
+                    else
+                        score=$((score + 2))
+                    fi
                     REASONS+=("$key")
                     ;;
                 warning)
@@ -7581,20 +7677,55 @@ aggregate_verdict() {
         done
     fi
 
-    # Persistence cluster scoring. Distinct persistence patterns multiply
-    # their weight contribution to score — multi-pattern persistence is the
-    # loud signal we want to surface above single-pattern hosts in fleet
-    # ranking. Floor at 25 ensures any persistence (even a single warn-tier
-    # signal) ranks above a score=0 clean host in CSV/JSON aggregation.
+    # v2.7.32 P1b: Pattern A on-disk subtype cluster bonus. Distinct strong-
+    # tier subtypes (sorry/readme/evidence_destruction/c2/binary/encryptor)
+    # rewarded together — multi-vector destruction is the loud signal.
+    local _pa_subs=${#PATTERN_A_SUBTYPES[@]}
+    if   (( _pa_subs >= 4 )); then score=$((score + 100))
+    elif (( _pa_subs >= 3 )); then score=$((score + 50))
+    elif (( _pa_subs >= 2 )); then score=$((score + 25))
+    fi
+
+    # v2.7.32 P1c: cross-pattern compromise letter cluster bonus. Distinct
+    # on-disk pattern letters at strong (A/B/C/D/F/G/H/I/J/K/L; excludes E
+    # since Pattern E is recon-shape even at strong tier).
+    local _comp_letters=${#COMPROMISE_LETTERS[@]}
+    if   (( _comp_letters >= 5 )); then score=$((score + 250))
+    elif (( _comp_letters >= 4 )); then score=$((score + 150))
+    elif (( _comp_letters >= 3 )); then score=$((score + 75))
+    elif (( _comp_letters >= 2 )); then score=$((score + 30))
+    fi
+
+    # v2.7.32 P5: aggregate cap on attempt-class evidence. Cap +20 regardless
+    # of count — recon-flood (700+ token_attempts, 200+ A/D2 quarantines) gets
+    # one bounded contribution instead of unbounded +2-per-emit inflation.
+    if (( attempt_evidence_count > 0 )); then
+        local _att=$(( attempt_evidence_count * 2 ))
+        (( _att > 20 )) && _att=20
+        score=$((score + _att))
+    fi
+
+    # v2.7.32 P6: persistence cluster — boosted multipliers (3/5/8 vs prior
+    # 2/3/4). Multi-pattern persistence dominates fleet rank.
     local persist_count=${#PERSIST_PATTERNS[@]}
     local persist_mult=1
-    (( persist_count >= 2 )) && persist_mult=2
-    (( persist_count >= 3 )) && persist_mult=3
-    (( persist_count >= 4 )) && persist_mult=4
+    (( persist_count >= 2 )) && persist_mult=3
+    (( persist_count >= 3 )) && persist_mult=5
+    (( persist_count >= 4 )) && persist_mult=8
     if (( persist_count >= 1 )); then
         score=$((score + persist_weight_sum * (persist_mult - 1)))
-        (( score < 25 )) && score=25
     fi
+
+    # v2.7.32 P7: compromise floor — confirmed-compromise hosts always rank
+    # above recon-only attempt-flood hosts (which cap at <70 via P5).
+    local _comp_floor=0
+    if (( _pa_subs > 0 )) || (( _comp_letters > 0 )) || (( persist_count >= 1 )); then
+        _comp_floor=100
+    fi
+    if (( persist_count >= 2 )) || (( _comp_letters >= 2 )); then
+        _comp_floor=200
+    fi
+    (( score < _comp_floor )) && score=$_comp_floor
 
     SCORE="$score"
     STRONG_COUNT="$strong_count"
