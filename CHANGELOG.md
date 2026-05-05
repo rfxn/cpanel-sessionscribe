@@ -24,6 +24,37 @@ on MariaDB repos, so disabling them for this transaction has no side
 effects on the install. Hosts whose MariaDB repos are fine see no
 behavior change; broken-repo hosts now succeed.
 
+## sessionscribe-ioc-scan.sh v2.7.29 — 2026-05-04
+
+### Changed (comment slop pruning — no behavior changes)
+
+Per project commenting discipline (default no comment, one short line max,
+multi-paragraph why → INTERNAL-NOTES.md / CHANGELOG). Sentinel review of
+v2.7.27 flagged multiple multi-paragraph blocks as slop. Compressed:
+
+- **Section dividers**: telemetry-cron management (27→4 lines), telemetry
+  POST (32→4), CSF posture (30→6), Pattern C nuclear.x86 (15→6).
+- **Constants block headers**: telemetry mode description (14→4),
+  telemetry-cron action description (9→3), UNPATCHED_TIERS rationale (8→2),
+  destruction-stage IOCs section (8→4), Pattern J description (11→5).
+- **Function-internal comments**: collect_host_meta description (11→3),
+  mitigate-quarantine secondary read (12→4), bash /dev/tcp safety
+  (16→4 — kept the injection-prevention WHY), install(1) 0600 mode
+  rationale (11→3), cron-line constants validation (8→3), ransom README
+  shape filter (11→3), aggregate_verdict host-state axis (12→5).
+- **Type/kind taxonomy**: STATIC_KINDS bug-vs-marker rationale (16→5),
+  _classify_history_match function header (12→7).
+
+Net: -189 lines of source comments. Institutional knowledge migrated to
+INTERNAL-NOTES.md (already had v2.7.13/v2.7.16/v2.7.17/v2.7.20/v2.7.21
+entries; references now point there).
+
+### Verification
+
+- 70/70 verdict tests pass.
+- 6/6 session-IOC tests pass.
+- bash -n syntax-clean.
+
 ## sessionscribe-ioc-scan.sh v2.7.28 — 2026-05-04
 
 ### Fixed (FP — shipped in v2.7.27, corrected here)

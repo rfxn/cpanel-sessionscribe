@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.28
+# sessionscribe-ioc-scan.sh v2.7.29
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.28"
+VERSION="2.7.29"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -121,14 +121,8 @@ VERSION="2.7.28"
 PATCHED_TIERS_KEYS=(86 110 118 124 126 130 132 134 136)
 PATCHED_TIERS_VALS=(41 97  63  35  54  19  29  20  5)
 
-# Tiers explicitly excluded from the vendor patch list. In-place patch
-# unavailable; hosts must be upgraded to a patched tier. Tier 124 was
-# in this list pre-advisory but was given an in-place patch (.35), so
-# is now moved into PATCHED_TIERS_KEYS above.
-# Maintained as an array (UNPATCHED_TIERS) so adding/removing tiers stays a
-# one-token edit; the derived UNPATCHED_TIERS_STR is what both call sites
-# (phase_defense and check_version) actually consume via the same substring-
-# match idiom (` $UNPATCHED_TIERS_STR ` == *" $tier "*).
+# Tiers with no in-place vendor patch — hosts must upgrade. Both call sites
+# (phase_defense, check_version) match via ` $UNPATCHED_TIERS_STR ` == *" $tier "*.
 UNPATCHED_TIERS=(112 114 116 120 122 128)
 UNPATCHED_TIERS_STR="${UNPATCHED_TIERS[*]}"
 
@@ -175,13 +169,9 @@ SESSION_MTIME_CTIME_THRESHOLD_SEC=600
 PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 
 ###############################################################################
-# Destruction-stage IOCs (Patterns A-I). Cheap host-state probes - bounded
-# stat / hash / grep checks suitable for fleet triage. The heavyweight
-# kill-chain reconstruction now runs inline under --full / --replay (same
-# script); this set just answers "does this host carry visible compromise
-# residue?"
-#
-# Last updated from incident dossier: 2026-05-01.
+# Destruction-stage IOCs (Patterns A-I). Bounded stat/hash/grep host-state
+# probes suitable for fleet triage. Full kill-chain reconstruction runs
+# inline under --full / --replay. Source: IC-5790 dossier (2026-05-01).
 ###############################################################################
 
 # Pattern A - .sorry encryptor + qTox ransom note. Masquerades as /root/sshd.
@@ -245,17 +235,11 @@ PATTERN_I_PROFILED="/etc/profile.d/system_profiled_service.sh"
 PATTERN_I_BINARY="/root/.local/bin/system-service"
 PATTERN_I_PROCNAME="system-service"
 
-# Pattern J - persistence via Linux init facilities (udev rule + systemd
-# unit). Shape-based detection (filenames vary per host); both observed
-# attacker shapes pull a payload binary. Two sub-detectors:
-#   J1: udev rule with `RUN+=...sh -c '...'` body that backgrounds via
-#       `at now` (the dossier-observed shape). Strong tier requires the
-#       pipe-to-`at now` form; nohup/setsid/disown demote to warning.
-#   J2: systemd unit with ExecStart pointing OUTSIDE legit binary roots
-#       (allowlist below) + unit not RPM-owned + Description shadows
-#       a known systemd/cPanel service name. /usr/share/<x>/<y> ExecStart
-#       is the strongest discriminator: legit systemd units never live in
-#       /usr/share/ per FHS (data, not executables).
+# Pattern J - persistence via Linux init facilities (udev + systemd).
+#   J1: udev rule with `RUN+=...sh -c | at now`. Strong; nohup/setsid demote.
+#   J2: systemd unit with ExecStart outside legit binary roots, not
+#       RPM-owned, Description shadows a known service. /usr/share/<x>
+#       ExecStart is the strongest discriminator (FHS: data, not exec).
 PATTERN_J_UDEV_DIRS=(/etc/udev/rules.d /run/udev/rules.d)
 PATTERN_J_SYSTEMD_UNIT_DIRS=(/etc/systemd/system)
 # ExecStart-allowed binary roots. Legit cPanel/LSWS/Plesk extras included
@@ -486,20 +470,10 @@ DO_UPLOAD=0
 INTAKE_URL="$INTAKE_DEFAULT_URL"
 INTAKE_TOKEN=""
 
-# Telemetry mode — lite bundle (no heavy tarballs) + optional envelope POST.
-# Designed for high-frequency fleet polling: ~50-100 KB on-disk per host vs
-# ~50 MB for full bundles. Lite bundle keeps envelope.json + kill-chain.{tsv,
-# jsonl,md} + manifest.txt + KB-scale forensic snapshots (ps/connections/
-# iptables + Pattern A/H/I attacker-binary metadata). Skips heavy tarballs
-# (sessions, access-logs, system-logs, cpanel-state, cpanel-users,
-# persistence, defense-state) and per-user bash histories.
-#
-# Transport ladder for --telemetry-url POST: curl > wget > bash native.
-# bash native uses /dev/tcp for HTTP and openssl s_client for HTTPS;
-# bash on RHEL/CL6+ is built --enable-net-redirections so the /dev/tcp
-# pseudo-path works without any external HTTP client. openssl is
-# universally present on cPanel hosts (cpsrvd uses libssl), so HTTPS
-# stays covered even on minimal installs that strip curl/wget.
+# Telemetry mode — lite bundle (envelope + kill-chain + KB-scale snapshots
+# only; no sessions/access-logs/persistence tarballs). ~50-100 KB per host.
+# Optional envelope POST via --telemetry-url; transport ladder curl > wget >
+# bash /dev/tcp + openssl. See INTERNAL-NOTES.md "v2.7.16/v2.7.17".
 TELEMETRY_MODE=0
 TELEMETRY_URL=""
 TELEMETRY_TOKEN=""
@@ -510,15 +484,9 @@ TELEMETRY_RETRY=2
 # KB; the cap is a defense-in-depth ceiling against pathological cases.
 TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 
-# --telemetry-cron <add|remove> [1h|2h|6h|12h|24h]: install or remove a system
-# cron entry under /etc/cron.d/ that runs the telemetry path on a fixed
-# interval (default 6h). The generated cron self-fetches the script with a
-# canonical→fallback source order at each tick (GitHub raw primary, rfxn
-# CDN fallback), atomically installs it to a stable path, runs syntax
-# validation (bash -n) before exec, then runs the scan under timeout 300.
-# This makes the cron entry portable (curl-pipe install needs no on-disk
-# script) and keeps fleet hosts on the latest released version with no
-# operator-side push. Splay 5-300s spreads fleet load across the minute mark.
+# --telemetry-cron <add|remove> [1h|2h|6h|12h|24h]: manages /etc/cron.d/
+# entry. Cron line self-fetches latest script (GitHub raw → sh.rfxn.com
+# fallback) every tick. See INTERNAL-NOTES.md "v2.7.16/v2.7.17".
 TELEMETRY_CRON_ACTION=""
 TELEMETRY_CRON_INTERVAL="6h"
 TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
@@ -750,31 +718,10 @@ EOF
 }
 
 ###############################################################################
-# Telemetry cron management — install / remove /etc/cron.d/<name> entry that
-# runs the telemetry path on a fixed interval (1h/2h/6h/12h/24h). Generated
-# cron is self-bootstrapping: each tick curl-fetches the latest script —
-# canonical source is GitHub raw (raw.githubusercontent.com/rfxn/cpanel-
-# sessionscribe), fallback is the rfxn CDN (sh.rfxn.com) — atomic-installs
-# to /usr/local/bin/ after a size guard + `bash -n` syntax check, then
-# runs under `timeout 300`. Splay 5-300s spreads fleet load. Curl-pipe
-# install works (no on-disk script required at --telemetry-cron add time)
-# since the cron line embeds the source URLs, not $0.
-#
-# Cron file format chosen: /etc/cron.d/<name>. Reasons:
-#   - System cron (works under cronie / vixie-cron / EL9 systemd-cron-shim);
-#     no per-user crontab dependency
-#   - SHELL=/bin/bash declared in-file so $((RANDOM % N)) works at run time
-#     (cron's default /bin/sh on Debian-derivatives is dash, no $RANDOM)
-#   - Easy to inspect / disable (cat / rm); no `crontab -l | { …; } | crontab`
-#     race window when re-running 'add'
-#   - install(1) preserves perms; restorecon(1) best-effort fixes SELinux
-#     context if the binary is present (cPanel hosts typically permissive
-#     selinux but the call is harmless either way)
-#
-# Defined here (early in the script, immediately after usage()) so the
-# dispatch site at the end of arg parsing can call it before any scan-mode
-# validation runs. Cron management is its own operational mode and exits
-# cleanly without attempting detection.
+# Telemetry cron management — install/remove /etc/cron.d/<name> entry. Cron
+# line self-fetches the latest script (GitHub canonical → sh.rfxn.com
+# fallback), atomic-installs after size+syntax check, runs under timeout 300.
+# See INTERNAL-NOTES.md "v2.7.16/v2.7.17/v2.7.18" for design rationale.
 ###############################################################################
 
 manage_telemetry_cron() {
@@ -806,15 +753,9 @@ manage_telemetry_cron() {
         exit 2
     fi
 
-    # The cron line is self-bootstrapping: it embeds source URL constants
-    # (GitHub canonical + CDN fallback) and the install path constant, not
-    # $0. So `--telemetry-cron add` works correctly when invoked via
-    # curl-pipe (where $0 is bash, not a real script path) — the cron entry
-    # is generated and installed regardless of how this script was launched.
-    # Validate that none of the embedded constants contain single-quotes
-    # (we single-quote all of them inside the heredoc; an embedded quote
-    # would close the outer quoting). Also validate the install path's
-    # parent exists so the per-tick mktemp doesn't fail on missing dir.
+    # The embedded cron-line constants are single-quoted in the heredoc;
+    # a single-quote in the value would close the outer quoting. Validate
+    # before install. Also confirm install path's parent exists.
     local _const _const_name
     for _const_name in TELEMETRY_CRON_GITHUB_URL TELEMETRY_CRON_CDN_URL TELEMETRY_CRON_INSTALL_PATH; do
         eval "_const=\${$_const_name}"
@@ -916,17 +857,9 @@ CRONEOF
         exit 2
     fi
 
-    # install(1) atomically replaces the target with correct perms/owner.
-    # Mode 0600 (root-only) instead of the cron.d-standard 0644 because the
-    # generated cron line embeds --upload-token values verbatim — leaving
-    # the file world-readable would expose the intake credential to any
-    # local user via `cat /etc/cron.d/sessionscribe-telemetry`. cronie /
-    # vixie-cron read /etc/cron.d/* as root and don't require world-
-    # readability; verified locally that 0600 entries are picked up
-    # normally with no journal rejection. We use 0600 unconditionally
-    # (even without an embedded token) for consistency — the file's
-    # contents aren't otherwise sensitive but mode-uniformity makes
-    # operator audit trivial.
+    # 0600 not the cron.d-standard 0644: cron line embeds --upload-token
+    # verbatim; world-readable would leak the intake credential. cronie
+    # reads /etc/cron.d/* as root, no readability requirement.
     if ! install -m 0600 -o root -g root "$tmp" "$TELEMETRY_CRON_FILE" 2>/dev/null; then
         rm -f "$tmp"
         echo "Error: install failed (cannot write $TELEMETRY_CRON_FILE)" >&2
@@ -1205,19 +1138,9 @@ EXIT_CODE=0
 LOGS_CRLF_CHAIN_FIRST_EPOCH=0
 LOGS_2XX_CPSESS_FIRST_EPOCH=0
 
-# Host-meta globals consumed by phase_defense (CPANEL_NORM patch matching),
-# print_verdict (host/cpanel/os summary), phase_bundle (manifest.txt), and
-# write_kill_chain_primitives (meta record). Values are assigned by
-# collect_host_meta() in the main flow; declared empty here so any reference
-# before that assignment yields "" instead of "unbound" under set -u.
-# Earlier revisions documented these as `set by banner()` but banner() only
-# printed - manifest/meta fields rendered empty in every bundle until the
-# host-meta phase was added.
-#
-# LP_UID is the exception: declared with `:=` so an inherited environment
-# variable (`LP_UID=nx-prod-12 ./sessionscribe-ioc-scan ...`) survives this
-# initialization. A plain `LP_UID=""` would clobber the env-var before any
-# function had a chance to read it.
+# Host-meta globals; assigned by collect_host_meta(). Declared empty here
+# so pre-assignment references don't trip set -u. LP_UID uses `:=` to
+# preserve an inherited env-var (`LP_UID=nx-prod-12 ./script ...`).
 PATCHED_BUILDS_CPANEL=()   # populated from PATCHED_TIERS_KEYS/VALS just below
 for _i in "${!PATCHED_TIERS_KEYS[@]}"; do
     PATCHED_BUILDS_CPANEL+=("11.${PATCHED_TIERS_KEYS[$_i]}.0.${PATCHED_TIERS_VALS[$_i]}")
@@ -1356,17 +1279,9 @@ banner() {
     fi
 }
 
-# Populate host-meta globals (CPANEL_NORM / PRIMARY_IP / OS_PRETTY / LP_UID
-# and their *_J twins) read by phase_defense, print_verdict, phase_bundle's
-# manifest, and write_json's meta record. Called once from the main flow
-# after local_init() (so $CPANEL_ROOT is set) and before any phase that
-# consumes these globals or any envelope/manifest write.
-#
-# Resolution order for CPANEL_NORM mirrors check_version() so both yield
-# the same value from the same source. LP_UID has no canonical filesystem
-# source today; honor an `LP_UID` env-var override at fleet dispatch and
-# default to empty (envelope/manifest field stays empty when not applicable,
-# but is now operator-configurable, not silently never-assigned).
+# Populate host-meta globals (CPANEL_NORM/PRIMARY_IP/OS_PRETTY/LP_UID + *_J
+# JSON-escaped twins). CPANEL_NORM resolution mirrors check_version() so
+# both yield the same value. LP_UID accepts an env-var override.
 collect_host_meta() {
     # OS_PRETTY: /etc/os-release preferred; /etc/redhat-release fallback for
     # EL6 hosts that predate os-release. Read with a data-only key=value
@@ -3978,36 +3893,10 @@ phase_upload() {
 }
 
 ###############################################################################
-# Telemetry POST — ships envelope JSON to a fleet collector.
-#
-# Distinct from phase_upload (which PUTs the outer tarball to intake): this
-# only sends the envelope.json (KB-scale), gated on --telemetry-url. Designed
-# for high-frequency fleet polling where you want every host's signals[]
-# stream into a central database without the per-host tarball overhead.
-#
-# Transport ladder (best-first):
-#   1. curl   — preferred; --data-binary @file avoids ARG_MAX, -w embeds
-#               http_code in stdout, --max-time per attempt
-#   2. wget   — --post-file=, --server-response captures HTTP/x.x line for
-#               status extraction; --tries=1 because we manage retry here
-#   3. bash   — bash-native fallback. /dev/tcp socket for HTTP; openssl
-#               s_client wraps the same request payload for HTTPS. No
-#               external HTTP client required — relies only on bash
-#               (built --enable-net-redirections, the RHEL/CL6+ default)
-#               and openssl (universally present on cPanel hosts; cpsrvd
-#               itself uses it). The whole transaction is wrapped in
-#               `timeout` so a hung connect or stalled read can't outlive
-#               TELEMETRY_TIMEOUT.
-#
-# Retry: up to (1 + TELEMETRY_RETRY) attempts with exponential backoff
-# (2^attempt seconds: 2, 4, 8, ...). Each attempt has its own timeout via
-# TELEMETRY_TIMEOUT — the cumulative wall is bounded but generous enough
-# that a slow link doesn't fail spuriously.
-#
-# Failure mode: emits a warning signal (`telemetry_post_failed`) but does
-# NOT change EXIT_CODE — telemetry shipping is operationally reportable
-# but should not fail the scan; the lite bundle on disk is the durable
-# artifact.
+# Telemetry POST — ships envelope JSON to a fleet collector. Distinct from
+# phase_upload (tarball PUT to intake); ships envelope.json only (KB-scale).
+# Transport ladder: curl > wget > bash /dev/tcp + openssl. Retry with expo
+# backoff (2^N s); failure emits warning but never changes EXIT_CODE.
 ###############################################################################
 
 phase_telemetry_post() {
@@ -4243,22 +4132,10 @@ phase_telemetry_post() {
                         > "$_resp_file" 2>/dev/null
                     rc=$?
                 else
-                    # Plain HTTP via bash /dev/tcp. We spawn a child bash
-                    # with `timeout` wrapping it — this gives us a bound
-                    # on both connect-time AND read-time without bash
-                    # builtin gymnastics. The child opens FD 9 (avoiding
-                    # 3-collision with our own redirection space if any),
-                    # writes the request, then `cat <&9` reads everything
-                    # the server sends until close.
-                    #
-                    # SAFETY: pass _host/_port/_req_file via the env, NOT
-                    # via shell-string interpolation. URL host/port come
-                    # from the operator's --telemetry-url; if the value
-                    # contained a single-quote (e.g. "x';rm -rf /'") the
-                    # interpolated form ('...'"$_host"'...') would break
-                    # quote nesting and execute the injected command in
-                    # the child shell. Env passthrough makes the values
-                    # data, not code.
+                    # SAFETY: pass _host/_port/_req_file via env (not shell
+                    # interpolation) — operator-supplied URL host could
+                    # contain a single-quote that breaks quote nesting and
+                    # injects a command into the child shell.
                     _SS_H="$_host" _SS_P="$_port" _SS_R="$_req_file" \
                     timeout "$TELEMETRY_TIMEOUT" bash -c '
                         exec 9<>/dev/tcp/"$_SS_H"/"$_SS_P" || exit 1
@@ -4476,22 +4353,11 @@ STATIC_FIXED_PATS=(
     'comet_backup_license_verification'
     'tr/[^/]*\\r[^/]*\\n[^/]*//[a-z]*|tr/[^/]*\\n[^/]*\\r[^/]*//[a-z]*|s/\[[^]]*\\[rn][^]]*\]//[a-z]*|s/\\r/[^/]*/[a-z]*[[:space:]]*[;}].*s/\\n/[^/]*/[a-z]*'
 )
-# Pattern kind: 'bug' = a real ancillary bug surfaced as advisory when unpatched
-#               'marker' = build-line patch marker, informational only.
-# None of these patterns are the load-bearing fix itself - that lives in the
-# patched cpsrvd binary's compiled logic. The cve_41940_set_pass_crlf_strip
-# marker IS the CVE-2026-41940 fix in source: set_pass() / saveSession() now
-# strips \r and \n in addition to NUL.
-#
-# alg_length_optrec_bug demoted from 'bug' to 'marker' in v2.7.13 — fleet
-# observation showed it as the single most-firing signal (one row per host
-# on tiers 110/118/126/132, which is most of the fleet) with zero
-# SessionScribe verdict impact. The pre-existing OIDC operator-precedence
-# bug is real but unrelated to CVE-2026-41940; demoting silences the
-# advisory while preserving the per-host detection (queryable via
-# severity=info / key=patch_marker_absent in records.jsonl). The twin
-# start_authorize_in_die (index 1) remains 'bug'-class for now — flip it
-# too if fleet data shows the same noise profile.
+# Pattern kind: 'bug' = ancillary bug (advisory when unpatched);
+# 'marker' = build-line patch marker, informational. The CVE-2026-41940 fix
+# itself is in the cpsrvd binary; cve_41940_set_pass_crlf_strip marker just
+# tracks its presence. See INTERNAL-NOTES.md "v2.7.13" for the bug→marker
+# demote rationale on alg_length_optrec_bug.
 STATIC_KINDS=(marker bug marker marker marker marker marker marker)
 STATIC_EXPLAINS=(
     'OpenIdConnectBase.pm:795 operator-precedence trap (`if !length $algorithm > 2` is always false). Pre-existing OIDC bug, NOT the SessionScribe primitive; post-auth defense-in-depth, fixed on the 134-line and not backported to 110/118/126/132. Resolves on tier upgrade.'
@@ -5576,17 +5442,10 @@ check_sessions() {
     fi
 
     # ---- (b) Mitigate-quarantine secondary read --------------------------
-    # On hosts where sessionscribe-mitigate.sh ran, forged sessions have
-    # been moved out of /var/cpanel/sessions/raw/ and into the quarantine
-    # tree at $MITIGATE_BACKUP_ROOT/<RUN>/quarantined-sessions/raw/. The
-    # live walk above sees an empty raw/ on those hosts, so without this
-    # secondary path a previously-compromised host scans CLEAN. Sidecars
-    # next to each quarantined file (`<sname>.info`) carry the original
-    # mtime + IOC pattern letters that fired the quarantine - emit
-    # synthetic signals from those fields so the kill-chain timeline
-    # reflects when the attacker forged the session, not when we
-    # quarantined it. Direct call (not `$( … )`) - subshell would discard
-    # SIGNALS[] mutations from emit().
+    # Post-mitigation, forged sessions live under $MITIGATE_BACKUP_ROOT/
+    # <RUN>/quarantined-sessions/raw/ instead of /var/cpanel/sessions/raw/.
+    # Sidecars (`<sname>.info`) carry the original mtime + IOC reasons.
+    # Direct call (not subshell) so emit()'s SIGNALS[] mutations persist.
     check_quarantined_sessions
     ioc_hits=$((ioc_hits + QUARANTINED_HITS))
 
@@ -5957,17 +5816,13 @@ check_pattern_j_persistence() {
 }
 
 # ---- _classify_history_match ---------------------------------------------
-# Diagnostic-shape classifier hoisted from v2.7.5 Pattern C inline awk so
-# Patterns C, F, H3 share one source of truth.
+# Diagnostic-shape classifier shared by Patterns C/F/H3.
 #   $1 mode  : "regex"   - <needle> is awk ERE (e.g. nuclear\.x86)
 #              "literal" - <needle> is literal substring (e.g. __S_MARK__)
 #   $2 needle: matcher per mode
 #   $3.. files
-# Output (one line): h=N d=N u=N fhe=EPOCH file_h=PATH
-# Counts are AGGREGATE across all matched files (matches v2.7.5 Pattern C
-# precedent); file_h is the file containing the first hostile-or-unknown
-# match. fhe = embedded `#<epoch>` marker before that match - diagnostic-
-# only matches do not pollute the kill-chain epoch.
+# Output: h=N d=N u=N fhe=EPOCH file_h=PATH (counts aggregate; file_h is
+# the file with the first hostile/unknown match; fhe = its `#<epoch>` marker).
 _classify_history_match() {
     local mode="$1" needle="$2"
     shift 2
@@ -6228,17 +6083,9 @@ check_destruction_iocs() {
              "note" "found .sorry-encrypted files (Pattern A); re-run with --full for the full kill-chain + bundle (CRITICAL)."
         ((hits++))
     fi
-    # qTox ransom README at /root/README.md (canonical) + /home/*/README.md
-    # (per-user). Content/path-shape filter (added 2.7.6) demotes long files
-    # (>200 lines = documentation, real ransom notes are <50 lines) and
-    # IR-notes filename shapes to info-tier so responder docs that
-    # reference the dossier TOX_ID hash don't FP-strong. Path-prefix
-    # branches (^/root/(IR|notes|runbooks|.claude|.cache)/) are
-    # future-proofing - the current candidate-file walk only reaches
-    # /root/README.md + /home/*/README.md, none of which match those
-    # subtrees; the filename-substring branches (IR-notes, runbook,
-    # notes-<digit>) are the active filter for /home/*/README.md
-    # operator-notes drops.
+    # qTox ransom README at /root/README.md + /home/*/README.md. Long files
+    # (>200 lines) and IR-notes filename shapes demote to info-tier so
+    # responder docs referencing the dossier TOX_ID hash don't FP-strong.
     local readme_hits=()
     [[ -f "$PATTERN_A_README" ]] && readme_hits+=("$PATTERN_A_README")
     while IFS= read -r rf; do
@@ -6368,20 +6215,11 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern C: nuclear.x86 botnet drop ------------------------------
-    # Three independent signals: literal binary name in shell history,
-    # binary still on disk in known drop paths (sha256 anchored), or C2
-    # host/IP referenced in history or persistence files.
-    #
-    # bash_history hits are classified hostile-shape vs diagnostic-shape
-    # before emit. LW responders routinely run `history | grep -F
-    # "nuclear.x86"` or `cat /root/.bash_history | grep nuclear.x86` post-
-    # patch as part of an IR/QA check; without classification, every
-    # checked host emits strong/COMPROMISED. Field-reported by V.Narayanan
-    # + R.Poulose on 2026-05-03 against patched-clean cPanel hosts.
-    # Hostile shape = download (wget/curl/fetch/tftp) / pipe-to-shell /
-    # chmod +x / ./<bin> / source-eval-exec verb / bin-as-leading-token.
-    # Diagnostic shape = read-only verb (history/cat/grep/find/ls/...) at
-    # line start with no hostile verb anywhere.
+    # Three independent signals: literal binary name in bash_history,
+    # binary on disk in known drop paths (sha256 anchored), or C2 host/IP
+    # referenced. bash_history hits are hostile-shape vs diagnostic-shape
+    # classified before emit so IR `history | grep nuclear.x86` doesn't
+    # FP. See INTERNAL-NOTES.md "v2.7.5" for shape-classifier rationale.
     local nuke_files=()
     local _nf
     for _nf in /root/.bash_history /home/*/.bash_history; do
@@ -7536,35 +7374,11 @@ check_destruction_iocs() {
 }
 
 # ---- CSF firewall posture ------------------------------------------------
-# Validates that ConfigServer Firewall is installed AND actually enforcing on
-# the host. Fleet hosts are expected to run CSF; "installed but not loaded"
-# (chains absent, lfd dead, TESTING=1, csf.disable, ipset gap) is a common
-# silent-failure mode — the binary lives in PATH and the operator assumes
-# protection while iptables is wide open.
-#
-# Severity discipline: posture findings are DEFENSIVE-degradation signals,
-# not exploit IOCs. Keys use the `posture_` prefix (never `ioc_`) so they
-# surface in the section matrix and JSON envelope without flipping
-# host_verdict to SUSPICIOUS/COMPROMISED. The IOC engine is reserved for
-# attacker-evidence rows.
-#
-# Probe ladder (each phase is independent; later phases run even when an
-# earlier phase finds a fault, so a single run surfaces every break-mode):
-#   1. presence              — csf binary + /etc/csf/csf.conf
-#   2. csf.disable           — administrative kill-switch (advisory + return)
-#   3. csf.conf missing      — broken install (binary without config)
-#   4. TESTING=1             — production posture requires TESTING=0
-#   5. lfd liveness          — pidfile → /proc/<pid>/comm → pidof/pgrep
-#   6. iptables availability — binary on PATH or /sbin or /usr/sbin
-#   7. csf -v self-test      — binary cannot self-report version
-#   8. chain enumeration     — LOCALINPUT/LOCALOUTPUT/LOGDROPIN in iptables -nL
-#   9. INPUT->LOCALINPUT     — orphaned-chain detection
-#  10. LOCALINPUT rule count — chain hydrated (kill -9 mid-load FP)
-#  11. LF_IPSET=1 promised   — ipset binary present, set list non-empty
-#  12. healthy roll-up       — info-tier emit with rule_count, lfd_pid, version
-#
-# Snapshot mode (--root): all live probes skipped; emits a single info row.
-# Bash 4.1 / set -u safe: every local initialized; no [[ -v ]]; no namerefs.
+# Validates CSF is installed AND enforcing. Posture findings emit with the
+# `posture_` prefix (not `ioc_`) so they surface in the matrix without
+# escalating host_verdict — they're defense-degradation, not attacker
+# evidence. Probe phases run independently so one run surfaces every break.
+# Snapshot mode (--root): all live probes skipped.
 check_csf_posture() {
     if [[ -n "$ROOT_OVERRIDE" ]]; then
         hdr_section "posture" "CSF posture (skipped: snapshot mode)"
@@ -8085,18 +7899,11 @@ aggregate_verdict() {
         EXIT_CODE=2
     fi
 
-    # Host-state axis (the exploitation question). COMPROMISED dominates the
-    # exit code: a patched host can still carry forensic evidence of prior
-    # exploitation, and we want fleet-aggregation to triage these first.
-    # SUSPICIOUS now exits 3 unconditionally (in all modes, including --ioc-only).
-    # This disambiguates from code-state INCONCLUSIVE which keeps exit 2.
-    # Compromise gate: post-attack residue required. compromise_critical is
-    # the subset of strong-tier ioc_* signals classified as persistence,
-    # destruction, or token_used (see ioc_compromise_class). Strong-tier
-    # attempt-class signals (Pattern E websocket Shell, X CRLF chain,
-    # forged-session evidence) on their own do NOT escalate — they prove
-    # the attacker reached the host but not that they took action.
-    # Persistence cluster (persist_count>=1) also gates COMPROMISED.
+    # Host-state axis. COMPROMISED requires post-attack residue: at least
+    # one strong-tier compromise-class ioc_* signal (persistence /
+    # destruction / token_used per ioc_compromise_class) OR persist_count>=1.
+    # Strong-tier attempt-class (Pattern E entry, X CRLF, forged sessions)
+    # alone → SUSPICIOUS. EXIT_CODE 4 dominates 1/2/3 for fleet triage.
     if (( compromise_critical > 0 )) || (( persist_count >= 1 )); then
         HOST_VERDICT="COMPROMISED"
         EXIT_CODE=4
