@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.27
+# sessionscribe-ioc-scan.sh v2.7.28
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.27"
+VERSION="2.7.28"
 
 # Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
 # vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
@@ -1661,46 +1661,8 @@ emit_signal() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Package-ownership probe for Pattern J FP gating. Prefer rpm; fall back
-# to dpkg for debian-ish hosts; if neither tool exists, return 2 ("no
-# probe available") so callers can downgrade severity rather than guess.
-# Returns: 0 = file is owned by an installed package
-#          1 = file is NOT owned by any installed package
-#          2 = no ownership probe available (rpm AND dpkg both missing)
-# Always returns text on stdout for diagnostic logging:
-#   "owned:<pkg>" | "not_owned" | "no_probe"
-# Set -u safe: every branch initializes _own and uses `|| true` to swallow
-# rpm/dpkg non-zero exit codes (rpm -qf rc=1 on not-owned is normal).
-is_rpm_owned() {
-    local _file="$1" _own=""
-    if have_cmd rpm; then
-        _own=$(rpm -qf -- "$_file" 2>/dev/null || true)
-        if [[ -z "$_own" || "$_own" == *"not owned by any package"* \
-              || "$_own" == *"No such file"* ]]; then
-            printf 'not_owned'
-            return 1
-        fi
-        printf 'owned:%s' "$_own"
-        return 0
-    fi
-    if have_cmd dpkg; then
-        # dpkg -S returns "<pkg>: <path>" on owned, exit non-zero on not-owned.
-        _own=$(dpkg -S -- "$_file" 2>/dev/null || true)
-        if [[ -z "$_own" ]]; then
-            printf 'not_owned'
-            return 1
-        fi
-        printf 'owned:%s' "${_own%%:*}"
-        return 0
-    fi
-    printf 'no_probe'
-    return 2
-}
-
-# Bulk variant: pass an array of paths, get back tab-separated lines
-# of "<rc>\t<path>" where rc is 0/1/2 per is_rpm_owned semantics. Uses
-# one rpm process for all paths (rpmdb opens once instead of N times).
-# Performance: ~200ms once vs ~50-80ms × N for the per-path form.
+# Package-ownership probe for Pattern J FP gating. Returns one TSV line
+# per input path: <rc>\t<path> where rc is 0=owned, 1=not_owned, 2=no_probe.
 bulk_rpm_owned_filter() {
     (( $# > 0 )) || return 0
     local _f
@@ -1845,10 +1807,39 @@ ioc_key_to_persist_pattern() {
         (ioc_pattern_g_*)                       echo G ;;
         (ioc_pattern_j_*)                       echo J ;;
         (ioc_pattern_i_*)                       echo I ;;
-        (ioc_pattern_f_cmd_done*|ioc_pattern_f_smark*|ioc_pattern_f_harvester) echo F ;;
+        (ioc_pattern_f_cmd_done*|ioc_pattern_f_smark*) echo F ;;
         (ioc_pattern_d_reseller*|ioc_pattern_d_token*|ioc_pattern_d_whm_fullroot*) echo D ;;
         (ioc_pattern_h_seobot*|ioc_pattern_h_alldone*) echo H ;;
         (*)                                     echo "" ;;
+    esac
+}
+
+# Map a signal key to its compromise class for verdict gating. Returns
+# "persistence" | "destruction" | "token_used" | "" (attempt-class).
+# COMPROMISED requires post-attack residue: at least one strong-tier
+# compromise-class signal OR persistence cluster. ATTEMPT signals
+# (Pattern E entry RCE, X CRLF chain, T1-origin attacker IPs, forged
+# session evidence) escalate only as far as SUSPICIOUS — they prove
+# the attacker reached the host but not that they took action.
+# Aligned with the v3 incident ladder principle: attempted ≠ compromised.
+ioc_compromise_class() {
+    case "$1" in
+        # Persistence — mirrors ioc_key_to_persist_pattern().
+        (ioc_pattern_g_*|ioc_pattern_j_*|ioc_pattern_i_*) echo persistence ;;
+        (ioc_pattern_f_cmd_done*|ioc_pattern_f_smark*)    echo persistence ;;
+        (ioc_pattern_d_reseller*|ioc_pattern_d_token*|ioc_pattern_d_whm_fullroot*) echo persistence ;;
+        (ioc_pattern_h_seobot*|ioc_pattern_h_alldone*)    echo persistence ;;
+        # Destruction / deployment — confirmed post-RCE action.
+        (ioc_pattern_a_*|ioc_pattern_b_*|ioc_pattern_c_*) echo destruction ;;
+        (ioc_pattern_d_acctlog*|ioc_pattern_d_evidence_destroyed) echo destruction ;;
+        (ioc_pattern_h_kill_prelude*|ioc_pattern_h_competitor_kill*|ioc_pattern_h_zip_dropper|ioc_pattern_h_dropper_archive) echo destruction ;;
+        (ioc_pattern_k_*|ioc_pattern_l_*) echo destruction ;;
+        # Token consumption (post-CRLF, in proximity to 2xx_on_cpsess).
+        # Pre-compromise variants stay attempt-class via the route below.
+        (ioc_attacker_ip_2xx_on_cpsess) echo token_used ;;
+        # Default: attempt-class (Pattern E entry, X CRLF, recon, X-forged
+        # sessions, _pre_compromise variants, _orphan, _probes_only, etc.).
+        (*) echo "" ;;
     esac
 }
 
@@ -6697,9 +6688,10 @@ check_destruction_iocs() {
 
     # ---- Pattern G: suspect SSH keys ------------------------------------
     # IC-5790 fingerprint: mtime forged to 2019-12-13 + IP-shaped key
-    # comment. Both required (LW provisioning legitimately uses IP-labeled
-    # keys) so we don't FP on real ops. _g_hit feeds the lsyncd-
-    # amplification check at end of this block.
+    # comment. _g_hit feeds the lsyncd-amplification check at end of this
+    # block. IP-labeled count excludes known-good provisioning labels
+    # (lwadmin/liquidweb/nexcess/Parent Child key for ...) so warning-tier
+    # emit doesn't FP on legitimate operator labels with IPv4 comments.
     local _g_hit=0
     local key_file
     for key_file in "${SSH_KEY_FILES[@]}"; do
@@ -6710,8 +6702,9 @@ check_destruction_iocs() {
         local has_forged_mtime=0
         [[ "$key_mtime_iso" == "$PATTERN_G_FORGED_MTIME" ]] && has_forged_mtime=1
         local ip_labeled_lines
-        ip_labeled_lines=$(grep -cE '^(ssh-(rsa|ed25519|ecdsa|dsa))[[:space:]]+[A-Za-z0-9+/=]+[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}([[:space:]]|$)' \
-                              "$key_file" 2>/dev/null)
+        ip_labeled_lines=$(grep -E '^(ssh-(rsa|ed25519|ecdsa|dss))[[:space:]]+[A-Za-z0-9+/=]+[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}([[:space:]]|$)' \
+                              "$key_file" 2>/dev/null \
+                           | grep -cvE "$SSH_KNOWN_GOOD_RE" || true)
         ip_labeled_lines="${ip_labeled_lines:-0}"
         if (( has_forged_mtime && ip_labeled_lines > 0 )); then
             emit "destruction" "ioc_pattern_g_ssh_key" "strong" \
@@ -6744,10 +6737,10 @@ check_destruction_iocs() {
             # provisioning key (Parent Child key for <PJID>, lwadmin,
             # liquidweb, nexcess). These are legitimate placements in
             # /etc and /var/spool/cron and should not surface as IOCs.
-            _odd_total=$(grep -cE '^[[:space:]]*(ssh-(rsa|ed25519|ecdsa|dsa)|ecdsa-sha2-)[[:space:]]+[A-Za-z0-9+/=]+' "$_odd" 2>/dev/null)
+            _odd_total=$(grep -cE '^[[:space:]]*(ssh-(rsa|ed25519|ecdsa|dss)|ecdsa-sha2-)[[:space:]]+[A-Za-z0-9+/=]+' "$_odd" 2>/dev/null)
             _odd_total="${_odd_total:-0}"
             if (( _odd_total > 0 )); then
-                _odd_known=$(grep -cE "^[[:space:]]*(ssh-(rsa|ed25519|ecdsa|dsa)|ecdsa-sha2-)[[:space:]]+[A-Za-z0-9+/=]+.*${SSH_KNOWN_GOOD_RE}" "$_odd" 2>/dev/null)
+                _odd_known=$(grep -cE "^[[:space:]]*(ssh-(rsa|ed25519|ecdsa|dss)|ecdsa-sha2-)[[:space:]]+[A-Za-z0-9+/=]+.*${SSH_KNOWN_GOOD_RE}" "$_odd" 2>/dev/null)
                 _odd_known="${_odd_known:-0}"
                 _odd_unknown=$(( _odd_total - _odd_known ))
                 if (( _odd_unknown <= 0 )); then
@@ -7865,6 +7858,11 @@ check_localhost_probe() {
 aggregate_verdict() {
     local score=0 strong_count=0 fixed_count=0 inconclusive_count=0
     local ioc_critical=0 ioc_review=0 advisory_count=0 probe_artifact_count=0
+    # compromise_critical = strong-tier ioc_* signals that are post-attack
+    # residue (destruction/persistence/token_used). Drives the COMPROMISED
+    # gate independently of ioc_critical so attempt-class strong signals
+    # (Pattern E entry, X CRLF chain) on their own land at SUSPICIOUS.
+    local compromise_critical=0
     # Version-string authority flags. Set when check_version emits one of the
     # build-comparison signals - these are the single load-bearing signal for
     # patch-state determination because the binary fingerprint can't
@@ -7951,21 +7949,21 @@ aggregate_verdict() {
                 SECTION_KEYS[$area]="${SECTION_KEYS[$area]:-} $key"
             fi
             weight="${weight:-0}"
-            # Persistence-class accumulation. Tracked at strong/evidence/warning
-            # severity (info/advisory excluded — info is too low-confidence,
-            # advisories are explicitly non-verdict-affecting). Uses pattern
-            # letter so multiple keys per pattern dedupe to one cluster slot.
+            # Persistence-class accumulation. Tracked at strong/warning
+            # severity (info/advisory/evidence excluded — info too low-confidence,
+            # advisories explicitly non-verdict-affecting, no persistence-class
+            # emit currently uses evidence severity). Uses pattern letter so
+            # multiple keys per pattern dedupe to one cluster slot.
             case "$sev" in
-                strong|evidence|warning)
+                strong|warning)
                     local _pp
                     _pp=$(ioc_key_to_persist_pattern "$key")
                     if [[ -n "$_pp" ]]; then
                         PERSIST_PATTERNS["$_pp"]=1
                         local _pw
                         case "$sev" in
-                            strong)   _pw=$((weight > 0 ? weight : 5)) ;;
-                            evidence) _pw=2 ;;
-                            warning)  _pw=$((weight > 0 ? weight : 4)) ;;
+                            strong)  _pw=$((weight > 0 ? weight : 5)) ;;
+                            warning) _pw=$((weight > 0 ? weight : 4)) ;;
                         esac
                         persist_weight_sum=$((persist_weight_sum + _pw))
                     fi
@@ -7977,10 +7975,14 @@ aggregate_verdict() {
                     ((strong_count++))
                     REASONS+=("$key")
                     # Host-state axis: IOC-prefixed strong signals are exploitation
-                    # evidence, not code-state evidence.
+                    # evidence, not code-state evidence. compromise_critical is the
+                    # subset that's post-attack residue (drives COMPROMISED gate).
                     if [[ "$key" == ioc_* ]]; then
                         ((ioc_critical++))
                         IOC_KEYS+=("$key")
+                        local _cc
+                        _cc=$(ioc_compromise_class "$key")
+                        [[ -n "$_cc" ]] && ((compromise_critical++))
                     fi
                     ;;
                 evidence)
@@ -8048,6 +8050,7 @@ aggregate_verdict() {
     ADVISORY_COUNT="$advisory_count"
     IOC_CRITICAL="$ioc_critical"
     IOC_REVIEW="$ioc_review"
+    COMPROMISE_CRITICAL="$compromise_critical"
     PROBE_ARTIFACT_COUNT="$probe_artifact_count"
     PERSIST_COUNT="$persist_count"
     PERSIST_WEIGHT_SUM="$persist_weight_sum"
@@ -8087,13 +8090,17 @@ aggregate_verdict() {
     # exploitation, and we want fleet-aggregation to triage these first.
     # SUSPICIOUS now exits 3 unconditionally (in all modes, including --ioc-only).
     # This disambiguates from code-state INCONCLUSIVE which keeps exit 2.
-    # Persistence gate: any class=persistence signal (G/J/I/F-harvester/D-reseller/
-    # H-seobot) at strong+ severity escalates to COMPROMISED independently of
-    # ioc_critical — persistence is by definition post-compromise evidence.
-    if (( ioc_critical > 0 )) || (( persist_count >= 1 )); then
+    # Compromise gate: post-attack residue required. compromise_critical is
+    # the subset of strong-tier ioc_* signals classified as persistence,
+    # destruction, or token_used (see ioc_compromise_class). Strong-tier
+    # attempt-class signals (Pattern E websocket Shell, X CRLF chain,
+    # forged-session evidence) on their own do NOT escalate — they prove
+    # the attacker reached the host but not that they took action.
+    # Persistence cluster (persist_count>=1) also gates COMPROMISED.
+    if (( compromise_critical > 0 )) || (( persist_count >= 1 )); then
         HOST_VERDICT="COMPROMISED"
         EXIT_CODE=4
-    elif (( ioc_review > 0 )); then
+    elif (( ioc_critical > 0 )) || (( ioc_review > 0 )); then
         HOST_VERDICT="SUSPICIOUS"
         EXIT_CODE=3
     else
@@ -8285,8 +8292,8 @@ write_json() {
         printf '  "host_verdict": "%s",\n' "$HOST_VERDICT"
         printf '  "score": %d,\n' "$SCORE"
         printf '  "exit_code": %d,\n' "$EXIT_CODE"
-        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s"},\n' \
-            "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}" \
+        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"compromise_critical":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s"},\n' \
+            "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${COMPROMISE_CRITICAL:-0}" "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}" \
             "${PERSIST_COUNT:-0}" "${PERSIST_WEIGHT_SUM:-0}" "${PERSIST_MULTIPLIER:-1}" "$(json_esc "${PERSIST_PATTERNS_LIST:-}")"
         printf '  "advisories": [\n'
         first=1
@@ -8347,9 +8354,9 @@ write_csv() {
     {
         # Column order: existing columns 1-17 unchanged for back-compat with
         # fleet aggregators that index positionally (cut -f17, awk -F, '$NF',
-        # etc). New persist_* columns appended at end as columns 18-21.
-        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns\n'
-        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s\n' \
+        # etc). New persist_* + compromise_critical columns appended at end.
+        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns,compromise_critical\n'
+        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%d\n' \
             "$(csv_field "$HOSTNAME_FQDN")" \
             "$(csv_field "$RUN_ID")" \
             "$(csv_field "$TS_ISO")" \
@@ -8370,7 +8377,8 @@ write_csv() {
             "${PERSIST_COUNT:-0}" \
             "${PERSIST_WEIGHT_SUM:-0}" \
             "${PERSIST_MULTIPLIER:-1}" \
-            "$(csv_field "${PERSIST_PATTERNS_LIST:-}")"
+            "$(csv_field "${PERSIST_PATTERNS_LIST:-}")" \
+            "${COMPROMISE_CRITICAL:-0}"
     } > "$out"
 }
 

@@ -24,6 +24,103 @@ on MariaDB repos, so disabling them for this transaction has no side
 effects on the install. Hosts whose MariaDB repos are fine see no
 behavior change; broken-repo hosts now succeed.
 
+## sessionscribe-ioc-scan.sh v2.7.28 — 2026-05-04
+
+### Fixed (FP — shipped in v2.7.27, corrected here)
+
+**Compromise gate refinement.** v2.7.27's COMPROMISED gate fired on any
+strong-tier ioc_* signal (`ioc_critical > 0`). This violated the v3
+incident-ladder principle (memory: *"attempted ≠ compromised — only
+post-attack activity (A/B/C/H/F/D/token_used_2xx) = COMPROMISED;
+attempt signals (X, watchTowr stack, T1-origin) = ATTEMPT"*). Hosts
+with only Pattern E websocket Shell hits (RCE entry, no residue),
+CRLF chain (CVE-2026-41940 attempt anchor), or forged-session evidence
+landed at COMPROMISED on circumstantial signals.
+
+Concrete FP from the fleet — `s2.sharonparq.com` view: 1 critical
+(Pattern E websocket Shell strong), 43 review-tier warnings (CRLF
+chains, quarantined sessions, anomalous root sessions, failed exploit
+attempts), no Pattern A/B/C/F/D/G/H/I/J/K/L compromise residue.
+Pre-v2.7.28: COMPROMISED + score 180. Post-v2.7.28: SUSPICIOUS.
+
+Two changes:
+
+1. **`ioc_compromise_class()`** (new). Classifies signal keys into
+   `persistence` / `destruction` / `token_used` / `""` (attempt). The
+   compromise set is the union of:
+   - persistence: G/J/I/F-harvester/D-reseller/H-seobot (per
+     `ioc_key_to_persist_pattern`)
+   - destruction: A/B/C/D-acctlog/H-non-seobot/K/L (post-attack
+     destructive action — ransom, mysql wipe, nuclear deploy, log
+     encryption, defacement setup, backdoor fetch, filesystem nuke)
+   - token_used: `ioc_attacker_ip_2xx_on_cpsess` (post-CRLF + proximity
+     to 2xx_on_cpsess; pre-compromise variant remains attempt-class)
+
+   Attempt-class (returns ""): pattern_e_*, ioc_cve_2026_41940_*,
+   ioc_quarantined_session_*, ioc_failed_exploit_attempt,
+   ioc_attacker_ip_*_pre_compromise, ioc_attacker_ip_recon_only,
+   anomalous_root_sessions, X-forged-session evidence.
+
+2. **COMPROMISED gate** (line 8094) now reads:
+   ```
+   if ((compromise_critical > 0)) || ((persist_count >= 1)); then
+       HOST_VERDICT="COMPROMISED"
+   elif ((ioc_critical > 0)) || ((ioc_review > 0)); then
+       HOST_VERDICT="SUSPICIOUS"
+   ```
+
+   `compromise_critical` counts strong-tier ioc_* signals where
+   `ioc_compromise_class != ""`. Pattern E strong on its own
+   (compromise_critical=0) → SUSPICIOUS. Pattern E + Pattern F
+   (compromise_critical=1, persist_count=1) → COMPROMISED.
+   Pattern A ransom alone → COMPROMISED. Pattern C nuclear deploy
+   alone → COMPROMISED.
+
+3. **Pattern G IP-labeled-keys FP fix** (line 6743). v2.7.27 + the
+   warning-tier persist gate could flip a host to COMPROMISED on a
+   single legitimate operator-labeled SSH key with an IPv4 comment
+   (e.g. `ssh-rsa ... 192.168.10.5`). Added `SSH_KNOWN_GOOD_RE`
+   filter to the IP-labeled-lines count, parallel to the offense-phase
+   implementation at line 2125. Host with one LW-provisioning IP-labeled
+   key now reads zero, no false COMPROMISED.
+
+### Fixed (sentinel review of v2.7.27)
+
+- **DSA key-type typo** at lines 6743 and 6779/6782. The ssh-rsa/
+  ed25519/ecdsa/dsa regex used `dsa` — but OpenSSH's wire format is
+  `ssh-dss` (DSA keys are ssh-dss in authorized_keys). Offense-phase
+  code at line 2129 already uses `dss` correctly. Destruction-phase
+  drift fixed.
+- **Dead code: `is_rpm_owned()` (lines 1674-1698)** — defined with
+  multi-line docstring but only `bulk_rpm_owned_filter()` is ever
+  called (handles single-path case via `"${arr[1]}"`). Deleted.
+- **Dead classifier alternation `ioc_pattern_f_harvester`** at line
+  1848. No `emit ... ioc_pattern_f_harvester` ever fires; smark
+  envelope uses `ioc_pattern_f_smark_envelope` (already covered by
+  the smark glob). Removed.
+- **Dead `evidence` arm in cluster accumulator** at line 7959. The
+  only `evidence`-tier emit is `anomalous_root_sessions` which is not
+  persistence-class. The `evidence) _pw=2` branch was unreachable.
+  Removed; case narrowed to `strong|warning`.
+
+### Added
+
+- **`summary.compromise_critical`** in JSON envelope + CSV column
+  appended at end. Lets fleet aggregators distinguish "1 strong ioc
+  any-class" (which v2.7.27 used as COMPROMISED gate) from
+  "1 strong ioc compromise-class" (the v2.7.28 gate).
+
+### Verification
+
+- 70/70 unit tests pass (`bash tests/run-verdict-tests.sh`). New
+  cases: compromise-class classification (28 mappings: 6 persistence,
+  10 destruction, 1 token_used, 11 attempt-class negative cases);
+  Pattern E-only → SUSPICIOUS; CRLF + quarantined-only → SUSPICIOUS
+  (centos6-reason-style attempt host); Pattern A/H-non-seobot/L
+  destruction-class → COMPROMISED via compromise_critical;
+  token_used → COMPROMISED.
+- 6/6 existing session-IOC tests pass (`bash tests/run-session-tests.sh`).
+
 ## sessionscribe-ioc-scan.sh v2.7.27 — 2026-05-04
 
 ### Added (host-state elevation: persistence cluster scoring)
