@@ -74,7 +74,7 @@ heuristic-J COMPROMISED FPs in the 300-host fleet sample to SUSPICIOUS,
 with no real compromise demoted (none of the 6 audit-confirmed
 compromises depend on the heuristic — Patterns C/F/D drive them).
 
-### Added (soft-variant suffix gate — defense-in-depth)
+### Added (soft-variant suffix gate — material behavior change + future-proofing)
 
 `ioc_key_is_soft_variant()` is called from `ioc_key_to_persist_pattern`
 and `ioc_compromise_class` BEFORE the `ioc_pattern_X_*` prefix match.
@@ -82,13 +82,31 @@ Suffixes filtered: `_review`, `_review_*`, `_diagnostic`,
 `_diagnostic_only`, `_candidate`, `_undetermined`, `_orphan`,
 `_pre_compromise`, `_probes_only`, `_unknown_dim_only`, `_unknown_hash`.
 
-Most soft variants already emit at info/advisory/warning severity in
-v2.7.30 (`ioc_pattern_j_systemd_unit_candidate` advisory since
-v2.7.20; `ioc_pattern_e_*_pre_compromise` advisory; `_diagnostic`
+**Today's demotions (intentional fleet-FP reduction).** Warning-tier
+soft-variant emits previously bumped `persist_count` via prefix match,
+which gates COMPROMISED at `persist_count >= 1`:
+
+- `ioc_pattern_g_ip_keys_review` (warning, line 6269 of v2.7.30) →
+  matched `ioc_pattern_g_*` → G in PERSIST_PATTERNS → COMPROMISED.
+  Now classifier returns "" → SUSPICIOUS.
+- `ioc_pattern_h_kill_prelude_review` (warning, line 6437 of v2.7.30)
+  → matched `ioc_pattern_h_*` → H in PERSIST_PATTERNS → COMPROMISED.
+  Now classifier returns "" → SUSPICIOUS.
+
+A `_review` variant is operator-review evidence ("looks suspicious;
+needs hand-check") — not confirmed persistence residue. Demoting hosts
+whose ONLY persistence-class signal is a `_review` warning is consistent
+with the v3 incident-ladder principle: confirmed residue = COMPROMISED,
+unconfirmed/review = SUSPICIOUS. Regression tests added at
+`g_ip_keys_review_only/SUSPICIOUS` and
+`h_kill_prelude_review_only/SUSPICIOUS` lock this in.
+
+**Future-proofing.** Most soft variants already emit at info/advisory
+severity in v2.7.30 (`ioc_pattern_j_systemd_unit_candidate` advisory
+since v2.7.20; `ioc_pattern_e_*_pre_compromise` advisory; `_diagnostic`
 keys at info). The strong-only `compromise_critical` gate already
-filters them. The soft-variant guard is defense-in-depth: if a future
-emit raises severity for one of these keys, the prefix match alone
-won't escalate to COMPROMISED.
+filters them. The soft-variant guard catches drift if a future emit
+raises severity for one of these keys.
 
 ### Fixed (cleanup — write-only state, dead vars, dead helper)
 
@@ -100,7 +118,7 @@ won't escalate to COMPROMISED.
 - Dead-var pruning per shellcheck SC2034: `RECONCILED_EVENTS` (shadow
   of `RECONCILED`), `N_DEF`/`N_OFF` (replaced by `N_PRE`/`N_POST`
   earlier and never finished), `CODE_VERDICT` (replaced by
-  per-axis `VERDICT`/`HOST_VERDICT`), `PATTERN_LABEL` (15-entry
+  per-axis `VERDICT`/`HOST_VERDICT`), `PATTERN_LABEL` (13-entry
   declaration with zero readers), `GLYPH_BOX_TR`/`GLYPH_BOX_BR`
   (declared in both UTF-8 and ASCII glyph branches, never used —
   TL/BL/H/V are the only glyphs the kill-chain renderer reads), local

@@ -1636,13 +1636,9 @@ ioc_key_is_soft_variant() {
     return 1
 }
 
-# Map a signal key to a persistence-class pattern letter for cluster
-# scoring. Returns empty string for non-persistence keys. Persistence
-# patterns: D-reseller (WHM token), F-harvester (cmd_done / s_mark / harvester
-# shell artifacts), G (ssh keys), H-seobot (defacement webshell on disk),
-# I (profile.d backdoor), J (systemd unit / udev / atjob).
-# Pattern A/B/C/E/H-non-seobot/K/L/X are NOT persistence (destruction, RCE,
-# recon, exploit-prep, forged-session evidence).
+# Persistence-class letter for cluster scoring. "" for non-persistence.
+# G ssh-keys · I profile.d · J cdrom-id-helper/dbus-broker-helper dossier
+# paths · F harvester · D reseller-token · H seobot/alldone.
 ioc_key_to_persist_pattern() {
     ioc_key_is_soft_variant "$1" && { echo ""; return; }
     case "$1" in
@@ -1656,14 +1652,8 @@ ioc_key_to_persist_pattern() {
     esac
 }
 
-# Map a signal key to its compromise class for verdict gating. Returns
-# "persistence" | "destruction" | "token_used" | "" (attempt-class).
-# COMPROMISED requires post-attack residue: at least one strong-tier
-# compromise-class signal OR persistence cluster. ATTEMPT signals
-# (Pattern E entry RCE, X CRLF chain, T1-origin attacker IPs, forged
-# session evidence) escalate only as far as SUSPICIOUS — they prove
-# the attacker reached the host but not that they took action.
-# Aligned with the v3 incident ladder principle: attempted ≠ compromised.
+# Compromise class for verdict gating: persistence / destruction /
+# token_used / "" (attempt). v3 ladder — see CHANGELOG v2.7.28.
 ioc_compromise_class() {
     ioc_key_is_soft_variant "$1" && { echo ""; return; }
     case "$1" in
