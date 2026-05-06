@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.35"
+VERSION="2.7.36"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -8136,9 +8136,8 @@ aggregate_verdict() {
     SESSION_TIERED_COUNT="$session_tiered_count"
     SESSION_MAX_REASONS="$session_max_reasons"
 
-    # Code-state axis. Version is authoritative: on 134+ tier, vulnerable
-    # and patched cpsrvd binaries share ACL/token-reader strings, so the
-    # binary fingerprint cannot discriminate.
+    # Code-state axis: pure cpanel -V driven. IOC evidence informs
+    # HOST_VERDICT only — runtime hits never imply binary patch level.
     if (( IOC_ONLY )); then
         VERDICT="SKIPPED"
         EXIT_CODE=0
@@ -8146,17 +8145,6 @@ aggregate_verdict() {
         VERDICT="VULNERABLE"
         EXIT_CODE=1
     elif (( version_says_patched )); then
-        if (( score >= 5 )); then
-            VERDICT="INCONCLUSIVE"
-            EXIT_CODE=2
-        else
-            VERDICT="PATCHED"
-            EXIT_CODE=0
-        fi
-    elif (( score >= 5 )); then
-        VERDICT="VULNERABLE"
-        EXIT_CODE=1
-    elif (( score <= -5 )); then
         VERDICT="PATCHED"
         EXIT_CODE=0
     else

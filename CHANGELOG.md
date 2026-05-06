@@ -4,6 +4,33 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.36 — 2026-05-06
+
+### Fixed (code_verdict false-VULNERABLE explosion after v2.7.35)
+
+`aggregate_verdict()` now drives `code_verdict` purely from `cpanel -V`:
+the score-based fallback that escalated hosts to `VULNERABLE` whenever
+any single strong-tier IOC fired has been removed. v2.7.35's runtime
+track (25 `live_compromise` + new strong IOCs at weight=10) caused
+hosts in non-authoritative version states (`unparseable`, `dev_tier`,
+`cutoff_unknown`, `no_cpanel_binary`) to flip to `VULNERABLE` on a
+single runtime hit — a category error: VULNERABLE is a cpsrvd
+binary-state assertion, not a host-state assertion.
+
+New verdict ladder:
+
+  - `version_says_vuln`     → VULNERABLE (exit 1)
+  - `version_says_patched`  → PATCHED    (exit 0)
+  - otherwise               → INCONCLUSIVE (exit 2)
+
+Host-state evidence still drives `host_verdict` (COMPROMISED /
+SUSPICIOUS / CLEAN) on its independent axis — a PATCHED host with
+runtime IOCs is correctly graded `code=PATCHED, host=COMPROMISED`.
+
+Validated under `--version-string` against the v2.7.34 matrix plus
+the three regression cases (`garbage_no_parse`, `11.131.0.5`
+dev-tier, `11.86.0.40` boundary).
+
 ## sessionscribe-ioc-scan.sh v2.7.35 — 2026-05-06
 
 ### Added (envelope plumbing + bundle lsof + runtime-state IOC track)
