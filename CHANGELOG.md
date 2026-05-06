@@ -4,6 +4,31 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.37 — 2026-05-06
+
+### Fixed (lsof.txt stderr pollution + indistinguishable failure modes)
+
+`phase_bundle` lsof block redirects stderr to `/dev/null` (was `2>&1`,
+which mixed `lsof: no pwd entry for UID NNN` warnings into the data
+file — observed on quench-archived bundles bloating lsof.txt to 35 MB
+with 24,082 stderr lines on a host with an orphaned UID).
+
+Adds four distinct envelope signals so consumer renders can tell
+why an lsof.txt is empty:
+
+  - `lsof_captured`  (info)  — bytes recorded; healthy
+  - `lsof_timeout`   (warn)  — 30 s SIGKILL; lsof.txt may be partial
+  - `lsof_failed`    (warn)  — non-zero rc from lsof itself
+  - `lsof_empty`     (warn)  — rc=0 with no rows (pathological)
+  - `lsof_missing`   (info)  — `have_cmd lsof` short-circuit (binary absent)
+
+Pre-fix, a 0-byte lsof.txt was indistinguishable from a missing-binary
+case. Quench fleet survey across 300 recent bundles: 96 % healthy,
+4 % empty (timeout-class, now flagged), 0 % missing-from-tar.
+
+CentOS 6 floor preserved: `timeout` (coreutils 8.4) returns 124 on
+SIGKILL, `stat -c %s` and bash 4.1 arithmetic both confirmed.
+
 ## sessionscribe-ioc-scan.sh v2.7.36 — 2026-05-06
 
 ### Fixed (code_verdict false-VULNERABLE explosion after v2.7.35)

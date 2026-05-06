@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.36"
+VERSION="2.7.37"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -3786,13 +3786,35 @@ phase_bundle() {
     if have_cmd iptables; then
         iptables -L -nv > "$bdir/iptables.txt" 2>&1 || true
     fi
-    # 30s cap; -X skips socket xref (ss already has it).
+    # 30s cap; -X skips socket xref (ss already has it). stderr→/dev/null so
+    # `lsof: no pwd entry for UID NNN` warnings don't pollute the data file.
+    # Emit distinct signals so renders can tell missing/timeout/empty apart.
     if have_cmd lsof; then
+        local _lsof_rc=0 _lsof_bytes=0
         if have_cmd timeout; then
-            timeout 30 lsof -nP -X > "$bdir/lsof.txt" 2>&1 || true
+            timeout 30 lsof -nP -X >"$bdir/lsof.txt" 2>/dev/null
         else
-            lsof -nP -X > "$bdir/lsof.txt" 2>&1 || true
+            lsof -nP -X >"$bdir/lsof.txt" 2>/dev/null
         fi
+        _lsof_rc=$?
+        [[ -f "$bdir/lsof.txt" ]] && _lsof_bytes=$(stat -c %s "$bdir/lsof.txt" 2>/dev/null)
+        _lsof_bytes="${_lsof_bytes:-0}"
+        if   (( _lsof_rc == 124 )); then
+            emit_signal bundle warn lsof_timeout \
+                "lsof exceeded 30s SIGKILL; lsof.txt may be partial (${_lsof_bytes}B)" \
+                rc "$_lsof_rc" bytes "$_lsof_bytes"
+        elif (( _lsof_rc != 0 )); then
+            emit_signal bundle warn lsof_failed \
+                "lsof rc=$_lsof_rc (${_lsof_bytes}B)" rc "$_lsof_rc" bytes "$_lsof_bytes"
+        elif (( _lsof_bytes == 0 )); then
+            emit_signal bundle warn lsof_empty \
+                "lsof rc=0 but produced no rows" rc "$_lsof_rc"
+        else
+            emit_signal bundle info lsof_captured \
+                "lsof captured (${_lsof_bytes}B)" bytes "$_lsof_bytes"
+        fi
+    else
+        emit_signal bundle info lsof_missing "lsof binary not in PATH"
     fi
 
     # 7. Pattern A binary - capture metadata only, NOT the binary itself
