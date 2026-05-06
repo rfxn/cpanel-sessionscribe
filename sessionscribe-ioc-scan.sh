@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.37"
+VERSION="2.7.38"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -7335,10 +7335,20 @@ check_destruction_iocs() {
 
         _rt_line=$(grep -E "$RUNTIME_MASQ_RESPAWN_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_gsocket_respawn" "live_compromise" \
-                 "ioc_runtime_gsocket_persistence_shim" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "GSocket pkill-respawn shim active in process tree — operator persistence (CRITICAL)."
+            # UID 0 in the shim = root-owned gsocket → COMPROMISED. Non-root
+            # UID is a user-account compromise (cPanel user owned) — surface
+            # as strong IOC for IR but do not flip host to COMPROMISED.
+            if [[ "$_rt_line" =~ pkill[[:space:]]+-0[[:space:]]+-U0[[:space:]] ]]; then
+                emit "destruction" "ioc_runtime_gsocket_respawn" "live_compromise" \
+                     "ioc_runtime_gsocket_persistence_shim" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "GSocket pkill-respawn shim active under root — operator persistence (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_gsocket_respawn_userland" "strong" \
+                     "ioc_runtime_gsocket_persistence_shim_userland" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "GSocket pkill-respawn shim active under non-root UID — user-account compromise; review tier."
+            fi
             ((hits++))
         fi
 

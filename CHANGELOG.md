@@ -4,6 +4,33 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.38 — 2026-05-06
+
+### Changed (gsocket persistence-shim: UID-discriminated severity)
+
+`ioc_runtime_gsocket_respawn` (the `pkill -0 -U<UID> (defunct|gs-dbus|
+lscgib)` ps-tree match) now splits by the UID embedded in the shim:
+
+  - `-U0` (root-owned gsocket) → severity `live_compromise` →
+    `host_verdict=COMPROMISED` (unchanged).
+  - any non-zero UID (user-account-owned gsocket) → severity `strong` →
+    `host_verdict=SUSPICIOUS`. New signal id
+    `ioc_runtime_gsocket_respawn_userland` /
+    `ioc_runtime_gsocket_persistence_shim_userland`.
+
+Rationale: a gsocket persistence shim running under a cPanel user
+account is a user-account compromise (handled by Imunify360 / cleanup
+workflow), not a host-level operator-resident compromise. Pre-v2.7.38
+both cases flipped `host_verdict=COMPROMISED`, which was inflating
+the COMPROMISED bucket on shared-hosting fleets.
+
+The regex anchor `-U0[[:space:]]` cleanly disambiguates `-U0` from
+`-U10`, `-U500`, etc. — validated against a six-case matrix.
+
+The b64-wrapped shim variant (`ioc_runtime_gsocket_b64_shim`) cannot
+be UID-discriminated from the base64 prefix alone and remains
+`live_compromise`.
+
 ## sessionscribe-ioc-scan.sh v2.7.37 — 2026-05-06
 
 ### Fixed (lsof.txt stderr pollution + indistinguishable failure modes)
