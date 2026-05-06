@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.33"
+VERSION="2.7.34"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -4164,10 +4164,25 @@ check_version() {
     emit "version" "version_detect" "info" "detected" 0 \
          "version" "${tier}.0.${build}" "tier" "$tier" "build" "$build" "raw" "$raw"
 
-    # Classify
-    if (( tier < 110 )); then
-        emit "version" "tier_class" "strong" "vulnerable_eol" 5 \
-             "tier" "$tier" "note" "Pre-LTS - no vendor patch will be issued. Migrate or decommission."
+    # Classify. Patched-table lookup is authoritative for any tier in the KB,
+    # so it must run BEFORE residual EOL/dev/unknown branches — otherwise a
+    # patched 11.86.x / 11.94.x / 11.102.x host gets misclassified.
+    local i cutoff=""
+    for i in "${!PATCHED_TIERS_KEYS[@]}"; do
+        if [[ "${PATCHED_TIERS_KEYS[$i]}" == "$tier" ]]; then
+            cutoff="${PATCHED_TIERS_VALS[$i]}"; break
+        fi
+    done
+    if [[ -n "$cutoff" ]]; then
+        if (( build >= cutoff )); then
+            emit "version" "tier_class" "info" "patched_per_build" 5 \
+                 "tier" "$tier" "build" "$build" "cutoff" "$cutoff" \
+                 "note" "${tier}.0.${build} ≥ vendor cutoff ${tier}.0.${cutoff}"
+        else
+            emit "version" "tier_class" "strong" "vulnerable_per_build" 5 \
+                 "tier" "$tier" "build" "$build" "cutoff" "$cutoff" \
+                 "note" "${tier}.0.${build} < vendor cutoff ${tier}.0.${cutoff}"
+        fi
         return
     fi
     if [[ " $UNPATCHED_TIERS_STR " == *" $tier "* ]]; then
@@ -4181,27 +4196,13 @@ check_version() {
              "tier" "$tier" "note" "Odd-major dev/EDGE tier; not in vendor patch list."
         return
     fi
-    # Lookup cutoff
-    local i cutoff=""
-    for i in "${!PATCHED_TIERS_KEYS[@]}"; do
-        if [[ "${PATCHED_TIERS_KEYS[$i]}" == "$tier" ]]; then
-            cutoff="${PATCHED_TIERS_VALS[$i]}"; break
-        fi
-    done
-    if [[ -z "$cutoff" ]]; then
-        emit "version" "tier_class" "warning" "cutoff_unknown" 0 \
-             "tier" "$tier" "note" "No published cutoff for this tier - verify manually."
+    if (( tier < 86 )); then
+        emit "version" "tier_class" "strong" "vulnerable_eol" 5 \
+             "tier" "$tier" "note" "Pre-LTS - no vendor patch will be issued. Migrate or decommission."
         return
     fi
-    if (( build >= cutoff )); then
-        emit "version" "tier_class" "info" "patched_per_build" 5 \
-             "tier" "$tier" "build" "$build" "cutoff" "$cutoff" \
-             "note" "${tier}.0.${build} ≥ vendor cutoff ${tier}.0.${cutoff}"
-    else
-        emit "version" "tier_class" "strong" "vulnerable_per_build" 5 \
-             "tier" "$tier" "build" "$build" "cutoff" "$cutoff" \
-             "note" "${tier}.0.${build} < vendor cutoff ${tier}.0.${cutoff}"
-    fi
+    emit "version" "tier_class" "warning" "cutoff_unknown" 0 \
+         "tier" "$tier" "note" "No published cutoff for this tier - verify manually."
 }
 
 # ---- static patterns -------------------------------------------------------

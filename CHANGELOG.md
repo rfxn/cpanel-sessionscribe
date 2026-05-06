@@ -4,6 +4,40 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.34 — 2026-05-05
+
+### Fixed (check_version() early-return misclassified patched 86/94/102 hosts)
+
+`check_version()` short-circuited on `tier < 110` and emitted
+`vulnerable_eol` (severity strong) before the patched-table lookup
+could run. This made the v2.7.33 table refresh inert: any host on
+11.86.0.41+, 11.94.0.28+, or 11.102.0.39+ scanned VULNERABLE with
+the wrong remediation guidance ("Migrate or decommission" instead of
+"already patched, no action"). The 86 case was latent since v2.6.1
+(masked because most 86 hosts are actually EOL); the 2026-05-05 KB
+add of 94 and 102 elevated it to a live regression.
+
+`check_version()` reordered:
+
+1. Patched-table lookup runs first — authoritative for any tier in the KB.
+2. `UNPATCHED_TIERS` explicit-exclusion list.
+3. Odd-major dev/EDGE tiers.
+4. Sub-86 truly pre-LTS → `vulnerable_eol` (threshold tightened from
+   `< 110` to `< 86`; cPanel's KB lists 86 as the lowest patched line).
+5. Even tier in supported range but not in our table → `cutoff_unknown`.
+
+Validated under `--version-string` against a 29-case matrix covering
+all five branches, boundary builds at every patched cutoff, both
+parser formats (`11.X.0.Y` and `X.0 (build Y)`), and regression
+checks for 110/118/126/130/136. No behavioral change for hosts that
+were already correctly classified pre-fix.
+
+**Corrigendum to v2.7.33:** the "silently inconclusive" framing in the
+v2.7.33 entry below is incorrect — pre-fix behavior was a strong
+`vulnerable_eol` verdict (false positive at the code_verdict gate),
+not an unscored `cutoff_unknown`. v2.7.33 added the cutoffs to the
+table; v2.7.34 makes the table reachable for those tiers.
+
 ## sessionscribe-ioc-scan.sh v2.7.33 — 2026-05-05
 
 ### Changed (vendor table refresh — KB 40073787579671 update of 2026-05-05 17:14 CST)
