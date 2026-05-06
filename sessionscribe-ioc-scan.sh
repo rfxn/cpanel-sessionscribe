@@ -112,14 +112,12 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.32"
+VERSION="2.7.33"
 
-# Vendor patched-build cutoff per tier (cPanel KB 40073787579671). Per the
-# vendor advisory: tier 86 (EL6 path) and tier 124 added; tier 130 cutoff
-# bumped from .18 to .19. WP Squared product line: separate patch at build
-# 136.1.7 (tracked in mitigate/forensic, not in this tier-keyed map).
-PATCHED_TIERS_KEYS=(86 110 118 124 126 130 132 134 136)
-PATCHED_TIERS_VALS=(41 97  63  35  54  19  29  20  5)
+# Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
+# (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
+PATCHED_TIERS_KEYS=(86 94 102 110 118 124 126 130 132 134 136)
+PATCHED_TIERS_VALS=(41 28 39  97  63  35  54  19  29  20  5)
 
 # Tiers with no in-place vendor patch — hosts must upgrade. Both call sites
 # (phase_defense, check_version) match via ` $UNPATCHED_TIERS_STR ` == *" $tier "*.

@@ -4,6 +4,26 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.33 — 2026-05-05
+
+### Changed (vendor table refresh — KB 40073787579671 update of 2026-05-05 17:14 CST)
+
+cPanel published patched-build cutoffs for two previously-unmapped
+tiers: 11.94.0.28 and 11.102.0.39. Without this refresh, hosts on
+those tiers hit the `cutoff_unknown` branch in `check_version()` and
+contributed nothing to the version verdict — silently inconclusive
+rather than PATCHED/UNPATCHED.
+
+- `PATCHED_TIERS_KEYS`/`VALS`: 9 → 11 tiers (added 94/28 and 102/39).
+  Comment block trimmed: prior version-history annotations (tier
+  86/124 add, tier 130 bump) belong here, not in source.
+
+No behavioral logic changes — cutoff comparison, verdict gate, and
+scoring weights unchanged. C6/CL6 direct-update build 11.110.0.103
+already evaluates PATCHED via the existing tier-110 cutoff (97).
+WP Squared (`PATCHED_BUILD_WPSQUARED=11.136.1.7`) untouched — KB
+update did not move that lineage.
+
 ## sessionscribe-mitigate.sh v0.7.4 — 2026-05-04
 
 ### Fixed (broken MariaDB 10.x repos block epel-release install on CentOS 6/7)
