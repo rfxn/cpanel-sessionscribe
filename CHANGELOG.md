@@ -4,7 +4,213 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
-## sessionscribe-ioc-scan.sh v2.7.34 — 2026-05-05
+## sessionscribe-ioc-scan.sh v2.7.35 — 2026-05-06
+
+### Added (envelope plumbing + bundle lsof + runtime-state IOC track)
+
+Closes the verdict gap surfaced by the 2026-05-05 ps-hunt: 34 of 51
+hosts running active malicious processes were CLEAN-rated because the
+engine graded session-forensic evidence (IC-5790 entry-vector signals)
+but did not grade live runtime state. v2.7.35 adds three pieces in one
+shipping unit so the runtime track is usable from day one rather than
+deferred to a future release.
+
+**1. Envelope: known-bad file metadata.** `known_bad_meta()` helper
+populates `META_KV[]` with `sha256`, `md5`, `size_bytes`, `ctime_epoch`,
+`mtime_epoch`, `owner`, `mode` for any path it is asked to fingerprint.
+Wired into Pattern A (`/root/sshd`), Pattern H (`seobot.php`,
+`/tmp/seobot.zip`), Pattern I (`/etc/profile.d/system_profiled_service.sh`,
+`/root/.local/bin/system-service`), and the new runtime-track detect
+sites so every flagged high-value file ships with the same seven-field
+forensic fingerprint inside `signals[].kv` of the envelope. Operators
+no longer have to SSH back to the host to compute the hash for IR
+ticketing. Pre-existing `mtime_epoch`-only emit calls are replaced;
+no kv key was renamed (`mtime_epoch` is retained as the canonical
+field name).
+
+**2. Bundle: lsof snapshot.** `phase_bundle` now writes `lsof.txt` next
+to `ps.txt` / `connections.txt` / `iptables.txt`. Command:
+`timeout 30 lsof -nP -X` (or bare `lsof -nP -X` if `timeout(1)` is
+absent — both paths gated on `have_cmd lsof`, so hosts without lsof
+silently skip). `-n` skips DNS, `-P` skips service-name lookup,
+`-X` skips the socket cross-reference table that `ss -tnp` already
+produces. The 30s wall-clock cap prevents a wedged kernel-thread or
+unresponsive network FS from stalling the bundle. CentOS 6/CL6 safe
+(`timeout` is in coreutils ≥ 8.4, lsof package is optional). Surfaces
+masqueraded binary paths (`./.ld-linux.so`, `./https`, `./python3`)
+and the `(deleted)` tell on running-but-unlinked binaries that `ps`
+cannot show.
+
+**3. Runtime-state IOC track.** New rule cluster inside
+`check_destruction_iocs()` — runs after Patterns A–L on every triage
+scan (snapshot/--root mode skips it like A–I). Catches active operator
+infrastructure that survives the cpsrvd patch and ages out of the 90-day
+session window:
+
+  - **Known-bad on-disk paths** (six, exact match): `/dev/shm/.gs`
+    (GSocket listener), `/root/c3pool/{xmrig,config.json}`,
+    `/root/moneroocean/{xmrig,config.json}`, `/tmp/codeItems3` (PHP
+    cron-bot stage-2 payload). Any existence → `strong`/10 with full
+    forensic fingerprint.
+
+  - **GSocket relay-key files** (six globs): `/home/*/.config/{htop,dbus}/{defunct,lscgib,gs-dbus}.dat`
+    and the same set under `/root/.config/`. Any match → `strong`/10
+    with fingerprint. The keyfile is the linchpin — anyone who has it
+    can connect back through the relay.
+
+  - **`/tmp/.<hex32+>` PHP webshell drops** (cap 5 per scan). Exempts
+    CloudLinux LVE per-user mounts (`.temp_mount_*`), Imunify360 staging
+    (`.imunify360-*`), and Postgres lock files (`.s.PGSQL.*`). Match →
+    `warning`/4 (review tier — pattern is high-precision but not
+    zero-FP).
+
+  - **GSocket pkill-respawn shim**: regex `pkill -0 -U<UID> (defunct|gs-dbus|lscgib)`
+    in any cmdline → `strong`/10. The PR_SET_NAME mask + respawn-loop is
+    the gsocket-htop persistence signature.
+
+  - **xmrig argv masquerades** (three): `./.ld-linux.so` + `-c config.json`
+    or `--config=` (the dynamic linker is a library, not an exec —
+    unambiguous), `./https` + `-a rx/0` or pool flags, `./python[0-9]`
+    + `--donate-level` or `--threads ... --url ... pool*`. Each → `strong`/10.
+
+  - **Visible xmrig** (path + args two-stage): `[ /]xmrig` exec with
+    `--config=`, pool URL, c3pool/moneroocean/supportxmr/nanopool/hashvault
+    string in same line → `strong`/10.
+
+  - **Loader pipes in flight**: `setup_c3pool_miner.sh`, `c3pool/xmrig_setup`,
+    `/atdu` (perl bot), `/start.php?v=` (codeItems3 fetcher), `/s/xminstall`
+    in any cmdline → `strong`/10.
+
+  - **XMR wallet prefixes** (three, 16-char base58 prefix to match both
+    full and `ps`-truncated forms): `423Gvxk9VMFH3FUy`, `4AypWi9xNQvSy11F`,
+    `47eqhWc4e88EVdqb`. Match in any cmdline → `strong`/10. Wallet hits
+    are zero-FP (these strings do not occur in legitimate code paths).
+
+  - **Known C2 IPs** (six) in cmdline: `147.182.224.216` (atdu),
+    `45.140.17.{40,23}` (codeItems3), `157.245.235.139` (xminstall),
+    `57.129.119.218` (xmrig pool/relay), `209.14.84.37` (snap-itservices
+    novel implant). Match → `strong`/10.
+
+  - **Known C2 hosts** (one): `u.lihq.me` (custom GSocket relay,
+    operator-owned). Match → `strong`/10.
+
+  - **C2 ESTAB connections**: independent corroborator via `ss -tnp`;
+    catches dormant beacons whose loader pipe has exited but whose
+    connection persists. Match → `strong`/10.
+
+  - **Reverse-shell shapes** (six patterns, each FP-tightened across two
+    sentinel passes):
+    1. `perl /<dir>/<file>.{pl,sh} <ip4> <port>` — the
+       `ultimate2.shoppepro.com` `bc.pl` shape; IP+port-anchored.
+    2. `bash -ic .../dev/tcp/<ip>/<port>` — IP+port-anchored.
+    3. `nc ... -e /bin/bash` — requires `-e` payload tell (bare `nc -lvp`
+       was dropping benign health probes into live_compromise; first
+       sentinel pass).
+    4. `ncat ... --exec | --sh-exec` — Alpine/modern PoCs; second sentinel
+       pass coverage gap.
+    5. `socat ... TCP-{LISTEN,CONNECT}:<port>` — port-anchored.
+    6. `python -c ... (pty.spawn | .connect( | os.dup2 | subprocess.shell=True
+       | asyncio.open_connection | pwn import | paramiko.connect | /bin/sh
+       at non-identifier boundary)` — corroborator-only matching, no `import`
+       ordering requirement (broadened in second sentinel pass after pwntools
+       / paramiko / asyncio / corroborator-before-import shapes were
+       missing). FP-rejects Datadog/zabbix `socket.gethostname` / `os.path`
+       admin one-liners.
+    Each match → `live_compromise`/10.
+
+  - **LPE exploit binaries** (cwd-relative, 9 names): `./dirty`, `./dirtycow`,
+    `./dirtypipe`, `./can_bcm` (CVE-2021-22555), `./exploit`, `./poc`,
+    `./pwnkit`, `./0day`, `./local-root`. argv[0] match via awk forward-walk
+    over `\_` forest-tree tokens (`for (i=11; i<=NF && $i == "\\_"; i++)`),
+    handling arbitrary forest depth. FP-rejects `find / -name ./dirty`
+    (whose $11 is `find`, not `\_`). Second sentinel pass replaced an
+    earlier depth-1-only ternary that missed deeper-nested LPE binaries.
+    Match → `live_compromise`/10.
+
+  - **Generic 95-char XMR wallet**: regex-matches any `[48][0-9A-Za-z]{94}`
+    on a non-alphanumeric boundary, catching wallets beyond the three
+    known prefixes. Zero-FP. Match → `live_compromise`/10.
+
+  - **Base64-wrapped GSocket shim**: matches the b64 prefix `L3Vzci9iaW4vcGtpbGw`
+    (literal "/usr/bin/pkill" prefix in base64) anywhere in a cmdline.
+    Catches `host01.educabras.com`-class envelopes where the operator
+    launched the persistence loop via `bash -c "{ echo <b64> | base64 -d; }"`
+    and the plaintext `pkill -0 -U` regex above never sees the decoded
+    form. Match → `live_compromise`/10.
+
+Net runtime cost: one `ps auxfww`, one `ss -tnp`, ~6 stat calls per
+scan. ~100 ms wall-clock added. Snapshot/replay mode (`--root`) skips
+the runtime block, mirroring the existing Patterns A–I skip.
+
+**4. New severity tier — `live_compromise`.** Narrow opt-in tier above
+`strong`, reserved for the runtime IOCs whose evidence is unambiguous
+on a single hit. Mechanics:
+
+- Emit at severity `live_compromise` (or `live` via the `emit_signal`
+  wrapper). Same weight as `strong` (10).
+- The per-signal accumulator increments `compromise_critical`
+  **unconditionally** for `live_compromise` emits, bypassing the v3
+  class ladder (`ioc_compromise_class()`). Existing `strong` emits
+  still consult the ladder; the v3 FP-elimination behavior is
+  preserved for every Pattern A–L signal.
+- Single-hit `compromise_critical > 0` drives `host_verdict=COMPROMISED`
+  via the existing gate at line 8079. No threshold-based score logic
+  was changed.
+- New `[LIVE]` tag (bold red) in human-readable output; `[LIVE]` ranks
+  above `[IOC]` in the per-section worst-wins matrix.
+
+The 13 emit sites tagged `live_compromise`:
+
+| Emit `id` | Match shape |
+|---|---|
+| `ioc_runtime_reverse_shell` | perl/bash /dev/tcp / nc -e / ncat --exec / socat / python (pwntools, paramiko, asyncio, dup2, pty.spawn, subprocess shell=True, /bin/sh) |
+| `ioc_runtime_lpe_binary` | `./can_bcm`/`./dirty`/`./pwnkit` etc. running with CPU |
+| `ioc_runtime_xmrig_visible` | xmrig + pool/config args running |
+| `ioc_runtime_xmrig_ldlinux` / `_https` / `_python` | xmrig argv masquerades |
+| `ioc_runtime_wallet` | known XMR wallet prefix in cmdline |
+| `ioc_runtime_xmr_wallet_generic` | 95-char wallet regex in cmdline |
+| `ioc_runtime_loader_in_flight` | c3pool installer / atdu / xminstall pipe in process |
+| `ioc_runtime_c2_in_cmdline` / `_c2_host_in_cmdline` | known C2 IP/host in process cmdline |
+| `ioc_runtime_c2_estab` | TCP ESTAB to known C2 IP |
+| `ioc_runtime_known_bad_path` (for `/dev/shm/.gs` and `/tmp/codeItems3`) | RAM-only listener / specifically-named PHP loader payload |
+| `ioc_runtime_gsocket_respawn` (plaintext) | GSocket `pkill -0 -U` respawn shim |
+| `ioc_runtime_gsocket_b64_shim` | base64-wrapped form of the same |
+
+The 2 emit sites that stay at lower tiers:
+
+| Emit `id` | Tier | Why |
+|---|---|---|
+| `ioc_runtime_known_bad_path` (for c3pool/moneroocean install paths) | `strong` | Installed binary on disk; if xmrig is also running, the masquerade emits fire and drive live_compromise. |
+| `ioc_runtime_gsocket_keyfile` | `strong` | Keyfile alone, no shim seen — operator has a way back but isn't presently active. |
+| `ioc_runtime_tmp_hex_blob` | `warning` | High-precision `/tmp/.<hex32+>` but not zero-FP. |
+
+### Known limitations / follow-ups (not addressed in v2.7.35)
+
+- **Score-weight caps on non-IC-5790 signals.** The hunt's broader
+  finding — that `csf_disabled`, `patch_marker_absent`, `ioc_token_attempt_*`,
+  and `ioc_quarantined_session_*` are weight-capped so they cannot
+  combine to cross the SUSPICIOUS threshold — is unchanged in v2.7.35.
+  The runtime track adds a second source of high-weight signals that
+  do contribute to the score; combined-signal recalibration of the
+  capped non-session classes is a separate scoring change targeted for
+  v2.7.36.
+- **kill-chain.tsv / kill-chain.jsonl rendering.** Runtime IOCs land in
+  `signals[]` but are not yet rendered as KCE rows. CLEAN-rated hosts
+  with runtime hits will show in `signals[]` and the host_verdict but
+  not in the kill-chain timeline. Wiring the runtime rules into kill-
+  chain rendering is a v2.7.36 follow-up.
+- **Anomalous outbound port detection** (ESTAB to non-private IP on
+  non-standard port from non-root user) is intentionally deferred —
+  the rule is high-FP without a baseline of legitimate per-cPanel-user
+  outbound profiles.
+
+**Validation.** `bash -n` clean. `shellcheck -S warning` clean for the
+new code. Helper smoke-tested against `/etc/passwd` returning all seven
+metadata fields. Score-time replay against the 14k-host telemetry
+archive should be run before the runtime track is enabled fleet-wide;
+expected outcome is ~34 CLEAN→COMPROMISED transitions per the hunt.
+
+
 
 ### Fixed (check_version() early-return misclassified patched 86/94/102 hosts)
 

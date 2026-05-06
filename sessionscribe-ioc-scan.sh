@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.34"
+VERSION="2.7.35"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -271,6 +271,72 @@ PATTERN_L_NUKE_RE="rm[[:space:]]+-rf[[:space:]]+--no-preserve-root[[:space:]]+/(
 PATTERN_L_CMD_START="__CMD_START__"
 PATTERN_L_CMD_END="__CMD_END__"
 PATTERN_L_CMD_ENVELOPE_RE="${PATTERN_L_CMD_START}|${PATTERN_L_CMD_END}"
+
+# Runtime-state IOC tables — post-exploitation residue (gsocket, miners,
+# loaders, C2). See CHANGELOG v2.7.35 for source + rationale.
+RUNTIME_KNOWN_BAD_PATHS=(
+    "/dev/shm/.gs"
+    "/root/c3pool/xmrig"
+    "/root/c3pool/config.json"
+    "/root/moneroocean/xmrig"
+    "/root/moneroocean/config.json"
+    "/tmp/codeItems3"
+)
+RUNTIME_KEYFILE_GLOBS=(
+    "/home/*/.config/htop/defunct.dat"
+    "/home/*/.config/htop/lscgib.dat"
+    "/home/*/.config/dbus/gs-dbus.dat"
+    "/root/.config/htop/defunct.dat"
+    "/root/.config/htop/lscgib.dat"
+    "/root/.config/dbus/gs-dbus.dat"
+)
+RUNTIME_C2_IPS=(
+    "147.182.224.216"
+    "45.140.17.40"
+    "45.140.17.23"
+    "157.245.235.139"
+    "57.129.119.218"
+    "209.14.84.37"
+)
+RUNTIME_C2_HOSTS=(
+    "u.lihq.me"
+)
+# 16-char prefixes — match both full and ps-truncated XMR addresses.
+RUNTIME_WALLET_PREFIXES=(
+    "423Gvxk9VMFH3FUy"
+    "4AypWi9xNQvSy11F"
+    "47eqhWc4e88EVdqb"
+)
+RUNTIME_MASQ_RESPAWN_RE='pkill[[:space:]]+-0[[:space:]]+-U[0-9]+[[:space:]]+(defunct|gs-dbus|lscgib)'
+RUNTIME_LDLINUX_MASQ_RE='\./\.?ld-linux\.so[^[:space:]]*[[:space:]]+(-c[[:space:]]+config\.json|--config=)'
+RUNTIME_HTTPS_MASQ_RE='\./https[[:space:]]+(-a[[:space:]]+rx/0|-o[[:space:]].*pool\.|--url=.*pool\.)'
+RUNTIME_PYTHON_MASQ_RE='\./python[0-9]*([[:space:]]|$)'
+RUNTIME_PYTHON_MASQ_ARGS_RE='(--donate-level|--url[[:space:]]+(stratum\+)?[a-z]+://.*(pool|c3pool|moneroocean|supportxmr)|-o[[:space:]]+.*pool\.|--threads[[:space:]].*--url[[:space:]].*pool)'
+RUNTIME_LOADER_PIPE_RE='(c3pool/setup_c3pool_miner|c3pool/xmrig_setup|setup_c3pool_miner\.sh|/atdu([^a-zA-Z0-9_]|$)|/start\.php\?v=|/s/xminstall)'
+RUNTIME_TMP_HEX_RE='/\.[a-fA-F0-9]{32,}$'
+
+# CloudLinux LVE / Imunify360 / Postgres lock-file exemptions applied at
+# the call site (see check_destruction_iocs).
+RUNTIME_REVERSE_SHELL_RES=(
+    'perl[[:space:]]+(/tmp/|/dev/shm/|/var/tmp/|/home/[^/[:space:]]+/)[^[:space:]]+\.(pl|sh)[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}[[:space:]]+[0-9]+'
+    'bash[[:space:]]+-[ic]+[[:space:]].*/dev/tcp/([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+'
+    '(^|[[:space:]])nc[[:space:]].*-e[[:space:]]+/bin/(ba)?sh'
+    '(^|[[:space:]])ncat[[:space:]].*(--exec|--sh-exec)[[:space:]]+'
+    '(^|[[:space:]])socat[[:space:]]+.*TCP-(LISTEN|CONNECT):[0-9]+'
+    'python[0-9]*[[:space:]]+-c[[:space:]].*(pty\.spawn|\.connect[[:space:]]*\(|os\.dup2|subprocess\.[^=]*shell=True|asyncio\.open_connection|pwn[[:space:]]+import|paramiko\..*connect|(os\.exec[a-z]*|subprocess\.(call|run|Popen)|os\.system|os\.popen)\(([[:space:]]*\[)?[[:space:]]*['\''"]?/bin/(ba)?sh)'
+)
+
+# LPE PoC binaries — cwd-relative argv[0] match.
+RUNTIME_LPE_BINARIES=(
+    "./dirty" "./dirtycow" "./dirtypipe" "./can_bcm" "./exploit"
+    "./poc" "./pwnkit" "./0day" "./local-root"
+)
+
+# 95-char XMR wallet, boundary-anchored.
+RUNTIME_XMR_WALLET_RE='[ /=][48][0-9A-Za-z]{94}([[:space:]]|$)'
+
+# Base64 prefix of "/usr/bin/pkill" — catches base64-wrapped GSocket shim.
+RUNTIME_GS_B64_PREFIX='L3Vzci9iaW4vcGtpbGw'
 
 # Attacker-planted jumphost-mimic SSH key labels (per IC-5790 dossier).
 PATTERN_G_BAD_KEY_LABELS=(
@@ -1066,6 +1132,7 @@ ENV_SCORE=""
 ENV_IOC_TOOL_VERSION=""
 ENV_IOC_RUN_ID=""
 ENV_IOC_TS=""
+ENV_HOST=""
 N_PRE=0                 # PRE-DEFENSE event count (set in phase_reconcile)
 N_POST=0                # POST-DEFENSE event count (set in phase_reconcile)
 RECONCILED=()           # "verdict|delta|epoch|pattern|key|note" strings (phase_reconcile output)
@@ -1383,6 +1450,7 @@ print_signal_human() {
     local area="$1" id="$2" severity="$3" key="$4"; shift 4
     local tag color
     case "$severity" in
+        live_compromise) tag="[LIVE]"; color="${BOLD}${RED}" ;;
         strong)   tag="[IOC]";      color="$RED"    ;;
         evidence) tag="[EVIDENCE]"; color="$YELLOW" ;;
         warning)  tag="[WARN]";     color="$YELLOW" ;;
@@ -1514,10 +1582,11 @@ emit_signal() {
     shift 4
     local ioc_sev="info" weight=0
     case "$sev" in
-        (pass|info)  ioc_sev="info";    weight=0  ;;
-        (warn)       ioc_sev="warning"; weight=4  ;;
-        (fail)       ioc_sev="strong";  weight=10 ;;
-        (*)          ioc_sev="info";    weight=0  ;;
+        (pass|info)  ioc_sev="info";            weight=0  ;;
+        (warn)       ioc_sev="warning";         weight=4  ;;
+        (fail)       ioc_sev="strong";          weight=10 ;;
+        (live)       ioc_sev="live_compromise"; weight=10 ;;
+        (*)          ioc_sev="info";            weight=0  ;;
     esac
     emit "$area" "$key" "$ioc_sev" "$key" "$weight" "note" "$note" "$@"
 }
@@ -1534,6 +1603,32 @@ mtime_of() {
     local f="$1"
     [[ -e "$f" ]] || { echo ""; return; }
     stat -c %Y "$f" 2>/dev/null
+}
+
+# Populates META_KV[] with sha256/md5/size/ctime/mtime/owner/mode for $1.
+META_KV=()
+META_SHA256=""
+known_bad_meta() {
+    local f="$1" v
+    META_KV=()
+    META_SHA256=""
+    [[ -f "$f" ]] || return 0
+    if have_cmd sha256sum; then
+        v=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+        if [[ -n "$v" ]]; then
+            META_KV+=(sha256 "$v")
+            META_SHA256="$v"
+        fi
+    fi
+    if have_cmd md5sum; then
+        v=$(md5sum "$f" 2>/dev/null | awk '{print $1}')
+        [[ -n "$v" ]] && META_KV+=(md5 "$v")
+    fi
+    v=$(stat -c %s "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(size_bytes "$v")
+    v=$(stat -c %Z "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(ctime_epoch "$v")
+    v=$(stat -c %Y "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(mtime_epoch "$v")
+    v=$(stat -c %U "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(owner "$v")
+    v=$(stat -c %a "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(mode "$v")
 }
 
 cat_log() {
@@ -1609,6 +1704,7 @@ ioc_key_to_pattern() {
         (ioc_pattern_j_*)                       echo J ;;
         (ioc_pattern_k_*)                       echo K ;;
         (ioc_pattern_l_*)                       echo L ;;
+        (ioc_runtime_*)                         echo R ;;
         # Mitigate-quarantine secondary-read replay signals - synthetic
         # emits derived from sidecar fields, NOT from re-running the live
         # IOC ladder. Routed to X (forged-session evidence) since that's
@@ -1647,6 +1743,30 @@ ioc_key_to_persist_pattern() {
         (ioc_pattern_d_reseller*|ioc_pattern_d_token*|ioc_pattern_d_whm_fullroot*) echo D ;;
         (ioc_pattern_h_seobot*|ioc_pattern_h_alldone*) echo H ;;
         (*)                                     echo "" ;;
+    esac
+}
+
+# Section grouping for kill-chain PERSISTENCE/DESTRUCTION render blocks.
+# Returns: persistence | destruction | "".
+ioc_section_group() {
+    ioc_key_is_soft_variant "$1" && { echo ""; return; }
+    local cls
+    cls=$(ioc_compromise_class "$1")
+    case "$cls" in
+        persistence)            echo persistence; return ;;
+        destruction|token_used) echo destruction; return ;;
+    esac
+    case "$1" in
+        ioc_runtime_gsocket_keyfile_present|ioc_runtime_gsocket_persistence_shim)
+            echo persistence ;;
+        ioc_runtime_known_bad_path_present|ioc_runtime_xmrig_masquerade| \
+        ioc_runtime_xmrig_visible_active|ioc_runtime_xmr_wallet_in_cmdline| \
+        ioc_runtime_wallet_in_cmdline|ioc_runtime_known_loader_in_flight| \
+        ioc_runtime_c2_callback|ioc_runtime_c2_callback_active| \
+        ioc_runtime_reverse_shell_active|ioc_runtime_lpe_binary_running| \
+        ioc_runtime_tmp_hex_blob_present)
+            echo destruction ;;
+        *) echo "" ;;
     esac
 }
 
@@ -1727,6 +1847,7 @@ read_envelope_meta() {
     ENV_IOC_TOOL_VERSION=$(envelope_root_field "$env" tool_version)
     ENV_IOC_RUN_ID=$(envelope_root_field "$env" run_id)
     ENV_IOC_TS=$(envelope_root_field "$env" ts)
+    ENV_HOST=$(envelope_root_field "$env" host)
 }
 
 ioc_primitive_row() {
@@ -1787,7 +1908,7 @@ read_iocs_from_envelope() {
         # the kill-chain. Advisory does not escalate host_verdict; any
         # future advisory keys default to filtered-out.
         case "$severity" in
-            (strong|warning) ;;
+            (strong|warning|live_compromise) ;;
             (advisory)
                 case "$key" in
                     (ioc_pattern_e_websocket_shell_hits_pre_compromise|ioc_pattern_e_websocket_shell_hits_orphan|ioc_attacker_ip_2xx_on_cpsess_pre_compromise) ;;
@@ -2603,7 +2724,9 @@ aggregate_attacker_ips() {
     ATTACKER_IP_OVERFLOW=""
     ATTACKER_IP_TOTAL=0
 
+    # Two-step init: bash 4 + set -u trips on empty-assoc deref otherwise.
     declare -A ip_count ip_stages ip_first
+    ip_count=(); ip_stages=(); ip_first=()
 
     local idx
     for (( idx=0; idx<${#IOC_PRIMITIVES[@]}; idx++ )); do
@@ -2678,12 +2801,77 @@ fmt_delta_human() {
     fi
 }
 
+# Partition OFFENSE_EVENTS+IOC_PRIMITIVES into KC_*_ROWS and KC_*_LETTERS.
+KC_PERSIST_ROWS=()
+KC_DESTRUCT_ROWS=()
+declare -A KC_PERSIST_LETTERS
+declare -A KC_DESTRUCT_LETTERS
+build_kc_section_rows() {
+    KC_PERSIST_ROWS=()
+    KC_DESTRUCT_ROWS=()
+    KC_PERSIST_LETTERS=()
+    KC_DESTRUCT_LETTERS=()
+    (( ${#OFFENSE_EVENTS[@]} == 0 )) && return 0
+    local i _oe pattern key note _rec _path _ip _ _grp
+    for (( i=0; i<${#OFFENSE_EVENTS[@]}; i++ )); do
+        _oe="${OFFENSE_EVENTS[$i]}"
+        pattern=$(printf '%s' "$_oe" | cut -d'|' -f2)
+        key=$(printf '%s' "$_oe" | cut -d'|' -f3)
+        note=$(printf '%s' "$_oe" | cut -d'|' -f4)
+        _grp=$(ioc_section_group "$key")
+        [[ -z "$_grp" ]] && continue
+        _rec="${IOC_PRIMITIVES[$i]:-}"
+        IFS="$PRIM_SEP" read -r _ _ip _path _ <<< "$_rec"
+        case "$_grp" in
+            persistence)
+                KC_PERSIST_ROWS+=("${pattern}|${key}|${_path:-}|${note}")
+                KC_PERSIST_LETTERS["$pattern"]=1
+                ;;
+            destruction)
+                KC_DESTRUCT_ROWS+=("${pattern}|${key}|${_path:-}|${note}")
+                KC_DESTRUCT_LETTERS["$pattern"]=1
+                ;;
+        esac
+    done
+}
+
+# Args: title, color, rows... (each row is pipe-delimited pattern|key|path|note).
+render_kc_section() {
+    local title="$1" hdr_color="$2"
+    shift 2
+    (( $# == 0 )) && return 0
+
+    local count=$#
+    local plural; (( count == 1 )) && plural="" || plural="s"
+    printf '\n  %s%s%s  %s%s── %s (%d indicator%s) ──%s\n' \
+        "$C_DIM" "$GLYPH_BOX_V" "$C_NC" \
+        "$hdr_color" "$C_BLD" "$title" "$count" "$plural" "$C_NC"
+
+    local row p k pth n display
+    for row in "$@"; do
+        IFS='|' read -r p k pth n <<< "$row"
+        display="${pth:-$n}"
+        if (( ${#display} > 80 )); then
+            display="${display:0:77}${GLYPH_ELLIPSIS}"
+        fi
+        # %-30.30s pads + truncates so long keys keep column alignment.
+        printf '  %s%s     %s%s%s pattern %-4s  %s%-30.30s%s  %s\n' \
+            "$C_DIM" "$GLYPH_BOX_V" "$C_NC" \
+            "$hdr_color" "$GLYPH_ARROW" \
+            "$p" \
+            "$C_CYN" "$k" "$C_NC" \
+            "$display"
+    done
+}
+
 render_kill_chain() {
     (( QUIET )) && return 0
 
     # Aggregate attacker IPs once for the HEADLINE section. Walks
     # IOC_PRIMITIVES + RECONCILED; sets ATTACKER_IP_* globals.
     aggregate_attacker_ips
+
+    build_kc_section_rows
 
     # Build a single chronologically-merged event list (defense + offense)
     # so the timeline reads as one story instead of two parallel sections.
@@ -2760,12 +2948,45 @@ render_kill_chain() {
             "$C_BLD" "$GLYPH_BOX_TL" "$GLYPH_BOX_H" "$GLYPH_BOX_H" \
             "$C_BLD" "$title" "$C_NC" \
             "$C_BLD" "$right_bar" "$C_NC"
-        printf '%s%s%s host         %s%s%s (%s)\n'   "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$C_BLD" "$HOSTNAME_FQDN" "$C_NC" "$PRIMARY_IP"
+        # Replay/forensic mode: prefer envelope's source host over the
+        # local replay-host. Suppress IP parens when no IP is available
+        # (envelope-replay typically has no primary_ip at root).
+        local _kc_host="${ENV_HOST:-$HOSTNAME_FQDN}" _kc_ip="$PRIMARY_IP"
+        if [[ -n "$_kc_ip" ]]; then
+            printf '%s%s%s host         %s%s%s (%s)\n' "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$C_BLD" "$_kc_host" "$C_NC" "$_kc_ip"
+        else
+            printf '%s%s%s host         %s%s%s\n'      "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$C_BLD" "$_kc_host" "$C_NC"
+        fi
         printf '%s%s%s cpanel       %s   os %s\n'    "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "${CPANEL_NORM:-unknown}" "${OS_PRETTY:-unknown}"
         printf '%s%s%s verdict      %s%s%s\n'        "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$hv_color" "$verdict_line" "$C_NC"
+        local _pcount=${#KC_PERSIST_ROWS[@]}
+        local _dcount=${#KC_DESTRUCT_ROWS[@]}
+        if (( _pcount > 0 || _dcount > 0 )); then
+            local _cta="" _ltrs _section_count=0
+            # sort -u for stable order across bash versions.
+            if (( _pcount > 0 )); then
+                _ltrs=$(printf '%s\n' "${!KC_PERSIST_LETTERS[@]}" | LC_ALL=C sort -u | paste -sd,)
+                _cta+="${_pcount} persistence (${_ltrs})"
+                _section_count=$(( _section_count + 1 ))
+            fi
+            if (( _dcount > 0 )); then
+                _ltrs=$(printf '%s\n' "${!KC_DESTRUCT_LETTERS[@]}" | LC_ALL=C sort -u | paste -sd,)
+                _cta+="${_cta:+ + }${_dcount} destruction (${_ltrs})"
+                _section_count=$(( _section_count + 1 ))
+            fi
+            local _section_plural; (( _section_count == 1 )) && _section_plural="" || _section_plural="s"
+            printf '%s%s%s action       %s%s — review section%s below%s\n' \
+                "$C_BLD" "$GLYPH_BOX_V" "$C_NC" \
+                "${C_BLD}${C_RED}" "$_cta" "$_section_plural" "$C_NC"
+        fi
         printf '%s%s%s defenses     patch %s   modsec %s   csf %s   mitigate %s\n' \
             "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$def_patch" "$def_modsec" "$def_csf" "$def_mitigate"
         printf '%s%s%s%s\n' "$C_BLD" "$GLYPH_BOX_BL" "$full_bar" "$C_NC"
+
+        (( ${#KC_PERSIST_ROWS[@]} > 0 )) \
+            && render_kc_section "PERSISTENCE" "$C_YEL" "${KC_PERSIST_ROWS[@]}"
+        (( ${#KC_DESTRUCT_ROWS[@]} > 0 )) \
+            && render_kc_section "DESTRUCTION" "$C_RED" "${KC_DESTRUCT_ROWS[@]}"
 
         # ── Chronological tree ──────────────────────────────────────────
         # Single merged stream: defense + offense events, time-sorted, with
@@ -3564,6 +3785,14 @@ phase_bundle() {
     fi
     if have_cmd iptables; then
         iptables -L -nv > "$bdir/iptables.txt" 2>&1 || true
+    fi
+    # 30s cap; -X skips socket xref (ss already has it).
+    if have_cmd lsof; then
+        if have_cmd timeout; then
+            timeout 30 lsof -nP -X > "$bdir/lsof.txt" 2>&1 || true
+        else
+            lsof -nP -X > "$bdir/lsof.txt" 2>&1 || true
+        fi
     fi
 
     # 7. Pattern A binary - capture metadata only, NOT the binary itself
@@ -5706,7 +5935,7 @@ check_destruction_iocs() {
         check_pattern_j_persistence
         return
     fi
-    hdr_section "destruct" "destruction IOC scan (Patterns A-J)"
+    hdr_section "destruct" "destruction IOC scan (Patterns A-L + runtime)"
     local hits=0
 
     # History files swept by Pattern F harvester and Pattern H markers
@@ -5723,16 +5952,11 @@ check_destruction_iocs() {
 
     # ---- Pattern A: /root/sshd encryptor + .sorry + ransom README + C2 ---
     if [[ -f "$PATTERN_A_BINARY" ]]; then
-        local actual_sha="" bin_mtime
-        bin_mtime=$(stat -c %Y "$PATTERN_A_BINARY" 2>/dev/null)
-        if command -v sha256sum >/dev/null 2>&1; then
-            actual_sha=$(sha256sum "$PATTERN_A_BINARY" 2>/dev/null | awk '{print $1}')
-        fi
-        if [[ "$actual_sha" == "$PATTERN_A_SHA256" ]]; then
+        known_bad_meta "$PATTERN_A_BINARY"
+        if [[ "$META_SHA256" == "$PATTERN_A_SHA256" ]]; then
             emit "destruction" "ioc_pattern_a_encryptor" "strong" \
                  "ioc_pattern_a_encryptor_match" 10 \
-                 "path" "$PATTERN_A_BINARY" "sha256" "$actual_sha" \
-                 "mtime_epoch" "${bin_mtime:-0}" \
+                 "path" "$PATTERN_A_BINARY" "${META_KV[@]}" \
                  "note" "$PATTERN_A_BINARY sha256 matches IC-5790 .sorry encryptor (CRITICAL)."
             ((hits++))
         else
@@ -5740,8 +5964,7 @@ check_destruction_iocs() {
             # Warning, not strong, to avoid FPs on legitimate operator drops.
             emit "destruction" "ioc_pattern_a_unknown" "warning" \
                  "ioc_pattern_a_binary_present_unknown_hash" 4 \
-                 "path" "$PATTERN_A_BINARY" "sha256" "${actual_sha:-unknown}" \
-                 "mtime_epoch" "${bin_mtime:-0}" \
+                 "path" "$PATTERN_A_BINARY" "${META_KV[@]}" \
                  "note" "$PATTERN_A_BINARY exists but sha256 differs from known sample - review."
             ((hits++))
         fi
@@ -6353,11 +6576,10 @@ check_destruction_iocs() {
     fi
     rm -f "$docroot_list"
     if [[ -n "$h_seobot_hit" ]]; then
-        local h_mtime
-        h_mtime=$(stat -c %Y "$h_seobot_hit" 2>/dev/null)
+        known_bad_meta "$h_seobot_hit"
         emit "destruction" "ioc_pattern_h_seobot_php" "strong" \
              "ioc_pattern_h_seobot_dropper_present" 10 \
-             "sample_path" "$h_seobot_hit" "mtime_epoch" "${h_mtime:-0}" \
+             "sample_path" "$h_seobot_hit" "${META_KV[@]}" \
              "note" "$PATTERN_H_DROPPER_FILE planted in $h_seobot_hit - Pattern H SEO defacement (CRITICAL)."
         ((hits++))
         _h1_hit=1
@@ -6438,11 +6660,10 @@ check_destruction_iocs() {
             h_zip_b64=$(head -c 16 "$PATTERN_H_ZIP_PATH" 2>/dev/null | base64 -w0 2>/dev/null)
         fi
         if [[ -n "$h_zip_b64" && "$h_zip_b64" == "${PATTERN_H_ZIP_MAGIC_B64}"* ]]; then
-            local h_zip_mtime
-            h_zip_mtime=$(stat -c %Y "$PATTERN_H_ZIP_PATH" 2>/dev/null)
+            known_bad_meta "$PATTERN_H_ZIP_PATH"
             emit "destruction" "ioc_pattern_h_zip_dropper" "strong" \
                  "ioc_pattern_h_dropper_archive" 10 \
-                 "path" "$PATTERN_H_ZIP_PATH" "mtime_epoch" "${h_zip_mtime:-0}" \
+                 "path" "$PATTERN_H_ZIP_PATH" "${META_KV[@]}" \
                  "note" "Pattern H dropper archive at $PATTERN_H_ZIP_PATH (base64 zip header matches H signature - operator did not self-clean)."
             ((hits++))
             _h4_hit=1
@@ -6483,23 +6704,20 @@ check_destruction_iocs() {
     # I1: profile.d hook file. Filename is unique per dossier; no benign
     # system component creates this exact filename.
     if [[ -f "$PATTERN_I_PROFILED" ]]; then
-        local i_hook_mtime
-        i_hook_mtime=$(stat -c %Y "$PATTERN_I_PROFILED" 2>/dev/null)
+        known_bad_meta "$PATTERN_I_PROFILED"
         emit "destruction" "ioc_pattern_i_profiled_hook" "strong" \
              "ioc_pattern_i_profiled_hook_present" 10 \
-             "path" "$PATTERN_I_PROFILED" "mtime_epoch" "${i_hook_mtime:-0}" \
+             "path" "$PATTERN_I_PROFILED" "${META_KV[@]}" \
              "note" "Pattern I profile.d backdoor hook at $PATTERN_I_PROFILED - fires on every interactive login (CRITICAL)."
         ((hits++))
     fi
 
-    # I2: binary at non-standard /root/.local/bin path. Capture mtime only;
-    # forensic v0.10.1+ hashes the binary into bundle metadata.
+    # I2: binary at non-standard /root/.local/bin path.
     if [[ -f "$PATTERN_I_BINARY" ]]; then
-        local i_bin_mtime
-        i_bin_mtime=$(stat -c %Y "$PATTERN_I_BINARY" 2>/dev/null)
+        known_bad_meta "$PATTERN_I_BINARY"
         emit "destruction" "ioc_pattern_i_binary" "strong" \
              "ioc_pattern_i_binary_present" 10 \
-             "path" "$PATTERN_I_BINARY" "mtime_epoch" "${i_bin_mtime:-0}" \
+             "path" "$PATTERN_I_BINARY" "${META_KV[@]}" \
              "note" "Pattern I binary at $PATTERN_I_BINARY - non-standard daemon path, masquerades as user-installed (CRITICAL)."
         ((hits++))
     fi
@@ -7036,9 +7254,230 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
+    # ---- Runtime-state IOCs ---- see CHANGELOG v2.7.35.
+    local _rt_p
+    for _rt_p in "${RUNTIME_KNOWN_BAD_PATHS[@]}"; do
+        [[ -f "$_rt_p" ]] || continue
+        known_bad_meta "$_rt_p"
+        local _rt_label _rt_sev
+        case "$_rt_p" in
+            /dev/shm/.gs)               _rt_label="GSocket listener binary"; _rt_sev="live_compromise" ;;
+            /tmp/codeItems3)            _rt_label="PHP cron-bot stage-2 payload"; _rt_sev="live_compromise" ;;
+            */c3pool/xmrig)             _rt_label="c3pool xmrig install"; _rt_sev="strong" ;;
+            */c3pool/config.json)       _rt_label="c3pool xmrig config"; _rt_sev="strong" ;;
+            */moneroocean/xmrig)        _rt_label="moneroocean xmrig install"; _rt_sev="strong" ;;
+            */moneroocean/config.json)  _rt_label="moneroocean xmrig config"; _rt_sev="strong" ;;
+            *)                          _rt_label="runtime artifact"; _rt_sev="strong" ;;
+        esac
+        emit "destruction" "ioc_runtime_known_bad_path" "$_rt_sev" \
+             "ioc_runtime_known_bad_path_present" 10 \
+             "path" "$_rt_p" "${META_KV[@]}" \
+             "note" "$_rt_label at $_rt_p — runtime payload artifact (CRITICAL)."
+        ((hits++))
+    done
+
+    local _rt_g _rt_hit
+    for _rt_g in "${RUNTIME_KEYFILE_GLOBS[@]}"; do
+        for _rt_hit in $_rt_g; do
+            [[ -f "$_rt_hit" ]] || continue
+            known_bad_meta "$_rt_hit"
+            emit "destruction" "ioc_runtime_gsocket_keyfile" "strong" \
+                 "ioc_runtime_gsocket_keyfile_present" 10 \
+                 "path" "$_rt_hit" "${META_KV[@]}" \
+                 "note" "GSocket relay-key file at $_rt_hit — interactive backdoor persistence (CRITICAL)."
+            ((hits++))
+        done
+    done
+
+    # /tmp dotfile webshells; cap 5.
+    local _rt_drop _rt_drop_count=0
+    while IFS= read -r _rt_drop; do
+        [[ -z "$_rt_drop" ]] && continue
+        case "$_rt_drop" in
+            /tmp/.temp_mount_*|/tmp/.imunify360-*|/tmp/.s.PGSQL.*) continue ;;
+        esac
+        known_bad_meta "$_rt_drop"
+        emit "destruction" "ioc_runtime_tmp_hex_blob" "warning" \
+             "ioc_runtime_tmp_hex_blob_present" 4 \
+             "path" "$_rt_drop" "${META_KV[@]}" \
+             "note" "/tmp dotfile with hex32+ name at $_rt_drop — likely PHP webshell drop, manual review."
+        ((hits++))
+        _rt_drop_count=$((_rt_drop_count + 1))
+        (( _rt_drop_count >= 5 )) && break
+    done < <(find /tmp -maxdepth 1 -type f -name '.*' 2>/dev/null \
+             | grep -E "$RUNTIME_TMP_HEX_RE" 2>/dev/null)
+
+    local _rt_ps_cap; _rt_ps_cap=$(mktemp /tmp/ssioc.psrun.XXXXXX 2>/dev/null)
+    if [[ -n "$_rt_ps_cap" ]] && ps auxfww > "$_rt_ps_cap" 2>/dev/null; then
+        local _rt_line
+
+        _rt_line=$(grep -E "$RUNTIME_MASQ_RESPAWN_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_gsocket_respawn" "live_compromise" \
+                 "ioc_runtime_gsocket_persistence_shim" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "GSocket pkill-respawn shim active in process tree — operator persistence (CRITICAL)."
+            ((hits++))
+        fi
+
+        _rt_line=$(grep -E "$RUNTIME_LDLINUX_MASQ_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_xmrig_ldlinux" "live_compromise" \
+                 "ioc_runtime_xmrig_masquerade" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "xmrig camouflaged as ./.ld-linux.so (the dynamic linker is a library, not an exec) — active miner (CRITICAL)."
+            ((hits++))
+        fi
+
+        _rt_line=$(grep -E "$RUNTIME_HTTPS_MASQ_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_xmrig_https" "live_compromise" \
+                 "ioc_runtime_xmrig_masquerade" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "xmrig renamed to ./https with pool/randomx args — active miner (CRITICAL)."
+            ((hits++))
+        fi
+
+        _rt_line=$(grep -E "$RUNTIME_PYTHON_MASQ_RE" "$_rt_ps_cap" 2>/dev/null \
+                  | grep -E "$RUNTIME_PYTHON_MASQ_ARGS_RE" | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_xmrig_python" "live_compromise" \
+                 "ioc_runtime_xmrig_masquerade" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "xmrig renamed to ./python[0-9] with pool/donate-level args — active miner (CRITICAL)."
+            ((hits++))
+        fi
+
+        # Two-stage gate: path AND pool/config args.
+        _rt_line=$(grep -E '[ /]xmrig( |$)' "$_rt_ps_cap" 2>/dev/null \
+                  | grep -E '(--config=|-o[[:space:]]+(stratum\+)?[a-z]+://|--url=.*pool\.|c3pool|moneroocean|supportxmr|nanopool|hashvault)' \
+                  | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_xmrig_visible" "live_compromise" \
+                 "ioc_runtime_xmrig_visible_active" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "xmrig running with pool/config args — active cryptominer (CRITICAL)."
+            ((hits++))
+        fi
+
+        _rt_line=$(grep -E "$RUNTIME_LOADER_PIPE_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_loader_in_flight" "live_compromise" \
+                 "ioc_runtime_known_loader_in_flight" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "Known cryptominer/PHP-loader install pipe in flight — operator deploying payload (CRITICAL)."
+            ((hits++))
+        fi
+
+        local _rt_w
+        for _rt_w in "${RUNTIME_WALLET_PREFIXES[@]}"; do
+            _rt_line=$(grep -F "$_rt_w" "$_rt_ps_cap" 2>/dev/null | head -1)
+            if [[ -n "$_rt_line" ]]; then
+                emit "destruction" "ioc_runtime_wallet" "live_compromise" \
+                     "ioc_runtime_wallet_in_cmdline" 10 \
+                     "wallet_prefix" "$_rt_w" "sample" "${_rt_line:0:200}" \
+                     "note" "XMR wallet prefix $_rt_w in process cmdline — operator-attributed miner (CRITICAL)."
+                ((hits++))
+            fi
+        done
+
+        local _rt_ip _rt_ip_re
+        for _rt_ip in "${RUNTIME_C2_IPS[@]}"; do
+            # Octet-precise (grep -F substring-matches 45.140.17.40 in 145.140.17.401).
+            _rt_ip_re="(^|[^0-9])${_rt_ip//./\\.}($|[^0-9])"
+            _rt_line=$(grep -E "$_rt_ip_re" "$_rt_ps_cap" 2>/dev/null | head -1)
+            if [[ -n "$_rt_line" ]]; then
+                emit "destruction" "ioc_runtime_c2_in_cmdline" "live_compromise" \
+                     "ioc_runtime_c2_callback" 10 \
+                     "c2_ip" "$_rt_ip" "sample" "${_rt_line:0:200}" \
+                     "note" "Known C2 IP $_rt_ip in process cmdline — active loader/beacon (CRITICAL)."
+                ((hits++))
+            fi
+        done
+
+        local _rt_h
+        for _rt_h in "${RUNTIME_C2_HOSTS[@]}"; do
+            _rt_line=$(grep -F "$_rt_h" "$_rt_ps_cap" 2>/dev/null | head -1)
+            if [[ -n "$_rt_line" ]]; then
+                emit "destruction" "ioc_runtime_c2_host_in_cmdline" "live_compromise" \
+                     "ioc_runtime_c2_callback" 10 \
+                     "c2_host" "$_rt_h" "sample" "${_rt_line:0:200}" \
+                     "note" "Known C2 host $_rt_h in process cmdline — active loader/beacon (CRITICAL)."
+                ((hits++))
+            fi
+        done
+
+        local _rt_re
+        for _rt_re in "${RUNTIME_REVERSE_SHELL_RES[@]}"; do
+            _rt_line=$(grep -E "$_rt_re" "$_rt_ps_cap" 2>/dev/null | head -1)
+            if [[ -n "$_rt_line" ]]; then
+                emit "destruction" "ioc_runtime_reverse_shell" "live_compromise" \
+                     "ioc_runtime_reverse_shell_active" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "Reverse-shell process active in cmdline — operator-side listener bound or interactive shell upgraded (CRITICAL)."
+                ((hits++))
+            fi
+        done
+
+        # Walk past `\_` forest tokens to argv[0]; FP-rejects find/grep over the binary name.
+        local _rt_lpe
+        for _rt_lpe in "${RUNTIME_LPE_BINARIES[@]}"; do
+            _rt_line=$(awk -v b="$_rt_lpe" '{
+                for (i=11; i<=NF && $i == "\\_"; i++) {}
+                if ($i == b) { print; exit }
+            }' "$_rt_ps_cap" 2>/dev/null)
+            if [[ -n "$_rt_line" ]]; then
+                emit "destruction" "ioc_runtime_lpe_binary" "live_compromise" \
+                     "ioc_runtime_lpe_binary_running" 10 \
+                     "binary" "$_rt_lpe" "sample" "${_rt_line:0:200}" \
+                     "note" "Cwd-relative LPE PoC binary $_rt_lpe in process tree — privilege-escalation tool staged (CRITICAL)."
+                ((hits++))
+            fi
+        done
+
+        _rt_line=$(grep -E "$RUNTIME_XMR_WALLET_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
+        if [[ -n "$_rt_line" ]]; then
+            emit "destruction" "ioc_runtime_xmr_wallet_generic" "live_compromise" \
+                 "ioc_runtime_xmr_wallet_in_cmdline" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "95-char Monero wallet on process cmdline — active miner (CRITICAL)."
+            ((hits++))
+        fi
+
+        if grep -qF "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null; then
+            _rt_line=$(grep -F "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null | head -1)
+            emit "destruction" "ioc_runtime_gsocket_b64_shim" "live_compromise" \
+                 "ioc_runtime_gsocket_persistence_shim" 10 \
+                 "sample" "${_rt_line:0:200}" \
+                 "note" "GSocket pkill-respawn shim base64-wrapped in cmdline — operator persistence (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+    rm -f "$_rt_ps_cap" 2>/dev/null
+
+    local _rt_conn_cap=""
+    if have_cmd ss; then
+        _rt_conn_cap=$(mktemp /tmp/ssioc.connrun.XXXXXX 2>/dev/null)
+        [[ -n "$_rt_conn_cap" ]] && ss -tnp > "$_rt_conn_cap" 2>/dev/null || true
+    fi
+    if [[ -n "$_rt_conn_cap" && -s "$_rt_conn_cap" ]]; then
+        local _rt_ip _rt_line
+        for _rt_ip in "${RUNTIME_C2_IPS[@]}"; do
+            _rt_line=$(grep -E "ESTAB.*[[:space:]]${_rt_ip//./\\.}:" "$_rt_conn_cap" 2>/dev/null | head -1)
+            if [[ -n "$_rt_line" ]]; then
+                emit "destruction" "ioc_runtime_c2_estab" "live_compromise" \
+                     "ioc_runtime_c2_callback_active" 10 \
+                     "c2_ip" "$_rt_ip" "sample" "${_rt_line:0:200}" \
+                     "note" "Active TCP ESTAB to known C2 IP $_rt_ip — backdoor live and connected (CRITICAL)."
+                ((hits++))
+            fi
+        done
+    fi
+    rm -f "$_rt_conn_cap" 2>/dev/null
+
     if (( hits == 0 )); then
         emit "destruction" "destruction_scan" "info" "no_destruction_iocs" 0 \
-             "note" "no destruction-stage residue (Patterns A-L) found"
+             "note" "no destruction-stage residue (Patterns A-L + runtime) found"
     fi
 }
 
@@ -7432,9 +7871,10 @@ aggregate_verdict() {
                 probe_canary_session|probe_artifact_count)
                     ((probe_artifact_count++)) ;;
             esac
-            # Per-section worst-wins tag: [IOC] > [VULN] > [WARN] > [ADVISORY] > [OK].
+            # Per-section worst-wins tag: [LIVE] > [IOC] > [VULN] > [WARN] > [ADVISORY] > [OK].
             local _tag=""
             case "$sev" in
+                live_compromise)  _tag="[LIVE]" ;;
                 strong)
                     if [[ "$key" == ioc_* ]]; then _tag="[IOC]"; else _tag="[VULN]"; fi ;;
                 evidence|warning) _tag="[WARN]" ;;
@@ -7450,14 +7890,16 @@ aggregate_verdict() {
                 local _cur="${SECTION_VERDICT[$area]:-}"
                 if [[ -z "$_cur" ]] \
                    || [[ "$_cur" == "[OK]" ]] \
-                   || [[ "$_cur" == "[ADVISORY]" && "$_tag" =~ ^\[(WARN|VULN|IOC)\]$ ]] \
-                   || [[ "$_cur" == "[WARN]" && "$_tag" =~ ^\[(VULN|IOC)\]$ ]] \
-                   || [[ "$_cur" == "[VULN]" && "$_tag" == "[IOC]" ]]; then
+                   || [[ "$_cur" == "[ADVISORY]" && "$_tag" =~ ^\[(WARN|VULN|IOC|LIVE)\]$ ]] \
+                   || [[ "$_cur" == "[WARN]" && "$_tag" =~ ^\[(VULN|IOC|LIVE)\]$ ]] \
+                   || [[ "$_cur" == "[VULN]" && "$_tag" =~ ^\[(IOC|LIVE)\]$ ]] \
+                   || [[ "$_cur" == "[IOC]" && "$_tag" == "[LIVE]" ]]; then
                     SECTION_VERDICT[$area]="$_tag"
                 fi
             fi
             # Per-area roll-up counts (used in matrix detail column).
             case "$sev" in
+                live_compromise) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} live" ;;
                 strong)   SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} ioc" ;;
                 warning|evidence) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} warn" ;;
                 advisory) SECTION_COUNTS[$area]="${SECTION_COUNTS[$area]:-} advisory" ;;
@@ -7470,7 +7912,7 @@ aggregate_verdict() {
             esac
             # Per-area unique key list (used by --verbose matrix expansion).
             # Append to a space-joined string; print_section_matrix dedupes via sort -u.
-            if [[ "$sev" == "strong" || "$sev" == "warning" || "$sev" == "evidence" || "$sev" == "advisory" ]]; then
+            if [[ "$sev" == "live_compromise" || "$sev" == "strong" || "$sev" == "warning" || "$sev" == "evidence" || "$sev" == "advisory" ]]; then
                 SECTION_KEYS[$area]="${SECTION_KEYS[$area]:-} $key"
             fi
             # Persistence-class accumulation. Tracked at strong/warning
@@ -7479,13 +7921,14 @@ aggregate_verdict() {
             # emit currently uses evidence severity). Uses pattern letter so
             # multiple keys per pattern dedupe to one cluster slot.
             case "$sev" in
-                strong|warning)
+                live_compromise|strong|warning)
                     local _pp
                     _pp=$(ioc_key_to_persist_pattern "$key")
                     if [[ -n "$_pp" ]]; then
                         PERSIST_PATTERNS["$_pp"]=1
                         local _pw
                         case "$sev" in
+                            live_compromise) _pw=$((weight > 0 ? weight : 10)) ;;
                             strong)  _pw=$((weight > 0 ? weight : 5)) ;;
                             warning) _pw=$((weight > 0 ? weight : 4)) ;;
                         esac
@@ -7552,6 +7995,17 @@ aggregate_verdict() {
                         local _cc
                         _cc=$(ioc_compromise_class "$key")
                         [[ -n "$_cc" ]] && ((compromise_critical++))
+                    fi
+                    ;;
+                live_compromise)
+                    # Single-hit COMPROMISED (bypasses v3 ladder); see CHANGELOG v2.7.35.
+                    score=$((score + (weight > 0 ? weight : 10)))
+                    ((strong_count++))
+                    REASONS+=("$key")
+                    if [[ "$key" == ioc_* ]]; then
+                        ((ioc_critical++))
+                        IOC_KEYS+=("$key")
+                        ((compromise_critical++))
                     fi
                     ;;
                 evidence)
@@ -7749,14 +8203,15 @@ aggregate_verdict() {
 print_section_matrix() {
     (( QUIET )) && return
     local area label tag counts color tok
-    local n_ioc n_warn n_adv n_ok detail
+    local n_live n_ioc n_warn n_adv n_ok detail
     for area in "${SECTION_ORDER[@]}"; do
         label="${SECTION_LABEL[$area]:-$area}"
         tag="${SECTION_VERDICT[$area]:-[..]}"
         counts="${SECTION_COUNTS[$area]:-}"
-        n_ioc=0; n_warn=0; n_adv=0; n_ok=0
+        n_live=0; n_ioc=0; n_warn=0; n_adv=0; n_ok=0
         for tok in $counts; do
             case "$tok" in
+                live)     ((n_live++)) ;;
                 ioc)      ((n_ioc++)) ;;
                 warn)     ((n_warn++)) ;;
                 advisory) ((n_adv++)) ;;
@@ -7767,6 +8222,7 @@ print_section_matrix() {
             detail="skipped"
         else
             detail=""
+            (( n_live > 0 )) && detail+="${detail:+, }${n_live} live"
             (( n_ioc  > 0 )) && detail+="${detail:+, }${n_ioc} ioc"
             (( n_warn > 0 )) && detail+="${detail:+, }${n_warn} warn"
             (( n_adv  > 0 )) && detail+="${detail:+, }${n_adv} advisory"
@@ -7774,6 +8230,7 @@ print_section_matrix() {
         fi
         color="$DIM"
         case "$tag" in
+            "[LIVE]")                  color="${BOLD}${RED}" ;;
             "[IOC]"|"[VULN]"|"[ERR]") color="$RED"    ;;
             "[WARN]")                  color="$YELLOW" ;;
             "[ADVISORY]")              color="$CYAN"   ;;
