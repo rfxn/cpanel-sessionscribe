@@ -1,94 +1,13 @@
 #!/bin/bash
-#
-##
 # sessionscribe-mitigate.sh v0.7.4
-#             (C) 2026, R-fx Networks <proj@rfxn.com>
-# This program may be freely redistributed under the terms of the GNU GPL v2
-##
-#
-###############################################################################
-# sessionscribe-mitigate.sh
-#
-# DISCLAIMER / USE AT YOUR OWN RISK
-#   Active mitigation. Modifies firewall, repos, tweaksettings, Apache
-#   config; may launch /scripts/upcp. Default --check is read-only;
-#   --apply mutates. Validate against change-control first.
-###############################################################################
-#
-# ============================================================================
-# Attribution
-# ============================================================================
-#
-# CVE-2026-41940 (SessionScribe)
-#   Researcher: Sina Kheirkhah (@SinSinology) / watchTowr Labs.
-#   Public PoC: github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py
-#
-# Mitigation tooling + companion ModSec WhmScribe-A coverage
-#   Author: Ryan MacDonald, Nexcess Engineering <rmacdonald@nexcess.net>
-#           Ryan MacDonald, rfxn | forged in prod | <ryan@rfxn.com>
+#   (C) 2026 R-fx Networks <proj@rfxn.com> — GPLv2.
+#   Author: Ryan MacDonald <rmacdonald@nexcess.net> / <ryan@rfxn.com>
 #   Project: https://rfxn.com/research/cpanel-sessionscribe-cve-2026-41940
+#   CVE-2026-41940 researcher: Sina Kheirkhah (@SinSinology) / watchTowr Labs.
 #
-# ============================================================================
-#
-# Defense-in-depth active mitigation for CVE-2026-41940 (SessionScribe) and
-# the related cPanel/WHM exposure surface. One phased pass that brings a
-# host into the documented "patched + proxy-endpoint enforcement + ModSec"
-# posture. Idempotent - safe to run repeatedly. All mutations write
-# timestamped backups to /var/cpanel/sessionscribe-mitigation/<TS>/.
-#
-# Phases (in order; selectable via --only, --no-PHASE, or --list-phases):
-#
-#   snapshot    pre-mitigation evidence capture (users/, accounting.log,
-#               sessions/, cpanel.config, tweaksettings) BEFORE mutation.
-#   patch       cpanel -V vs published patched-build cutoffs
-#   preflight   epel-release present; threatdown.repo absent; broken
-#               non-base repos disabled (centos/alma/rocky baseos/appstream/
-#               extras/etc untouched even if currently broken)
-#   upcp        if patch=UNPATCHED, kick off /scripts/upcp --force --bg
-#   proxysub    enable proxysubdomains + proxysubdomainsfornewaccounts
-#   csf         /etc/csf/csf.conf TCP_IN/TCP6_IN scrubbed of cpsrvd ports
-#   apf         /etc/apf/conf.apf IG_TCP_CPORTS scrubbed of cpsrvd ports
-#   runfw       running iptables/ip6tables INPUT chain inspection
-#   apache      httpd active + security2_module loaded
-#   modsec      modsec2.user.conf contains 1500030 + 1500031
-#   sessions    sessions/raw IOC ladder; quarantine forged sessions to
-#               backup dir w/ .info (ctime); rm originals
-#   probe       (opt-in via --probe) self-test via remote-probe against
-#               127.0.0.1; expect SAFE/blocked verdict
-#   kill        (opt-in via --kill) targeted quarantine + IP block from
-#               an IOC envelope (sessionscribe-ioc-scan output). Reads
-#               the latest /var/cpanel/sessionscribe-ioc/*.json (or
-#               --envelope PATH), builds a manifest of file quarantines
-#               + attacker IP blocks, and (with --apply) executes them:
-#               files moved to <BACKUP_DIR>/quarantine/<mirrored-path>
-#               with sha256 chain-of-custody; per-incident IPs added via
-#               csf -d; rfxn fleet blocklist registered in
-#               /etc/csf/csf.blocklists with LF_IPSET=1. Path allowlist
-#               refuses anything outside /root/, /home/*/, /etc/profile.d/,
-#               /etc/systemd/system/, /etc/udev/rules.d/, /etc/cron.{d,*}/,
-#               /var/spool/cron/, /usr/local/cpanel/var/. Gated on
-#               host_verdict == COMPROMISED (override: --kill-anyway).
-#
-# Output:
-#   default     ANSI sectioned report on stderr
-#   --json      single JSON envelope on stdout (per-host)
-#   --jsonl     stream one JSON signal per line on stdout
-#   --csv       single CSV summary row on stdout (header + one row)
-#   --quiet     suppress sectioned report
-#
-# Exit codes (highest priority wins):
-#   0  clean - patched + posture ok, no action needed
-#   1  remediation applied successfully (--apply made changes)
-#   2  manual intervention required (warns in --check, or fail in --apply)
-#   3  tool error (bad args, missing dependencies, not root for --apply)
-#
-# Fleet usage:
-#   ansible -i hosts all -m script -a 'sessionscribe-mitigate.sh --jsonl'
-#   pdsh -w cpanel-fleet 'bash -s --' -- --csv < sessionscribe-mitigate.sh
-#
-# Run as root for full coverage (--check tolerates non-root with reduced
-# fidelity; --apply requires root).
-###############################################################################
+# Phased active mitigation for CVE-2026-41940. Idempotent. --check is
+# read-only; --apply mutates and requires root. Backups: /var/cpanel/
+# sessionscribe-mitigation/<TS>/. See --help / --list-phases for usage.
 
 set -u
 
@@ -199,21 +118,14 @@ DO_PROBE=0              # --probe opt-in
 RUN_KILL=0              # --kill opt-in (phase_kill from IOC envelope)
 KILL_ENVELOPE=""        # --envelope PATH override; empty = auto-discover
 KILL_ANYWAY=0           # --kill-anyway: bypass host_verdict gate
-# v0.7.0 ssh-key prune knobs. P3 wires the --ssh-* CLI flags; P2 reads the
-# globals so the manifest sweep + apply consumer + supersede check are
-# operable under MITIGATE_LIBRARY_ONLY=1 unit tests via the
-# MITIGATE_FORCE_SSH_PRUNE=1 test seam (un-documented, NOT a usage flag).
 KILL_SSH_PRUNE=0
 KILL_SSH_PRUNE_UNLABELED=0
 KILL_SSH_ALLOW_LOCKOUT=0
 KILL_SSH_ALLOW_DRIFT=0
 KILL_SSH_TRUST_RE_EFFECTIVE=""
-# shellcheck disable=SC2034  # populated by --ssh-allow REGEX (P3 CLI flag)
+# shellcheck disable=SC2034  # populated by --ssh-allow REGEX
 declare -a KILL_SSH_ALLOW_EXTRAS=()
-# Populated ONCE at phase_kill startup (P3 wiring) so the supersede check
-# is O(1) per signal. P2's manifest sweep falls back to a direct
-# kill_sshkey_canonical_paths invocation when the cache is empty
-# (testability under MITIGATE_LIBRARY_ONLY).
+# Populated once at phase_kill startup so supersede check is O(1) per signal.
 declare -a KILL_SSHKEY_CANONICAL_CACHE=()
 declare -A PHASE_DISABLED=()
 JSON_OUT=0
@@ -380,20 +292,12 @@ while [[ $# -gt 0 ]]; do
         --ssh-prune-unlabeled)
                             RUN_KILL=1; KILL_SSH_PRUNE=1; KILL_SSH_PRUNE_UNLABELED=1; shift ;;
         --ssh-allow)
-            # say_fail / say_warn are not yet defined at arg-parse time
-            # (definitions land after this loop); use plain stderr +
-            # the same exit-3 convention as the unknown-option branch.
             [[ -z "${2:-}" ]] && { echo "Error: --ssh-allow requires REGEX" >&2; exit 3; }
-            # Validate as ERE: probe with empty + non-empty input. bash =~
-            # returns 0 (match), 1 (no match), 2 (regex error). rc=2 from
-            # EITHER probe = bad regex. The (...) subshell is INTENTIONAL
-            # — it isolates the [[ regex-error ]] from the parent shell so
-            # the script doesn't trip set-e / set-u behavior on a syntax
-            # error in operator-supplied input.
-            # shellcheck disable=SC2234  # subshell intentional (regex isolation)
+            # Validate as ERE; subshells isolate regex-syntax error from set -e/-u.
+            # shellcheck disable=SC2234
             ( [[ "" =~ $2 ]] ) 2>/dev/null
             rc_empty=$?
-            # shellcheck disable=SC2234  # subshell intentional (regex isolation)
+            # shellcheck disable=SC2234
             ( [[ "x" =~ $2 ]] ) 2>/dev/null
             rc_nonempty=$?
             if (( rc_empty > 1 || rc_nonempty > 1 )); then
@@ -646,9 +550,7 @@ sk()  { P_KEY="$1"; shift; P_KV=("$@"); }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Epoch -> ISO-8601 UTC. Empty input or non-numeric -> empty output. Used
-# by phase_sessions for .info-file timestamp serialization. Bash 4.1
-# compatible: relies on GNU coreutils `date -d @<epoch>` (CentOS 6+).
+# Epoch -> ISO-8601 UTC; empty / non-numeric -> empty.
 epoch_to_iso() {
     local e="${1:-}"
     [[ -z "$e" ]] && { echo ""; return; }
@@ -657,12 +559,9 @@ epoch_to_iso() {
 }
 
 ###############################################################################
-# Kill-chain (phase_kill) helpers - read IOC envelope, build manifest of
-# intended quarantine + IP-block actions. Manifest is the audit-trail source
-# of truth. K1 deliverable: read-only manifest construction. Mutating actions
-# land in K3 (file quarantine), K4 (CSF deny), K5 (rfxn blocklist register).
-# Field-extraction helpers mirror sessionscribe-ioc-scan.sh primitives so
-# producer/consumer parsing is a single shared contract.
+# Kill-chain (phase_kill) helpers — read IOC envelope, build audit-trail
+# manifest of intended quarantine + IP-block actions. Field-extraction
+# helpers mirror sessionscribe-ioc-scan.sh for shared producer/consumer parsing.
 ###############################################################################
 
 KILL_ENVELOPE_DIR="/var/cpanel/sessionscribe-ioc"
@@ -761,19 +660,12 @@ kill_action_for_pattern() {
 }
 
 ###############################################################################
-# SSH-key prune helpers (v0.7.0 phase_kill --ssh-prune family). Implements
-# the parser + classifier + surgical-prune contract from PLAN-sshkey-prune.md.
-# All helpers are callable under MITIGATE_LIBRARY_ONLY=1 for unit testing.
+# SSH-key prune helpers (--ssh-prune): parser + classifier + surgical prune.
+# Library-callable under MITIGATE_LIBRARY_ONLY=1 for unit tests.
 ###############################################################################
 
-# ssh_key_parse_line LINE — emit "<keytype>\t<comment>\t<base64>" on stdout
-# for a parseable key line. rc=1 (no output) for blank/comment/unparseable.
-# Handles options-prefix lines via FIRST-MATCH-WINS keytype detection
-# (whole-line scan via gawk 2-arg `match()`; the keytype regex is anchored
-# only by what appears in the source — substring matching is intentional
-# so options-prefix syntax like `from="..." ssh-rsa AAAA user` works).
-# Empty comment is a valid result (rc=0 with "<keytype>\t\t<base64>"); the
-# classifier applies policy.
+# ssh_key_parse_line LINE — emit "<keytype>\t<comment>\t<base64>". rc=1 on
+# blank/comment/unparseable. Handles options-prefix via first-match keytype.
 ssh_key_parse_line() {
     local line="${1-}"
     [[ -z "$line" ]] && return 1
@@ -894,35 +786,28 @@ ssh_keys_classify() {
     return 0
 }
 
-# ssh_keys_prune FILE TRUST_RE BACKUP_DEST FLAGS — surgical rewrite per
-# the contract in PLAN-sshkey-prune.md (steps 1-14). FLAGS is a CSV
-# subset of {allow_lockout, prune_unlabeled}. Caller-visible globals:
-#   KILL_LAST_PRUNE_RESULT  — bare primary from result vocabulary
-#   KILL_LAST_PRUNE_DETAIL  — human-readable detail line
-#   KILL_LAST_PRUNE_KEEP    — count of effective-kept keys
-#   KILL_LAST_PRUNE_PRUNED  — count of pruned keys
-#   KILL_LAST_PRUNE_SHA_PRE — sha256 of source before rewrite
-#   KILL_LAST_PRUNE_SHA_POST — sha256 of result after mv (apply only)
-#   KILL_LAST_PRUNE_BACKUP  — backup path on apply
-#   KILL_LAST_PRUNE_SIDECAR — removed-keys sidecar path on apply
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# ssh_keys_prune FILE TRUST_RE BACKUP_DEST FLAGS — surgical authorized_keys
+# rewrite. FLAGS is a CSV subset of {allow_lockout, prune_unlabeled}.
+# Returns via KILL_LAST_PRUNE_* globals (result, detail, keep/pruned counts,
+# sha pre/post, backup + sidecar paths).
+# shellcheck disable=SC2034  # consumed by manifest emit-site + apply path
 KILL_LAST_PRUNE_RESULT=""
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_DETAIL=""
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_KEEP=0
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_PRUNED=0
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_SHA_PRE=""
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_SHA_POST=""
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_BACKUP=""
-# shellcheck disable=SC2034  # consumed by P2 manifest emit-site + apply path
+# shellcheck disable=SC2034
 KILL_LAST_PRUNE_SIDECAR=""
 
-# shellcheck disable=SC2034  # KILL_LAST_PRUNE_* globals consumed by P2/P3
+# shellcheck disable=SC2034
 ssh_keys_prune() {
     local path="$1" trust_re="$2" backup_dest="$3" flags="${4-}"
     KILL_LAST_PRUNE_RESULT=""
@@ -1126,12 +1011,7 @@ ssh_keys_prune() {
 
     sync "$tmp" 2>/dev/null || true
 
-    # Step 10: line-count verify of tmp before mv. Count any non-blank,
-    # non-comment line — the previous `grep -cE '^[^[:space:]#]'`
-    # excluded leading-whitespace key lines (rare but legal per
-    # sshd(8) AUTHORIZED_KEYS FILE FORMAT) and produced a spurious
-    # `prune_failed: tmp line-count 0 != expected 1` against files
-    # that contained indented keys.
+    # Step 10: line-count verify before mv. awk (not grep) so leading-whitespace keys count.
     local tmp_keep_count
     tmp_keep_count=$(awk '
         /^[[:space:]]*$/    {next}
@@ -1189,15 +1069,8 @@ ssh_keys_prune() {
         fi
     fi
 
-    # Step 14: write removed-keys JSONL sidecar. The class_tmp comment
-    # field ($4) is attacker-controlled (it's whatever they planted in
-    # the authorized_keys line), so a `"` or `\` in the comment would
-    # break the emitted JSON unless we escape. The main manifest emit
-    # site uses bash json_esc; here we emit inside an awk block, so
-    # define jesc() inline. Tabs/CR/LF cannot appear in $4 because the
-    # parser collapses [[:space:]]+ to a single space, leaving only `"`
-    # and `\` as real risks. Type/fingerprint are alphanumeric+dash+
-    # colon only, but pass them through jesc() defensively.
+    # Step 14: removed-keys sidecar. Comment ($4) is attacker-controlled —
+    # awk-side jesc() escapes `"` and `\` (only real risks post-parser).
     local removed_sidecar="${backup_dest}.removed-keys"
     {
         printf '# sessionscribe v0.7.2 ssh-key prune — removed keys for %s\n' "$path"
@@ -1230,18 +1103,9 @@ ssh_keys_prune() {
     return 0
 }
 
-# kill_sshkey_path_safe PATH — rc=0 if PATH contains zero shell
-# metacharacters, newlines, tabs, or control bytes. v0.7.2 sentinel-fix:
-# Linux directory names CAN legally contain `"`, `;`, `$()`, `\`, `&`,
-# `|`, `<`, `>`, `*`, `?`, `!`. A SessionScribe-compromised WHM can
-# create cPanel users with hostile names; that name flows into a
-# canonical authorized_keys path, then into a `trap "rm -f \"$tmp\" ..."`
-# expansion at trap-set time (line 1066/1068), executing the injected
-# command on SIGINT/SIGTERM during the 10s lock-wait window. Refusing
-# hostile paths at the canonical-paths emit-site stops every downstream
-# consumer (trap-string expansion, recovery_hint, sidecar headers) from
-# absorbing attacker-controlled bytes. Operators must rename the dir to
-# prune those keys.
+# Refuse paths with shell metacharacters, newlines, tabs, or control bytes.
+# A hostile cPanel user-home name (created by compromised WHM) would otherwise
+# reach trap-string expansion at SIGINT/SIGTERM. Operator must rename the dir.
 kill_sshkey_path_safe() {
     case "$1" in
         (*[\"\;\$\`\\\&\|\<\>\*\?\!\'\(\)\{\}\[\]]*) return 1 ;;
@@ -1251,12 +1115,8 @@ kill_sshkey_path_safe() {
     return 0
 }
 
-# kill_sshkey_canonical_paths — emit canonical authorized_keys paths one
-# per line. Used by both the orphan-tmp sweep and the P2 manifest
-# enumerator. Root home discovered via getent passwd; /root fallback.
-# v0.7.2: filters paths through kill_sshkey_path_safe so a hostile
-# user-home name (created by a compromised WHM) cannot reach trap
-# strings or recovery_hint shell strings downstream.
+# Emit canonical authorized_keys paths (one per line). getent passwd for
+# root home with /root fallback; filters via kill_sshkey_path_safe.
 kill_sshkey_canonical_paths() {
     local root_home
     root_home=$(getent passwd root 2>/dev/null | cut -d: -f6)
@@ -1268,12 +1128,7 @@ kill_sshkey_canonical_paths() {
         say_warn "refusing root home with hostile shell-metachar path: $root_home"
     fi
     if [[ -d /home ]]; then
-        # -maxdepth 1 (NOT 2): canonical paths are at depth-1 only
-        # (/home/<user>/.ssh/authorized_keys). With -maxdepth 2, find
-        # also returned depth-2 subdirs (e.g. /home/<user>/sub) and the
-        # caller appended /.ssh/authorized_keys to those, producing
-        # non-canonical paths that polluted the supersede cache and
-        # triggered build-time misses.
+        # -maxdepth 1: canonical paths are at /home/<user>/ depth only.
         local h
         while IFS= read -r -d '' h; do
             if kill_sshkey_path_safe "$h"; then
@@ -1397,17 +1252,8 @@ kill_sshkey_path_canonical() {
     return 1
 }
 
-# kill_sshkey_recovery_hint PATH BACKUP_DIR — emit the single-line
-# operator recovery command baked into the manifest item. Keeps the hint
-# co-located with the audit trail so a paged-out 3am operator can grep
-# for it without reading source. quarantine layout mirrors the logic in
-# kill_quarantine_one ($BACKUP_DIR/quarantine/${path#/}).
-#
-# v0.7.2: shell-quote both paths with single-quotes (with `'\''`
-# escape for embedded single-quotes). Defense-in-depth — even if a
-# future change bypasses the canonical-paths metacharacter filter
-# (kill_sshkey_path_safe), the recovery_hint cannot become an injection
-# vector for an operator pasting it verbatim under incident stress.
+# Emit single-line operator recovery command for the manifest. Both paths
+# single-quoted (with `'\''` escape) so paste-execute can't inject.
 kill_sshkey_recovery_hint() {
     local path="$1" backup_dir="$2"
     local mirror="${backup_dir}/quarantine/${path#/}.original-pre-prune"
@@ -1417,36 +1263,17 @@ kill_sshkey_recovery_hint() {
         "$q_mirror" "$q_path" "$q_path"
 }
 
-# kill_sshkey_emit_manifest_item PATH TRUST_RE TRUST_RE_EFFECTIVE BACKUP_DIR
-#                                MODE_STR
-# Run ssh_keys_prune in classify-only / classify-and-rewrite mode (governed
-# by the calling MODE) and emit ONE JSON object representing the
-# kind:sshkey manifest item. Caller is responsible for the leading `,\n`
-# separator. This helper isolates the JSON-shape concern from
-# kill_build_manifest's printf chain and the JSON's nested pruned_keys[]
-# array shape from inline-printf gymnastics.
-#
-# In MODE_STR=check the result is prefixed `planned_`. In MODE_STR=apply
-# the result field is null (the apply-path consumer
-# prune_ssh_keys_from_manifest patches it via sidecar).
+# Emit one kind:sshkey manifest JSON object. In check mode result is
+# `planned_<primary>`; in apply mode result is null (sidecar patches later).
 kill_sshkey_emit_manifest_item() {
     local path="$1" trust_re="$2" trust_re_eff="$3" backup_dir="$4" mode_str="$5"
 
-    # Skip absent paths at build time (empty-fleet case): per plan
-    # "no ~/.ssh/authorized_keys files anywhere → manifest sshkey items=0".
-    # Symlinks ARE surfaced (refused_symlink) so an operator sees the
-    # backdoor pattern in the manifest; only outright-absent paths are
-    # silently skipped.
+    # Symlinks surface as refused_symlink; only outright-absent paths skip silently.
     if [[ ! -e "$path" && ! -L "$path" ]]; then
         return 1
     fi
 
-    # Run classifier through ssh_keys_prune (MODE != apply branch always
-    # short-circuits in step 5 with a bare-primary KILL_LAST_PRUNE_RESULT;
-    # apply branch returns the same primary post-rewrite, but at
-    # manifest-build time we always force classify-only by setting
-    # MODE=check locally — apply-path mutation happens later in
-    # prune_ssh_keys_from_manifest).
+    # Force classify-only at build time; apply-path mutation runs later.
     local saved_mode="${MODE:-check}"
     MODE="check"
     local flags=""
@@ -1461,12 +1288,8 @@ kill_sshkey_emit_manifest_item() {
     local detail="${KILL_LAST_PRUNE_DETAIL:-}"
     local sha_pre="${KILL_LAST_PRUNE_SHA_PRE:-}"
 
-    # Re-classify the file (read-only) to populate pruned_keys[] +
-    # tally counts; ssh_keys_prune's class_tmp is consumed and rm'd
-    # internally so we re-run here. For sentinel result strings (gone,
-    # refused_symlink, refused_unparseable, lock_contended) the
-    # classifier won't have anything actionable; pruned_keys[] stays
-    # empty and counts are zero.
+    # Re-classify (read-only) for pruned_keys[] + tallies. Sentinel results
+    # (gone/refused_*/lock_contended) yield empty pruned_keys[] + zero counts.
     local class_out=""
     local n_keep=0 n_prune=0 n_keep_unl=0 n_total=0
     if [[ "$primary" != "gone" && "$primary" != "refused_symlink" \
@@ -1547,13 +1370,8 @@ kill_sshkey_emit_manifest_item() {
         "$(json_esc "$recovery")"
 }
 
-# Pure-bash absolute-path normalizer. Collapses /./ and /../ segments
-# without touching the filesystem; needed when neither realpath -m nor
-# readlink -m is available (EL6 coreutils 8.4) AND the path's parent
-# directories may not exist (a traversal probe like
-# /home/foo/../../etc/shadow where /home/foo is absent makes
-# `readlink -f` return empty). Returns 1 on relative input or on
-# above-root traversal (e.g. /../etc -> error). bash 4.1 / set -u safe.
+# Pure-bash absolute-path normalizer (collapses /./ and /../, no FS access).
+# Fallback when realpath -m / readlink -m absent (EL6 coreutils 8.4).
 kill_normalize_abs_path() {
     local input="$1" segment out p
     local -a parts=()
@@ -1589,58 +1407,17 @@ kill_normalize_abs_path() {
     printf '%s' "$out"
 }
 
-# Path-allowlist gate. Refuses any path outside the documented allowlist
-# of mutable roots; protects against (a) malformed envelopes, (b) path
-# traversal from a compromised ioc-scan, (c) operator misconfiguration.
-#
-# Allowlist:
-#   /root/                              user home (root operator)
-#   /home/*/                            cPanel user homes (incl. .ssh, public_html)
-#   /etc/profile.d/                     login-time hooks (Pattern I)
-#   /etc/systemd/system/                unit files (Pattern J)
-#   /etc/udev/rules.d/                  udev rules (Pattern J)
-#   /etc/cron.d/, cron.{hourly,daily,weekly,monthly}/  scheduled tasks
-#   /var/spool/cron/                    user crontabs
-#   /usr/local/cpanel/var/              cPanel reseller token files (Pattern D)
-#
-# Shape probes (envelope-injection defense):
-#   - Path must be absolute (envelope contract; relative is operator
-#     error).
-#   - No control chars (NUL, newline, tab, ESC).
-#   - No `..` segments. The IOC scanner writes paths absolute + already
-#     normalized at source; any `..` here is intent-hidden traversal
-#     (operator misconfig or compromised upstream). Refusing on
-#     presence is stricter than collapse-then-match, because a path
-#     like /home/x/../etc/shadow would collapse to /home/etc/shadow
-#     and slip past the case below.
-#
-# Resolution chain (after shape probes pass): prefer `realpath -m`
-# (handles symlinks + non-existent paths), fall back to `readlink -f`
-# (handles symlinks but needs every intermediate dir to exist), fall
-# back to the pure-bash normalizer (no symlink resolution, but
-# collapses /. and absorbs an absolute-path no-op). `realpath -m` is
-# coreutils 8.15+; the EL6 floor (coreutils 8.4) may have realpath
-# without `-m` OR no realpath at all - probe before relying on -m so
-# we don't fail-open on every path with a misleading "invalid option".
-#
-# Sibling primitive: `kill_sshkey_path_safe` (line ~1245) is the
-# stricter shell-context filter — it refuses any path containing
-# shell metacharacters (`"`, `;`, `$`, `` ` ``, `\`, `&`, `|`, `<`,
-# `>`, `*`, `?`, `!`, `'`, parens/braces/brackets) or whitespace
-# control bytes. Use that one for paths that flow into trap strings,
-# eval contexts, or operator-paste recovery hints. This one is the
-# lighter cntrl-byte + traversal filter used for IOC-quarantine
-# allowlist gating where the path never reaches a shell context.
+# Path-allowlist gate for IOC-quarantine paths. Shape-probes (absolute,
+# no control chars, no `..`) then matches against documented mutable
+# roots. Resolution chain: realpath -m → readlink -f → pure-bash.
+# For paths that flow into shell context (trap strings, eval, operator
+# paste), use kill_sshkey_path_safe (stricter — refuses shell metachars).
 kill_path_in_allowlist() {
     local path="$1" resolved=""
     [[ -n "$path" ]] || return 1
     [[ "$path" == /* ]] || return 1
     [[ "$path" =~ [[:cntrl:]] ]] && return 1
-    # Refuse any path containing a `..` segment outright. The envelope
-    # writes IOC paths absolute + normalized at source; any `..` in a
-    # path here is intent-hidden traversal (operator misconfiguration
-    # or compromised upstream). Match leading "../", embedded "/../",
-    # and trailing "/..".
+    # Refuse `..` segments outright (envelope IOCs are pre-normalized; `..` = traversal intent).
     case "$path" in
         (*/../*|*/..) return 1 ;;
     esac
@@ -1694,16 +1471,8 @@ kill_action_record() {
     } >> "$sidecar"
 }
 
-# Quarantine one file: stat -> sha256 -> mv (with cp+rm cross-fs fallback)
-# -> sha256 verify. Records action via kill_action_record. Returns 0 on
-# success or benign skip (gone / refused_special_file), 1 on failure.
-# Result vocabulary:
-#   ok                      moved + sha256 verified
-#   gone                    file already absent (no action needed)
-#   refused_special_file    not a regular file (block/char/fifo/socket)
-#   mv_failed               both mv and cp+rm failed
-#   rm_failed_after_copy    cp succeeded but rm failed (incomplete quarantine)
-#   corrupt_during_move     sha256 mismatch between source and dest
+# Quarantine one file: stat -> sha256 -> mv (cp+rm cross-fs fallback) ->
+# sha256 verify. Returns 0 on success/benign-skip, 1 on failure.
 kill_quarantine_one() {
     local path="$1" key="$2" pattern="$3" sidecar="$4"
     local sha_pre="" sha_post="" size="" dest="" result=""
@@ -1715,11 +1484,7 @@ kill_quarantine_one() {
     fi
 
     if [[ ! -f "$path" || -L "$path" ]]; then
-        # Symlinks are "special" in this context: even though backdoor
-        # symlinks (eg /home/x/.ssh -> /etc) are interesting, quarantining
-        # the link without resolving the target leaves the target intact;
-        # quarantining via realpath would cross the allowlist boundary.
-        # Refuse and surface to operator for hand-handling.
+        # Refuse symlinks: realpath-resolve would cross the allowlist boundary.
         kill_action_record "$sidecar" "file" "$path" "$key" "$pattern" "" "" "" "" "refused_special_file"
         return 0
     fi
@@ -1845,13 +1610,8 @@ kill_csf_conf_set() {
     sed -i -E "s|^(${key}[[:space:]]*=[[:space:]]*\")[^\"]*(\".*)$|\1${value}\2|" "$conf"
 }
 
-# Register the rfxn fleet blocklist as a CSF-managed ipset. Idempotent.
-# Verifies LF_IPSET=1 (flips to 1 on --apply if 0, warns in --check).
-# Optional 2nd arg: csf root dir (default /etc/csf) - used for testing.
-#
-# Side effects (only in --apply):
-#   - /etc/csf/csf.conf: LF_IPSET 0 -> 1 (with backup_file)
-#   - /etc/csf/csf.blocklists: append RFXN_FH_L2L3|86400|0|<url> (with backup)
+# Register rfxn fleet blocklist as CSF-managed ipset. Idempotent.
+# --apply: flips LF_IPSET 0→1 and appends RFXN_FH_L2L3 to csf.blocklists.
 register_rfxn_blocklist() {
     local manifest="$1"
     local csf_dir="${2:-/etc/csf}"
@@ -1925,17 +1685,8 @@ register_rfxn_blocklist() {
     return 0
 }
 
-# Walk a manifest, csf -d every kind=ip action=csf-deny item. Skips
-# private/loopback/link-local/multicast IPs (envelope-injection guard).
-# Skips IPs already present in /etc/csf/csf.deny (idempotent re-runs).
-# Returns 0 if all ok or all benign skips, non-zero on csf_failed.
-#
-# Result vocabulary:
-#   ok                  csf -d succeeded
-#   already_blocked     IP already on first whitespace-delimited field of csf.deny
-#   private_skipped     RFC1918 / loopback / link-local / multicast / malformed
-#   csf_failed          csf binary returned non-zero
-#   csf_not_installed   csf binary absent (skipped, not failed)
+# Walk manifest, csf -d every kind=ip action=csf-deny. Skips bogon IPs
+# (envelope-injection guard) and already-blocked IPs (idempotent re-runs).
 apply_csf_blocks() {
     local manifest="$1"
     [[ -n "$manifest" && -f "$manifest" ]] || return 1
@@ -2012,12 +1763,7 @@ quarantine_from_manifest() {
     return $fails
 }
 
-# Append one ssh-key-prune action record to the kill-actions sidecar
-# JSONL. Mirrors kill_action_record / kill_ip_action_record / kill_csf_
-# action_record shape: kind={file,ip,csf,sshkey} → 4th sidecar value the
-# v0.6.1 verdict-merger pipeline already understands. P3 wires the
-# verdict-promotion read into kill_compute_verdict; P2 just writes the
-# rows so the apply-path is fully audited even before P3 ships.
+# Append one ssh-key-prune action record to the kill-actions sidecar JSONL.
 kill_sshkey_action_record() {
     local sidecar="$1" path="$2" result="$3" detail="$4"
     local keys_pruned="$5" keys_kept="$6" sha_pre="$7" sha_post="$8"
@@ -2046,18 +1792,9 @@ kill_sshkey_action_record() {
     } >> "$sidecar"
 }
 
-# Walk a manifest, prune every kind:sshkey action:prune item via
-# ssh_keys_prune. Apply-path consumer (called from phase_kill in P3
-# under MODE=apply). Sidecar shape is the BARE primary result (no
-# `planned_` prefix — that translation is at the manifest emit-site
-# in --check mode only).
-#
-# Returns the number of items that produced a fail-class result
-# (prune_failed | clobbered_post_mv); benign skips
-# (gone | refused_symlink | nothing_to_prune | kept_unlabeled_warned
-# | would_lock_out | concurrent_modification | lock_contended) do not
-# contribute to the failure count — verdict-promotion logic in
-# kill_compute_verdict (P3) handles WARN promotion.
+# Apply-path: walk manifest, prune every kind:sshkey action:prune via
+# ssh_keys_prune. Returns count of fail-class results; benign skips
+# are promoted to WARN later in kill_compute_verdict.
 prune_ssh_keys_from_manifest() {
     local manifest="$1"
     [[ -n "$manifest" && -f "$manifest" ]] || return 1
@@ -2076,15 +1813,8 @@ prune_ssh_keys_from_manifest() {
         path=$(kill_json_str_field "$line" path)
         [[ -z "$path" ]] && continue
 
-        # v0.7.3 defense-in-depth: re-validate the manifest path against
-        # the shell-metachar filter at consume-time. The build-time gate
-        # in kill_sshkey_canonical_paths (v0.7.2) is the primary defense,
-        # but a manifest emitted by a pre-v0.7.2 mitigate run could be
-        # replayed under v0.7.3+ with a hostile path baked in, reaching
-        # ssh_keys_prune's trap-string expansion at step 7. Refuse here
-        # so a stale-manifest replay cannot rebuild the trap-injection
-        # vector. Sibling primitive: kill_path_in_allowlist (line ~1625)
-        # is the lighter cntrl-byte filter for non-shell-context paths.
+        # Re-validate at consume-time so a stale pre-v0.7.2 manifest
+        # replay cannot reach ssh_keys_prune's trap-string expansion.
         if ! kill_sshkey_path_safe "$path"; then
             say_warn "refusing manifest sshkey item with hostile shell-metachar path: $path"
             kill_sshkey_action_record "$sidecar" "$path" \
@@ -2094,12 +1824,6 @@ prune_ssh_keys_from_manifest() {
             continue
         fi
 
-        # Pull the manifest's pre-baked backup paths so the apply-path
-        # writes to the same locations the manifest's recovery_hint
-        # field promised the operator. Falls back to the canonical
-        # mirror layout if the manifest somehow elides the field
-        # (defensive — kill_sshkey_emit_manifest_item always writes
-        # them).
         original_backup_path=$(kill_json_str_field "$line" original_backup_path)
         removed_sidecar_path=$(kill_json_str_field "$line" removed_keys_sidecar_path)
         local backup_dest
@@ -2174,16 +1898,8 @@ kill_sidecar_to_lookup() {
                 printf 'csf\t%s\tvalue\t%s\n'  "$csf_key" "$value"
                 ;;
             sshkey)
-                # v0.7.0: per-file sshkey actions. Apply path emits BARE
-                # primaries (pruned_ok, forced_full_prune, ...). Path is
-                # the lookup key. keys_pruned + keys_kept feed the
-                # finalize_manifest summary aggregates.
-                # v0.7.2: also emit sha256_pre and result_detail so the
-                # awk patcher can fill the manifest's "sha256_pre":null
-                # and "result_detail":null placeholders that K1 wrote in
-                # apply mode. Without these, an apply-mode manifest's
-                # kind:sshkey rows kept null result_detail/sha256_pre
-                # forever, gapping the audit trail.
+                # Per-file sshkey actions. Path is lookup key; counts +
+                # sha256_pre + detail feed finalize_manifest patcher.
                 path=$(kill_json_str_field "$line" path)
                 local kp_v kk_v sha_pre_v sha_post_v detail_v
                 kp_v=$(kill_json_num_field "$line" keys_pruned)
@@ -2202,18 +1918,8 @@ kill_sidecar_to_lookup() {
     done < "$sidecar"
 }
 
-# Compute the phase_kill verdict from sidecar action results + manifest
-# refused items. Sets the global LAST_KILL_VERDICT and LAST_KILL_DETAIL
-# so the caller can phase_set kill ${verdict} "${detail}".
-#
-# Verdict logic:
-#   FAIL    - any mv_failed / corrupt_during_move / rm_failed_after_copy
-#             / csf_failed / config_set_failed
-#   ACTION  - at least one ok action and no failures
-#   WARN    - --check mode finds work, OR --apply with non-fatal skips
-#             (private_skipped, already_blocked, gone, needs_apply_*)
-#   OK      - nothing planned, nothing done
-#   SKIPPED - set by caller before this fn (gate-not-met)
+# Compute phase_kill verdict from sidecar + manifest. Sets globals
+# LAST_KILL_VERDICT and LAST_KILL_DETAIL.
 LAST_KILL_VERDICT=""
 LAST_KILL_DETAIL=""
 kill_compute_verdict() {
@@ -2223,14 +1929,11 @@ kill_compute_verdict() {
     local files_q=0 files_f=0 files_g=0 files_special=0 files_refused=0
     local ips_ok=0 ips_skip=0 ips_fail=0
     local csf_failed=0 csf_changed=0 csf_pending=0
-    # v0.7.0: kind:sshkey accumulators. Read from sidecar (apply mode) and
-    # from manifest "result":"planned_<primary>" (check mode, since sidecar
-    # is empty until prune_ssh_keys_from_manifest runs).
+    # sshkey: read from sidecar in apply mode, manifest "planned_<primary>" in check mode.
     local sshkeys_ok=0 sshkeys_skip=0 sshkeys_fail=0 sshkeys_pending=0
     local sshkeys_warn_promote=0
 
-    # grep -c always emits a number (0 when no match) but rc=1 when zero -
-    # do NOT chain `|| echo 0` here, that would append a second "0\n".
+    # grep -c emits 0 with rc=1; don't chain `|| echo 0` (would append extra 0).
     files_refused=$(grep -cE '"action":"refused"' "$manifest" 2>/dev/null)
     files_refused="${files_refused:-0}"
 
@@ -2303,11 +2006,7 @@ kill_compute_verdict() {
         done < "$sidecar"
     fi
 
-    # --check mode: sidecar is empty (or only K5-pending). Read sshkey
-    # plan-of-record straight from the manifest's "result":"planned_*" rows.
-    # Apply mode also reads the manifest as a fallback for items that
-    # appear in the manifest but produced no sidecar record (e.g., emitter
-    # short-circuited at gone/refused_symlink before a sidecar write).
+    # --check: read sshkey plan-of-record from manifest "planned_*" rows.
     if [[ "$MODE" != "apply" ]]; then
         local pl ml
         while IFS= read -r ml; do
@@ -2479,13 +2178,8 @@ finalize_manifest() {
         /^  \},$/ && in_csf               { in_csf = 0; print; next }
         /^  "summary":\{$/                { in_summary = 1
                                             print
-                                            # files_planned / ips_planned / files_refused
-                                            # and the sshkey planned/keep totals are emitted
-                                            # as "0" placeholders here; the sed pass after
-                                            # awk re-extracts the real K1 / kind:sshkey
-                                            # values from the source manifest and patches
-                                            # them in. Source of truth = the original
-                                            # summary block + on-disk kind:sshkey items.
+                                            # planned/refused/sshkey totals = 0 placeholders;
+                                            # sed pass after awk patches the real values.
                                             printf "    \"files_planned\":0,\n"
                                             printf "    \"ips_planned\":0,\n"
                                             printf "    \"files_refused\":0,\n"
@@ -2496,10 +2190,7 @@ finalize_manifest() {
                                             printf "    \"ips_blocked\":%d,\n",       ips_ok
                                             printf "    \"ips_skipped\":%d,\n",       ips_skip
                                             printf "    \"ips_failed\":%d,\n",        ips_fail
-                                            # v0.7.0 sshkey block. files_planned / keys_*
-                                            # are placeholders (see sed pass below); the
-                                            # remaining counters come from sidecar
-                                            # aggregates above (BARE primaries).
+                                            # sshkey block: planned counts are sed-patched; rest from sidecar.
                                             printf "    \"sshkeys_files_planned\":0,\n"
                                             printf "    \"sshkeys_files_pruned\":%d,\n",         sshkeys_files_pruned
                                             printf "    \"sshkeys_files_clean\":%d,\n",          sshkeys_files_clean
@@ -2558,16 +2249,7 @@ finalize_manifest() {
             print line
             next
         }
-        # v0.7.0: kind:sshkey item patcher. Apply path writes a sidecar
-        # record with BARE primary results; the K1 manifest "result" field
-        # is null and gets patched here (or stays null in --check, where
-        # the K1 emit already wrote "planned_<primary>").
-        # v0.7.2: also patch sha256_pre + result_detail. K1 in apply
-        # mode writes null for all three; the sidecar carries real
-        # values from KILL_LAST_PRUNE_*. Without these patches the
-        # apply-mode manifest kind:sshkey rows showed null
-        # result_detail / sha256_pre after the prune actually ran —
-        # audit-completeness gap.
+        # kind:sshkey: patch result, sha256_pre, result_detail from sidecar.
         in_items == 1 && /\{"kind":"sshkey"/ {
             line = $0
             path = json_str(line, "path")
@@ -2630,25 +2312,14 @@ finalize_manifest() {
         }
     ' "$manifest" > "$tmp" || { rm -f "$tmp" "$lookup"; return 1; }
 
-    # Source of truth for files_planned / ips_planned / files_refused is
-    # the original "summary":{} block written by K1. The awk pass above
-    # emits "0" placeholders for these three keys (because the summary
-    # block sits at the end of the manifest, awk has already re-emitted
-    # its replacement before the original lines arrive). Re-extract the
-    # K1 values from the on-disk manifest and patch the placeholders.
+    # Re-extract K1 planned counts to patch the awk placeholders.
     local fp ip_p fr
     fp=$(grep -oE '"files_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
     ip_p=$(grep -oE '"ips_planned":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
     fr=$(grep -oE '"files_refused":[0-9]+' "$manifest" | head -1 | grep -oE '[0-9]+')
     fp="${fp:-0}"; ip_p="${ip_p:-0}"; fr="${fr:-0}"
 
-    # v0.7.0 sshkey planned counts: derived from the manifest's kind:sshkey
-    # items themselves (K1 wrote them). Sum keys_pruned, keys_kept,
-    # keys_kept_unlabeled across every kind:sshkey row; total file count is
-    # the row count. In --check the per-key totals come from the planned
-    # classifier output; in --apply they reflect the original plan-of-record
-    # (sidecar BARE primaries handle post-mutation result reconciliation in
-    # the awk pass above).
+    # sshkey planned counts: sum keys_{pruned,kept,kept_unlabeled} across every kind:sshkey row.
     local sk_files_planned sk_keys_pruned sk_keys_kept sk_keys_kept_unl
     sk_files_planned=$(grep -cE '"kind":"sshkey"' "$manifest" 2>/dev/null)
     sk_files_planned="${sk_files_planned:-0}"
@@ -2679,10 +2350,7 @@ finalize_manifest() {
     return 0
 }
 
-# Build the manifest. Walks signals, applies pattern->action policy,
-# aggregates attacker IPs, writes JSON to OUT_FILE. Returns 0 on success,
-# 1 if envelope is missing/unreadable. K3/K4/K5/K6 patch the manifest
-# in place to record results.
+# Build the manifest from envelope signals; later K3-K6 patch results in place.
 kill_build_manifest() {
     local env="$1" out="$2"
     [[ -n "$env" && -f "$env" ]] || return 1
@@ -2697,17 +2365,11 @@ kill_build_manifest() {
     local ts_planned
     ts_planned=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    # MITIGATE_FORCE_SSH_PRUNE=1 is a P2 test seam (NOT a documented flag).
-    # P3 wires --ssh-prune to set KILL_SSH_PRUNE directly; under
-    # MITIGATE_LIBRARY_ONLY this env var lets tests exercise the manifest
-    # sweep + supersede paths without going through arg parsing. Local
-    # toggle so the seam doesn't leak past this function.
+    # MITIGATE_FORCE_SSH_PRUNE=1 is an internal test seam (not a CLI flag).
     local _ssh_prune_eff="${KILL_SSH_PRUNE:-0}"
     if [[ "${MITIGATE_FORCE_SSH_PRUNE:-0}" == "1" ]]; then
         _ssh_prune_eff=1
     fi
-    # Effective trust regex: KILL_SSH_TRUST_RE plus any --ssh-allow extras
-    # P3 appends. P2 falls back to the base regex when extras are unset.
     local _trust_re_eff="${KILL_SSH_TRUST_RE_EFFECTIVE:-}"
     if [[ -z "$_trust_re_eff" ]]; then
         _trust_re_eff="$KILL_SSH_TRUST_RE"
@@ -2851,13 +2513,8 @@ kill_build_manifest() {
             done <<< "$ips_agg"
         fi
 
-        # kind:sshkey block. Order in manifest: file → ip → sshkey. Only
-        # emitted when --ssh-prune is active (KILL_SSH_PRUNE=1, set by P3
-        # arg-parse OR the MITIGATE_FORCE_SSH_PRUNE=1 P2 test seam). Uses
-        # KILL_SSHKEY_CANONICAL_CACHE if populated (P3 phase_kill startup
-        # walks /home once into the cache); otherwise falls back to a
-        # direct kill_sshkey_canonical_paths invocation here so unit
-        # tests can drive the manifest sweep without phase_kill setup.
+        # kind:sshkey block (only when --ssh-prune active). Use canonical-paths
+        # cache if populated; fall back to direct enumeration for unit tests.
         if (( _ssh_prune_eff )); then
             local _sk_path
             if (( ${#KILL_SSHKEY_CANONICAL_CACHE[@]} > 0 )); then
@@ -2940,11 +2597,9 @@ backup_file() {
 }
 
 ###############################################################################
-# 0. snapshot - pre-mitigation evidence capture. Runs FIRST so state is
-# frozen before mutating phases. tier1: users/, accounting.log[.*],
-# audit.log[.*], cpanel.config, pre-mitigate-tweaksettings.txt (proxysub
-# mutation has no per-file backup). tier2 (capped): sessions/{raw,preauth,
-# cache}/. Output rides into forensic bundles via defense-state.tgz.
+# 0. snapshot — pre-mitigation evidence capture. Runs FIRST. tier1: users,
+# accounting.log, audit.log, cpanel.config, tweaksettings. tier2 (capped):
+# sessions/{raw,preauth,cache}. Rides into forensic bundles.
 ###############################################################################
 
 phase_snapshot() {
@@ -3896,12 +3551,8 @@ phase_modsec() {
 }
 
 ###############################################################################
-# 10. sessions - forged-session IOC ladder + quarantine. Mirrors
-# ioc-scan.sh's ladder. Patch closes the vector; leaked tokens survive
-# until session expiry, so quarantine is still required. --apply moves
-# raw + preauth + cache copies (listaccts propagates raw → cache, so
-# removing only raw leaves the token live). Probe-canary sessions
-# (^nxesec_canary_<nonce>=) skipped + counted separately.
+# 10. sessions - forged-session IOC ladder + quarantine (mirrors ioc-scan).
+# --apply moves raw + preauth + cache copies; probe canaries skipped.
 ###############################################################################
 
 phase_sessions() {
@@ -3925,19 +3576,11 @@ phase_sessions() {
     local scanned=0 forged=0 quarantined=0 partial=0 failed=0 probe_artifacts=0
     local f session_shape reasons sname preauth_file cache_file has_b q_rc
 
-    # Iterate. nullglob is not enabled globally, so guard with -f.
     for f in "$raw_dir"/*; do
         [[ -f "$f" ]] || continue
         scanned=$((scanned+1))
 
-        # awk emits PROBE_ARTIFACT / FORGED:<csv> / OK. B-cand confirmed in
-        # bash via paired preauth companion (cpsrvd removes preauth on
-        # promotion). IOC-D2: single-line pass= on a badpass session is
-        # injection footprint (saveSession writes pass= only length>0;
-        # badpass call site doesn't pass `pass`). IOC-2: re-audit
-        # Cpanel/Security/Authn/TwoFactorAuth/Verify.pm + Cpanel/Server.pm
-        # on patch tier bump — extend has_kg if a new legitimate origin
-        # appears, else FP.
+        # awk emits PROBE_ARTIFACT / FORGED:<csv> / OK; B-cand confirmed via paired preauth.
         session_shape=$(awk -v now="$now_epoch" -v floor="$PASS_FORGERY_MAX_LEN" \
                             -v canary_re="$PROBE_CANARY_PAT" '
             BEGIN { line_idx=0; pass_count=0; pass_at=0 }
@@ -4060,11 +3703,7 @@ phase_sessions() {
             local would_msg="ioc=$reasons; would quarantine"
             (( has_b ))     && would_msg+=" + preauth"
             (( has_cache )) && would_msg+=" + cache"
-            # ATTEMPT-class shapes (D2-only / 2-only) tag as "attempt
-            # session:" so operators can tell forensic-grade hits from
-            # session-level attempt residue without parsing reason letters.
-            # Display-only split: confirmed-class (A/B/C/D/E/E2/F/H/I) =
-            # forged; D2/2 alone = attempt. Quarantine action identical.
+            # Display-only split (action identical): D2/2-only = "attempt", rest = "forged".
             local class_tag="forged"
             case ",$reasons," in
                 (*,A,*|*,B,*|*,C,*|*,D,*|*,E,*|*,E2,*|*,F,*|*,H,*|*,I,*) ;;
@@ -4147,14 +3786,10 @@ quarantine_session() {
         return 1
     fi
 
-    # Metadata sidecar - written from the ORIGINAL's stat (not the copy)
-    # so ctime reflects the attacker's write, not our cp.
+    # Metadata sidecar uses ORIGINAL's stat (so ctime reflects attacker write).
     write_session_info "$src" "$dest" "$reasons" > "$info" 2>/dev/null
 
-    # Track whether any rm step failed across raw + companions. The raw
-    # rm at the bottom may also flip this; partial-success (rc=2) wins
-    # over full success but is dominated by an earlier rc=1 (which
-    # already returned).
+    # rc=2 (partial) wins over rc=0; earlier rc=1 already returned.
     local partial=0
 
     # Companion preauth file. Only quarantined if IOC-B fired (i.e. the
@@ -4293,14 +3928,9 @@ phase_probe() {
     esac
 }
 
-# phase_kill - targeted quarantine + IP block from an IOC envelope. Opt-in
-# via --kill. Default-off; never runs unless RUN_KILL=1. Gated on
-# host_verdict == COMPROMISED unless --kill-anyway is set.
-#
-# Pipeline: K1 manifest build -> K3 file quarantine -> K4 csf -d ->
-# K5 csf.blocklists register -> K6 finalize manifest + verdict. K3/K4/K5
-# are mutating and require --apply. csf -ra reload at end if any csf
-# state changed.
+# phase_kill — targeted quarantine + IP block from an IOC envelope (opt-in
+# via --kill). Pipeline: build manifest → quarantine → csf -d → register
+# blocklist → finalize. Mutating steps require --apply; csf -ra at end.
 phase_kill() {
     P_CUR=kill
     phase_begin kill
@@ -4609,17 +4239,7 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         exit 0
     fi
     if [[ "${MITIGATE_RUN_P1_TESTS:-0}" == "1" ]]; then
-        # P1+P2+P3 test harness — 50 cases from PLAN-sshkey-prune.md
-        # plus v0.7.1 / v0.7.2 / v0.7.3 sentinel-fix regressions.
-        # P1 = 29 (helpers + drift gate), P2 = 6 (manifest sweep + apply
-        # consumer), P3 = 9 (CLI flags + phase_kill drift gate),
-        # v0.7.1 = 2 (45-46 sidecar JSONL escape + leading-whitespace),
-        # v0.7.2 = 3 (47 trap-injection metachar gate, 48 recovery_hint
-        # shell-quote, 49 finalize_manifest sshkey detail+sha256_pre patch),
-        # v0.7.3 = 1 (50 deeper trap-time test — consume-time gate
-        # blocks stale-manifest-replay PoC).
-        # Each test prints OK(<n> <description>) or FAIL(<n> <description>:
-        # <diagnostic>) on stdout. Exits 0 on all-OK, 1 on any FAIL.
+        # ssh-key-prune test harness (50 cases). Exits 0 on all-OK, 1 on any FAIL.
         _t_pass=0
         _t_fail=0
         _t_dir=$(mktemp -d /tmp/sessionscribe-p1-tests-XXXXXX)
@@ -4895,21 +4515,12 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
                 "result=$KILL_LAST_PRUNE_RESULT pre=$_f24_pre post=$_f24_post"
         fi
 
-        # Test 25: sha256-mismatch-injection via a sha256sum SHIM on PATH.
-        # An on-disk wrapper script intercepts every sha256sum invocation
-        # — including pipeline-fork subshells where in-process function
-        # overrides are unreliable on bash 4.1 (function-table inheritance
-        # across pipeline stages is implementation-defined). The shim
-        # uses a file-counter to fabricate a non-matching sha on the 3rd
-        # call (step 8's post-lock re-read), causing
-        # concurrent_modification.
+        # Test 25: PATH-shim sha256sum (function override is unreliable
+        # across bash 4.1 pipeline forks); shim fakes step-8 sha → concurrent_modification.
         _real_sha256sum=$(command -v sha256sum)
         _shim_dir="$_t_dir/shim"
         mkdir -p "$_shim_dir"
-        # Shim source body: $vars must NOT expand at WRITE time (they are
-        # the shim's own runtime state, not the harness's). Single quotes
-        # are intentional. shellcheck disable=SC2016.
-        # shellcheck disable=SC2016
+        # shellcheck disable=SC2016  # $vars in shim body are runtime, not harness
         {
             printf '#!/bin/bash\n'
             printf 'set -u\n'
@@ -4940,17 +4551,8 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         } > "$_f25"
         _f25_pre=$(command "$_real_sha256sum" "$_f25" | awk '{print $1}')
         printf '0\n' > "$_t_dir/count"
-        # Call sequence on a 2-key file when ssh-keygen lacks the
-        # algorithm and falls back to base64-decoded sha256:
-        #   1 = step 2 (sha_pre)
-        #   2,3 = ssh_key_fingerprint per key during classify
-        #   4 = step 6 (backup integrity)
-        #   5 = step 8 (post-lock sha_now) ← target the abort path here
-        #   6 = step 12 (sha_post)
-        # Trigger=5 fabricates step 8's sha_now → concurrent_modification.
+        # Trigger=5: fabricate step 8 sha_now → concurrent_modification abort path.
         printf '5\n' > "$_t_dir/trigger"
-        # PATH-shimmed sha256sum is now active. ssh_keys_prune will hit
-        # the wrapper at every step 2/6/8/12 invocation.
         PATH="$_shim_dir:$_orig_PATH"
         hash -r 2>/dev/null || true
         ssh_keys_prune "$_f25" "$KILL_SSH_TRUST_RE" "$_t_dir/25-backup/keys" "" >/dev/null 2>&1
@@ -4967,11 +4569,7 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
                 "result=$KILL_LAST_PRUNE_RESULT pre=$_f25_pre post=$_f25_post"
         fi
 
-        # Test 26: mid-flight modification — fabricate sha_pre on the
-        # 1st call (step 2). Step 6's backup integrity check (call 2 =
-        # sha of backup) returns the real sha, which won't match the
-        # fabricated sha_pre → prune_failed (backup_integrity). Original
-        # preserved.
+        # Test 26: fabricate sha_pre on call 1 → step 6 backup_integrity → prune_failed.
         _f26="$_t_dir/26.keys"
         {
             printf 'ssh-rsa AAAA Parent Child key for W9Z2DL\n'
@@ -5054,12 +4652,7 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         unset KILL_SSH_TRUST_DRIFT_TEST_PATH
         KILL_SSH_ALLOW_DRIFT=0
 
-        # ===================================================================
-        # P2 tests (30-35). Manifest sweep + apply consumer + canonical-cache
-        # supersede gate. Same _t_dir, same _t_ok / _t_fail; the harness is
-        # additive over P1 so a single MITIGATE_RUN_P1_TESTS=1 invocation
-        # covers all 35 cases.
-        # ===================================================================
+        # P2 tests (30-35): manifest sweep + apply consumer + supersede gate.
 
         # Test 30: prune_ssh_keys_from_manifest applied to a planted file
         # with one Parent Child + one evil@host → sidecar gets one
@@ -5160,12 +4753,8 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
                 "got rc=0 unexpectedly"
         fi
 
-        # Test 34: kill_build_manifest in --check mode emits kind:sshkey
-        # with result=planned_pruned_ok for a planted authorized_keys
-        # under the cache. Exercises the full sweep+emit path under
-        # MITIGATE_FORCE_SSH_PRUNE=1 (test seam). Synthetic envelope is
-        # an empty-signal envelope (no kind:file / kind:ip rows); the
-        # sweep is signal-independent so this is enough to drive emission.
+        # Test 34: --check kill_build_manifest emits kind:sshkey result=planned_pruned_ok
+        # for planted authorized_keys (full sweep+emit under MITIGATE_FORCE_SSH_PRUNE=1).
         MODE="check"
         _f34="$_t_dir/34.keys"
         {
@@ -5242,14 +4831,8 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
         KILL_SSHKEY_CANONICAL_CACHE=()
         unset MITIGATE_FORCE_SSH_PRUNE
 
-        # ===================================================================
-        # P3 tests (36-44). CLI flags + phase_kill drift gate.
-        # Tests 36-43 spawn subprocesses that re-invoke this script with
-        # MITIGATE_LIBRARY_ONLY=1 + MITIGATE_DUMP_FLAGS=1 so the arg-parse
-        # loop runs once and the post-parse global state is dumped to
-        # stdout for inspection. Test 44 drives phase_kill in-process via
-        # a synthetic envelope + fake ioc-scan companion path.
-        # ===================================================================
+        # P3 tests (36-44): CLI flags + phase_kill drift gate. 36-43 reinvoke
+        # this script with MITIGATE_DUMP_FLAGS=1 to dump post-parse globals.
         _self_path="${BASH_SOURCE[0]}"
 
         # Test 36: --ssh-allow with a valid regex is accepted (exit 0).
@@ -5343,12 +4926,8 @@ if [[ "${MITIGATE_LIBRARY_ONLY:-0}" == "1" ]]; then
             _t_fail 43 "--ssh-allow-drift" "out=$_o43"
         fi
 
-        # Test 44: phase_kill with synthesized trust-regex drift —
-        # default flags fail with phase_set kill FAIL detail mentioning
-        # "drift"; KILL_SSH_ALLOW_DRIFT=1 proceeds with WARN.
-        # Set up a fake ioc-scan companion at a non-default path with a
-        # divergent SSH_KNOWN_GOOD_RE so kill_sshkey_check_trust_drift
-        # returns rc=1.
+        # Test 44: phase_kill with synthesized trust-regex drift.
+        # Default → FAIL with "drift"; KILL_SSH_ALLOW_DRIFT=1 → WARN.
         _fake_ioc44="$_t_dir/44-iocscan.sh"
         {
             printf '#!/bin/bash\n'
@@ -5471,14 +5050,8 @@ sys.exit(0 if ok else 1)
                 "result=$KILL_LAST_PRUNE_RESULT detail='$KILL_LAST_PRUNE_DETAIL' kept=$_kept46 pruned=$_pruned46"
         fi
 
-        # Test 47 (v0.7.2 sentinel-fix MUST-FIX): kill_sshkey_path_safe
-        # refuses paths containing shell metacharacters that would
-        # otherwise reach the SIGINT/SIGTERM trap-string expansion at
-        # ssh_keys_prune line 1066/1068, allowing a hostile cPanel user
-        # name (e.g. `x"; touch /tmp/X; "y` from a SessionScribe-
-        # compromised WHM) to inject commands when the lock-wait window
-        # gets killed. Probes BOTH the helper directly and the canonical
-        # path emitter via getent override.
+        # Test 47: kill_sshkey_path_safe refuses shell-metachar paths that would
+        # reach ssh_keys_prune's trap-string expansion (probes helper + getent emitter).
         _safe47_dq=0; _safe47_semi=0; _safe47_dollar=0; _safe47_bt=0
         _safe47_bs=0; _safe47_amp=0; _safe47_pipe=0; _safe47_lt=0
         _safe47_gt=0; _safe47_star=0; _safe47_q=0; _safe47_bang=0
@@ -5548,10 +5121,7 @@ sys.exit(0 if ok else 1)
                 "dq=$_safe47_dq semi=$_safe47_semi dollar=$_safe47_dollar bt=$_safe47_bt bs=$_safe47_bs amp=$_safe47_amp pipe=$_safe47_pipe lt=$_safe47_lt gt=$_safe47_gt star=$_safe47_star q=$_safe47_q bang=$_safe47_bang sq=$_safe47_sq paren=$_safe47_paren brace=$_safe47_brace bracket=$_safe47_bracket nl=$_safe47_nl tab=$_safe47_tab clean=$_safe47_clean clean_hit=$_hit47_clean hostile_hit=$_hit47_hostile inject=$_hit47_inject"
         fi
 
-        # Test 48 (v0.7.2 sentinel-fix SHOULD-FIX-1): kill_sshkey_recovery_hint
-        # shell-quotes both paths with single-quotes (defense-in-depth
-        # against operator paste-execute under incident stress). Embedded
-        # single-quotes must round-trip via the `'\''` escape.
+        # Test 48: recovery_hint single-quotes both paths; embedded single-quote round-trips via `'\''`.
         _hint48=$(kill_sshkey_recovery_hint "/root/.ssh/authorized_keys" "/var/cpanel/sessionscribe-mitigation/run")
         _expect48="cp -a '/var/cpanel/sessionscribe-mitigation/run/quarantine/root/.ssh/authorized_keys.original-pre-prune' '/root/.ssh/authorized_keys' && restorecon -F '/root/.ssh/authorized_keys' 2>/dev/null && systemctl reload sshd"
         # Embedded single-quote case: `/home/o'malley/.ssh/authorized_keys`
@@ -5564,11 +5134,8 @@ sys.exit(0 if ok else 1)
                 "got1='$_hint48' want1='$_expect48' got2='$_hint48b' want2='$_expect48b'"
         fi
 
-        # Test 49 (v0.7.2 sentinel-fix SHOULD-FIX-2): finalize_manifest
-        # patches result_detail + sha256_pre on apply-mode kind:sshkey
-        # rows. K1 wrote null for all three (result, result_detail,
-        # sha256_pre); the sidecar carries real values; the awk pass
-        # must merge them, otherwise audit-completeness is broken.
+        # Test 49: finalize_manifest merges sidecar result_detail + sha256_pre
+        # into apply-mode kind:sshkey rows (K1 emits null; awk pass patches).
         MODE="apply"
         BACKUP_DIR="$_t_dir/49-bdir"
         mkdir -p "$BACKUP_DIR"
@@ -5633,34 +5200,15 @@ sys.exit(0 if ok else 1)
                 "det_null=$_det49_null pre_null=$_pre49_null post_null=$_post49_null result_ok=$_result49_ok det_substr=$_det49_substr pre_hex=$_pre49_hex row='$_row49'"
         fi
 
-        # Test 50 (v0.7.3 SHOULD-FIX): kill_sshkey_path_safe runtime
-        # trap-injection PoC blocked by consume-time gate. Simulates a
-        # stale pre-v0.7.2 manifest replay: the manifest carries a
-        # hostile path that bypassed the build-time canonical-paths
-        # filter (because it was emitted before that filter shipped).
-        # prune_ssh_keys_from_manifest must refuse the row at
-        # consume-time (before ssh_keys_prune installs its trap), record
-        # `refused_hostile_path`, and leave no INJECTION_PROOF file.
-        #
-        # Why this is a deeper test than 47: test 47 exercises the
-        # build-time gate by overriding `find` so a hostile dir reaches
-        # kill_sshkey_canonical_paths. Test 50 hands a hostile path
-        # directly to the apply-path consumer — the only place left
-        # where a stale manifest could re-introduce the trap-injection
-        # vector after v0.7.2 closed the build-time hole.
+        # Test 50: stale-manifest replay → consume-time gate refuses hostile
+        # path before ssh_keys_prune installs its trap; no INJECTION_PROOF.
         MODE="apply"
         BACKUP_DIR="$_t_dir/50-bdir"
         mkdir -p "$BACKUP_DIR"
         rm -f "$_t_dir/INJECTION_PROOF"
-        # Hostile path: shell-metachar payload that, if expanded inside
-        # a trap-string, would touch INJECTION_PROOF. The path itself
-        # need not exist on disk — the consume-time gate fires before
-        # any I/O.
         _hostile50="/home/x\";touch $_t_dir/INJECTION_PROOF;\"y/.ssh/authorized_keys"
         _m50="$_t_dir/50-manifest.json"
         _bd50="$BACKUP_DIR/quarantine/${_hostile50#/}"
-        # Synthesize a stale-pre-v0.7.2 manifest carrying the hostile
-        # path. Single-item, minimal but finalize-compatible shape.
         {
             printf '{\n'
             printf '  "ts_applied":null,\n'
@@ -5691,21 +5239,13 @@ sys.exit(0 if ok else 1)
             printf '}\n'
         } > "$_m50"
         : > "${_m50%.json}.actions.jsonl"
-        # Drive the apply-path consumer. It must:
-        #   1. extract the hostile path via kill_json_str_field,
-        #   2. fail kill_sshkey_path_safe at the consume-time gate,
-        #   3. record `refused_hostile_path` in the sidecar,
-        #   4. NOT call ssh_keys_prune (so no trap is set, no
-        #      INJECTION_PROOF file is created).
         prune_ssh_keys_from_manifest "$_m50" >/dev/null 2>&1
         _sidecar50="${_m50%.json}.actions.jsonl"
         _refused50=$(grep -c '"result":"refused_hostile_path"' "$_sidecar50" 2>/dev/null)
         _pruned50=$(grep -c '"result":"pruned_ok"' "$_sidecar50" 2>/dev/null)
         _injected50=0
         [[ -e "$_t_dir/INJECTION_PROOF" ]] && _injected50=1
-        # Belt-and-suspenders: drive kill_compute_verdict over the
-        # synthesized sidecar to confirm refused_hostile_path is wired
-        # into the verdict vocabulary (skip + WARN-promote).
+        # Belt-and-suspenders: confirm refused_hostile_path is in the verdict vocabulary.
         kill_compute_verdict "$_m50" >/dev/null 2>&1
         _verdict50="${LAST_KILL_VERDICT:-}"
         if [[ "$_refused50" == "1" && "$_pruned50" == "0" \
