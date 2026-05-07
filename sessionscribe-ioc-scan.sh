@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.38"
+VERSION="2.7.39"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -7276,25 +7276,51 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # ---- Runtime-state IOCs ---- see CHANGELOG v2.7.35.
-    local _rt_p
+    # ---- Runtime-state IOCs ---- see CHANGELOG v2.7.35 / v2.7.39.
+    # Live IOCs that flip host_verdict=COMPROMISED only when root-attributed.
+    # Process-tree hits demote to strong (→ SUSPICIOUS) on non-root UID;
+    # file-path live hits use stat -c %u; ESTAB hits use /proc/<pid>/status.
+    # LPE PoC binaries stay live_compromise unconditionally (kernel/setuid
+    # exploitation aims at root in seconds — not account-tier malware).
+    local _rt_p _rt_owner _rt_id _rt_key _rt_sev _rt_label _rt_note_suffix
     for _rt_p in "${RUNTIME_KNOWN_BAD_PATHS[@]}"; do
         [[ -f "$_rt_p" ]] || continue
         known_bad_meta "$_rt_p"
-        local _rt_label _rt_sev
+        _rt_id="ioc_runtime_known_bad_path"
+        _rt_key="ioc_runtime_known_bad_path_present"
+        _rt_note_suffix=""
         case "$_rt_p" in
-            /dev/shm/.gs)               _rt_label="GSocket listener binary"; _rt_sev="live_compromise" ;;
-            /tmp/codeItems3)            _rt_label="PHP cron-bot stage-2 payload"; _rt_sev="live_compromise" ;;
+            /dev/shm/.gs)
+                _rt_label="GSocket listener binary"
+                _rt_owner=$(stat -c %u "$_rt_p" 2>/dev/null)
+                if [[ "${_rt_owner:-0}" == "0" ]]; then
+                    _rt_sev="live_compromise"
+                else
+                    _rt_sev="strong"; _rt_id="ioc_runtime_known_bad_path_userland"
+                    _rt_key="ioc_runtime_known_bad_path_userland_present"
+                    _rt_note_suffix=" (owner UID=${_rt_owner}; user-account compromise, review tier)"
+                fi
+                ;;
+            /tmp/codeItems3)
+                _rt_label="PHP cron-bot stage-2 payload"
+                _rt_owner=$(stat -c %u "$_rt_p" 2>/dev/null)
+                if [[ "${_rt_owner:-0}" == "0" ]]; then
+                    _rt_sev="live_compromise"
+                else
+                    _rt_sev="strong"; _rt_id="ioc_runtime_known_bad_path_userland"
+                    _rt_key="ioc_runtime_known_bad_path_userland_present"
+                    _rt_note_suffix=" (owner UID=${_rt_owner}; user-account compromise, review tier)"
+                fi
+                ;;
             */c3pool/xmrig)             _rt_label="c3pool xmrig install"; _rt_sev="strong" ;;
             */c3pool/config.json)       _rt_label="c3pool xmrig config"; _rt_sev="strong" ;;
             */moneroocean/xmrig)        _rt_label="moneroocean xmrig install"; _rt_sev="strong" ;;
             */moneroocean/config.json)  _rt_label="moneroocean xmrig config"; _rt_sev="strong" ;;
             *)                          _rt_label="runtime artifact"; _rt_sev="strong" ;;
         esac
-        emit "destruction" "ioc_runtime_known_bad_path" "$_rt_sev" \
-             "ioc_runtime_known_bad_path_present" 10 \
+        emit "destruction" "$_rt_id" "$_rt_sev" "$_rt_key" 10 \
              "path" "$_rt_p" "${META_KV[@]}" \
-             "note" "$_rt_label at $_rt_p — runtime payload artifact (CRITICAL)."
+             "note" "$_rt_label at $_rt_p — runtime payload artifact${_rt_note_suffix}."
         ((hits++))
     done
 
@@ -7331,13 +7357,11 @@ check_destruction_iocs() {
 
     local _rt_ps_cap; _rt_ps_cap=$(mktemp /tmp/ssioc.psrun.XXXXXX 2>/dev/null)
     if [[ -n "$_rt_ps_cap" ]] && ps auxfww > "$_rt_ps_cap" 2>/dev/null; then
-        local _rt_line
+        local _rt_line _rt_user
 
         _rt_line=$(grep -E "$RUNTIME_MASQ_RESPAWN_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            # UID 0 in the shim = root-owned gsocket → COMPROMISED. Non-root
-            # UID is a user-account compromise (cPanel user owned) — surface
-            # as strong IOC for IR but do not flip host to COMPROMISED.
+            # UID 0 in shim = root gsocket → COMPROMISED; non-zero UID = user-account compromise.
             if [[ "$_rt_line" =~ pkill[[:space:]]+-0[[:space:]]+-U0[[:space:]] ]]; then
                 emit "destruction" "ioc_runtime_gsocket_respawn" "live_compromise" \
                      "ioc_runtime_gsocket_persistence_shim" 10 \
@@ -7354,29 +7378,53 @@ check_destruction_iocs() {
 
         _rt_line=$(grep -E "$RUNTIME_LDLINUX_MASQ_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_xmrig_ldlinux" "live_compromise" \
-                 "ioc_runtime_xmrig_masquerade" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "xmrig camouflaged as ./.ld-linux.so (the dynamic linker is a library, not an exec) — active miner (CRITICAL)."
+            _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+            if [[ "$_rt_user" == "root" ]]; then
+                emit "destruction" "ioc_runtime_xmrig_ldlinux" "live_compromise" \
+                     "ioc_runtime_xmrig_masquerade" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig camouflaged as ./.ld-linux.so under root — active miner (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_xmrig_ldlinux_userland" "strong" \
+                     "ioc_runtime_xmrig_masquerade_userland" 10 \
+                     "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig camouflaged as ./.ld-linux.so under user '$_rt_user' — user-account miner; review tier."
+            fi
             ((hits++))
         fi
 
         _rt_line=$(grep -E "$RUNTIME_HTTPS_MASQ_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_xmrig_https" "live_compromise" \
-                 "ioc_runtime_xmrig_masquerade" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "xmrig renamed to ./https with pool/randomx args — active miner (CRITICAL)."
+            _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+            if [[ "$_rt_user" == "root" ]]; then
+                emit "destruction" "ioc_runtime_xmrig_https" "live_compromise" \
+                     "ioc_runtime_xmrig_masquerade" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig renamed to ./https under root with pool/randomx args — active miner (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_xmrig_https_userland" "strong" \
+                     "ioc_runtime_xmrig_masquerade_userland" 10 \
+                     "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig renamed to ./https under user '$_rt_user' — user-account miner; review tier."
+            fi
             ((hits++))
         fi
 
         _rt_line=$(grep -E "$RUNTIME_PYTHON_MASQ_RE" "$_rt_ps_cap" 2>/dev/null \
                   | grep -E "$RUNTIME_PYTHON_MASQ_ARGS_RE" | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_xmrig_python" "live_compromise" \
-                 "ioc_runtime_xmrig_masquerade" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "xmrig renamed to ./python[0-9] with pool/donate-level args — active miner (CRITICAL)."
+            _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+            if [[ "$_rt_user" == "root" ]]; then
+                emit "destruction" "ioc_runtime_xmrig_python" "live_compromise" \
+                     "ioc_runtime_xmrig_masquerade" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig renamed to ./python[0-9] under root with pool/donate-level args — active miner (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_xmrig_python_userland" "strong" \
+                     "ioc_runtime_xmrig_masquerade_userland" 10 \
+                     "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig renamed to ./python[0-9] under user '$_rt_user' — user-account miner; review tier."
+            fi
             ((hits++))
         fi
 
@@ -7385,19 +7433,35 @@ check_destruction_iocs() {
                   | grep -E '(--config=|-o[[:space:]]+(stratum\+)?[a-z]+://|--url=.*pool\.|c3pool|moneroocean|supportxmr|nanopool|hashvault)' \
                   | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_xmrig_visible" "live_compromise" \
-                 "ioc_runtime_xmrig_visible_active" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "xmrig running with pool/config args — active cryptominer (CRITICAL)."
+            _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+            if [[ "$_rt_user" == "root" ]]; then
+                emit "destruction" "ioc_runtime_xmrig_visible" "live_compromise" \
+                     "ioc_runtime_xmrig_visible_active" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig running under root with pool/config args — active cryptominer (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_xmrig_visible_userland" "strong" \
+                     "ioc_runtime_xmrig_visible_active_userland" 10 \
+                     "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                     "note" "xmrig running under user '$_rt_user' with pool/config args — user-account miner; review tier."
+            fi
             ((hits++))
         fi
 
         _rt_line=$(grep -E "$RUNTIME_LOADER_PIPE_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_loader_in_flight" "live_compromise" \
-                 "ioc_runtime_known_loader_in_flight" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "Known cryptominer/PHP-loader install pipe in flight — operator deploying payload (CRITICAL)."
+            _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+            if [[ "$_rt_user" == "root" ]]; then
+                emit "destruction" "ioc_runtime_loader_in_flight" "live_compromise" \
+                     "ioc_runtime_known_loader_in_flight" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "Known cryptominer/PHP-loader install pipe in flight under root — operator deploying payload (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_loader_in_flight_userland" "strong" \
+                     "ioc_runtime_known_loader_in_flight_userland" 10 \
+                     "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                     "note" "Known loader pipe in flight under user '$_rt_user' — user-account compromise; review tier."
+            fi
             ((hits++))
         fi
 
@@ -7405,10 +7469,18 @@ check_destruction_iocs() {
         for _rt_w in "${RUNTIME_WALLET_PREFIXES[@]}"; do
             _rt_line=$(grep -F "$_rt_w" "$_rt_ps_cap" 2>/dev/null | head -1)
             if [[ -n "$_rt_line" ]]; then
-                emit "destruction" "ioc_runtime_wallet" "live_compromise" \
-                     "ioc_runtime_wallet_in_cmdline" 10 \
-                     "wallet_prefix" "$_rt_w" "sample" "${_rt_line:0:200}" \
-                     "note" "XMR wallet prefix $_rt_w in process cmdline — operator-attributed miner (CRITICAL)."
+                _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+                if [[ "$_rt_user" == "root" ]]; then
+                    emit "destruction" "ioc_runtime_wallet" "live_compromise" \
+                         "ioc_runtime_wallet_in_cmdline" 10 \
+                         "wallet_prefix" "$_rt_w" "sample" "${_rt_line:0:200}" \
+                         "note" "XMR wallet prefix $_rt_w in root cmdline — operator-attributed miner (CRITICAL)."
+                else
+                    emit "destruction" "ioc_runtime_wallet_userland" "strong" \
+                         "ioc_runtime_wallet_in_cmdline_userland" 10 \
+                         "wallet_prefix" "$_rt_w" "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                         "note" "XMR wallet prefix $_rt_w in user '$_rt_user' cmdline — user-account miner; review tier."
+                fi
                 ((hits++))
             fi
         done
@@ -7419,10 +7491,18 @@ check_destruction_iocs() {
             _rt_ip_re="(^|[^0-9])${_rt_ip//./\\.}($|[^0-9])"
             _rt_line=$(grep -E "$_rt_ip_re" "$_rt_ps_cap" 2>/dev/null | head -1)
             if [[ -n "$_rt_line" ]]; then
-                emit "destruction" "ioc_runtime_c2_in_cmdline" "live_compromise" \
-                     "ioc_runtime_c2_callback" 10 \
-                     "c2_ip" "$_rt_ip" "sample" "${_rt_line:0:200}" \
-                     "note" "Known C2 IP $_rt_ip in process cmdline — active loader/beacon (CRITICAL)."
+                _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+                if [[ "$_rt_user" == "root" ]]; then
+                    emit "destruction" "ioc_runtime_c2_in_cmdline" "live_compromise" \
+                         "ioc_runtime_c2_callback" 10 \
+                         "c2_ip" "$_rt_ip" "sample" "${_rt_line:0:200}" \
+                         "note" "Known C2 IP $_rt_ip in root cmdline — active loader/beacon (CRITICAL)."
+                else
+                    emit "destruction" "ioc_runtime_c2_in_cmdline_userland" "strong" \
+                         "ioc_runtime_c2_callback_userland" 10 \
+                         "c2_ip" "$_rt_ip" "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                         "note" "Known C2 IP $_rt_ip in user '$_rt_user' cmdline — user-account compromise; review tier."
+                fi
                 ((hits++))
             fi
         done
@@ -7431,10 +7511,18 @@ check_destruction_iocs() {
         for _rt_h in "${RUNTIME_C2_HOSTS[@]}"; do
             _rt_line=$(grep -F "$_rt_h" "$_rt_ps_cap" 2>/dev/null | head -1)
             if [[ -n "$_rt_line" ]]; then
-                emit "destruction" "ioc_runtime_c2_host_in_cmdline" "live_compromise" \
-                     "ioc_runtime_c2_callback" 10 \
-                     "c2_host" "$_rt_h" "sample" "${_rt_line:0:200}" \
-                     "note" "Known C2 host $_rt_h in process cmdline — active loader/beacon (CRITICAL)."
+                _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+                if [[ "$_rt_user" == "root" ]]; then
+                    emit "destruction" "ioc_runtime_c2_host_in_cmdline" "live_compromise" \
+                         "ioc_runtime_c2_callback" 10 \
+                         "c2_host" "$_rt_h" "sample" "${_rt_line:0:200}" \
+                         "note" "Known C2 host $_rt_h in root cmdline — active loader/beacon (CRITICAL)."
+                else
+                    emit "destruction" "ioc_runtime_c2_host_in_cmdline_userland" "strong" \
+                         "ioc_runtime_c2_callback_userland" 10 \
+                         "c2_host" "$_rt_h" "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                         "note" "Known C2 host $_rt_h in user '$_rt_user' cmdline — user-account compromise; review tier."
+                fi
                 ((hits++))
             fi
         done
@@ -7443,15 +7531,25 @@ check_destruction_iocs() {
         for _rt_re in "${RUNTIME_REVERSE_SHELL_RES[@]}"; do
             _rt_line=$(grep -E "$_rt_re" "$_rt_ps_cap" 2>/dev/null | head -1)
             if [[ -n "$_rt_line" ]]; then
-                emit "destruction" "ioc_runtime_reverse_shell" "live_compromise" \
-                     "ioc_runtime_reverse_shell_active" 10 \
-                     "sample" "${_rt_line:0:200}" \
-                     "note" "Reverse-shell process active in cmdline — operator-side listener bound or interactive shell upgraded (CRITICAL)."
+                _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+                if [[ "$_rt_user" == "root" ]]; then
+                    emit "destruction" "ioc_runtime_reverse_shell" "live_compromise" \
+                         "ioc_runtime_reverse_shell_active" 10 \
+                         "sample" "${_rt_line:0:200}" \
+                         "note" "Reverse-shell process active under root — operator listener (CRITICAL)."
+                else
+                    emit "destruction" "ioc_runtime_reverse_shell_userland" "strong" \
+                         "ioc_runtime_reverse_shell_active_userland" 10 \
+                         "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                         "note" "Reverse-shell process active under user '$_rt_user' — user-account compromise; review tier."
+                fi
                 ((hits++))
             fi
         done
 
-        # Walk past `\_` forest tokens to argv[0]; FP-rejects find/grep over the binary name.
+        # LPE binaries: stay live_compromise even under non-root user. Whole point
+        # of LPE PoCs is kernel/setuid exploitation to root in seconds — threat
+        # horizon is imminent privilege escalation, not steady-state account malware.
         local _rt_lpe
         for _rt_lpe in "${RUNTIME_LPE_BINARIES[@]}"; do
             _rt_line=$(awk -v b="$_rt_lpe" '{
@@ -7469,13 +7567,22 @@ check_destruction_iocs() {
 
         _rt_line=$(grep -E "$RUNTIME_XMR_WALLET_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            emit "destruction" "ioc_runtime_xmr_wallet_generic" "live_compromise" \
-                 "ioc_runtime_xmr_wallet_in_cmdline" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "95-char Monero wallet on process cmdline — active miner (CRITICAL)."
+            _rt_user=$(printf '%s' "$_rt_line" | awk '{print $1}')
+            if [[ "$_rt_user" == "root" ]]; then
+                emit "destruction" "ioc_runtime_xmr_wallet_generic" "live_compromise" \
+                     "ioc_runtime_xmr_wallet_in_cmdline" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "note" "95-char Monero wallet on root cmdline — active miner (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_xmr_wallet_generic_userland" "strong" \
+                     "ioc_runtime_xmr_wallet_in_cmdline_userland" 10 \
+                     "user" "$_rt_user" "sample" "${_rt_line:0:200}" \
+                     "note" "95-char Monero wallet on user '$_rt_user' cmdline — user-account miner; review tier."
+            fi
             ((hits++))
         fi
 
+        # b64-shim variant: UID not extractable from base64 prefix alone; stays live_compromise.
         if grep -qF "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null; then
             _rt_line=$(grep -F "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null | head -1)
             emit "destruction" "ioc_runtime_gsocket_b64_shim" "live_compromise" \
@@ -7493,14 +7600,27 @@ check_destruction_iocs() {
         [[ -n "$_rt_conn_cap" ]] && ss -tnp > "$_rt_conn_cap" 2>/dev/null || true
     fi
     if [[ -n "$_rt_conn_cap" && -s "$_rt_conn_cap" ]]; then
-        local _rt_ip _rt_line
+        local _rt_ip _rt_line _rt_pid _rt_uid
         for _rt_ip in "${RUNTIME_C2_IPS[@]}"; do
             _rt_line=$(grep -E "ESTAB.*[[:space:]]${_rt_ip//./\\.}:" "$_rt_conn_cap" 2>/dev/null | head -1)
             if [[ -n "$_rt_line" ]]; then
-                emit "destruction" "ioc_runtime_c2_estab" "live_compromise" \
-                     "ioc_runtime_c2_callback_active" 10 \
-                     "c2_ip" "$_rt_ip" "sample" "${_rt_line:0:200}" \
-                     "note" "Active TCP ESTAB to known C2 IP $_rt_ip — backdoor live and connected (CRITICAL)."
+                # Resolve socket-owning pid → /proc/<pid>/status Uid (effective UID, field 2).
+                # Default to root on lookup failure (process gone) — connection itself is real evidence.
+                _rt_pid=$(printf '%s' "$_rt_line" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+                _rt_uid=""
+                [[ -n "$_rt_pid" && -r "/proc/$_rt_pid/status" ]] && \
+                    _rt_uid=$(awk '/^Uid:/{print $2; exit}' "/proc/$_rt_pid/status" 2>/dev/null)
+                if [[ -z "$_rt_uid" || "$_rt_uid" == "0" ]]; then
+                    emit "destruction" "ioc_runtime_c2_estab" "live_compromise" \
+                         "ioc_runtime_c2_callback_active" 10 \
+                         "c2_ip" "$_rt_ip" "pid" "${_rt_pid:-unknown}" "sample" "${_rt_line:0:200}" \
+                         "note" "Active TCP ESTAB to known C2 IP $_rt_ip (root or unknown UID) — backdoor live and connected (CRITICAL)."
+                else
+                    emit "destruction" "ioc_runtime_c2_estab_userland" "strong" \
+                         "ioc_runtime_c2_callback_active_userland" 10 \
+                         "c2_ip" "$_rt_ip" "pid" "$_rt_pid" "uid" "$_rt_uid" "sample" "${_rt_line:0:200}" \
+                         "note" "Active TCP ESTAB to known C2 IP $_rt_ip (UID=$_rt_uid) — user-account compromise; review tier."
+                fi
                 ((hits++))
             fi
         done

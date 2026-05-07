@@ -4,6 +4,44 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.39 — 2026-05-07
+
+### Changed (live IOC severity now UID-discriminated across the runtime track)
+
+Extends the v2.7.38 gsocket-shim pattern to every UID-discriminable
+runtime IOC: root-attributed hits stay `live_compromise` (→
+`host_verdict=COMPROMISED`); non-root hits demote to `strong` (→
+`host_verdict=SUSPICIOUS`) with an `_userland` ID/key suffix and the
+matched user/UID surfaced in the signal's `kv`. A host whose only
+material IOCs lean userspace now grades SUSPICIOUS, not COMPROMISED.
+
+UID source per match type:
+
+  - process-cmdline (ps auxfww): USER column 1 == "root"
+  - file-path (RUNTIME_KNOWN_BAD_PATHS): `stat -c %u $path` == 0
+  - network ESTAB (ss -tnp): `pid=NNN` → `/proc/NNN/status` Uid line, field 2 (effective UID); unknown UID defaults to live_compromise (defensive: connection itself is real evidence)
+
+Demoted on non-root UID:
+
+  - ioc_runtime_known_bad_path (/dev/shm/.gs, /tmp/codeItems3)
+  - ioc_runtime_xmrig_ldlinux / _https / _python / _visible
+  - ioc_runtime_loader_in_flight
+  - ioc_runtime_wallet (per-prefix loop)
+  - ioc_runtime_c2_in_cmdline / _c2_host_in_cmdline
+  - ioc_runtime_reverse_shell
+  - ioc_runtime_xmr_wallet_generic
+  - ioc_runtime_c2_estab
+
+Stays live_compromise unconditionally (rationale):
+
+  - ioc_runtime_lpe_binary — kernel/setuid exploit; threat horizon is
+    seconds-to-root, not steady-state account malware.
+  - ioc_runtime_gsocket_b64_shim — UID not extractable from b64 prefix.
+
+CL6 floor preserved: `awk '{print $1}'`, `stat -c %u`, `/proc/<pid>/status`,
+`grep -oE`, bash 4.1 string compare. Validated against synthetic ps fixtures
+(root / cpaneluser / apache / nobody) plus an end-to-end run.
+
 ## sessionscribe-ioc-scan.sh v2.7.38 — 2026-05-06
 
 ### Changed (gsocket persistence-shim: UID-discriminated severity)
