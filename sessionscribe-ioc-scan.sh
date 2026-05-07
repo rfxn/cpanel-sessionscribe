@@ -1054,7 +1054,15 @@ while [[ $# -gt 0 ]]; do
         --root)               ROOT_OVERRIDE="$2"; shift 2 ;;
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
-        --containment-glob)   EXTERNAL_QUARANTINE_GLOB="$2"; shift 2 ;;
+        --containment-glob)
+            # Documented trust-model constraint: single shell-glob, no
+            # embedded whitespace (the value expands unquoted in the
+            # walker — whitespace would fragment the path).
+            if [[ "${2:-}" =~ [[:space:]] ]]; then
+                echo "Error: --containment-glob must not contain whitespace (single glob expression only)" >&2
+                exit 2
+            fi
+            EXTERNAL_QUARANTINE_GLOB="$2"; shift 2 ;;
         --max-containment-hits)
             if ! [[ "${2:-}" =~ ^[0-9]+$ ]]; then
                 echo "Error: --max-containment-hits requires a non-negative integer" >&2
@@ -1118,6 +1126,18 @@ fi
 # Validate --max-bundle-mb is a non-negative integer.
 if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
     echo "Error: --max-bundle-mb requires a non-negative integer (MB)" >&2
+    exit 2
+fi
+
+# Validate external-quarantine integer caps. Both are env-overridable
+# (lines 478/484), so a non-integer env value would slip past the CLI
+# flag validation and break arithmetic in check_quarantined_artifacts.
+if ! [[ "$MAX_EXTERNAL_QUARANTINE_HITS" =~ ^[0-9]+$ ]]; then
+    echo "Error: MAX_EXTERNAL_QUARANTINE_HITS must be a non-negative integer (got: $MAX_EXTERNAL_QUARANTINE_HITS)" >&2
+    exit 2
+fi
+if ! [[ "$MAX_EXTERNAL_QUARANTINE_FILE_BYTES" =~ ^[0-9]+$ ]]; then
+    echo "Error: MAX_EXTERNAL_QUARANTINE_FILE_BYTES must be a non-negative integer (got: $MAX_EXTERNAL_QUARANTINE_FILE_BYTES)" >&2
     exit 2
 fi
 
