@@ -107,8 +107,8 @@
 #   pdsh -w cpanel-fleet 'bash -s' < sessionscribe-ioc-scan.sh
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
-    echo "Error: sessionscribe-ioc-scan.sh requires bash 4.1+ (CentOS 6 floor)." >&2
-    exit 2
+  echo "Error: sessionscribe-ioc-scan.sh requires bash 4.1+ (CentOS 6 floor)." >&2
+  exit 2
 fi
 set -u
 

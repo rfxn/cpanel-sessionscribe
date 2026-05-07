@@ -145,8 +145,8 @@
 # No python, no perl, no openssl.
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
-    echo "Error: sessionscribe-remote-probe.sh requires bash 4.1+ (CentOS 6 floor)." >&2
-    exit 2
+  echo "Error: sessionscribe-remote-probe.sh requires bash 4.1+ (CentOS 6 floor)." >&2
+  exit 2
 fi
 set -u
 SCRIPT_VERSION="1.2.2"
