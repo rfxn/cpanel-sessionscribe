@@ -457,30 +457,15 @@ INTAKE_DEFAULT_TOKEN="cd88c9970c3176997c9671a2566fadc84904be0b73edd5e3b071452ead
 PATCH_CANARY_FILE="/usr/local/cpanel/Cpanel/Session/Load.pm"
 MITIGATE_BACKUP_ROOT="/var/cpanel/sessionscribe-mitigation"
 
-# External containment workflow ingestion. Operator-side IR scripts that
-# move artifacts off live disk (hash-validating into a per-run dir before
-# removal) leave behind hashes.txt + ssh-pruned-keys.log we can replay
-# into the envelope. Without this, aggregate_verdict drops to CLEAN on a
-# host that was compromised yesterday and contained today.
-#
-# Trust model: this glob is expected to point at a root-owned path. The
-# default /root/quarantine-* sits inside /root, which is 0700 root:root
-# on a sane host, so contents are root-authored. Widening to operator-
-# writable paths (e.g. /tmp/) breaks the path/sha gating used downstream.
-# Must be a single shell-glob expression with no embedded whitespace —
-# the value is expanded via unquoted word-splitting in the walker, so
-# spaces would fragment the path. Override via --containment-glob;
-# empty value disables ingestion.
+# External containment ingestion: replay artifacts captured by operator IR
+# (`hashes.txt` + optional `ssh-pruned-keys.log`) so contained hosts still
+# retain compromise evidence in aggregate_verdict.
+# Trust model: keep the glob root-owned; default is /root/quarantine-*.
+# Must be a single glob expression with no embedded whitespace.
 EXTERNAL_QUARANTINE_GLOB="/root/quarantine-*"
-# Per-run signal cap. Mirrors PATTERN_J_MAX_QUARANTINE in shape — a
-# pathological QDIR with thousands of entries shouldn't be able to flood
-# the envelope. Env-overridable for forensic replays.
+# Per-run signal cap for containment-derived emits.
 MAX_EXTERNAL_QUARANTINE_HITS="${MAX_EXTERNAL_QUARANTINE_HITS:-200}"
-# Per-file byte cap. A genuine producer's hashes.txt /
-# ssh-pruned-keys.log is small (low KB at most). 1 MB is a forgiving
-# ceiling that still bounds bash `read` memory against a pathological or
-# adversarial file (e.g., a single multi-GB line designed to OOM the
-# scanner). Files over the cap emit a warning signal and are skipped.
+# Per-file size cap for containment input files; oversized files are skipped.
 MAX_EXTERNAL_QUARANTINE_FILE_BYTES="${MAX_EXTERNAL_QUARANTINE_FILE_BYTES:-1048576}"
 MODSEC_USER_CONFS=(
     "/etc/apache2/conf.d/modsec/modsec2.user.conf"   # EA4 (cPanel default)
@@ -1055,9 +1040,7 @@ while [[ $# -gt 0 ]]; do
         --version-string)     VERSION_OVERRIDE="$2"; shift 2 ;;
         --cpsrvd-path)        CPSRVD_OVERRIDE="$2"; shift 2 ;;
         --containment-glob)
-            # Documented trust-model constraint: single shell-glob, no
-            # embedded whitespace (the value expands unquoted in the
-            # walker — whitespace would fragment the path).
+            # Single unbroken glob only; walker expands this unquoted.
             if [[ "${2:-}" =~ [[:space:]] ]]; then
                 echo "Error: --containment-glob must not contain whitespace (single glob expression only)" >&2
                 exit 2
@@ -1129,9 +1112,7 @@ if ! [[ "$MAX_BUNDLE_MB" =~ ^[0-9]+$ ]]; then
     exit 2
 fi
 
-# Validate external-quarantine integer caps. Both are env-overridable
-# (lines 478/484), so a non-integer env value would slip past the CLI
-# flag validation and break arithmetic in check_quarantined_artifacts.
+# Validate env/CLI-overridable containment limits.
 if ! [[ "$MAX_EXTERNAL_QUARANTINE_HITS" =~ ^[0-9]+$ ]]; then
     echo "Error: MAX_EXTERNAL_QUARANTINE_HITS must be a non-negative integer (got: $MAX_EXTERNAL_QUARANTINE_HITS)" >&2
     exit 2
@@ -6033,62 +6014,15 @@ _classify_kill_prelude_context() {
 # constants, not cpanel-prefixed. Snapshot mode (--root) skips most patterns
 # but Pattern J does honor --root with degraded confidence (the udev/systemd
 # trees ARE present in a snapshot).
-# External-containment ingestion. Operator-side IR scripts move artifacts
-# off live disk into a per-run containment dir, hash-validating with
-# sha256sum BEFORE removal and appending `<sha>  <path>` to hashes.txt.
-# Pruned ssh keys are recorded in ssh-pruned-keys.log as
-#   `<authorized_keys_path>\tline=N\tfp=<fp>\tcomment=<comment>`.
-# We replay both into the envelope so a host whose live disk has been
-# cleaned still carries the right host_verdict — without this read-back,
-# aggregate_verdict scores the same host CLEAN.
-#
-# Pattern classification reuses the existing PATTERN_*_* constants
-# (PATTERN_A_BINARY, PATTERN_I_PROFILED, PATTERN_J_KNOWN_PATHS, etc.) so
-# there's a single source of truth: when the canonical-path lists move,
-# this function tracks them automatically.
-#
-# Hash cross-reference: when a path matches a pattern with a published
-# bad-hash IOC (PATTERN_A_SHA256, PATTERN_C_SHA256), we compare the
-# captured sha256 against it. `published_hash_match` is set to:
-#   - "match"      — path AND hash both match published IOC (highest
-#                    confidence: triple witness path+hash+contained).
-#   - "mismatch"   — path matches but sha256 differs from published IOC.
-#                    Possible decoy, recompiled variant, or attacker
-#                    substitution; still tier=strong because the path is
-#                    a known-bad placement, but the note flags it for
-#                    review.
-#   - "unverified" — no published hash exists for this pattern, so no
-#                    claim is made (most paths fall here).
-#
-# Severity tiering matches the rest of check_destruction_iocs: confirmed
-# destruction artifacts emit `strong` with tier_promoted_high_conf=1 (so
-# aggregate_verdict scores COMPROMISED on a contained host), forensic
-# evidence (history files) emits `info` with no tier promotion, and
-# unrecognized artifacts emit `warning` (medium tier — operator review,
-# not auto-COMPROMISED).
-#
-# Emitted `pattern` field values:
-#   - Single letters (A, C, G, H, I, J): canonical destruction patterns,
-#     resolved against the existing PATTERN_*_* constants.
-#   - "evidence": forensic-only files (shell histories) — captured for
-#     review, not scored as compromise on their own.
-#   - "unclassified": original_path didn't match any known pattern —
-#     surfaced as `warning` so the operator can investigate.
-# Downstream consumers that treat `pattern` as letter-only must allow
-# these descriptive values too.
-#
-# Resource exhaustion: hashes.txt and ssh-pruned-keys.log are size-capped
-# at MAX_EXTERNAL_QUARANTINE_FILE_BYTES before reading, so a pathological
-# (or adversarial) producer can't OOM the scanner via a multi-GB single-
-# line file. Oversized files emit a warning signal and are skipped.
-#
-# Direct call (not subshell): emit() mutates SIGNALS[].
+# External-containment replay:
+# - parses `<sha256> <original_path>` from hashes.txt
+# - parses pruned SSH keys from ssh-pruned-keys.log
+# - re-emits as destruction evidence so contained hosts do not score CLEAN
+# Pattern labels include A/C/G/H/I/J plus evidence/unclassified.
+# published_hash_match: match | mismatch | unverified.
+# Call directly (not via $()) because emit() mutates SIGNALS[].
 
-# Classifier returns its result via _CLASSIFY_OUT (no $() subshell, no
-# fork per row — keeps the hot path fork-free under
-# MAX_EXTERNAL_QUARANTINE_HITS). _CLASSIFY_KNOWN_HASH is the published
-# bad-hash IOC for this pattern when one exists, empty otherwise; the
-# caller uses it to compute published_hash_match.
+# Classifier writes result via globals to avoid per-row subshells.
 _CLASSIFY_OUT=""
 _CLASSIFY_KNOWN_HASH=""
 _classify_external_artifact() {
@@ -6096,19 +6030,11 @@ _classify_external_artifact() {
     base="${path##*/}"
     _CLASSIFY_KNOWN_HASH=""
 
-    # Exact-path matches against canonical pattern constants. Pattern A's
-    # published binary is the only one with a recorded bad hash at this
-    # exact path (PATTERN_A_SHA256); Pattern I's binaries don't ship with
-    # a published hash.
+    # Exact-path matches against canonical constants.
     if [[ "$path" == "$PATTERN_A_BINARY"   ]]; then
         _CLASSIFY_OUT=A; _CLASSIFY_KNOWN_HASH="$PATTERN_A_SHA256"; return
     fi
-    # PATTERN_A_README intentionally NOT classified as A: the live scan
-    # tiers /root/README.md by content (info/strong/warning depending on
-    # signature match — see emits at ioc_pattern_a_readme_*). With the
-    # file already off-disk we can't rerun those checks, so a contained
-    # README falls through to "unclassified" → warning (operator review)
-    # rather than auto-promoting to strong/COMPROMISED.
+    # PATTERN_A_README is intentionally not auto-classified as A.
     [[ "$path" == "$PATTERN_I_PROFILED" ]] && { _CLASSIFY_OUT=I; return; }
     [[ "$path" == "$PATTERN_I_BINARY"   ]] && { _CLASSIFY_OUT=I; return; }
     [[ "$path" == "$PATTERN_H_ZIP_PATH" ]] && { _CLASSIFY_OUT=H; return; }
@@ -6119,22 +6045,18 @@ _classify_external_artifact() {
         [[ "$path" == "$_j" ]] && { _CLASSIFY_OUT=J; return; }
     done
 
-    # Basename matches. PATTERN_C_BIN is the published Mirai binary name
-    # and ships with PATTERN_C_SHA256. The `nuclear.*` glob catches
-    # arch-suffixed variants (nuclear.arm, nuclear.mips, etc.) but rejects
-    # unrelated names like nuclear-physics.pdf. Variants have no recorded
-    # canonical hash, so _CLASSIFY_KNOWN_HASH stays empty.
+    # Basename matches. nuclear.* captures known arch-suffixed variants.
     if [[ "$base" == "$PATTERN_C_BIN" ]]; then
         _CLASSIFY_OUT=C; _CLASSIFY_KNOWN_HASH="$PATTERN_C_SHA256"; return
     fi
     [[ "$base" == nuclear.*                 ]] && { _CLASSIFY_OUT=C; return; }
     [[ "$base" == "$PATTERN_H_DROPPER_FILE" ]] && { _CLASSIFY_OUT=H; return; }
 
-    # Suffix / shape matches not represented by a canonical-path constant.
+    # Suffix/shape matches without dedicated path constants.
     [[ "$base" == *.sorry              ]] && { _CLASSIFY_OUT=A; return; }   # encryptor artifacts (variant; no known hash)
     [[ "$path" == */authorized_keys    ]] && { _CLASSIFY_OUT=G; return; }   # whole-file capture
 
-    # Forensic evidence — history files. Low-confidence by design.
+    # Forensic evidence only; not automatically compromise-critical.
     case "$base" in
         .bash_history|.zsh_history|.fish_history|.sh_history)
             _CLASSIFY_OUT=evidence; return ;;
@@ -6143,27 +6065,16 @@ _classify_external_artifact() {
     _CLASSIFY_OUT=unclassified
 }
 
-# Size-guard for external-quarantine input files. Returns 0 if the file
-# is within MAX_EXTERNAL_QUARANTINE_FILE_BYTES, non-zero (and emits a
-# warning signal) otherwise. Caller skips ingesting the file on non-zero.
+# Size-guard for external containment inputs.
 _external_quarantine_file_ok() {
     local f="$1" qdir="$2"
     local _b _max="${MAX_EXTERNAL_QUARANTINE_FILE_BYTES:-1048576}"
     _b=$(stat -c %s "$f" 2>/dev/null || echo 0)
     (( _b <= _max )) && return 0
-    # Key from qdir-basename + file-basename (sanitized) — `tr` of the
-    # full path collapses distinct paths that differ only in punctuation
-    # (e.g. /a/b and /a_b both → _a_b). Quarantine dirs are typically
-    # /root/quarantine-<ts>/, so basename-pair is collision-free in
-    # practice, fork-free, and stable across re-runs.
+    # Use basename pair for stable, low-collision keys.
     local _qbase="${qdir##*/}" _fbase="${f##*/}"
     _qbase="${_qbase//[^a-zA-Z0-9]/_}"
     _fbase="${_fbase//[^a-zA-Z0-9]/_}"
-    # `id` (positional 2) is the constant subtype identifier; `key`
-    # (positional 4) is the per-row unique identifier. Cycle 2's
-    # check_quarantined_artifacts emits use this convention; matching it
-    # here keeps SECTION_KEYS dedup, JSONL `id`/`key` semantics, and the
-    # human-readable row header consistent with the rest of the function.
     local _key="external_quarantine_file_oversized_${_qbase}_${_fbase}"
     emit "destruction" "external_quarantine_file_oversized" "warning" \
          "$_key" 4 \
@@ -6185,57 +6096,35 @@ check_quarantined_artifacts() {
     local _seen=0
     local qdir hashes_file pruned_log _qts _qbase_safe
 
-    # Walk most-recent-first by mtime. Multiple containment runs leave
-    # multiple containment dirs; we surface every one so a host contained
-    # twice carries both stories. Cap is shared across hashes.txt and
-    # ssh-pruned-keys.log so a flooded prune log can't bypass it.
+    # Walk most-recent containment dirs first. Cap is shared across files.
     while IFS= read -r qdir; do
-        # Top-of-loop cap gate — once total cap is hit, stop walking
-        # additional containment dirs entirely.
         (( _seen >= _max )) && break
         [[ -d "$qdir" ]] || continue
         hashes_file="$qdir/hashes.txt"
         pruned_log="$qdir/ssh-pruned-keys.log"
-        # If stat fails on the qdir, the dir is unreadable (race / perm) —
-        # skip it rather than emit signals with ts_epoch_first=0, which
-        # ioc_signal_epoch falls back to TS_EPOCH (scan-now), polluting
-        # cluster-onset analysis with the wrong anchor.
+        # Skip unreadable dirs (race/permission issue).
         _qts=$(stat -c %Y "$qdir" 2>/dev/null) || continue
-        # Sanitized qdir basename — used in keys (artifact + sshkey)
-        # so that the same sha/fingerprint contained in two different
-        # qdirs produces distinct rows. Computed once per qdir.
+        # Distinguish repeated containment runs in key space.
         _qbase_safe="${qdir##*/}"
         _qbase_safe="${_qbase_safe//[^a-zA-Z0-9]/_}"
 
         if [[ -f "$hashes_file" ]]; then
-            # Pre-check the cap so the size-guard's oversized emit is
-            # gated by `_max` too — without this, hitting the size-guard
-            # at `_seen == _max` overruns the cap by 1 per qdir.
             (( _seen >= _max )) && break
             if ! _external_quarantine_file_ok "$hashes_file" "$qdir"; then
-                # Oversized warning emitted by the size-guard counts
-                # against the cap so an operator who widens the glob to
-                # operator-writable dirs can't flood the envelope past
-                # MAX_EXTERNAL_QUARANTINE_HITS via many oversized files.
+                # Count oversized-file warning against cap.
                 ((_seen++)); ((hits++))
             else
             local sha path _pattern _id _key _sev _wt _hi _hash_match _note _key_id
             while read -r sha path; do
                 [[ -z "$sha" || -z "$path" ]] && continue
-                # 64 hex chars only — guards against malformed lines.
                 [[ "$sha" =~ ^[a-fA-F0-9]{64}$ ]] || continue
-                # Local break — let the prune-log loop and any subsequent
-                # containment dirs still get their cap budget.
                 (( _seen >= _max )) && break
                 ((_seen++))
 
                 _classify_external_artifact "$path"
                 _pattern="$_CLASSIFY_OUT"
 
-                # Hash cross-reference. When the classifier set a known
-                # bad-hash IOC for this pattern, compare it to the sha
-                # captured in hashes.txt. Three outcomes documented in
-                # the function header.
+                # Compare captured hash to published IOC hash when available.
                 if [[ -n "$_CLASSIFY_KNOWN_HASH" ]]; then
                     if [[ "$sha" == "$_CLASSIFY_KNOWN_HASH" ]]; then
                         _hash_match=match
@@ -6246,24 +6135,7 @@ check_quarantined_artifacts() {
                     _hash_match=unverified
                 fi
 
-                # Tier + key/id shape by classification.
-                #
-                # The `id` (emit positional 2) and `key` (positional 4)
-                # BOTH need the `ioc_pattern_<letter>_*` shape: aggregate_verdict
-                # routes via `key` for ioc_compromise_class / persist_pattern
-                # (gating COMPROMISED) and via `id` for COMPROMISE_LETTERS
-                # cluster bonus. Pattern H gets explicit cases in both
-                # classifiers (matching the existing seobot/alldone H
-                # clauses). Without correct shape on BOTH fields, contained
-                # signals only bump ioc_critical (→ SUSPICIOUS) and the PR
-                # would silently fail its primary purpose.
-                #
-                # Key uniqueness across (qdir, file): first 16 hex of sha
-                # plus the qdir-level sanitized basename. sha-only would
-                # collide when the same binary is contained in two
-                # different qdirs (re-quarantine, repeated incident);
-                # emit() does not dedupe so duplicate keys double-count
-                # strong_count and weight in aggregate_verdict.
+                # Keep id/key shape aligned with compromise routing.
                 _key_id="${_qbase_safe}_${sha:0:16}"
                 case "$_pattern" in
                     A|C|G|H|I|J)
@@ -6275,18 +6147,11 @@ check_quarantined_artifacts() {
                         _id="ioc_contained_evidence"
                         _key="${_id}_${_key_id}" ;;
                     *)
-                        # Unclassified: keeps the `ioc_*` prefix so the
-                        # row bumps `ioc_review` in aggregate_verdict and
-                        # routes the host to SUSPICIOUS (operator review
-                        # tier), not COMPROMISED. No pattern letter →
-                        # ioc_compromise_class returns "" so
-                        # `compromise_critical` is unaffected.
                         _sev=warning; _wt=4;  _hi=0
                         _id="ioc_contained_unclassified"
                         _key="${_id}_${_key_id}" ;;
                 esac
 
-                # Operator-facing note adapts to the cross-reference outcome.
                 case "$_hash_match" in
                     match)
                         _note="Pattern ${_pattern} CONFIRMED: path matches canonical IOC AND sha256 matches the published bad-hash (PATTERN_${_pattern}_SHA256). Triple witness — path + hash + contained-off-disk." ;;
@@ -6313,17 +6178,10 @@ check_quarantined_artifacts() {
             fi
         fi
 
-        # Mid-qdir cap check: if hashes.txt processing pushed `_seen`
-        # past `_max`, skip pruned_log immediately rather than letting
-        # its size-guard emit one more oversized warning before the
-        # outer-loop top-of-loop break catches it on the next iteration.
+        # Hash pass may have consumed the cap.
         (( _seen >= _max )) && continue
 
-        # ssh-pruned-keys.log: one signal per pruned key. Pruning an
-        # untrusted authorized_keys line IS Pattern G regardless of which
-        # file it came from — always strong/high-conf. Same shared cap as
-        # hashes.txt above; a pathological prune log can't flood the
-        # envelope past _max. Size-guarded the same way.
+        # One strong Pattern G signal per pruned-key log line.
         if [[ -f "$pruned_log" ]]; then
             (( _seen >= _max )) && break
             if ! _external_quarantine_file_ok "$pruned_log" "$qdir"; then
@@ -6331,10 +6189,7 @@ check_quarantined_artifacts() {
             else
             local _l_path _l_line _l_fp _l_comment _fp_safe
             while IFS=$'\t' read -r _l_path _l_line _l_fp _l_comment; do
-                # Strip prefixes BEFORE the emptiness check — a literal
-                # `fp=` (empty fingerprint) would otherwise pass the check
-                # (non-empty before strip) and emit an empty-fingerprint
-                # signal whose key collides across all such lines.
+                # Strip prefixes before emptiness checks.
                 _l_line="${_l_line#line=}"
                 _l_fp="${_l_fp#fp=}"
                 _l_comment="${_l_comment#comment=}"
@@ -6342,17 +6197,8 @@ check_quarantined_artifacts() {
                 (( _seen >= _max )) && break
                 ((_seen++))
                 _fp_safe="${_l_fp//[^a-zA-Z0-9]/_}"
-                # Compose key with qdir-basename so the same fingerprint
-                # contained in two different qdirs (re-quarantine /
-                # repeated incident) produces distinct rows; sha-only
-                # /fp-only keys would collide.
                 local _ssh_id="ioc_pattern_g_contained_sshkey"
                 local _ssh_key="${_ssh_id}_${_qbase_safe}_${_fp_safe}"
-                # `ioc_pattern_g_*` shape on BOTH id and key so
-                # aggregate_verdict's ioc_compromise_class / persist_pattern
-                # / pattern routers (which key on `key` not `id`) and the
-                # COMPROMISE_LETTERS regex (which keys on `id`) all
-                # correctly pick up the G classification.
                 emit "destruction" "$_ssh_id" "strong" \
                      "$_ssh_key" 10 \
                      "containment_dir" "$qdir" \
@@ -6391,10 +6237,7 @@ check_destruction_iocs() {
         # inside the function when ROOT_OVERRIDE is set. Direct call (not
         # `$( … )`) so emit()'s SIGNALS[] writes survive.
         check_pattern_j_persistence
-        # External-containment ingestion is snapshot-safe — hashes.txt and
-        # ssh-pruned-keys.log are static evidence files written into the
-        # containment dir before removal, so they're meaningful even when
-        # the live host filesystem isn't reachable.
+        # Containment logs are static evidence and safe to ingest in snapshot mode.
         check_quarantined_artifacts
         return
     fi
@@ -8068,10 +7911,7 @@ check_destruction_iocs() {
     fi
     rm -f "$_rt_conn_cap" 2>/dev/null
 
-    # External-containment ingestion. Direct call so emit()'s SIGNALS[]
-    # mutations land. QUARANTINED_ARTIFACTS_HITS feeds the all-clear gate
-    # so a host with NO live IOCs but a populated containment dir doesn't
-    # falsely emit `no_destruction_iocs`.
+    # Direct call: emits mutate SIGNALS[] and must count toward all-clear gating.
     check_quarantined_artifacts
     hits=$((hits + QUARANTINED_ARTIFACTS_HITS))
 
