@@ -26,6 +26,10 @@
 # Each run produces one tarball + sha256, keyed off `/usr/local/cpanel/cpanel -V`.
 # RPM packages are not included (use yumdownloader / dnf download separately).
 
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
+  echo "Error: sessionscribe-revsnap.sh requires bash 4.1+ (CentOS 6 floor)." >&2
+  exit 2
+fi
 set -u
 SNAPDIR="${SNAPDIR:-/var/cpanel/sessionscribe-revsnap}"
 HOST=$(hostname -s)

@@ -9,6 +9,10 @@
 # read-only; --apply mutates and requires root. Backups: /var/cpanel/
 # sessionscribe-mitigation/<TS>/. See --help / --list-phases for usage.
 
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
+  echo "Error: sessionscribe-mitigate.sh requires bash 4.1+ (CentOS 6 floor)." >&2
+  exit 2
+fi
 set -u
 
 VERSION="0.7.4"
