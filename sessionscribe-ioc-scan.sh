@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.40"
+VERSION="2.7.41"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -772,6 +772,49 @@ EOF
 # See INTERNAL-NOTES.md "v2.7.16/v2.7.17/v2.7.18" for design rationale.
 ###############################################################################
 
+# v2.7.41: rewrite legacy cron files. Bug class 1: unescaped '%' parses
+# as cron's command/stdin separator, so cron-shell never reaches bash.
+# Bug class 2: no MAILTO (or MAILTO=root) routes the parse error and
+# any future job output to root@. Self-heal forces MAILTO="" right after
+# the PATH= line and drops any prior MAILTO=root or duplicate MAILTO=
+# entries (non-root MAILTO overrides — e.g. ops@example.com — survive
+# the rewrite). Idempotent.
+repair_telemetry_cron_file() {
+    local f="$TELEMETRY_CRON_FILE" tmp
+    [[ -f "$f" && -w "$f" ]] || return 0
+    local has_pct_bug=0 has_root_mailto=0 has_any_mailto=0 has_canonical_mailto=0
+    grep -q 'RANDOM % '       "$f" 2>/dev/null && has_pct_bug=1
+    grep -Eq '^MAILTO=root\>' "$f" 2>/dev/null && has_root_mailto=1
+    grep -q  '^MAILTO='       "$f" 2>/dev/null && has_any_mailto=1
+    grep -q  '^MAILTO=""$'    "$f" 2>/dev/null && has_canonical_mailto=1
+    local needs_fix=0
+    (( has_pct_bug )) && needs_fix=1
+    (( has_root_mailto )) && needs_fix=1
+    (( has_any_mailto )) || needs_fix=1
+    (( needs_fix )) || return 0
+    tmp=$(mktemp "$f.XXXXXX") || return 0
+    if awk -v keep_existing="$(( has_any_mailto && ! has_root_mailto ))" '
+            /^MAILTO=root\>/ { next }
+            keep_existing && /^MAILTO=/ {
+                if (mailto_seen) next
+                mailto_seen=1
+            }
+            /^PATH=/ && !keep_existing && !mailto_inserted {
+                print; print "MAILTO=\"\""; mailto_inserted=1; next
+            }
+            { gsub(/RANDOM % /, "RANDOM \\% "); print }
+            END { if (!keep_existing && !mailto_inserted) print "MAILTO=\"\"" }
+        ' "$f" >"$tmp" 2>/dev/null \
+       && install -m 0600 -o root -g root "$tmp" "$f" 2>/dev/null; then
+        command -v restorecon >/dev/null 2>&1 && restorecon -F "$f" 2>/dev/null || true
+        command -v logger >/dev/null 2>&1 \
+            && logger -t sessionscribe-ioc-scan \
+               "self-heal: rewrote $f (escaped RANDOM %% + canonicalized MAILTO)" \
+            || true
+    fi
+    rm -f "$tmp"
+}
+
 manage_telemetry_cron() {
     local action="$TELEMETRY_CRON_ACTION"
     case "$action" in
@@ -896,7 +939,9 @@ manage_telemetry_cron() {
 #   cold start    -> [ -x "\$_D" ] short-circuits exec, no error spam
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
-${schedule} root { sleep \$((5 + RANDOM % 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && (curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_GITHUB_URL}' || curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}') && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}; } >/dev/null 2>&1
+MAILTO=""
+# '\%' is mandatory: cron splits on literal '%' in /etc/cron.d/* lines.
+${schedule} root { sleep \$((5 + RANDOM \% 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && (curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_GITHUB_URL}' || curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}') && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}; } >/dev/null 2>&1
 CRONEOF
 
     if [[ ! -s "$tmp" ]]; then
@@ -1058,6 +1103,11 @@ if [[ -n "$TELEMETRY_CRON_ACTION" ]]; then
     # refactor that drops the function-internal exits.
     exit 0
 fi
+
+# v2.7.41 self-heal: rewrite legacy /etc/cron.d/sessionscribe-telemetry
+# files whose '%' was unescaped (cron split on it; cron-shell never
+# reached bash) or that lack an explicit MAILTO (cron mails to root).
+repair_telemetry_cron_file
 
 # --csv and --jsonl both want stdout - mutual exclusion.
 if (( CSV && JSONL )); then
