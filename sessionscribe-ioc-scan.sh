@@ -447,9 +447,9 @@ DEFAULT_FORENSIC_SINCE_DAYS=90  # forensic-mode default --since when unspecified
 # disable pruning entirely.
 DEFAULT_BUNDLE_RETENTION=3
 INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
-# Convenience token for ad-hoc intake submissions; server enforces 1000-PUT
-# cap per token. For fleet use, supply --upload-token or RFXN_INTAKE_TOKEN.
-INTAKE_DEFAULT_TOKEN="cd88c9970c3176997c9671a2566fadc84904be0b73edd5e3b071452eade796e1"
+# No embedded default token — --upload requires an explicit token from
+# --upload-token or $RFXN_INTAKE_TOKEN. Mirror of the telemetry-token
+# model. Contact proj@rfxn.com for a fleet token.
 
 # Sentinel file whose mtime phase_defense uses to estimate when a host
 # adopted the vendor cPanel patch (Load.pm is the file the patch rewrites).
@@ -655,11 +655,15 @@ Bundle (active in full or replay mode):
 
 Upload (off by default):
       --upload               Submit bundle to $INTAKE_URL after capture.
-                             Intake URL and token can be overridden via the
-                             upload-url / upload-token flags documented in
-                             the Misc section below. Token resolution order:
-                             flag > $RFXN_INTAKE_TOKEN env > built-in token
-                             (1000-PUT cap; proj@rfxn.com for fleet token).
+                             Requires an explicit token via --upload-token
+                             or $RFXN_INTAKE_TOKEN env (no embedded
+                             default; mirrors the telemetry-token model).
+                             Intake URL/token may also be overridden via
+                             the upload-url / upload-token flags documented
+                             in the Misc section below. Token resolution
+                             order: flag > $RFXN_INTAKE_TOKEN env. Server
+                             enforces 1000-PUT cap per token; contact
+                             proj@rfxn.com for a fleet token.
 
 Telemetry (low-disk-usage fleet collection):
       --telemetry            Lite bundle: envelope.json + kill-chain.{tsv,
@@ -881,7 +885,11 @@ manage_telemetry_cron() {
     # quoted in the cron line so values containing spaces or special chars
     # don't break shell parsing at run time. Operators can rotate the
     # token by re-running '--telemetry-cron add ... --upload-token NEW'.
+    # Upload is only baked into the cron when --upload-token is supplied
+    # (no embedded default — see INTAKE_DEFAULT_URL block); otherwise the
+    # tick produces a lite bundle on disk + optional --telemetry-url POST.
     local extra_args=""
+    local upload_arg=""
     if [[ -n "${CHAIN_UPLOAD_URL:-}" ]]; then
         # Reject embedded single-quotes — would break the cron line shell
         # parsing. Operators with weird URL chars get a clear error.
@@ -897,6 +905,7 @@ manage_telemetry_cron() {
             exit 2
         fi
         extra_args+=" --upload-token '${CHAIN_UPLOAD_TOKEN}'"
+        upload_arg=" --chain-upload"
     fi
 
     # Heredoc preserves \$((…)) for cron-shell evaluation per tick.
@@ -941,7 +950,7 @@ SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 MAILTO=""
 # '\%' is mandatory: cron splits on literal '%' in /etc/cron.d/* lines.
-${schedule} root { sleep \$((5 + RANDOM \% 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && (curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_GITHUB_URL}' || curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}') && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}; } >/dev/null 2>&1
+${schedule} root { sleep \$((5 + RANDOM \% 296)); _D='${TELEMETRY_CRON_INSTALL_PATH}'; _T=\$(mktemp "\$_D.XXXXXX" 2>/dev/null) && (curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_GITHUB_URL}' || curl -fsS --max-time 60 -o "\$_T" '${TELEMETRY_CRON_CDN_URL}') && [ -s "\$_T" ] && bash -n "\$_T" && install -m 0755 -o root -g root "\$_T" "\$_D"; rm -f "\$_T" 2>/dev/null; [ -x "\$_D" ] && timeout 300 "\$_D" --telemetry --chain-on-all${upload_arg} --quiet --jsonl${extra_args}; } >/dev/null 2>&1
 CRONEOF
 
     if [[ ! -s "$tmp" ]]; then
@@ -976,10 +985,13 @@ CRONEOF
     echo "Source:    primary  $TELEMETRY_CRON_GITHUB_URL"
     echo "           fallback $TELEMETRY_CRON_CDN_URL"
     echo "Install:   $TELEMETRY_CRON_INSTALL_PATH (mode 0755, root:root)"
-    echo "Command:   timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Command:   timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all${upload_arg} --quiet --jsonl${extra_args}"
+    if [[ -z "$upload_arg" ]]; then
+        echo "Upload:    disabled (no --upload-token supplied; lite bundle stays local)"
+    fi
     echo
     echo "Inspect:   cat $TELEMETRY_CRON_FILE"
-    echo "Test now:  curl -fsS --max-time 60 -o '$TELEMETRY_CRON_INSTALL_PATH' '$TELEMETRY_CRON_GITHUB_URL' && timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all --chain-upload --quiet --jsonl${extra_args}"
+    echo "Test now:  curl -fsS --max-time 60 -o '$TELEMETRY_CRON_INSTALL_PATH' '$TELEMETRY_CRON_GITHUB_URL' && timeout 300 '$TELEMETRY_CRON_INSTALL_PATH' --telemetry --chain-on-all${upload_arg} --quiet --jsonl${extra_args}"
     echo "Remove:    '$TELEMETRY_CRON_INSTALL_PATH' --telemetry-cron remove"
     exit 0
 }
@@ -1134,9 +1146,15 @@ if (( FULL_MODE )) && (( ! REPLAY_MODE )) && (( NO_LEDGER )); then
     echo "Error: --full is incompatible with --no-ledger (forensic phases require the envelope on disk; use --ledger-dir to override the location instead)" >&2
     exit 2
 fi
-# Resolve upload token at parse time. Order: --upload-token > env > built-in.
+# Resolve upload token at parse time. Order: --upload-token > $RFXN_INTAKE_TOKEN.
+# No embedded default — fail fast if neither source provides a token, so the
+# operator gets a clear error before any forensic work begins.
 if (( DO_UPLOAD )); then
-    INTAKE_TOKEN="${CHAIN_UPLOAD_TOKEN:-${RFXN_INTAKE_TOKEN:-$INTAKE_DEFAULT_TOKEN}}"
+    INTAKE_TOKEN="${CHAIN_UPLOAD_TOKEN:-${RFXN_INTAKE_TOKEN:-}}"
+    if [[ -z "$INTAKE_TOKEN" ]]; then
+        echo "Error: --upload requires an explicit token via --upload-token TOK or RFXN_INTAKE_TOKEN env (no embedded default; contact proj@rfxn.com for a fleet token)" >&2
+        exit 2
+    fi
     [[ -n "$CHAIN_UPLOAD_URL" ]] && INTAKE_URL="$CHAIN_UPLOAD_URL"
 fi
 # Validate --max-bundle-mb is a non-negative integer.

@@ -6,6 +6,38 @@ versioned per the affected component.
 
 ## sessionscribe-ioc-scan.sh v2.7.41 — 2026-05-08
 
+### Changed (`--upload` now requires an explicit token — embedded default removed)
+
+`--upload` no longer falls back to a built-in convenience token. Token
+resolution order is now `--upload-token TOK` flag > `$RFXN_INTAKE_TOKEN`
+env, with no embedded default. Mirrors the existing telemetry-token
+model (`--telemetry-token`) where credentials must be supplied
+explicitly, never baked into the published source.
+
+If neither source provides a token, the script fails fast at parse
+time with an actionable error referencing both flags and the fleet-
+token contact (`proj@rfxn.com`); the operator gets the rejection
+before any forensic work begins. Empty-string tokens
+(`--upload-token ''`) are also rejected via `${VAR:-}` semantics.
+`phase_upload`'s defensive `INTAKE_TOKEN empty` guard is preserved as
+a second-line check.
+
+### Changed (`--telemetry-cron add` — `--chain-upload` now conditional)
+
+The cron line written by `--telemetry-cron add` previously baked
+`--chain-upload` unconditionally, relying on the embedded default to
+make per-tick uploads work without an `--upload-token`. With the
+embedded default removed, that path would fail at parse time on every
+tick. The generator now omits `--chain-upload` from the cron line when
+no `--upload-token` is supplied at install time; the tick produces a
+lite bundle on disk + the optional `--telemetry-url` envelope POST,
+but does not attempt an intake upload. Summary output gains an
+`Upload: disabled (no --upload-token supplied; lite bundle stays
+local)` line so the operator sees the resulting posture immediately.
+To enable per-tick uploads, re-run `--telemetry-cron add INTERVAL
+--upload-token TOK` (and optionally `--upload-url`); the cron line
+will be regenerated with the upload flags baked in.
+
 ### Fixed (cron `%` parsing — fleet-wide regression since v2.7.11)
 
 The cron line written to `/etc/cron.d/sessionscribe-telemetry` by
