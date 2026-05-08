@@ -30,20 +30,17 @@ Disclosed 2026-04-28 by Sina Kheirkhah / [watchTowr Labs](https://labs.watchtowr
 
 ## Quickstart
 
-Three commands, in operator priority order:
+Three oneliners, in operator priority order:
 
 ```bash
 # 1. Are we already compromised?  (on-host IOC scan, fast triage)
-curl -fsSLO https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh
-bash sessionscribe-ioc-scan.sh
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash
 
 # 2. Close the window  (idempotent; firewalls cpsrvd ports, deploys ModSec, etc.)
-curl -fsSLO https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh
-bash sessionscribe-mitigate.sh --apply
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --apply
 
 # 3. Sweep the fleet from anywhere  (non-destructive remote verdict)
-curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh \
-    | bash -s -- --target HOST
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh | bash -s -- --target HOST
 ```
 
 Exit codes are designed for fleet automation: `ioc-scan` exits `4` on
@@ -79,22 +76,22 @@ ingest, reconcile, kill-chain renderer, IR bundle).
 
 ```bash
 # fast triage  (detection only)
-bash sessionscribe-ioc-scan.sh
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash
 
 # full kill-chain reconstruction inline
-bash sessionscribe-ioc-scan.sh --full
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --full
 
 # full + ship IR bundle to intake
-bash sessionscribe-ioc-scan.sh --full --upload
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --full --upload
 
 # JSONL for SIEM ingest
-bash sessionscribe-ioc-scan.sh --jsonl --quiet > host.jsonl
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --jsonl --quiet > host.jsonl
 
 # host IOCs only - periodic post-patch sweep, last 7 days
-bash sessionscribe-ioc-scan.sh --ioc-only --since 7
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --ioc-only --since 7
 
 # replay forensic phases against a saved envelope (no re-scan)
-bash sessionscribe-ioc-scan.sh --replay /var/cpanel/sessionscribe-ioc/<run_id>.json
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh | bash -s -- --replay /var/cpanel/sessionscribe-ioc/<run_id>.json
 ```
 
 ### Verdicts
@@ -220,18 +217,18 @@ before touching any file.
 
 ```bash
 # read-only audit (default)
-bash sessionscribe-mitigate.sh
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash
 
 # full remediation
-bash sessionscribe-mitigate.sh --apply
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --apply
 
 # narrow scope
-bash sessionscribe-mitigate.sh --apply --only modsec --probe
-bash sessionscribe-mitigate.sh --only patch,preflight     # pre-upcp gate
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --apply --only modsec --probe
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --only patch,preflight     # pre-upcp gate
 
 # fleet roll-up - one CSV row per host
-bash sessionscribe-mitigate.sh --csv  > host.csv
-bash sessionscribe-mitigate.sh --jsonl > host.jsonl
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --csv  > host.csv
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --jsonl > host.jsonl
 ```
 
 | Phase | What it does |
@@ -264,8 +261,8 @@ Phase selection: `--only LIST`, `--no-PHASE`, `--no-fw` (shorthand for
 ### Sixty-second smoke check
 
 ```bash
-bash sessionscribe-mitigate.sh --list-phases    # surface the phase API
-bash sessionscribe-mitigate.sh --check          # safe read-only audit
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --list-phases    # surface the phase API
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh | bash -s -- --check          # safe read-only audit
 echo "exit=$?"                                  # 0 on a non-cPanel host
 ```
 
@@ -289,20 +286,20 @@ stage 5 logout — see the script header for the full safety model.
 
 ```bash
 # single host, default WHM-SSL ports
-bash sessionscribe-remote-probe.sh --target 1.2.3.4
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh | bash -s -- --target 1.2.3.4
 
 # Apache proxy test - whm./cpanel./webmail.example.com via 443 + 80
-bash sessionscribe-remote-probe.sh --target 1.2.3.4 --proxy example.com
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh | bash -s -- --target 1.2.3.4 --proxy example.com
 
 # fleet - CSV across many targets, exit 2 on any VULN
-bash sessionscribe-remote-probe.sh --csv \
-    $(awk '{print "--target "$1}' fleet.txt) > fleet.csv
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh \
+    | bash -s -- --csv $(awk '{print "--target "$1}' fleet.txt) > fleet.csv
 
 # fast scoping - banner-only fingerprint, no session minted
-bash sessionscribe-remote-probe.sh --target 1.2.3.4 --fingerprint-only
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh | bash -s -- --target 1.2.3.4 --fingerprint-only
 
 # clean canary sessions on a target after a run
-bash sessionscribe-remote-probe.sh --cleanup
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh | bash -s -- --cleanup
 ```
 
 Output modes: pretty (default), `-q`/`--quiet`, `--oneline`, `--csv`,
@@ -352,11 +349,11 @@ Built around `upcp` to capture pre/post-patch pairs.
 
 ```bash
 # capture current tier (writes to /var/cpanel/sessionscribe-revsnap/)
-bash sessionscribe-revsnap.sh
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-revsnap.sh | bash
 
 # upgrade and capture next tier - RE diff workflow
 /scripts/upcp --force
-bash sessionscribe-revsnap.sh
+curl -fsSL https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-revsnap.sh | bash
 ```
 
 Generalises beyond SessionScribe: every future cpsrvd CVE will land in
@@ -375,29 +372,36 @@ for the full RE walkthrough.
 > for `pdsh | jq` or `ansible -m script` roll-up across hundreds of
 > hosts in one pass.
 
+Same curl-piped-bash primitive — let each host fetch and exec the latest
+script directly:
+
 ```bash
+IOC=https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh
+MIT=https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-mitigate.sh
+PRB=https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-remote-probe.sh
+
 # IOC scan across fleet, JSONL to SIEM
 for h in $(cat fleet.txt); do
-    ssh "$h" 'bash -s' < sessionscribe-ioc-scan.sh -- --jsonl --quiet
+    ssh "$h" "curl -fsSL $IOC | bash -s -- --jsonl --quiet"
 done | jq -c '.' > fleet-ioc.jsonl
 
 # kill-chain reconciliation across fleet (no bundles on broad sweep)
-ansible -i hosts cpanel -m script \
-    -a 'sessionscribe-ioc-scan.sh --full --no-bundle --jsonl' > fleet-forensic.jsonl
+ansible -i hosts cpanel -m shell \
+    -a "curl -fsSL $IOC | bash -s -- --full --no-bundle --jsonl" > fleet-forensic.jsonl
 jq -r 'select(.phase=="summary" and .key=="verdict"
               and .note=="COMPROMISED_PRE_DEFENSE") | .host' \
     fleet-forensic.jsonl > pre-defense-hosts.txt
 
 # bundle collection on the pre-defense subset
-ansible -i pre-defense-hosts.txt all -m script \
-    -a 'sessionscribe-ioc-scan.sh --full --jsonl --bundle-dir /root/.ic5790-forensic'
+ansible -i pre-defense-hosts.txt all -m shell \
+    -a "curl -fsSL $IOC | bash -s -- --full --jsonl --bundle-dir /root/.ic5790-forensic"
 
 # mitigation posture roll-up
-pdsh -w cpanel-fleet 'bash -s -- --jsonl --quiet' < sessionscribe-mitigate.sh \
+pdsh -w cpanel-fleet "curl -fsSL $MIT | bash -s -- --jsonl --quiet" \
     | jq -c 'select(.severity != "info")' > fleet-mitigate.jsonl
 
-# remote probe sweep - exit 2 on any VULN
-bash sessionscribe-remote-probe.sh --csv --quiet \
+# remote probe sweep - exit 2 on any VULN  (run from operator workstation)
+curl -fsSL $PRB | bash -s -- --csv --quiet \
     $(awk '{print "--target "$1}' fleet.txt) > fleet-probe.csv
 ```
 
