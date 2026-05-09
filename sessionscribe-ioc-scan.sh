@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.43
+# sessionscribe-ioc-scan.sh v2.7.44
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.43"
+VERSION="2.7.44"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -1323,11 +1323,12 @@ PKG_INVENTORY_COUNT="0"
 # reconcile per-host CVE/erratum exposure without out-of-band bundle
 # pulls. encode_software_inventory_b64gz() populates these from
 # phase_bundle, after the sidecar is written. Note carries one of:
-# 'ok' | 'empty' | 'gzip_missing' | 'base64_missing' | 'encode_failed'
-# | 'exceeds_cap_<N>'. Receivers verify integrity via _SHA256 over the
-# pre-encoding bytes.
+# 'ok' | 'header_only' | 'empty' | 'gzip_missing' | 'base64_missing' |
+# 'encode_failed' | 'exceeds_cap_<N>' | 'not_collected' (encoder never
+# ran — default --triage mode does not invoke phase_bundle). Receivers
+# verify integrity via _SHA256 over the pre-encoding bytes.
 SOFTWARE_INVENTORY_B64GZ=""
-SOFTWARE_INVENTORY_B64GZ_NOTE=""
+SOFTWARE_INVENTORY_B64GZ_NOTE="not_collected"
 SOFTWARE_INVENTORY_SHA256=""
 SOFTWARE_INVENTORY_RAW_BYTES=0
 SOFTWARE_INVENTORY_ENCODED_BYTES=0
@@ -1695,6 +1696,13 @@ encode_software_inventory_b64gz() {
 
     if [[ ! -s "$inv_path" ]]; then
         SOFTWARE_INVENTORY_B64GZ_NOTE="empty"
+        return 0
+    fi
+    # Sidecar always carries a `# software-inventory ...` header line; without
+    # at least one non-comment row, the body is empty and `note=ok` would be
+    # misleading (consumer decodes ~70 bytes of header and finds no packages).
+    if ! grep -qv '^#' "$inv_path" 2>/dev/null; then
+        SOFTWARE_INVENTORY_B64GZ_NOTE="header_only"
         return 0
     fi
     if ! have_cmd gzip;   then SOFTWARE_INVENTORY_B64GZ_NOTE="gzip_missing";   return 0; fi

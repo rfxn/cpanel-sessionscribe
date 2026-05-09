@@ -4,6 +4,42 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.44 — 2026-05-08
+
+### Fixed (`software_inventory_meta.note` now disambiguates two prior false-`ok` cases)
+
+Sentinel review of v2.7.43 surfaced two consumer-side ambiguities in the
+new `software_inventory_meta.note` field. Both are 1-line fixes that
+preserve wire format (note is still a free-text string; only the value
+domain expands) and have zero impact on the round-trip decode contract.
+
+1. **`note=header_only`** — when the host has no detectable package
+   manager (`PKGMGR_KIND=unknown`), the sidecar still gets a
+   `# software-inventory kind= ts=... count=0` header line written, so
+   `[[ -s "$inv" ]]` returns true and the encoder previously proceeded,
+   shipping ~70 bytes of header content with `note=ok`. A consumer
+   would decode the b64gz, find no actual packages, and have no
+   diagnostic to distinguish "tiny package set" from "no package
+   manager." The encoder now peeks for at least one non-comment line
+   (`grep -qv '^#'`) and emits `note=header_only` with empty `b64gz`
+   when only the header is present.
+
+2. **`note=not_collected`** — in default `--triage` mode `phase_bundle`
+   does not run, so `encode_software_inventory_b64gz` is never invoked
+   and the `SOFTWARE_INVENTORY_B64GZ_NOTE` global retained its initial
+   empty-string value. A downstream collector receiving the envelope
+   could not distinguish "encoder ran and had no result" (which never
+   actually happens — every encoder branch sets `note` explicitly) from
+   "encoder never ran." The global now initializes to `not_collected`
+   so the absent-encoder case is unambiguous in the wire envelope.
+
+The full `note` value domain is now: `ok` | `header_only` | `empty` |
+`gzip_missing` | `base64_missing` | `encode_failed` |
+`exceeds_cap_<N>` | `not_collected`. Receivers that switch on `note`
+should treat `header_only` and `not_collected` as "no inventory
+available" (distinct from `ok` with `raw_bytes=0`, which currently
+cannot occur but is reserved for future encoder paths).
+
 ## sessionscribe-ioc-scan.sh v2.7.43 — 2026-05-09
 
 ### Changed (software-inventory.txt now embedded in JSON envelope)
