@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.42
+# sessionscribe-ioc-scan.sh v2.7.43
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.42"
+VERSION="2.7.43"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -1317,6 +1317,22 @@ DISK_INODE_FULL_MOUNTS=""
 BOOT_FREE_MB=""
 PKG_INVENTORY_COUNT="0"
 
+# Software-inventory transmission (v2.7.43+). The on-disk sidecar
+# software-inventory.txt is also gzipped + base64 encoded into the JSON
+# envelope so a fleet-collector receiving only the envelope POST can
+# reconcile per-host CVE/erratum exposure without out-of-band bundle
+# pulls. encode_software_inventory_b64gz() populates these from
+# phase_bundle, after the sidecar is written. Note carries one of:
+# 'ok' | 'empty' | 'gzip_missing' | 'base64_missing' | 'encode_failed'
+# | 'exceeds_cap_<N>'. Receivers verify integrity via _SHA256 over the
+# pre-encoding bytes.
+SOFTWARE_INVENTORY_B64GZ=""
+SOFTWARE_INVENTORY_B64GZ_NOTE=""
+SOFTWARE_INVENTORY_SHA256=""
+SOFTWARE_INVENTORY_RAW_BYTES=0
+SOFTWARE_INVENTORY_ENCODED_BYTES=0
+SOFTWARE_INVENTORY_B64GZ_MAX=$((1024 * 1024))   # 1 MB cap on the b64 string
+
 # Defense extraction outputs (set by phase_defense, read by phase_reconcile +
 # write_kill_chain_primitives). Empty = "defense state unknown".
 DEF_PATCH_TIME=""       # cpanel patch landed (Load.pm mtime if patched)
@@ -1655,6 +1671,57 @@ collect_software_digest() {
         local rc=$?
         (( rc == 1 )) && KERNEL_REBOOT_PENDING="1"
     fi
+}
+
+# Encode the on-disk software-inventory.txt sidecar into the
+# SOFTWARE_INVENTORY_B64GZ global so write_json can embed it in the
+# envelope. Decision: rpm-qa output on a 5,000+ pkg cPanel host is
+# ~300KB raw, ~50KB gzipped, ~70KB base64 — fits a single envelope
+# POST without breaking the curl/wget/bash transport ladder. Receivers
+# decode with `printf '%s' "$b64gz" | base64 -d | gunzip` and verify
+# integrity via the SHA256 emitted in software_inventory_meta.
+#
+# Failure modes: gzip/base64 missing on legacy CL6 hosts, or pathological
+# inventory exceeding the 1MB encoded cap. Both leave the b64gz field
+# empty with a diagnostic note; the sidecar on disk is unaffected.
+# `gzip -nc` strips name+timestamp so output is byte-stable for diffing.
+encode_software_inventory_b64gz() {
+    local inv_path="$1"
+    SOFTWARE_INVENTORY_B64GZ=""
+    SOFTWARE_INVENTORY_B64GZ_NOTE=""
+    SOFTWARE_INVENTORY_SHA256=""
+    SOFTWARE_INVENTORY_RAW_BYTES=0
+    SOFTWARE_INVENTORY_ENCODED_BYTES=0
+
+    if [[ ! -s "$inv_path" ]]; then
+        SOFTWARE_INVENTORY_B64GZ_NOTE="empty"
+        return 0
+    fi
+    if ! have_cmd gzip;   then SOFTWARE_INVENTORY_B64GZ_NOTE="gzip_missing";   return 0; fi
+    if ! have_cmd base64; then SOFTWARE_INVENTORY_B64GZ_NOTE="base64_missing"; return 0; fi
+
+    local raw_bytes
+    raw_bytes=$(stat -c %s "$inv_path" 2>/dev/null)
+    SOFTWARE_INVENTORY_RAW_BYTES="${raw_bytes:-0}"
+
+    if have_cmd sha256sum; then
+        SOFTWARE_INVENTORY_SHA256=$(sha256sum "$inv_path" 2>/dev/null | awk '{print $1}')
+    fi
+
+    local enc
+    enc=$(gzip -nc "$inv_path" 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
+    if [[ -z "$enc" ]]; then
+        SOFTWARE_INVENTORY_B64GZ_NOTE="encode_failed"
+        return 0
+    fi
+    if (( ${#enc} > SOFTWARE_INVENTORY_B64GZ_MAX )); then
+        SOFTWARE_INVENTORY_B64GZ_NOTE="exceeds_cap_${SOFTWARE_INVENTORY_B64GZ_MAX}"
+        return 0
+    fi
+
+    SOFTWARE_INVENTORY_B64GZ="$enc"
+    SOFTWARE_INVENTORY_ENCODED_BYTES="${#enc}"
+    SOFTWARE_INVENTORY_B64GZ_NOTE="ok"
 }
 
 ###############################################################################
@@ -3880,9 +3947,12 @@ phase_bundle() {
         echo "boot_free_mb=$BOOT_FREE_MB"
     } > "$bdir/manifest.txt"
 
-    # Package inventory sidecar: too large to embed in the JSON envelope
-    # but the per-host pkg list is the anchor for CVE/erratum reconciliation
-    # against the host-state snapshot.
+    # Package inventory sidecar: also gzip+base64-embedded in the JSON
+    # envelope (v2.7.43+) so a fleet collector receiving only the
+    # envelope POST can still reconcile per-host CVE/erratum exposure.
+    # The on-disk sidecar is preserved unchanged for out-of-band tooling
+    # and for hosts where encoding fails (no gzip/base64 on stripped
+    # legacy distros).
     local inv="$bdir/software-inventory.txt"
     local inv_kind=""
     {
@@ -3908,13 +3978,33 @@ phase_bundle() {
         "package inventory captured (kind=${inv_kind:-none} count=${PKG_INVENTORY_COUNT})" \
         kind "${inv_kind:-none}" count "$PKG_INVENTORY_COUNT" path "software-inventory.txt"
 
+    # Encode the inventory for envelope embedding. Populates SOFTWARE_INVENTORY_*
+    # globals; write_json reads them. Re-running write_json below picks the
+    # encoded fields up so the bundle copy + the telemetry POST both ship them.
+    encode_software_inventory_b64gz "$inv"
+    emit_signal bundle info pkg_inventory_b64gz \
+        "inventory encoded for envelope (note=${SOFTWARE_INVENTORY_B64GZ_NOTE:-unknown} raw=${SOFTWARE_INVENTORY_RAW_BYTES} enc=${SOFTWARE_INVENTORY_ENCODED_BYTES})" \
+        note "${SOFTWARE_INVENTORY_B64GZ_NOTE:-unknown}" \
+        raw_bytes "$SOFTWARE_INVENTORY_RAW_BYTES" \
+        encoded_bytes "$SOFTWARE_INVENTORY_ENCODED_BYTES" \
+        sha256 "${SOFTWARE_INVENTORY_SHA256:-}"
+
+    # Re-write the on-disk envelope NOW so phase_telemetry_post (which reads
+    # ${BUNDLE_BDIR}/ioc-scan-envelope.json or ENVELOPE_PATH) ships the
+    # inventory in the same POST. The post-bundle re-write at end-of-run
+    # would be too late — the POST has already happened.
+    local _env_src="${ENVELOPE_PATH:-${SESSIONSCRIBE_IOC_JSON:-}}"
+    if [[ -n "$_env_src" ]]; then
+        write_json "$_env_src" 2>/dev/null
+        chmod 0600 "$_env_src" 2>/dev/null
+    fi
+
     # Stash the upstream ioc-scan JSON envelope. Only the canonical structured
     # record is preserved (operator-facing stdout is not captured); without
     # this, an offline analyst can see the kill-chain reconciliation but not
     # the source per-signal evidence ioc-scan emitted. KB-sized, always safe
     # to bundle. In --full mode ENVELOPE_PATH is the authoritative source;
     # SESSIONSCRIBE_IOC_JSON is the legacy shim path (kept for back-compat).
-    local _env_src="${ENVELOPE_PATH:-${SESSIONSCRIBE_IOC_JSON:-}}"
     if [[ -n "$_env_src" && -f "$_env_src" ]]; then
         if cp "$_env_src" "$bdir/ioc-scan-envelope.json" 2>/dev/null; then
             chmod 0600 "$bdir/ioc-scan-envelope.json" 2>/dev/null
@@ -9077,7 +9167,7 @@ write_json() {
             done
         fi
         printf '\n  ],\n'
-        printf '  "software_digest": {"kernel_running":"%s","kernel_full":"%s","kernel_latest_installed":"%s","kernel_reboot_pending":%d,"kernel_tainted":"%s","pkgmgr_kind":"%s","pkgmgr_health":"%s","pkgmgr_health_note":"%s","pkgmgr_last_txn_epoch":"%s","disk_health":"%s","disk_full_mounts":"%s","disk_inode_full_mounts":"%s","boot_free_mb":"%s"}\n' \
+        printf '  "software_digest": {"kernel_running":"%s","kernel_full":"%s","kernel_latest_installed":"%s","kernel_reboot_pending":%d,"kernel_tainted":"%s","pkgmgr_kind":"%s","pkgmgr_health":"%s","pkgmgr_health_note":"%s","pkgmgr_last_txn_epoch":"%s","disk_health":"%s","disk_full_mounts":"%s","disk_inode_full_mounts":"%s","boot_free_mb":"%s"},\n' \
             "$(json_esc "$KERNEL_RUNNING")" \
             "$(json_esc "$KERNEL_FULL")" \
             "$(json_esc "$KERNEL_LATEST_INSTALLED")" \
@@ -9091,6 +9181,22 @@ write_json() {
             "$(json_esc "$DISK_FULL_MOUNTS")" \
             "$(json_esc "$DISK_INODE_FULL_MOUNTS")" \
             "$(json_esc "$BOOT_FREE_MB")"
+        # Software inventory in two parts:
+        #   software_inventory_b64gz  — gzip(base64) of software-inventory.txt
+        #                               (decode: base64 -d | gunzip)
+        #   software_inventory_meta   — sha256 + raw/encoded byte counts +
+        #                               diagnostic note. Receivers verify
+        #                               integrity by comparing sha256 of
+        #                               decoded content vs meta.sha256.
+        # When encoding is unavailable or the cap is exceeded, b64gz is ""
+        # and note carries the reason. The on-disk sidecar is independent
+        # — operators can always pull it out-of-band.
+        printf '  "software_inventory_b64gz": "%s",\n' "$SOFTWARE_INVENTORY_B64GZ"
+        printf '  "software_inventory_meta": {"sha256":"%s","raw_bytes":%d,"encoded_bytes":%d,"encoding":"gzip+base64","note":"%s"}\n' \
+            "$(json_esc "${SOFTWARE_INVENTORY_SHA256:-}")" \
+            "${SOFTWARE_INVENTORY_RAW_BYTES:-0}" \
+            "${SOFTWARE_INVENTORY_ENCODED_BYTES:-0}" \
+            "$(json_esc "${SOFTWARE_INVENTORY_B64GZ_NOTE:-}")"
         printf '}\n'
     } > "$out"
 }

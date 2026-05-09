@@ -4,6 +4,79 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.43 — 2026-05-09
+
+### Changed (software-inventory.txt now embedded in JSON envelope)
+
+The per-host package inventory is now shipped inside the JSON envelope
+under two new top-level fields, in addition to the on-disk
+`software-inventory.txt` sidecar that v2.7.42 introduced. This unblocks
+fleet CVE/erratum reconciliation for collectors that only receive the
+`--telemetry-url` POST and have no out-of-band path to pull the bundle
+directory.
+
+**Why not multipart-POST the sidecar.** Multipart breaks the existing
+client transport ladder: `curl -F` works natively but `wget` and the
+`bash /dev/tcp + openssl` fallback don't, and hand-rolling
+`multipart/form-data` boundaries in pure bash for the legacy floor is
+fragile. The single-body POST stays untouched; the inventory just
+piggy-backs on the envelope JSON.
+
+**Wire format:**
+
+```jsonc
+{
+  // ... existing envelope ...
+  "software_digest": { /* unchanged from v2.7.42 */ },
+  "software_inventory_b64gz": "<gzip → base64 of the sidecar bytes>",
+  "software_inventory_meta": {
+    "sha256":         "<sha256 of pre-encoding bytes, for receiver verification>",
+    "raw_bytes":      <int — sidecar size on disk>,
+    "encoded_bytes":  <int — length of the b64 string>,
+    "encoding":       "gzip+base64",
+    "note":           "ok | empty | gzip_missing | base64_missing | encode_failed | exceeds_cap_<N>"
+  }
+}
+```
+
+**Decode path:**
+
+```bash
+printf '%s' "$b64gz" | base64 -d | gunzip > inventory.txt
+sha256sum inventory.txt    # must match software_inventory_meta.sha256
+```
+
+**Sizing.** `gzip -nc | base64` of a typical ~5,000-pkg cPanel
+host's `rpm -qa` output runs ~70 KB; observed in test against a
+3,021-pkg host: 107 KB raw → 39 KB encoded (~36% ratio after the gzip
+benefit clears base64's 4:3 inflation). A 1 MB hard cap on the encoded
+string leaves ~3× headroom against the largest inventories observed in
+the fleet; pathological hosts emit an empty `b64gz` field with note
+`exceeds_cap_<N>` and the on-disk sidecar continues to carry the data.
+
+**Receiver-side compatibility.** Older collectors silently ignore the
+new fields (top-level JSON keys are additive); existing fields are
+unchanged. The `gzip -nc` flag strips name+timestamp so a byte-stable
+encoded payload is reproducible across runs of the same inventory —
+useful for diff-based CVE delta detection on the receiver.
+
+**Failure-mode behavior.** If `gzip` or `base64` is missing on the
+host (legacy CL6 with stripped coreutils), the encoder emits an empty
+`b64gz` with a diagnostic note rather than failing. The sidecar on
+disk is independent of the envelope embed and continues to be written
+either way.
+
+**Bundle phase ordering.** `phase_bundle` now re-writes the envelope
+to disk after generating the sidecar, BEFORE copying it into the
+bundle and BEFORE `phase_telemetry_post` runs. The end-of-run
+re-write at top-level main is preserved (it picks up forensic-phase
+signals); both writes now include the inventory.
+
+A new `pkg_inventory_b64gz` info signal in the `bundle` area records
+the encode result (note + raw/encoded byte counts + sha256), so the
+envelope's signal stream documents the inventory's encoded state
+without needing to inspect the b64gz field itself.
+
 ## sessionscribe-ioc-scan.sh v2.7.42 — 2026-05-08
 
 ### Added (software digest: kernel, disk, pkgmgr health, pkg inventory, reboot-pending)
