@@ -4,6 +4,61 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.7.42 — 2026-05-08
+
+### Added (software digest: kernel, disk, pkgmgr health, pkg inventory, reboot-pending)
+
+The detection phase now collects a per-host software digest alongside the
+existing host-meta record, exposing five new dimensions to the bundle
+manifest, the JSON envelope (`software_digest` object), and a sidecar
+inventory file:
+
+1. **Package-manager health.** Detects dnf/yum/apt and probes for broken
+   state (`rpm` query failure, `dpkg --audit` non-empty output) and live
+   locks (`/var/run/yum.pid`, `/var/run/dnf.pid`, `/var/lib/dpkg/lock*`,
+   `/var/lib/apt/lists/lock`) by checking that the recorded PID is still
+   alive — stale lockfiles after an interrupted transaction are common on
+   panicked hosts and the liveness check avoids the obvious false-positive.
+   Health rolls up to `ok / broken / locked / unknown` with a free-text
+   note. Latest-transaction epoch is captured from the dnf history sqlite,
+   the yum history dir, or `/var/log/dpkg.log` mtime.
+2. **Disk + inode pressure.** `df -P` scan flags any mount at ≥90% block
+   usage; `df -Pi` does the same for inodes (separate field — block-full
+   and inode-full are independent failure modes). `/boot` free MB is
+   tracked separately because a low `/boot` blocks kernel installs even
+   when root has plenty of space, which is a setup for missed security
+   updates.
+3. **Running-kernel full version string.** `uname -r` (running),
+   `uname -srvmo` (full string for fleet inventory diffs), and
+   `/proc/sys/kernel/tainted` (non-zero indicates loaded out-of-tree
+   modules, which is meaningful in IR context).
+4. **Installed package inventory.** Written as a sidecar
+   `software-inventory.txt` inside the bundle dir during `phase_bundle`
+   — NOT embedded in the JSON envelope (rpm output on a busy cPanel host
+   is hundreds of KB and would dominate the per-host record). Format is
+   `NAME<TAB>VERSION-RELEASE<TAB>ARCH` for RHEL family,
+   `Package<TAB>Version<TAB>Architecture` for Debian. Header comment
+   records `kind`, `ts`, and `count` so a downstream parser can validate
+   the file independently of the bundle manifest. Operators reconcile
+   CVE/erratum exposure by joining this against vendor advisory feeds.
+5. **Pending reboot / running ≠ installed kernel.** Compares the running
+   `uname -r` against the newest installed `kernel` / `kernel-core`
+   (RHEL, sorted via `sort -V` since `rpm --last` output format varies
+   across versions) or `linux-image-*` (Debian). Also honours
+   `/var/run/reboot-required` (Debian convention) and
+   `needs-restarting -r` (RHEL, run with a 5s `timeout` wrapper since
+   it can stall on hosts with very large rpmdbs). Any positive indicator
+   sets `kernel_reboot_pending=1` — a single boolean for fleet rollups.
+
+The five blocks are populated by a new `collect_software_digest()`
+function called from the detection phase right after `collect_host_meta`,
+following the same silent-populator pattern (no `say`/`emit` calls inside
+— the data lands in globals and is rendered downstream by
+`write_json` and `phase_bundle`'s manifest writer). The bundle phase
+also emits a single `pkg_inventory_written` info signal recording the
+inventory kind and row count so the per-host signal stream documents
+the sidecar's existence and size without needing to read the manifest.
+
 ## sessionscribe-ioc-scan.sh v2.7.41 — 2026-05-08
 
 ### Changed (`--upload` now requires an explicit token — embedded default removed)

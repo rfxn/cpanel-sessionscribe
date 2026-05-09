@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.40
+# sessionscribe-ioc-scan.sh v2.7.42
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -112,7 +112,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.41"
+VERSION="2.7.42"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -1301,6 +1301,22 @@ LP_UID_J=""                # json_esc'd LP_UID
 OS_J=""                    # json_esc'd OS_PRETTY
 CPV_J=""                   # json_esc'd CPANEL_NORM
 
+# Software-digest globals; populated by collect_software_digest().
+KERNEL_RUNNING=""
+KERNEL_FULL=""
+KERNEL_LATEST_INSTALLED=""
+KERNEL_REBOOT_PENDING="0"
+KERNEL_TAINTED=""
+PKGMGR_KIND=""
+PKGMGR_HEALTH=""
+PKGMGR_HEALTH_NOTE=""
+PKGMGR_LAST_TXN_EPOCH=""
+DISK_HEALTH=""
+DISK_FULL_MOUNTS=""
+DISK_INODE_FULL_MOUNTS=""
+BOOT_FREE_MB=""
+PKG_INVENTORY_COUNT="0"
+
 # Defense extraction outputs (set by phase_defense, read by phase_reconcile +
 # write_kill_chain_primitives). Empty = "defense state unknown".
 DEF_PATCH_TIME=""       # cpanel patch landed (Load.pm mtime if patched)
@@ -1505,6 +1521,140 @@ collect_host_meta() {
     OS_J=$(json_esc "$OS_PRETTY")
     CPV_J=$(json_esc "$CPANEL_NORM")
     LP_UID_J=$(json_esc "$LP_UID")
+}
+
+# Populate software-digest globals: running kernel, package-manager health,
+# disk + inode pressure, /boot free, reboot-pending. Silent populator (no
+# say/emit) — same pattern as collect_host_meta.
+collect_software_digest() {
+    KERNEL_RUNNING=$(uname -r 2>/dev/null)
+    KERNEL_FULL=$(uname -srvmo 2>/dev/null)
+    if [[ -r /proc/sys/kernel/tainted ]]; then
+        KERNEL_TAINTED=$(< /proc/sys/kernel/tainted)
+    fi
+
+    if   command -v dnf >/dev/null 2>&1; then PKGMGR_KIND="dnf"
+    elif command -v yum >/dev/null 2>&1; then PKGMGR_KIND="yum"
+    elif command -v apt >/dev/null 2>&1; then PKGMGR_KIND="apt"
+    else                                       PKGMGR_KIND="unknown"
+    fi
+
+    local note=""
+    case "$PKGMGR_KIND" in
+        (dnf|yum)
+            if command -v rpm >/dev/null 2>&1; then
+                if ! rpm -q --quiet rpm 2>/dev/null; then
+                    PKGMGR_HEALTH="broken"; note="rpmdb query failed"
+                else
+                    PKGMGR_HEALTH="ok"
+                fi
+            else
+                PKGMGR_HEALTH="unknown"; note="rpm binary missing"
+            fi
+            local lock_pid="" lock_file=""
+            for lock_file in /var/run/yum.pid /var/run/dnf.pid; do
+                [[ -f "$lock_file" ]] || continue
+                lock_pid=$(< "$lock_file" 2>/dev/null)
+                if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+                    PKGMGR_HEALTH="locked"
+                    note="${note:+${note}; }live lock $lock_file pid=$lock_pid"
+                fi
+            done
+            if [[ -d /var/lib/dnf/history ]]; then
+                local newest
+                newest=$(stat -c %Y /var/lib/dnf/history/*.sqlite 2>/dev/null | sort -n | tail -1)
+                [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="$newest"
+            elif [[ -d /var/lib/yum/history ]]; then
+                local newest
+                newest=$(find /var/lib/yum/history -maxdepth 2 -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+                [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="${newest%.*}"
+            fi
+            ;;
+        (apt)
+            if command -v dpkg >/dev/null 2>&1; then
+                local audit
+                audit=$(dpkg --audit 2>/dev/null)
+                if [[ -n "$audit" ]]; then
+                    PKGMGR_HEALTH="broken"; note="dpkg --audit reported issues"
+                else
+                    PKGMGR_HEALTH="ok"
+                fi
+            else
+                PKGMGR_HEALTH="unknown"; note="dpkg binary missing"
+            fi
+            local lock_pid="" lock_file=""
+            for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
+                [[ -f "$lock_file" ]] || continue
+                lock_pid=$(fuser "$lock_file" 2>/dev/null | awk '{print $1}')
+                if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+                    PKGMGR_HEALTH="locked"
+                    note="${note:+${note}; }live lock $lock_file pid=$lock_pid"
+                fi
+            done
+            if [[ -f /var/log/dpkg.log ]]; then
+                local newest
+                newest=$(stat -c %Y /var/log/dpkg.log 2>/dev/null)
+                [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="$newest"
+            fi
+            ;;
+        (*)
+            PKGMGR_HEALTH="unknown"; note="no supported package manager found"
+            ;;
+    esac
+    PKGMGR_HEALTH_NOTE="$note"
+
+    local full_list="" inode_list=""
+    full_list=$(df -P 2>/dev/null \
+        | awk 'NR>1 { gsub("%","",$5); if ($5+0 >= 90) printf "%s:%s%% ", $6, $5 }' \
+        | sed 's/ $//')
+    inode_list=$(df -Pi 2>/dev/null \
+        | awk 'NR>1 { gsub("%","",$5); if ($5 ~ /^[0-9]+$/ && $5+0 >= 90) printf "%s:%s%% ", $6, $5 }' \
+        | sed 's/ $//')
+    DISK_FULL_MOUNTS="$full_list"
+    DISK_INODE_FULL_MOUNTS="$inode_list"
+    if [[ -n "$full_list" || -n "$inode_list" ]]; then
+        DISK_HEALTH="pressure"
+    else
+        DISK_HEALTH="ok"
+    fi
+
+    local boot_mount=""
+    boot_mount=$(df -P /boot 2>/dev/null | awk 'NR==2 { print $6 }')
+    if [[ "$boot_mount" == "/boot" ]]; then
+        local boot_avail_kb
+        boot_avail_kb=$(df -P /boot 2>/dev/null | awk 'NR==2 { print $4 }')
+        if [[ "$boot_avail_kb" =~ ^[0-9]+$ ]]; then
+            BOOT_FREE_MB=$(( boot_avail_kb / 1024 ))
+        fi
+    fi
+
+    local newest_installed=""
+    if [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]] && command -v rpm >/dev/null 2>&1; then
+        newest_installed=$(rpm -q kernel kernel-core 2>/dev/null \
+            | grep -v 'is not installed' \
+            | sed -n 's/^kernel-core-//p; s/^kernel-//p' \
+            | sort -V | tail -1)
+    elif [[ "$PKGMGR_KIND" == "apt" ]] && command -v dpkg-query >/dev/null 2>&1; then
+        newest_installed=$(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null \
+            | sed 's/^linux-image-//' | sort -V | tail -1)
+    fi
+    KERNEL_LATEST_INSTALLED="$newest_installed"
+
+    if [[ -n "$newest_installed" && -n "$KERNEL_RUNNING" ]]; then
+        local arch_suffix; arch_suffix=$(uname -m 2>/dev/null)
+        local running_v="${KERNEL_RUNNING%."$arch_suffix"}"
+        if [[ "$newest_installed" != "$KERNEL_RUNNING" && "$newest_installed" != "$running_v" ]]; then
+            KERNEL_REBOOT_PENDING="1"
+        fi
+    fi
+    if [[ -f /var/run/reboot-required ]]; then
+        KERNEL_REBOOT_PENDING="1"
+    fi
+    if command -v needs-restarting >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        timeout 5 needs-restarting -r >/dev/null 2>&1
+        local rc=$?
+        (( rc == 1 )) && KERNEL_REBOOT_PENDING="1"
+    fi
 }
 
 ###############################################################################
@@ -3715,7 +3865,48 @@ phase_bundle() {
         echo "since_days=${SINCE_DAYS:-all}"
         echo "since_epoch=${SINCE_EPOCH:-}"
         echo "max_bundle_mb=$MAX_BUNDLE_MB"
+        echo "kernel_running=$KERNEL_RUNNING"
+        echo "kernel_full=$KERNEL_FULL"
+        echo "kernel_latest_installed=$KERNEL_LATEST_INSTALLED"
+        echo "kernel_reboot_pending=$KERNEL_REBOOT_PENDING"
+        echo "kernel_tainted=$KERNEL_TAINTED"
+        echo "pkgmgr_kind=$PKGMGR_KIND"
+        echo "pkgmgr_health=$PKGMGR_HEALTH"
+        echo "pkgmgr_health_note=$PKGMGR_HEALTH_NOTE"
+        echo "pkgmgr_last_txn_epoch=$PKGMGR_LAST_TXN_EPOCH"
+        echo "disk_health=$DISK_HEALTH"
+        echo "disk_full_mounts=$DISK_FULL_MOUNTS"
+        echo "disk_inode_full_mounts=$DISK_INODE_FULL_MOUNTS"
+        echo "boot_free_mb=$BOOT_FREE_MB"
     } > "$bdir/manifest.txt"
+
+    # Package inventory sidecar: too large to embed in the JSON envelope
+    # but the per-host pkg list is the anchor for CVE/erratum reconciliation
+    # against the host-state snapshot.
+    local inv="$bdir/software-inventory.txt"
+    local inv_kind=""
+    {
+        if [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]] && command -v rpm >/dev/null 2>&1; then
+            inv_kind="rpm"
+            rpm -qa --queryformat '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n' 2>/dev/null
+        elif [[ "$PKGMGR_KIND" == "apt" ]] && command -v dpkg-query >/dev/null 2>&1; then
+            inv_kind="dpkg"
+            dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' 2>/dev/null
+        fi
+    } > "$inv.body" 2>/dev/null
+    if [[ -s "$inv.body" ]]; then
+        PKG_INVENTORY_COUNT=$(wc -l < "$inv.body" 2>/dev/null)
+        PKG_INVENTORY_COUNT="${PKG_INVENTORY_COUNT//[[:space:]]/}"
+    fi
+    {
+        echo "# software-inventory kind=$inv_kind ts=$TS_ISO count=${PKG_INVENTORY_COUNT}"
+        cat "$inv.body" 2>/dev/null
+    } > "$inv"
+    rm -f "$inv.body"
+    chmod 0600 "$inv" 2>/dev/null
+    emit_signal bundle info pkg_inventory_written \
+        "package inventory captured (kind=${inv_kind:-none} count=${PKG_INVENTORY_COUNT})" \
+        kind "${inv_kind:-none}" count "$PKG_INVENTORY_COUNT" path "software-inventory.txt"
 
     # Stash the upstream ioc-scan JSON envelope. Only the canonical structured
     # record is preserved (operator-facing stdout is not captured); without
@@ -8885,7 +9076,21 @@ write_json() {
                     "$HOSTNAME_JSON" "$area" "$id" "$sev" "$key" "${weight:-0}" "${kv:+,$kv}"
             done
         fi
-        printf '\n  ]\n'
+        printf '\n  ],\n'
+        printf '  "software_digest": {"kernel_running":"%s","kernel_full":"%s","kernel_latest_installed":"%s","kernel_reboot_pending":%d,"kernel_tainted":"%s","pkgmgr_kind":"%s","pkgmgr_health":"%s","pkgmgr_health_note":"%s","pkgmgr_last_txn_epoch":"%s","disk_health":"%s","disk_full_mounts":"%s","disk_inode_full_mounts":"%s","boot_free_mb":"%s"}\n' \
+            "$(json_esc "$KERNEL_RUNNING")" \
+            "$(json_esc "$KERNEL_FULL")" \
+            "$(json_esc "$KERNEL_LATEST_INSTALLED")" \
+            "${KERNEL_REBOOT_PENDING:-0}" \
+            "$(json_esc "$KERNEL_TAINTED")" \
+            "$(json_esc "$PKGMGR_KIND")" \
+            "$(json_esc "$PKGMGR_HEALTH")" \
+            "$(json_esc "$PKGMGR_HEALTH_NOTE")" \
+            "$(json_esc "$PKGMGR_LAST_TXN_EPOCH")" \
+            "$(json_esc "$DISK_HEALTH")" \
+            "$(json_esc "$DISK_FULL_MOUNTS")" \
+            "$(json_esc "$DISK_INODE_FULL_MOUNTS")" \
+            "$(json_esc "$BOOT_FREE_MB")"
         printf '}\n'
     } > "$out"
 }
@@ -9098,6 +9303,7 @@ if (( ! REPLAY_MODE )); then
 
     local_init
     collect_host_meta
+    collect_software_digest
     if (( IOC_ONLY )); then
         hdr_section "ioc-only" "code-state checks skipped"
     else
