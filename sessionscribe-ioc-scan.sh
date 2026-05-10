@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.7.44
+# sessionscribe-ioc-scan.sh v2.8.0
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -81,10 +81,14 @@
 # Verdict axes (independent):
 #   code_verdict  PATCHED / VULNERABLE / INCONCLUSIVE - from version, Perl
 #                 patterns, cpsrvd binary fingerprint
-#   host_verdict  CLEAN / SUSPICIOUS / COMPROMISED - from session IOC scan
-#                 (vendor + CVE-2026-41940 ladder) and access-log scan.
+#   host_root_verdict  CLEAN / SUSPICIOUS / COMPROMISED - actor had root
+#                       access (X via WHM, /etc, /root, system paths).
+#                       Persistence cluster also routes here.
+#   host_user_verdict  CLEAN / SUSPICIOUS / COMPROMISED - actor had only
+#                       user-account access; impact scoped to one or more
+#                       cPanel tenants. See users[] for per-tenant detail.
 #                 Sessions tagged with the companion probe's canary attribute
-#                 bucket as PROBE_ARTIFACT (do NOT escalate).
+#                 bucket as PROBE_ARTIFACT (do NOT escalate either verdict).
 #
 # Exit codes (highest priority wins):
 #   0  PATCHED+CLEAN
@@ -112,7 +116,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.7.44"
+VERSION="2.8.0"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -486,9 +490,14 @@ CHAIN_UPLOAD_TOKEN=""
 # (skips SUSPICIOUS hosts). Implies --chain-forensic.
 CHAIN_ON_CRITICAL=0
 
-# --chain-on-all: always run forensic regardless of host_verdict.
+# --chain-on-all: always run forensic regardless of host verdicts.
 # Wins over --chain-on-critical. Implies --chain-forensic.
 CHAIN_ON_ALL=0
+
+# --chain-on-root-only: chain only when host_root_verdict==COMPROMISED.
+# Lets IR scope forensic to host-rebuild candidates and skip user-only
+# compromises (per-account cleanup queue).
+CHAIN_ON_ROOT_ONLY=0
 
 # Forensic / merged-mode defaults.
 FULL_MODE=0                             # 1 if --full set (or back-compat chain flag)
@@ -740,9 +749,13 @@ Telemetry (low-disk-usage fleet collection):
 
 Back-compat aliases (deprecated; set full-mode + the relevant gate):
       --chain-forensic       equivalent to full mode (no host-verdict gate)
-      --chain-on-critical    full mode only if host_verdict == COMPROMISED
+      --chain-on-critical    full mode only if host_root_verdict OR
+                             host_user_verdict == COMPROMISED
                              (CLEAN/SUSPICIOUS skip forensic phases)
-      --chain-on-all         full mode for EVERY host_verdict, including
+      --chain-on-root-only   like --chain-on-critical but skips hosts
+                             where only host_user_verdict==COMPROMISED
+                             (host-rebuild candidates only)
+      --chain-on-all         full mode for EVERY host, including
       --chain-always         CLEAN (overrides default CLEAN-skip + overrides
                              --chain-on-critical). Pair with --upload to
                              ship every bundle to intake (fleet baseline /
@@ -786,11 +799,10 @@ EOF
 repair_telemetry_cron_file() {
     local f="$TELEMETRY_CRON_FILE" tmp
     [[ -f "$f" && -w "$f" ]] || return 0
-    local has_pct_bug=0 has_root_mailto=0 has_any_mailto=0 has_canonical_mailto=0
+    local has_pct_bug=0 has_root_mailto=0 has_any_mailto=0
     grep -q 'RANDOM % '       "$f" 2>/dev/null && has_pct_bug=1
     grep -Eq '^MAILTO=root\>' "$f" 2>/dev/null && has_root_mailto=1
     grep -q  '^MAILTO='       "$f" 2>/dev/null && has_any_mailto=1
-    grep -q  '^MAILTO=""$'    "$f" 2>/dev/null && has_canonical_mailto=1
     local needs_fix=0
     (( has_pct_bug )) && needs_fix=1
     (( has_root_mailto )) && needs_fix=1
@@ -1072,6 +1084,7 @@ while [[ $# -gt 0 ]]; do
         --upload-url)         CHAIN_UPLOAD_URL="$2"; shift 2 ;;
         --upload-token)       CHAIN_UPLOAD_TOKEN="$2"; shift 2 ;;
         --chain-on-critical)  FULL_MODE=1; CHAIN_ON_CRITICAL=1; shift ;;
+        --chain-on-root-only) FULL_MODE=1; CHAIN_ON_CRITICAL=1; CHAIN_ON_ROOT_ONLY=1; shift ;;
         # chain-on-all override — runs forensic phases for EVERY host
         # (including CLEAN). Pair with --upload for unconditional bundle
         # submission across the fleet. Implies --full.
@@ -1248,7 +1261,8 @@ PRIM_SEP=$'\x1f'
 # is in effect. They mirror the envelope's root-level fields so the kill-
 # chain renderer can show host_verdict/score/tool_version without re-
 # parsing the envelope on every render call.
-ENV_HOST_VERDICT=""
+ENV_HOST_ROOT_VERDICT=""
+ENV_HOST_USER_VERDICT=""
 ENV_CODE_VERDICT=""
 ENV_SCORE=""
 ENV_IOC_TOOL_VERSION=""
@@ -1271,7 +1285,15 @@ IOC_CRITICAL=0
 IOC_REVIEW=0
 ADVISORY_COUNT=0
 PROBE_ARTIFACT_COUNT=0
-HOST_VERDICT="UNKNOWN"
+HOST_ROOT_VERDICT="UNKNOWN"
+HOST_USER_VERDICT="UNKNOWN"
+HOST_USER_TOTAL=0
+AFFECTED_USER_COUNT=0
+AFFECTED_USER_COMPROMISED=0
+AFFECTED_USER_SUSPECT=0
+USERS_TRUNCATED=0
+USERS_TRUNCATED_COUNT=0
+USERS_JSON=""
 VERDICT="UNKNOWN"
 EXIT_CODE=0
 
@@ -1780,6 +1802,15 @@ build_jsonkv() {
 # file's signals[] array (write_json) for the same reason.
 emit() {
     local area="$1" id="$2" severity="$3" key="$4" weight="$5"; shift 5
+    local _has_au=0 _has_ap=0 _i
+    for (( _i = 1; _i <= $#; _i += 2 )); do
+        case "${!_i}" in
+            affected_user)   _has_au=1 ;;
+            actor_privilege) _has_ap=1 ;;
+        esac
+    done
+    if (( ! _has_au )); then set -- "$@" affected_user "_root"; fi
+    if (( ! _has_ap )); then set -- "$@" actor_privilege "root"; fi
     local jsonkv; jsonkv=$(build_jsonkv "$@")
     SIGNALS+=("${area}"$'\t'"${id}"$'\t'"${severity}"$'\t'"${key}"$'\t'"${weight}"$'\t'"${jsonkv}")
     print_signal_human "$area" "$id" "$severity" "$key" "$@"
@@ -2188,7 +2219,8 @@ envelope_root_field() {
 read_envelope_meta() {
     local env="${1:-${SESSIONSCRIBE_IOC_JSON:-}}"
     [[ -n "$env" && -f "$env" ]] || return 0
-    ENV_HOST_VERDICT=$(envelope_root_field "$env" host_verdict)
+    ENV_HOST_ROOT_VERDICT=$(envelope_root_field "$env" host_root_verdict)
+    ENV_HOST_USER_VERDICT=$(envelope_root_field "$env" host_user_verdict)
     ENV_CODE_VERDICT=$(envelope_root_field "$env" code_verdict)
     ENV_SCORE=$(envelope_root_field "$env" score)
     ENV_IOC_TOOL_VERSION=$(envelope_root_field "$env" tool_version)
@@ -3268,9 +3300,23 @@ render_kill_chain() {
         local full_bar="" _bi2
         for (( _bi2=0; _bi2<W; _bi2++ )); do full_bar+="$GLYPH_BOX_H"; done
 
-        # Verdict color + display text.
-        local hv="${ENV_HOST_VERDICT:-}"
-        local hv_color="$C_GRN" hv_text="$hv"
+        # Verdict color + display text. Compound view of the two-axis
+        # verdict (root-trust + user-account); worst-of for the headline.
+        local hv_root="${ENV_HOST_ROOT_VERDICT:-}"
+        local hv_user="${ENV_HOST_USER_VERDICT:-}"
+        local hv=""
+        if [[ "$hv_root" == "COMPROMISED" || "$hv_user" == "COMPROMISED" ]]; then
+            hv="COMPROMISED"
+        elif [[ "$hv_root" == "SUSPICIOUS" || "$hv_user" == "SUSPICIOUS" ]]; then
+            hv="SUSPICIOUS"
+        elif [[ -n "$hv_root" || -n "$hv_user" ]]; then
+            hv="CLEAN"
+        fi
+        local hv_text="$hv"
+        if [[ -n "$hv" ]]; then
+            hv_text="$hv (root=$hv_root, user=$hv_user)"
+        fi
+        local hv_color="$C_GRN"
         case "$hv" in
             COMPROMISED) hv_color="$C_RED" ;;
             SUSPICIOUS)  hv_color="$C_YEL" ;;
@@ -3674,11 +3720,12 @@ write_kill_chain_primitives() {
     # Schema v3: 'stage' renamed to 'pattern' (v2); 'cpsess_token' added
     # (v3). _schema_changes in meta lets consumers auto-detect the rename.
     {
-        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":4,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"},{"v":4,"since_tool":"2.7.0","added":["pattern_j","quarantined_session_emit","quarantine_run_dir","original_path","reasons_ioc","low_confidence_no_sidecar","degraded_confidence_snapshot"],"note":"Pattern J (udev/systemd-unit init-facility persistence) + mitigate-quarantine secondary read (synthetic emits from .info sidecar fields)"}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
+        printf '{"kind":"meta","host":"%s","primary_ip":"%s","uid":"%s","os":"%s","cpanel_version":"%s","ts":"%s","tool":"sessionscribe-forensic","tool_version":"%s","schema_version":5,"_schema_changes":[{"v":2,"since_tool":"0.10.0","renamed":{"stage":"pattern"},"note":"IOC pattern letters were emitted as stage in schema v1 (forensic <= 0.9.x)"},{"v":3,"since_tool":"2.2.0","added":["cpsess_token"],"note":"cpsess token extracted at emit-time for Pattern E + ioc_attacker_ip_2xx_on_cpsess"},{"v":4,"since_tool":"2.7.0","added":["pattern_j","quarantined_session_emit","quarantine_run_dir","original_path","reasons_ioc","low_confidence_no_sidecar","degraded_confidence_snapshot"],"note":"Pattern J (udev/systemd-unit init-facility persistence) + mitigate-quarantine secondary read (synthetic emits from .info sidecar fields)"},{"v":5,"since_tool":"2.8.0","renamed":{"host_verdict":"host_root_verdict + host_user_verdict"},"note":"Two-axis verdict: actor-privilege (root/user) and affected_user split. host_verdict removed."}],"incident_id":"%s","run_id":"%s","ioc_scan_run_id":"%s","ioc_scan_tool_version":"%s","ioc_scan_ts":"%s","host_root_verdict":"%s","host_user_verdict":"%s","code_verdict":"%s","score":"%s","effective_patch_epoch":"%s","effective_modsec_epoch":"%s"}\n' \
             "${HOSTNAME_JSON:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
             "$VERSION" "${INCIDENT_ID:-}" "$RUN_ID" \
             "$(json_esc "${ENV_IOC_RUN_ID:-}")" "$(json_esc "${ENV_IOC_TOOL_VERSION:-}")" "$(json_esc "${ENV_IOC_TS:-}")" \
-            "$(json_esc "${ENV_HOST_VERDICT:-}")" "$(json_esc "${ENV_CODE_VERDICT:-}")" "$(json_esc "${ENV_SCORE:-}")" \
+            "$(json_esc "${ENV_HOST_ROOT_VERDICT:-}")" "$(json_esc "${ENV_HOST_USER_VERDICT:-}")" \
+            "$(json_esc "${ENV_CODE_VERDICT:-}")" "$(json_esc "${ENV_SCORE:-}")" \
             "${eff_patch:-}" "${eff_modsec:-}"
 
         local de de_epoch de_key de_note _de_line
@@ -6165,6 +6212,59 @@ check_pattern_j_persistence() {
     PATTERN_J_HITS="$hits"
 }
 
+# ---- _kv_get -------------------------------------------------------------
+# Pull a field value from a SIGNALS[] row's kv fragment (json-shaped).
+# $1 kv-blob, $2 field-name. Empty if not present.
+_kv_get() {
+    local _kv="$1" _f="$2" _v=""
+    if [[ "$_kv" == *"\"$_f\":\""* ]]; then
+        _v="${_kv#*\"$_f\":\"}"; _v="${_v%%\"*}"
+    fi
+    printf '%s\n' "$_v"
+}
+
+# ---- _attribute_path / _user_is_valid ------------------------------------
+# Map an absolute path to its cPanel-user owner or "_root" for system paths.
+# Conservative: unknown -> _root (host-level IR queue, not tenant notify).
+_attribute_path() {
+    local p="${1:-}"
+    case "$p" in
+        /home/*)
+            p="${p#/home/}"; printf '%s\n' "${p%%/*}" ;;
+        /var/spool/cron/*)
+            p="${p#/var/spool/cron/}"
+            [[ "$p" == "root" || -z "$p" ]] && printf '_root\n' || printf '%s\n' "${p%%/*}" ;;
+        /var/cpanel/users/*)
+            p="${p#/var/cpanel/users/}"; printf '%s\n' "${p%%/*}" ;;
+        /var/cpanel/userdata/*)
+            p="${p#/var/cpanel/userdata/}"; printf '%s\n' "${p%%/*}" ;;
+        *)
+            printf '_root\n' ;;
+    esac
+}
+
+_user_is_valid() {
+    case "${1:-}" in
+        ""|.|..|_root|root) return 1 ;;
+        */*)                return 1 ;;
+        *[!a-zA-Z0-9_-]*)   return 1 ;;
+        *)                  return 0 ;;
+    esac
+}
+
+# Resolve attribution at emit-time. Echoes "user=<u> priv=<root|user>".
+# $1 = path-or-empty, $2 = privilege-default ("root" or "user").
+# If $1 is path-derived, looks up via _attribute_path; else falls back
+# to "_root". Used by emit() helpers; see PLAN-multiuser-verdict.md.
+_attrib_for_emit() {
+    local _ap="${1:-}" _ad="${2:-root}" _au="_root"
+    if [[ -n "$_ap" ]]; then
+        _au=$(_attribute_path "$_ap")
+        _user_is_valid "$_au" || _au="_root"
+    fi
+    printf 'user=%s priv=%s\n' "$_au" "$_ad"
+}
+
 # ---- _classify_history_match ---------------------------------------------
 # Diagnostic-shape classifier shared by Patterns C/F/H3.
 #   $1 mode  : "regex"   - <needle> is awk ERE (e.g. nuclear\.x86)
@@ -6506,6 +6606,13 @@ check_quarantined_artifacts() {
                             _note="Artifact contained off-disk into $qdir (pattern=$_pattern, sev=$_sev). sha256 validated before removal." ;;
                     esac
 
+                    local _au_eq _ap_eq=root
+                    _au_eq=$(_attribute_path "$path")
+                    _user_is_valid "$_au_eq" || _au_eq="_root"
+                    case "$_pattern" in
+                        H) [[ "$_au_eq" != "_root" ]] && _ap_eq=user ;;
+                    esac
+
                     emit "destruction" "$_id" "$_sev" \
                          "$_key" "$_wt" \
                          "containment_dir" "$qdir" \
@@ -6517,6 +6624,8 @@ check_quarantined_artifacts() {
                          "quarantine_ts" "$_qts" \
                          "ts_epoch_first" "$_qts" \
                          "tier_promoted_high_conf" "$_hi" \
+                         "affected_user" "$_au_eq" \
+                         "actor_privilege" "$_ap_eq" \
                          "note" "$_note"
                     ((hits++))
                 done < "$hashes_file"
@@ -6543,6 +6652,10 @@ check_quarantined_artifacts() {
                     _fp_safe="${_l_fp//[^a-zA-Z0-9]/_}"
                     local _ssh_id="ioc_pattern_g_contained_sshkey"
                     local _ssh_key="${_ssh_id}_${_qbase_safe}_${_fp_safe}"
+                    local _au_ssh _ap_ssh=root
+                    _au_ssh=$(_attribute_path "$_l_path")
+                    _user_is_valid "$_au_ssh" || _au_ssh="_root"
+                    [[ "$_au_ssh" != "_root" ]] && _ap_ssh=user
                     emit "destruction" "$_ssh_id" "strong" \
                          "$_ssh_key" 10 \
                          "containment_dir" "$qdir" \
@@ -6555,6 +6668,8 @@ check_quarantined_artifacts() {
                          "quarantine_ts" "$_qts" \
                          "ts_epoch_first" "$_qts" \
                          "tier_promoted_high_conf" 1 \
+                         "affected_user" "$_au_ssh" \
+                         "actor_privilege" "$_ap_ssh" \
                          "note" "Pattern G — untrusted SSH key pruned during external containment ($qdir); rotate affected credentials."
                     ((hits++))
                 done < "$pruned_log"
@@ -6636,12 +6751,16 @@ check_destruction_iocs() {
         [[ -n "$first_sorry" ]] && break
     done
     if [[ -n "$first_sorry" ]]; then
-        local sorry_mtime
+        local sorry_mtime _au_sorry
         sorry_mtime=$(stat -c %Y "$first_sorry" 2>/dev/null)
+        _au_sorry=$(_attribute_path "$first_sorry")
+        _user_is_valid "$_au_sorry" || _au_sorry="_root"
         emit "destruction" "ioc_pattern_a_sorry" "strong" \
              "ioc_pattern_a_sorry_files_present" 10 \
              "sample_path" "$first_sorry" \
              "mtime_epoch" "${sorry_mtime:-0}" \
+             "affected_user" "$_au_sorry" \
+             "actor_privilege" "root" \
              "note" "found .sorry-encrypted files (Pattern A); re-run with --full for the full kill-chain + bundle (CRITICAL)."
         ((hits++))
     fi
@@ -6660,7 +6779,7 @@ check_destruction_iocs() {
     if (( ${#readme_hits[@]} > 0 )); then
         for rf in "${readme_hits[@]}"; do
             if grep -qE "qtox|TOX ID|Sorry-ID|${PATTERN_A_TOX_ID}" "$rf" 2>/dev/null; then
-                local rf_mtime tox_match=0 _rf_lines=0 _rf_doc_shape=0
+                local rf_mtime tox_match=0 _rf_lines=0 _rf_doc_shape=0 _au_rf
                 rf_mtime=$(stat -c %Y "$rf" 2>/dev/null)
                 grep -qF "$PATTERN_A_TOX_ID" "$rf" 2>/dev/null && tox_match=1
                 _rf_lines=$(wc -l < "$rf" 2>/dev/null | tr -d ' ')
@@ -6668,12 +6787,16 @@ check_destruction_iocs() {
                 if [[ "$rf" =~ $_ir_paths_re ]] || (( _rf_lines > 200 )); then
                     _rf_doc_shape=1
                 fi
+                _au_rf=$(_attribute_path "$rf")
+                _user_is_valid "$_au_rf" || _au_rf="_root"
                 if (( _rf_doc_shape )); then
                     emit "destruction" "ioc_pattern_a_readme_documentation" "info" \
                          "ioc_pattern_a_ransom_readme_documentation" 0 \
                          "path" "$rf" "tox_id_match" "$tox_match" \
                          "line_count" "$_rf_lines" \
                          "mtime_epoch" "${rf_mtime:-0}" \
+                         "affected_user" "$_au_rf" \
+                         "actor_privilege" "root" \
                          "note" "qtox/Sorry-ID/TOX_ID strings in $rf (lines=$_rf_lines) but file is in IR-notes path or too long for a ransom README - documentation-shape, not Pattern A drop."
                 elif (( tox_match )); then
                     emit "destruction" "ioc_pattern_a_readme" "strong" \
@@ -6681,6 +6804,8 @@ check_destruction_iocs() {
                          "path" "$rf" "tox_id_match" "$tox_match" \
                          "line_count" "$_rf_lines" \
                          "mtime_epoch" "${rf_mtime:-0}" \
+                         "affected_user" "$_au_rf" \
+                         "actor_privilege" "root" \
                          "note" "qTox ransom README at $rf (tox_id_exact_match=1, lines=$_rf_lines) - Pattern A drop (CRITICAL)."
                     ((hits++))
                 else
@@ -6689,6 +6814,8 @@ check_destruction_iocs() {
                          "path" "$rf" "tox_id_match" "$tox_match" \
                          "line_count" "$_rf_lines" \
                          "mtime_epoch" "${rf_mtime:-0}" \
+                         "affected_user" "$_au_rf" \
+                         "actor_privilege" "root" \
                          "note" "qtox/Sorry-ID strings in $rf (lines=$_rf_lines) without exact TOX_ID hash match - manual review (may be IR documentation referencing the dossier)."
                     ((hits++))
                 fi
@@ -6761,12 +6888,16 @@ check_destruction_iocs() {
     btc_hit=$(find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
                 | xargs -0 grep -lF "$PATTERN_B_BTC_ADDR" 2>/dev/null | head -1)
     if [[ -n "$btc_hit" ]]; then
-        local btc_mtime
+        local btc_mtime _au_btc
         btc_mtime=$(stat -c %Y "$btc_hit" 2>/dev/null)
+        _au_btc=$(_attribute_path "$btc_hit")
+        _user_is_valid "$_au_btc" || _au_btc="_root"
         emit "destruction" "ioc_pattern_b_btc_note" "strong" \
              "ioc_pattern_b_btc_index_present" 10 \
              "sample_path" "$btc_hit" \
              "mtime_epoch" "${btc_mtime:-0}" \
+             "affected_user" "$_au_btc" \
+             "actor_privilege" "user" \
              "note" "BTC ransom note in $btc_hit - Pattern B index drop (CRITICAL)."
         ((hits++))
     fi
@@ -7228,9 +7359,14 @@ check_destruction_iocs() {
     rm -f "$docroot_list"
     if [[ -n "$h_seobot_hit" ]]; then
         known_bad_meta "$h_seobot_hit"
+        local _au_seobot
+        _au_seobot=$(_attribute_path "$h_seobot_hit")
+        _user_is_valid "$_au_seobot" || _au_seobot="_root"
         emit "destruction" "ioc_pattern_h_seobot_php" "strong" \
              "ioc_pattern_h_seobot_dropper_present" 10 \
              "sample_path" "$h_seobot_hit" "${META_KV[@]}" \
+             "affected_user" "$_au_seobot" \
+             "actor_privilege" "user" \
              "note" "$PATTERN_H_DROPPER_FILE planted in $h_seobot_hit - Pattern H SEO defacement (CRITICAL)."
         ((hits++))
         _h1_hit=1
@@ -8570,6 +8706,17 @@ aggregate_verdict() {
     local compromise_critical=0
     local version_says_vuln=0 version_says_patched=0
     local row area id sev key weight kv
+    # Per-axis counters mirror the global counters but split by attribution.
+    # Computed inline so we don't re-walk SIGNALS[] in aggregate_per_user_verdict.
+    local root_compromise_critical=0 root_ioc_critical=0 root_ioc_review=0
+    local user_compromise_critical=0 user_ioc_critical=0 user_ioc_review=0
+    declare -gA USER_SEVERITY=()
+    declare -gA USER_PATTERNS=()
+    declare -gA USER_KEYS=()
+    declare -gA USER_PRIV_MAX=()
+    declare -gA USER_FIRST_EPOCH=()
+    declare -gA USER_LAST_EPOCH=()
+    declare -gA USER_COUNT=()
     # Persistence cluster tracking. Dedupes by pattern letter (G/J/I/F/D/H);
     # multiplier rewards distinct patterns, not key count.
     local -A PERSIST_PATTERNS=()
@@ -8614,6 +8761,13 @@ aggregate_verdict() {
         for row in "${SIGNALS[@]}"; do
             IFS=$'\t' read -r area id sev key weight kv <<< "$row"
             weight="${weight:-0}"
+            # Per-axis attribution captured up-front so the rest of the loop
+            # can branch on it without re-parsing kv.
+            local _au _ap
+            _au=$(_kv_get "$kv" affected_user)
+            _ap=$(_kv_get "$kv" actor_privilege)
+            [[ -z "$_au" ]] && _au="_root"
+            [[ -z "$_ap" ]] && _ap="root"
             # P3 Pattern E pre-compromise re-credit when on-disk letter present (CHANGELOG v2.7.32).
             if [[ "$id" == "ioc_pattern_e_websocket" ]] && (( pre_compromise_present )) \
                && [[ "$weight" == "0" ]]; then
@@ -8813,7 +8967,7 @@ aggregate_verdict() {
                         IOC_KEYS+=("$key")
                         # Surface review-tier IOCs in the verdict reasons line
                         # so operators see e.g. "ioc_attacker_ip_in_access_log_probes_only"
-                        # even when host_verdict is SUSPICIOUS not COMPROMISED.
+                        # even when host_root_verdict/user_verdict resolves to SUSPICIOUS not COMPROMISED.
                         REASONS+=("$key")
                     fi
                     ;;
@@ -8842,6 +8996,77 @@ aggregate_verdict() {
                     ADVISORIES+=("${id}|${key}|${note}")
                     ;;
             esac
+
+            # Per-axis + per-user bookkeeping. Counters mirror the global
+            # ioc_critical / ioc_review / compromise_critical but split by
+            # actor_privilege (root vs user). When affected_user != _root,
+            # also accumulate into the per-user severity/pattern bucket.
+            case "$sev" in
+                strong|live_compromise)
+                    if [[ "$key" == ioc_* ]]; then
+                        if [[ "$_ap" == "user" ]]; then
+                            ((user_ioc_critical++))
+                        else
+                            ((root_ioc_critical++))
+                        fi
+                        local _cc2
+                        _cc2=$(ioc_compromise_class "$key")
+                        if [[ -n "$_cc2" ]] || [[ "$sev" == "live_compromise" ]]; then
+                            if [[ "$_ap" == "user" ]]; then
+                                ((user_compromise_critical++))
+                            else
+                                ((root_compromise_critical++))
+                            fi
+                        fi
+                    fi
+                    ;;
+                warning)
+                    if [[ "$key" == ioc_* ]]; then
+                        if [[ "$_ap" == "user" ]]; then
+                            ((user_ioc_review++))
+                        else
+                            ((root_ioc_review++))
+                        fi
+                    fi
+                    ;;
+            esac
+
+            if [[ "$_au" != "_root" ]] && _user_is_valid "$_au"; then
+                local _u_sev_cur="${USER_SEVERITY[$_au]:-clean}"
+                local _u_sev_new="$_u_sev_cur"
+                case "$sev" in
+                    live_compromise|strong)
+                        [[ "$key" == ioc_* ]] && _u_sev_new="strong" ;;
+                    warning|evidence)
+                        [[ "$_u_sev_cur" != "strong" && "$key" == ioc_* ]] && _u_sev_new="warning" ;;
+                esac
+                if [[ "$_u_sev_new" != "$_u_sev_cur" ]]; then
+                    USER_SEVERITY[$_au]="$_u_sev_new"
+                fi
+                if [[ "$key" == ioc_* ]] && [[ "$sev" == "strong" || "$sev" == "live_compromise" || "$sev" == "warning" ]]; then
+                    USER_COUNT[$_au]=$(( ${USER_COUNT[$_au]:-0} + 1 ))
+                    USER_KEYS[$_au]="${USER_KEYS[$_au]:-} $key"
+                    if [[ "$id" =~ ^ioc_pattern_([abcdefghijkl])_ ]]; then
+                        USER_PATTERNS[$_au]="${USER_PATTERNS[$_au]:-} ${BASH_REMATCH[1]^^}"
+                    fi
+                    local _cur_priv="${USER_PRIV_MAX[$_au]:-user}"
+                    if [[ "$_ap" == "root" ]] || [[ "$_cur_priv" == "root" ]]; then
+                        USER_PRIV_MAX[$_au]="root"
+                    else
+                        USER_PRIV_MAX[$_au]="user"
+                    fi
+                    local _ep
+                    _ep=$(_kv_get "$kv" mtime_epoch)
+                    [[ -z "$_ep" || ! "$_ep" =~ ^[0-9]+$ ]] && _ep=$(_kv_get "$kv" ts_epoch_first)
+                    [[ -z "$_ep" || ! "$_ep" =~ ^[0-9]+$ ]] && _ep=""
+                    if [[ -n "$_ep" ]]; then
+                        local _fe="${USER_FIRST_EPOCH[$_au]:-}"
+                        local _le="${USER_LAST_EPOCH[$_au]:-}"
+                        [[ -z "$_fe" || "$_ep" -lt "$_fe" ]] && USER_FIRST_EPOCH[$_au]="$_ep"
+                        [[ -z "$_le" || "$_ep" -gt "$_le" ]] && USER_LAST_EPOCH[$_au]="$_ep"
+                    fi
+                fi
+            fi
         done
     fi
 
@@ -8924,7 +9149,7 @@ aggregate_verdict() {
     SESSION_MAX_REASONS="$session_max_reasons"
 
     # Code-state axis: pure cpanel -V driven. IOC evidence informs
-    # HOST_VERDICT only — runtime hits never imply binary patch level.
+    # host_root/user verdicts only — runtime hits never imply binary patch level.
     if (( IOC_ONLY )); then
         VERDICT="SKIPPED"
         EXIT_CODE=0
@@ -8939,19 +9164,31 @@ aggregate_verdict() {
         EXIT_CODE=2
     fi
 
-    # Host-state axis. COMPROMISED requires post-attack residue: at least
-    # one strong-tier compromise-class ioc_* signal (persistence /
-    # destruction / token_used per ioc_compromise_class) OR persist_count>=1.
-    # Strong-tier attempt-class (Pattern E entry, X CRLF, forged sessions)
-    # alone → SUSPICIOUS. EXIT_CODE 4 dominates 1/2/3 for fleet triage.
-    if (( compromise_critical > 0 )) || (( persist_count >= 1 )); then
-        HOST_VERDICT="COMPROMISED"
-        EXIT_CODE=4
-    elif (( ioc_critical > 0 )) || (( ioc_review > 0 )); then
-        HOST_VERDICT="SUSPICIOUS"
-        EXIT_CODE=3
+    # Host-state axes (v2.8.0 split). Two parallel verdicts:
+    #   host_root_verdict — actor had root (X via WHM, /etc, /root, system).
+    #     Persistence cluster (any actor_privilege) also routes here since
+    #     persistence implies system-level write access.
+    #   host_user_verdict — actor had only user-account access; impact is
+    #     scoped to one or more cPanel tenants.
+    # EXIT_CODE 4 dominates 1/2/3 for fleet triage.
+    if (( root_compromise_critical > 0 )) || (( persist_count >= 1 )); then
+        HOST_ROOT_VERDICT="COMPROMISED"
+    elif (( root_ioc_critical > 0 )) || (( root_ioc_review > 0 )); then
+        HOST_ROOT_VERDICT="SUSPICIOUS"
     else
-        HOST_VERDICT="CLEAN"
+        HOST_ROOT_VERDICT="CLEAN"
+    fi
+    if (( user_compromise_critical > 0 )); then
+        HOST_USER_VERDICT="COMPROMISED"
+    elif (( user_ioc_critical > 0 )) || (( user_ioc_review > 0 )); then
+        HOST_USER_VERDICT="SUSPICIOUS"
+    else
+        HOST_USER_VERDICT="CLEAN"
+    fi
+    if [[ "$HOST_ROOT_VERDICT" == "COMPROMISED" || "$HOST_USER_VERDICT" == "COMPROMISED" ]]; then
+        EXIT_CODE=4
+    elif [[ "$HOST_ROOT_VERDICT" == "SUSPICIOUS" || "$HOST_USER_VERDICT" == "SUSPICIOUS" ]]; then
+        EXIT_CODE=3
     fi
 
     # Cluster advisory: surface multi-pattern persistence as a distinct
@@ -8969,6 +9206,111 @@ aggregate_verdict() {
         ((advisory_count++))
         ADVISORY_COUNT="$advisory_count"
     fi
+}
+
+# Materialise the per-user verdict block from USER_* maps populated by
+# aggregate_verdict. Caps at USERS_BLOCK_CAP (50) by severity-then-count.
+# Sets USERS_JSON / USERS_TRUNCATED / USERS_TRUNCATED_COUNT and
+# AFFECTED_USER_COUNT / AFFECTED_USER_COMPROMISED / AFFECTED_USER_SUSPECT.
+# total_users counts /var/cpanel/users/ for fleet visibility.
+USERS_BLOCK_CAP=50
+aggregate_per_user_verdict() {
+    AFFECTED_USER_COUNT=0
+    AFFECTED_USER_COMPROMISED=0
+    AFFECTED_USER_SUSPECT=0
+    USERS_TRUNCATED=0
+    USERS_TRUNCATED_COUNT=0
+    USERS_JSON=""
+    HOST_USER_TOTAL=0
+
+    if [[ -d /var/cpanel/users ]]; then
+        HOST_USER_TOTAL=$(find /var/cpanel/users -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l)
+        HOST_USER_TOTAL="${HOST_USER_TOTAL//[^0-9]/}"
+        HOST_USER_TOTAL="${HOST_USER_TOTAL:-0}"
+    fi
+
+    if (( ${#USER_SEVERITY[@]} == 0 )); then
+        return
+    fi
+
+    local _u _sev _cnt
+    local -a _rows=()
+    for _u in "${!USER_SEVERITY[@]}"; do
+        _sev="${USER_SEVERITY[$_u]:-clean}"
+        _cnt="${USER_COUNT[$_u]:-0}"
+        case "$_sev" in
+            strong)  ((AFFECTED_USER_COMPROMISED++)) ;;
+            warning) ((AFFECTED_USER_SUSPECT++)) ;;
+            *)       continue ;;
+        esac
+        ((AFFECTED_USER_COUNT++))
+        local _rank
+        case "$_sev" in
+            strong)  _rank=2 ;;
+            warning) _rank=1 ;;
+            *)       _rank=0 ;;
+        esac
+        _rows+=("${_rank}|${_cnt}|${_u}")
+    done
+
+    if (( ${#_rows[@]} == 0 )); then
+        return
+    fi
+
+    local -a _sorted
+    mapfile -t _sorted < <(printf '%s\n' "${_rows[@]}" | sort -t'|' -k1,1nr -k2,2nr)
+    local _total=${#_sorted[@]}
+    if (( _total > USERS_BLOCK_CAP )); then
+        USERS_TRUNCATED=1
+        USERS_TRUNCATED_COUNT=$(( _total - USERS_BLOCK_CAP ))
+    fi
+
+    local _json="" _i=0
+    local _row _r_rank _r_cnt _r_user _verdict _patterns _keys _priv _fe _le
+    for _row in "${_sorted[@]}"; do
+        (( _i >= USERS_BLOCK_CAP )) && break
+        IFS='|' read -r _r_rank _r_cnt _r_user <<< "$_row"
+        case "$_r_rank" in
+            2) _verdict="USER_COMPROMISED" ;;
+            1) _verdict="USER_SUSPECT" ;;
+            *) continue ;;
+        esac
+        _patterns=$(printf '%s\n' ${USER_PATTERNS[$_r_user]:-} | sort -u | tr '\n' ',' | sed 's/,$//; s/^,//')
+        _keys=$(printf '%s\n' ${USER_KEYS[$_r_user]:-} | sort -u | tr '\n' ',' | sed 's/,$//; s/^,//')
+        _priv="${USER_PRIV_MAX[$_r_user]:-user}"
+        _fe="${USER_FIRST_EPOCH[$_r_user]:-0}"
+        _le="${USER_LAST_EPOCH[$_r_user]:-0}"
+        local _pat_json="" _key_json=""
+        local _t
+        local IFS=','
+        for _t in $_patterns; do
+            [[ -z "$_t" ]] && continue
+            [[ -n "$_pat_json" ]] && _pat_json+=,
+            _pat_json+="\"$(json_esc "$_t")\""
+        done
+        for _t in $_keys; do
+            [[ -z "$_t" ]] && continue
+            [[ -n "$_key_json" ]] && _key_json+=,
+            _key_json+="\"$(json_esc "$_t")\""
+        done
+        unset IFS
+
+        (( _i > 0 )) && _json+=","
+        _json+=$'\n    '
+        _json+=$(printf '{"user":"%s","verdict":"%s","evidence_count":%d,"actor_privilege_max":"%s","patterns":[%s],"ioc_keys":[%s],"first_evidence_epoch":%d,"last_evidence_epoch":%d}' \
+                 "$(json_esc "$_r_user")" "$_verdict" "$_r_cnt" "$_priv" \
+                 "$_pat_json" "$_key_json" "${_fe:-0}" "${_le:-0}")
+
+        if (( JSONL )); then
+            printf '{"host":"%s","run_id":"%s","kind":"user_summary","user":"%s","verdict":"%s","evidence_count":%d,"actor_privilege_max":"%s","patterns":[%s],"ioc_keys":[%s],"first_evidence_epoch":%d,"last_evidence_epoch":%d}\n' \
+                "$HOSTNAME_JSON" "$RUN_ID" \
+                "$(json_esc "$_r_user")" "$_verdict" "$_r_cnt" "$_priv" \
+                "$_pat_json" "$_key_json" "${_fe:-0}" "${_le:-0}"
+        fi
+
+        ((_i++))
+    done
+    USERS_JSON="$_json"
 }
 
 # Per-section verdict matrix - mitigate-style 7-row table rendered at the
@@ -9051,16 +9393,47 @@ print_verdict() {
         INCONCLUSIVE) code_color="$YELLOW" ;;
         SKIPPED)      code_color="$DIM" ;;
     esac
-    local host_color=""
-    case "$HOST_VERDICT" in
-        COMPROMISED) host_color="$RED" ;;
-        SUSPICIOUS)  host_color="$YELLOW" ;;
-        CLEAN)       host_color="$GREEN" ;;
+    local _root_color="" _user_color=""
+    case "$HOST_ROOT_VERDICT" in
+        COMPROMISED) _root_color="$RED" ;;
+        SUSPICIOUS)  _root_color="$YELLOW" ;;
+        CLEAN)       _root_color="$GREEN" ;;
+        *)           _root_color="$DIM" ;;
+    esac
+    case "$HOST_USER_VERDICT" in
+        COMPROMISED) _user_color="$RED" ;;
+        SUSPICIOUS)  _user_color="$YELLOW" ;;
+        CLEAN)       _user_color="$GREEN" ;;
+        *)           _user_color="$DIM" ;;
     esac
 
     say ""
     sayf ' %sCode verdict:%s %s%s%s    score=%+d\n' "$BOLD" "$NC" "$code_color" "$VERDICT" "$NC" "$SCORE"
-    sayf ' %sHost verdict:%s %s%s%s\n' "$BOLD" "$NC" "$host_color" "$HOST_VERDICT" "$NC"
+    sayf ' %sHost root verdict:%s %s%s%s\n' "$BOLD" "$NC" "$_root_color" "$HOST_ROOT_VERDICT" "$NC"
+    sayf ' %sHost user verdict:%s %s%s%s   (affected_users=%d, total=%d)\n' \
+        "$BOLD" "$NC" "$_user_color" "$HOST_USER_VERDICT" "$NC" \
+        "${AFFECTED_USER_COUNT:-0}" "${HOST_USER_TOTAL:-0}"
+
+    if (( ${AFFECTED_USER_COUNT:-0} > 0 )); then
+        local _u _u_sev _u_cnt _u_pat _shown=0
+        for _u in "${!USER_SEVERITY[@]}"; do
+            (( _shown >= 10 )) && break
+            _u_sev="${USER_SEVERITY[$_u]:-clean}"
+            [[ "$_u_sev" == "clean" ]] && continue
+            _u_cnt="${USER_COUNT[$_u]:-0}"
+            _u_pat=$(printf '%s\n' ${USER_PATTERNS[$_u]:-} | sort -u | tr '\n' ',' | sed 's/,$//; s/^,//')
+            local _u_color="$YELLOW"
+            [[ "$_u_sev" == "strong" ]] && _u_color="$RED"
+            sayf '   %suser%s %-20s %s%-10s%s patterns=%s (events=%d)\n' \
+                "$DIM" "$NC" "$_u" "$_u_color" \
+                "${_u_sev/strong/COMPROMISED}" "$NC" "${_u_pat:-?}" "$_u_cnt"
+            ((_shown++))
+        done
+        if (( USERS_TRUNCATED )); then
+            sayf '   %s...and %d more (users[] capped at %d)%s\n' \
+                "$DIM" "$USERS_TRUNCATED_COUNT" "$USERS_BLOCK_CAP" "$NC"
+        fi
+    fi
 
     if (( ${PERSIST_COUNT:-0} >= 1 )); then
         sayf '   persistence: %s%d distinct pattern(s) (%s) — cluster_score=%d ×%d%s\n' \
@@ -9084,7 +9457,7 @@ print_verdict() {
         done
     fi
 
-    if [[ "$HOST_VERDICT" == "COMPROMISED" ]]; then
+    if [[ "$HOST_ROOT_VERDICT" == "COMPROMISED" || "$HOST_USER_VERDICT" == "COMPROMISED" ]]; then
         say ""
         sayf ' %s!! HOST SHOWS EXPLOITATION ARTIFACTS - IR REQUIRED !!%s\n' "$RED$BOLD" "$NC"
         say "   Vendor-recommended response (KB 40073787579671):"
@@ -9139,7 +9512,15 @@ write_json() {
             printf '  "since_epoch": %d,\n' "$SINCE_EPOCH"
         fi
         printf '  "code_verdict": "%s",\n' "$VERDICT"
-        printf '  "host_verdict": "%s",\n' "$HOST_VERDICT"
+        printf '  "host_root_verdict": "%s",\n' "$HOST_ROOT_VERDICT"
+        printf '  "host_user_verdict": "%s",\n' "$HOST_USER_VERDICT"
+        printf '  "host_user_summary": {"total_users":%d,"compromised":%d,"suspect":%d,"clean_or_unknown":%d},\n' \
+            "${HOST_USER_TOTAL:-0}" "${AFFECTED_USER_COMPROMISED:-0}" \
+            "${AFFECTED_USER_SUSPECT:-0}" \
+            "$(( ${HOST_USER_TOTAL:-0} - ${AFFECTED_USER_COMPROMISED:-0} - ${AFFECTED_USER_SUSPECT:-0} ))"
+        printf '  "users": [%s%s],\n' "${USERS_JSON}" "$([[ -n "$USERS_JSON" ]] && printf '\n  ')"
+        printf '  "users_truncated": %s,\n' "$([[ ${USERS_TRUNCATED:-0} -eq 1 ]] && echo true || echo false)"
+        printf '  "users_truncated_count": %d,\n' "${USERS_TRUNCATED_COUNT:-0}"
         printf '  "score": %d,\n' "$SCORE"
         printf '  "exit_code": %d,\n' "$EXIT_CODE"
         printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"compromise_critical":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s","session_tiered_count":%d,"session_max_reasons":%d},\n' \
@@ -9233,16 +9614,20 @@ write_csv() {
         adv_ids="${adv_ids:+${adv_ids};}${adv_id}"
     done
     {
-        # Column order: existing columns 1-17 unchanged for back-compat with
-        # fleet aggregators that index positionally. New columns appended.
-        printf 'host,run_id,ts,tool_version,code_verdict,host_verdict,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns,compromise_critical,session_tiered_count,session_max_reasons\n'
-        printf '%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%d,%d,%d\n' \
+        # Column order: v2.8.0 swaps host_verdict for two-axis verdicts
+        # and appends affected_user_count + users_truncated. Consumers must
+        # update header parsing; positional consumers must remap col 6.
+        printf 'host,run_id,ts,tool_version,code_verdict,host_root_verdict,host_user_verdict,affected_user_count,users_truncated,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns,compromise_critical,session_tiered_count,session_max_reasons\n'
+        printf '%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%d,%d,%d\n' \
             "$(csv_field "$HOSTNAME_FQDN")" \
             "$(csv_field "$RUN_ID")" \
             "$(csv_field "$TS_ISO")" \
             "$(csv_field "$VERSION")" \
             "$(csv_field "$VERDICT")" \
-            "$(csv_field "$HOST_VERDICT")" \
+            "$(csv_field "$HOST_ROOT_VERDICT")" \
+            "$(csv_field "$HOST_USER_VERDICT")" \
+            "${AFFECTED_USER_COUNT:-0}" \
+            "${USERS_TRUNCATED:-0}" \
             "$SCORE" \
             "$EXIT_CODE" \
             "$STRONG_COUNT" \
@@ -9282,9 +9667,9 @@ ledger_write() {
     end_epoch=$(date -u +%s)
     duration=$(( end_epoch - TS_EPOCH ))
     local line
-    line=$(printf '{"ts":"%s","run_id":"%s","host":"%s","tool_version":"%s","code_verdict":"%s","host_verdict":"%s","score":%d,"exit_code":%d,"duration_s":%d,"ioc_critical":%d,"ioc_review":%d}' \
+    line=$(printf '{"ts":"%s","run_id":"%s","host":"%s","tool_version":"%s","code_verdict":"%s","host_root_verdict":"%s","host_user_verdict":"%s","affected_user_count":%d,"score":%d,"exit_code":%d,"duration_s":%d,"ioc_critical":%d,"ioc_review":%d}' \
         "$TS_ISO" "$RUN_ID" "$HOSTNAME_JSON" "$VERSION" \
-        "$VERDICT" "$HOST_VERDICT" "$SCORE" "$EXIT_CODE" "$duration" \
+        "$VERDICT" "$HOST_ROOT_VERDICT" "$HOST_USER_VERDICT" "${AFFECTED_USER_COUNT:-0}" "$SCORE" "$EXIT_CODE" "$duration" \
         "$IOC_CRITICAL" "$IOC_REVIEW")
     # Append - flock would be ideal but introduces a util-linux dependency
     # we don't want for fleet portability. The single-line atomic write
@@ -9331,9 +9716,9 @@ syslog_emit() {
     (( SYSLOG )) || return 0
     command -v logger >/dev/null 2>&1 || return 0
     local msg
-    msg=$(printf 'run_id=%s host=%s code=%s host_verdict=%s exit=%d ioc_critical=%d ioc_review=%d' \
-        "$RUN_ID" "$HOSTNAME_FQDN" "$VERDICT" "$HOST_VERDICT" \
-        "$EXIT_CODE" "$IOC_CRITICAL" "$IOC_REVIEW")
+    msg=$(printf 'run_id=%s host=%s code=%s host_root=%s host_user=%s aff_users=%d exit=%d ioc_critical=%d ioc_review=%d' \
+        "$RUN_ID" "$HOSTNAME_FQDN" "$VERDICT" "$HOST_ROOT_VERDICT" "$HOST_USER_VERDICT" \
+        "${AFFECTED_USER_COUNT:-0}" "$EXIT_CODE" "$IOC_CRITICAL" "$IOC_REVIEW")
     logger -t sessionscribe-ioc -p auth.notice -- "$msg" 2>/dev/null || true
 }
 
@@ -9432,6 +9817,7 @@ if (( ! REPLAY_MODE )); then
     check_localhost_probe
 
     aggregate_verdict
+    aggregate_per_user_verdict
 
     # Write the envelope to disk BEFORE forensic phases run so the forensic
     # path can read it from disk via the same code path used by --replay.
@@ -9447,10 +9833,11 @@ else
     # --replay PATH: skip detection, set ENVELOPE_PATH from resolved input.
     resolve_replay_envelope "$REPLAY_PATH"
     ENVELOPE_PATH="$RESOLVED_ENVELOPE_PATH"
-    # Read host_verdict / score / tool_version from the envelope so the
+    # Read host verdicts / score / tool_version from the envelope so the
     # forensic phases see consistent context.
     read_envelope_meta "$ENVELOPE_PATH"
-    HOST_VERDICT="${ENV_HOST_VERDICT:-UNKNOWN}"
+    HOST_ROOT_VERDICT="${ENV_HOST_ROOT_VERDICT:-UNKNOWN}"
+    HOST_USER_VERDICT="${ENV_HOST_USER_VERDICT:-UNKNOWN}"
     SCORE="${ENV_SCORE:-0}"
     hdr_section "replay" "forensic phases on $ENVELOPE_PATH"
 fi
@@ -9462,18 +9849,29 @@ RUN_FORENSIC=0
 if (( REPLAY_MODE )); then
     RUN_FORENSIC=1
 elif (( FULL_MODE )); then
+    _root_compromised=0; _user_compromised=0
+    [[ "$HOST_ROOT_VERDICT" == "COMPROMISED" ]] && _root_compromised=1
+    [[ "$HOST_USER_VERDICT" == "COMPROMISED" ]] && _user_compromised=1
+    _any_compromised=$(( _root_compromised || _user_compromised ))
     if (( CHAIN_ON_ALL )); then
         emit "summary" "forensic_run" "info" "forensic_chain_on_all" 0 \
-             "host_verdict" "$HOST_VERDICT" \
-             "note" "host_verdict=$HOST_VERDICT; --chain-on-all forces forensic phases regardless of verdict."
+             "host_root_verdict" "$HOST_ROOT_VERDICT" \
+             "host_user_verdict" "$HOST_USER_VERDICT" \
+             "note" "host_root=$HOST_ROOT_VERDICT host_user=$HOST_USER_VERDICT; --chain-on-all forces forensic phases regardless of verdict."
         RUN_FORENSIC=1
-    elif (( CHAIN_ON_CRITICAL )) && [[ "$HOST_VERDICT" != "COMPROMISED" ]]; then
+    elif (( CHAIN_ON_ROOT_ONLY )) && (( ! _root_compromised )); then
+        emit "summary" "forensic_skip" "info" "forensic_skipped_user_only" 0 \
+             "host_root_verdict" "$HOST_ROOT_VERDICT" \
+             "host_user_verdict" "$HOST_USER_VERDICT" \
+             "note" "host_root=$HOST_ROOT_VERDICT host_user=$HOST_USER_VERDICT; --chain-on-root-only requires host_root_verdict=COMPROMISED."
+    elif (( CHAIN_ON_CRITICAL )) && (( ! _any_compromised )); then
         emit "summary" "forensic_skip" "info" "forensic_skipped_below_critical" 0 \
-             "host_verdict" "$HOST_VERDICT" \
-             "note" "host_verdict=$HOST_VERDICT; --chain-on-critical limits forensic to COMPROMISED."
-    elif [[ "$HOST_VERDICT" == "CLEAN" ]]; then
+             "host_root_verdict" "$HOST_ROOT_VERDICT" \
+             "host_user_verdict" "$HOST_USER_VERDICT" \
+             "note" "host_root=$HOST_ROOT_VERDICT host_user=$HOST_USER_VERDICT; --chain-on-critical limits forensic to COMPROMISED on either axis."
+    elif [[ "$HOST_ROOT_VERDICT" == "CLEAN" && "$HOST_USER_VERDICT" == "CLEAN" ]]; then
         emit "summary" "forensic_skip" "info" "forensic_skipped_clean" 0 \
-             "note" "host_verdict=CLEAN; not running forensic phases (use --chain-on-all to override)."
+             "note" "both verdicts CLEAN; not running forensic phases (use --chain-on-all to override)."
     else
         RUN_FORENSIC=1
     fi

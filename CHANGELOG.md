@@ -4,6 +4,73 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.8.0 — 2026-05-10
+
+### Changed — host_verdict split into root/user axes (BREAKING)
+
+`host_verdict` is replaced by two parallel verdicts: `host_root_verdict`
+and `host_user_verdict`. Multi-tenant cPanel hosts (50–500 users) need
+to distinguish "the box is owned" (e.g. SessionScribe + WHM root API
+abuse) from "one tenant got popped" (e.g. compromised user-account
+uploads `seobot.php` to their public_html). Operationally these are
+two different IR responses — host rebuild vs per-account cleanup —
+and the prior single-axis verdict collapsed both into COMPROMISED.
+
+Each `signals[]` entry now carries `affected_user` (cPanel username
+or `_root` for system-wide) and `actor_privilege` (`root` or `user`).
+The envelope adds `users[]` (capped at 50) listing each affected
+tenant with their own `verdict` (USER_COMPROMISED / USER_SUSPECT),
+pattern letters, IOC keys, evidence count, max actor privilege, and
+first/last evidence epoch. `host_user_summary` provides
+total/compromised/suspect/clean counts. `users_truncated` flags hosts
+where more than 50 users have evidence.
+
+The JSONL stream gains `kind=user_summary` events (one per affected
+tenant) so per-user views can be stream-processed without parsing
+the full envelope.
+
+A new `--chain-on-root-only` flag scopes `--full` mode to hosts
+where `host_root_verdict==COMPROMISED`, useful for IR teams who
+want to queue host-rebuild candidates separately from per-account
+cleanup.
+
+The forensic-bundle meta `schema_version` bumps to 5.
+
+**Consumer impact:**
+
+- `host_verdict` is gone from the envelope, the CSV row, the ledger
+  line, the syslog one-liner, and the forensic-bundle meta.
+- CSV column 6 was `host_verdict`; it is now `host_root_verdict`,
+  with `host_user_verdict`, `affected_user_count`, `users_truncated`
+  inserted as new columns 7–9. Positional consumers must update.
+- Aggregator (`build_master_compromised.py`,
+  `aggregate_complist.py`), the `comp.last-ioc-run-comped.csv`
+  generator, and the rfxn-website comp.list endpoint must update in
+  lockstep before fleet rollout.
+
+**Path-to-user attribution table** (covers all path-derived patterns):
+
+```
+/home/<u>/...                        → <u>
+/var/spool/cron/<u> (≠root)          → <u>
+/var/cpanel/users/<u>                → <u>
+/var/cpanel/userdata/<u>/...         → <u>
+/root/, /etc/, /usr/local/           → _root
+/var/log/, /var/cpanel/              → _root
+all cpsess events                    → _root
+```
+
+**Per-pattern privilege defaults:** Patterns A, C, D, E, F, G, I, J,
+K, L and SessionScribe (X) always emit `actor_privilege=root`.
+Pattern H (`seobot.php` under public_html) and Pattern B (BTC index
+drop) emit `actor_privilege=user` when path is under `/home/<u>/`.
+External-quarantine ingestion follows the source path.
+
+### Fixed
+
+- `has_canonical_mailto` dead variable in `repair_telemetry_cron_file`
+  removed (shellcheck SC2034).
+
 ## sessionscribe-ioc-scan.sh v2.7.44 — 2026-05-08
 
 ### Fixed (`software_inventory_meta.note` now disambiguates two prior false-`ok` cases)
