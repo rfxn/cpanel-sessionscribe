@@ -29,6 +29,14 @@ versioned per affected component.
 ### Added
 - `timeout 300` cap on long discovery walks (Pattern A / B / G / M7,
   suspect-IP log scan). `timeout 60` on `ps auxfww` and `ss -tnp`.
+- `timeout 30` on rpm/dpkg health probes, kernel queries, and
+  `needs-restarting -r` (was unguarded `rpm -qa` could hang on a
+  corrupt rpmdb; `needs-restarting` was capped at 5s, now 30s to
+  match floor). `timeout 300` on the full inventory query
+  (`rpm -qa` / `dpkg-query -W`).
+- Skip downstream pkgmgr queries when the health probe reports
+  anything but `ok` (broken / locked / unknown). Avoids burning the
+  timeout caps on a package db that's guaranteed to stall.
 
 ## ioc-scan v2.8.4 — 2026-05-11
 

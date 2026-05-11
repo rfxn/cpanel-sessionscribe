@@ -1611,8 +1611,8 @@ collect_software_digest() {
     case "$PKGMGR_KIND" in
         (dnf|yum)
             if command -v rpm >/dev/null 2>&1; then
-                if ! rpm -q --quiet rpm 2>/dev/null; then
-                    PKGMGR_HEALTH="broken"; note="rpmdb query failed"
+                if ! timeout 30 rpm -q --quiet rpm 2>/dev/null; then
+                    PKGMGR_HEALTH="broken"; note="rpmdb query failed or timed out"
                 else
                     PKGMGR_HEALTH="ok"
                 fi
@@ -1640,9 +1640,11 @@ collect_software_digest() {
             ;;
         (apt)
             if command -v dpkg >/dev/null 2>&1; then
-                local audit
-                audit=$(dpkg --audit 2>/dev/null)
-                if [[ -n "$audit" ]]; then
+                local audit audit_rc
+                audit=$(timeout 30 dpkg --audit 2>/dev/null); audit_rc=$?
+                if (( audit_rc == 124 )); then
+                    PKGMGR_HEALTH="unknown"; note="dpkg --audit timed out"
+                elif [[ -n "$audit" ]]; then
                     PKGMGR_HEALTH="broken"; note="dpkg --audit reported issues"
                 else
                     PKGMGR_HEALTH="ok"
@@ -1696,15 +1698,20 @@ collect_software_digest() {
         fi
     fi
 
+    # Skip downstream pkgmgr queries when the health probe already flagged
+    # the rpmdb/dpkg state as not-ok. Avoids burning the 30s/300s caps on a
+    # corrupt or locked package db that's guaranteed to time out.
     local newest_installed=""
-    if [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]] && command -v rpm >/dev/null 2>&1; then
-        newest_installed=$(rpm -q kernel kernel-core 2>/dev/null \
-            | grep -v 'is not installed' \
-            | sed -n 's/^kernel-core-//p; s/^kernel-//p' \
-            | sort -V | tail -1)
-    elif [[ "$PKGMGR_KIND" == "apt" ]] && command -v dpkg-query >/dev/null 2>&1; then
-        newest_installed=$(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null \
-            | sed 's/^linux-image-//' | sort -V | tail -1)
+    if [[ "$PKGMGR_HEALTH" == "ok" ]]; then
+        if [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]] && command -v rpm >/dev/null 2>&1; then
+            newest_installed=$(timeout 30 rpm -q kernel kernel-core 2>/dev/null \
+                | grep -v 'is not installed' \
+                | sed -n 's/^kernel-core-//p; s/^kernel-//p' \
+                | sort -V | tail -1)
+        elif [[ "$PKGMGR_KIND" == "apt" ]] && command -v dpkg-query >/dev/null 2>&1; then
+            newest_installed=$(timeout 30 dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null \
+                | sed 's/^linux-image-//' | sort -V | tail -1)
+        fi
     fi
     KERNEL_LATEST_INSTALLED="$newest_installed"
 
@@ -1718,8 +1725,10 @@ collect_software_digest() {
     if [[ -f /var/run/reboot-required ]]; then
         KERNEL_REBOOT_PENDING="1"
     fi
-    if command -v needs-restarting >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-        timeout 5 needs-restarting -r >/dev/null 2>&1
+    if [[ "$PKGMGR_HEALTH" == "ok" ]] \
+       && command -v needs-restarting >/dev/null 2>&1 \
+       && command -v timeout >/dev/null 2>&1; then
+        timeout 30 needs-restarting -r >/dev/null 2>&1
         local rc=$?
         (( rc == 1 )) && KERNEL_REBOOT_PENDING="1"
     fi
@@ -4103,16 +4112,34 @@ phase_bundle() {
     # and for hosts where encoding fails (no gzip/base64 on stripped
     # legacy distros).
     local inv="$bdir/software-inventory.txt"
-    local inv_kind=""
-    {
-        if [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]] && command -v rpm >/dev/null 2>&1; then
+    local inv_kind="" inv_rc=0
+    # Skip the inventory query when the pkgmgr health probe already flagged
+    # the rpmdb/dpkg state as broken/locked/unknown — rpm -qa hangs forever
+    # on a corrupt rpmdb and would burn the 300s cap for no payload.
+    if [[ "$PKGMGR_HEALTH" != "ok" ]]; then
+        : > "$inv.body"
+        inv_rc=125
+        if [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]]; then
             inv_kind="rpm"
-            rpm -qa --queryformat '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n' 2>/dev/null
-        elif [[ "$PKGMGR_KIND" == "apt" ]] && command -v dpkg-query >/dev/null 2>&1; then
+        elif [[ "$PKGMGR_KIND" == "apt" ]]; then
             inv_kind="dpkg"
-            dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' 2>/dev/null
         fi
-    } > "$inv.body" 2>/dev/null
+    elif [[ "$PKGMGR_KIND" == "dnf" || "$PKGMGR_KIND" == "yum" ]] && command -v rpm >/dev/null 2>&1; then
+        inv_kind="rpm"
+        timeout 300 rpm -qa --queryformat '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n' \
+            > "$inv.body" 2>/dev/null
+        inv_rc=$?
+    elif [[ "$PKGMGR_KIND" == "apt" ]] && command -v dpkg-query >/dev/null 2>&1; then
+        inv_kind="dpkg"
+        timeout 300 dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\n' \
+            > "$inv.body" 2>/dev/null
+        inv_rc=$?
+    fi
+    # Treat timeout (124) and health-skip (125) as no-inventory so a partial
+    # rpm -qa truncated mid-stream doesn't masquerade as a complete list.
+    if (( inv_rc == 124 || inv_rc == 125 )); then
+        : > "$inv.body"
+    fi
     if [[ -s "$inv.body" ]]; then
         PKG_INVENTORY_COUNT=$(wc -l < "$inv.body" 2>/dev/null)
         PKG_INVENTORY_COUNT="${PKG_INVENTORY_COUNT//[[:space:]]/}"
