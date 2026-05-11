@@ -324,12 +324,10 @@ RUNTIME_WALLET_PREFIXES=(
     "47eqhWc4e88EVdqb"
 )
 RUNTIME_MASQ_RESPAWN_RE='pkill[[:space:]]+-0[[:space:]]+-U[0-9]+[[:space:]]+(defunct|gs-dbus|lscgib)'
-# Runtime-context probe (populated by _rt_runtime_context). Pre-declared
-# at top-level so `set -u` doesn't trip on first read in consumers.
-_RT_CTX_USER=""        # ps auxfww column 1 (real running user)
-_RT_CTX_PID=""         # ps auxfww column 2 (PID)
-_RT_CTX_JAILED=0       # 1 if cgroup shows cagefs/lve user-jail membership
-_RT_CTX_OWNER=""       # "root" iff USER=root AND not jailed; user otherwise
+_RT_CTX_USER=""
+_RT_CTX_PID=""
+_RT_CTX_JAILED=0
+_RT_CTX_OWNER=""
 RUNTIME_LDLINUX_MASQ_RE='\./\.?ld-linux\.so[^[:space:]]*[[:space:]]+(-c[[:space:]]+config\.json|--config=)'
 RUNTIME_HTTPS_MASQ_RE='\./https[[:space:]]+(-a[[:space:]]+rx/0|-o[[:space:]].*pool\.|--url=.*pool\.)'
 RUNTIME_PYTHON_MASQ_RE='\./python[0-9]*([[:space:]]|$)'
@@ -1331,15 +1329,12 @@ for _i in "${!PATCHED_TIERS_KEYS[@]}"; do
     PATCHED_BUILDS_CPANEL+=("11.${PATCHED_TIERS_KEYS[$_i]}.0.${PATCHED_TIERS_VALS[$_i]}")
 done
 unset _i
-PATCHED_BUILD_WPSQUARED="11.136.1.7"  # WP Squared product line (separate
-                            # patch lineage; see comment at PATCHED_TIERS_KEYS)
-PATCHED_WPSQUARED_TIER=136  # WP Squared tier and build cutoff. Split out
-PATCHED_WPSQUARED_BUILD=7   # so phase_defense/check_version can compare
-                            # build >= cutoff (not just exact-match).
-CPANEL_NORM=""             # normalised cPanel version "11.<tier>.0.<build>"
-                            # or "11.<tier>.1.<build>" for WP Squared.
-CPANEL_WPSQ_TIER=""        # populated alongside CPANEL_NORM when raw matches
-CPANEL_WPSQ_BUILD=""       # the WP Squared shape (11.<t>.1.<b> / <t>.1 (build <b>))
+PATCHED_BUILD_WPSQUARED="11.136.1.7"
+PATCHED_WPSQUARED_TIER=136
+PATCHED_WPSQUARED_BUILD=7
+CPANEL_NORM=""
+CPANEL_WPSQ_TIER=""
+CPANEL_WPSQ_BUILD=""
 PRIMARY_IP=""              # primary outbound IPv4 (ip-route-get probe)
 OS_PRETTY=""               # /etc/os-release PRETTY_NAME or redhat-release line
 : "${LP_UID:=}"            # hosting-provider UID; env-overridable, default ""
@@ -2615,12 +2610,7 @@ phase_defense() {
         emit_signal defense warn patch_unknown "cpanel build unparseable" \
             build "$CPANEL_NORM" patch_state "$PATCH_STATE"
     else
-        # Patched if the build is >= the vendor cutoff for the host's tier.
-        # Exact-equality (pre-v2.8.5) FP'd any post-upcp host above the
-        # cutoff, including C6/CL6 direct-update 11.110.0.103, every WP
-        # Squared host, and every host bumped past the original .41/.28/...
-        # release. Parses CPANEL_NORM directly so the function works
-        # regardless of whether the CPANEL_WPSQ_* globals are populated.
+        # PATCHED iff build >= vendor cutoff for the host's tier.
         local patched=0 _pd_tier="" _pd_build="" _pd_i
         if [[ "$CPANEL_NORM" =~ ^11\.([0-9]+)\.0\.([0-9]+)$ ]]; then
             _pd_tier="${BASH_REMATCH[1]}"; _pd_build="${BASH_REMATCH[2]}"
@@ -4973,12 +4963,8 @@ check_version() {
         return
     fi
 
-    # Anchored to start-of-string (skipping leading whitespace) so a stray
-    # 4+ digit prefix doesn't match its trailing 2-3 digits via leftmost-not-
-    # anchored bash regex behavior. Mirrors collect_host_meta() so both
-    # functions yield the same value from the same source.
-    # WP Squared product line uses 11.<tier>.1.<build> instead of .0. — when
-    # detected, dispatch to the WPS cutoff and short-circuit the main ladder.
+    # Mirrors collect_host_meta(). WP Squared shape (11.<t>.1.<b>) dispatches
+    # to its own cutoff and short-circuits the main ladder.
     local tier="" build="" _is_wpsq=0
     if [[ "$raw" =~ ^[[:space:]]*([0-9]{2,3})\.0[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
         tier="${BASH_REMATCH[1]}"; build="${BASH_REMATCH[2]}"
@@ -5001,8 +4987,6 @@ check_version() {
          "version" "${tier}.${_shape_label}.${build}" "tier" "$tier" \
          "build" "$build" "raw" "$raw" "wpsquared" "$_is_wpsq"
 
-    # WP Squared dispatch — its own cutoff (PATCHED_WPSQUARED_*), separate
-    # from the main tier ladder.
     if (( _is_wpsq )); then
         if [[ "$tier" == "$PATCHED_WPSQUARED_TIER" ]]; then
             if (( build >= PATCHED_WPSQUARED_BUILD )); then
@@ -6403,37 +6387,22 @@ _user_is_valid() {
     esac
 }
 
-# Classify the runtime context of a ps auxfww line. ps's USER column tells
-# us the real running UID, but CloudLinux CageFS / LVE jails can have
-# root-owned processes that are effectively user-axis activity (a
-# user-launched setuid binary, jailshell-spawned root helper, etc.). The
-# cgroup file at /proc/<pid>/cgroup carries `cagefs/<user>` or `lve/<uid>`
-# membership which lets us distinguish a real-root operator process from a
-# user-jailed root impersonator. Sets globals:
-#   _RT_CTX_USER   = ps column 1 (USER)
-#   _RT_CTX_PID    = ps column 2 (PID)
-#   _RT_CTX_JAILED = 1 iff cgroup shows cagefs/lve user-jail membership
-#   _RT_CTX_OWNER  = "root" iff USER=root AND not jailed; jail-user
-#                    otherwise (so emit's affected_user maps to the right
-#                    axis for the host_user_verdict gate).
+# Classify a ps auxfww line's runtime context. CageFS/LVE-jailed root
+# attributes to the cgroup-path user, not "root".
 _rt_runtime_context() {
     local _line="${1:-}"
     _RT_CTX_USER=$(printf '%s' "$_line" | awk '{print $1}')
     _RT_CTX_PID=$(printf '%s' "$_line" | awk '{print $2}')
     _RT_CTX_JAILED=0
     _RT_CTX_OWNER="${_RT_CTX_USER:-unknown}"
-    if [[ -n "$_RT_CTX_PID" && -r "/proc/$_RT_CTX_PID/cgroup" ]]; then
-        if grep -qE '/(cagefs|lve)/' "/proc/$_RT_CTX_PID/cgroup" 2>/dev/null; then
-            _RT_CTX_JAILED=1
-        fi
+    if [[ -n "$_RT_CTX_PID" && -r "/proc/$_RT_CTX_PID/cgroup" ]] \
+       && grep -qE '/(cagefs|lve)/' "/proc/$_RT_CTX_PID/cgroup" 2>/dev/null; then
+        _RT_CTX_JAILED=1
     fi
     if [[ "$_RT_CTX_USER" == "root" ]] && (( _RT_CTX_JAILED == 0 )); then
         _RT_CTX_OWNER="root"
     elif (( _RT_CTX_JAILED == 1 )) && [[ "$_RT_CTX_USER" == "root" ]]; then
-        # Jailed root: prefer the cagefs/lve username from the cgroup path
-        # over the bare USER column. Falls back to "root" if extraction
-        # fails; downstream emits still mark actor_privilege=user.
-        local _cu=""
+        local _cu
         _cu=$(grep -oE '/(cagefs|lve)/[^/[:space:]]+' "/proc/$_RT_CTX_PID/cgroup" 2>/dev/null \
               | head -1 | awk -F/ '{print $NF}')
         [[ -n "$_cu" ]] && _RT_CTX_OWNER="$_cu"
@@ -7024,8 +6993,6 @@ check_destruction_iocs() {
     # destruction signal; survives /home restore.
     local fe_count=0 fe_acct=0 fe_sample="" _fe_list=""
     if [[ -d /var/log || -d /var/cpanel ]]; then
-        # Single walk; derive count and sample from one output. 5min cap
-        # against pathological /var/log trees (#hotfix v2.8.5).
         _fe_list=$(timeout 300 find /var/log /var/cpanel -maxdepth 6 \
                        -name '*.sorry' -not -path '*/imunify360/cache/*' \
                        2>/dev/null)
@@ -7076,7 +7043,6 @@ check_destruction_iocs() {
         fi
     fi
     # BTC index.html drops nested under /home/*/public_html (cohort).
-    # 5min walltime cap; head -1 closes the pipe at first hit (#hotfix v2.8.5).
     local btc_hit=""
     btc_hit=$(timeout 300 bash -c \
         'find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
@@ -8293,10 +8259,7 @@ check_destruction_iocs() {
         done
     fi
 
-    # M3 — sudoers.d NOPASSWD:ALL post-disclosure. Strong on known-bad name;
-    # info-tier on documented LW/Nexcess provisioning shape (re-image+restore
-    # re-stamps mtime/ctime and is the most common FP source — Jamoore/JSexton
-    # 2026-05-11). Otherwise warning/review-tier (does not flip COMPROMISED).
+    # M3 — sudoers.d NOPASSWD:ALL post-disclosure.
     if [[ -d /etc/sudoers.d ]]; then
         local _m_sd
         while IFS= read -r _m_sd; do
@@ -8316,11 +8279,7 @@ check_destruction_iocs() {
             local _m_sd_key=ioc_pattern_m_sudoers_nopasswd_review
             local _m_sd_note="Sudoers drop $_m_sd has NOPASSWD:ALL (post-disclosure mtime/ctime) - review (legitimate IR/devops can create these; Pattern M variants drop 99-<user>)."
 
-            # Known-good LW/Nexcess provisioning shape. Filename matches a
-            # documented drop name AND content includes either a Defaults:
-            # line or a user line whose first token starts with the same
-            # prefix (e.g. `lwadmin-H29ZBN ALL=(ALL) NOPASSWD:ALL`). Demote
-            # to info-tier so re-image+restore doesn't surface as an IOC.
+            # Known-good LW/Nexcess provisioning shapes: info-tier.
             case "$_m_sd_base" in
                 lwadmin|lw-admin|liquidweb|nexcess)
                     if grep -qE "^[[:space:]]*(Defaults:)?(lwadmin|lw-admin|liquidweb|nexcess)[-_[:space:]]" "$_m_sd" 2>/dev/null; then
@@ -8332,10 +8291,7 @@ check_destruction_iocs() {
                     ;;
             esac
 
-            # Known-bad name shape (Pattern M backdoor users) — overrides
-            # the known-good demote above on the off chance an attacker
-            # names their drop after a documented LW path AND embeds a
-            # known-bad username.
+            # Known-bad name overrides known-good demote.
             local _m_known2
             for _m_known2 in "${PATTERN_M_KNOWN_USERS[@]}"; do
                 if [[ "$_m_sd_base" == *"$_m_known2"* ]]; then
@@ -8356,10 +8312,7 @@ check_destruction_iocs() {
         done < <(find /etc/sudoers.d -maxdepth 1 -type f 2>/dev/null)
     fi
 
-    # M7 — Monero wallet literal. Single batched grep (find | xargs grep)
-    # across all candidate dirs at once; 5min walltime cap. Replaces a
-    # per-file fork loop that could exceed an hour on hosts with deep
-    # /etc or /tmp trees (#hotfix v2.8.5).
+    # M7 — Monero wallet literal. Batched grep, 5min walltime cap.
     local _m_xmr_hit="" _m_xmr_paths=(
         /root /etc /opt /tmp /var/tmp /var/spool/cron
         /usr/local/bin /usr/local/sbin
@@ -8372,8 +8325,7 @@ check_destruction_iocs() {
         local _m_xmr_f
         while IFS= read -r _m_xmr_f; do
             [[ -n "$_m_xmr_f" ]] || continue
-            # Self-reference: file assigns the constant OR includes our
-            # script identifier — toolkit copy, not attacker drop.
+            # Skip toolkit self-reference.
             if grep -qE 'PATTERN_M_XMR_WALLET=|sessionscribe-ioc-scan' "$_m_xmr_f" 2>/dev/null; then
                 continue
             fi
@@ -8693,13 +8645,7 @@ check_destruction_iocs() {
 
         _rt_line=$(grep -E "$RUNTIME_MASQ_RESPAWN_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            # Verdict requires BOTH signals: (a) the shim's pkill target UID
-            # is 0 (operator deployed root gsocket) AND (b) the shim itself
-            # is running as real root — ps USER=root AND not inside a
-            # CageFS/LVE user-jail. Either condition failing → user-axis
-            # compromise (jailshell processes can show USER=root in ps but
-            # are effectively userland; cmdline literally containing `-U0`
-            # without root context is a userland imposter).
+            # HOST-comp requires BOTH pkill target=root AND real-root context.
             _rt_runtime_context "$_rt_line"
             local _u0_target=0
             [[ "$_rt_line" =~ pkill[[:space:]]+-0[[:space:]]+-U0[[:space:]] ]] && _u0_target=1
@@ -8928,11 +8874,7 @@ check_destruction_iocs() {
             ((hits++))
         fi
 
-        # b64-shim variant: the base64 prefix can't tell us the operator's
-        # intended target UID, but ps USER + cgroup still tell us whether
-        # the shim is actually running as real root. Real-root context →
-        # live_compromise (operator persistence). User-jailed root or
-        # non-root → user-axis review.
+        # b64 shim: target UID hidden in base64, but ps USER + cgroup still gate.
         if grep -qF "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null; then
             _rt_line=$(grep -F "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null | head -1)
             _rt_runtime_context "$_rt_line"

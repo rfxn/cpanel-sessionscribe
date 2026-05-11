@@ -7,57 +7,28 @@ versioned per affected component.
 ## ioc-scan v2.8.5 — 2026-05-11
 
 ### Fixed
-- EL6 floor regression: 7 `declare -gA USER_*` arrays in
-  `aggregate_verdict()` rejected by bash 4.1.2 (no `-g` flag) caused
-  the script to abort on CentOS 6 after the posture section. Moved
-  to top-level `declare -A` with in-function reassignment, matching
-  the existing pattern for `SIGNALS` / `REASONS` / `IOC_KEYS`.
-- Pattern M3 sudoers FP: `/etc/sudoers.d/{lwadmin,lw-admin,liquidweb,
-  nexcess}` files matching the documented LW/Nexcess provisioning
-  shape now emit info-tier `ioc_pattern_m_sudoers_known_good` instead
-  of warning-tier review. Re-image+restore re-stamps mtime/ctime
-  post-disclosure on these files, surfacing them as M3 review noise.
-  Known-bad usernames still override to strong/critical.
-- `phase_defense` PATCH_STATE used exact-equality against the cutoff
-  list and falsely classified every host *above* the cutoff as
-  UNPATCHED (post-upcp builds, C6/CL6 direct-update 11.110.0.103, all
-  WP Squared hosts). Now uses the same `build >= cutoff` comparison
-  as `check_version`, so the kill-chain timeline and envelope
-  `patch_state` field agree across the two code paths.
-- WP Squared product line (11.&lt;tier&gt;.1.&lt;build&gt; shape) is now
-  parsed by both `collect_host_meta` and `check_version` and
-  dispatched against its own cutoff (11.136.1.7). Pre-fix:
-  `CPANEL_NORM=unknown` → PATCH_STATE=UNKNOWN regardless of patch
-  state. New globals `CPANEL_WPSQ_TIER`/`CPANEL_WPSQ_BUILD` and
-  constants `PATCHED_WPSQUARED_TIER`/`PATCHED_WPSQUARED_BUILD`.
-- GSocket persistence-shim verdict gate hardened. Pre-fix used only
-  the shim's `pkill -0 -U<N>` cmdline target as the root/userland
-  signal — but a userland process (CageFS-jailed root, LVE jail,
-  cPanel user shell) can run a cmdline literally containing `-U0`
-  and would FP as host-axis COMPROMISED. Verdict now requires BOTH
-  the `-U0` target AND a real-root running context (`ps` USER=root
-  AND `/proc/&lt;pid&gt;/cgroup` does not show cagefs/lve membership).
-  Anything else routes to `ioc_runtime_gsocket_*_userland` with
-  `actor_privilege=user` and `affected_user` set from the cgroup
-  path. Same gate applied to the base64-wrapped variant
-  (`ioc_runtime_gsocket_b64_shim_userland` is new). New runtime
-  helper `_rt_runtime_context`.
+- EL6 floor regression: `declare -gA` in `aggregate_verdict` aborted
+  the script on bash 4.1.2. Moved to top-level `declare -A`.
+- Pattern M3 FP: `lwadmin` / `lw-admin` / `liquidweb` / `nexcess`
+  sudoers drops matching the LW/Nexcess provisioning shape demote
+  to info-tier; re-image+restore no longer surfaces as a review IOC.
+- `phase_defense` PATCH_STATE used exact-equality and FP'd every
+  host above the cutoff (post-upcp, direct-update 11.110.0.103).
+  Now uses `build >= cutoff` to match `check_version`.
+- WP Squared (11.&lt;t&gt;.1.&lt;b&gt; shape) is now parsed and dispatched
+  against its own cutoff (11.136.1.7); was emitting UNKNOWN.
+- GSocket shim verdict-gate respects real-root vs CageFS/LVE-jailed
+  context (`ps` USER + `/proc/&lt;pid&gt;/cgroup`); user-jailed root
+  now routes to `*_userland` with `affected_user` from the cgroup.
 
 ### Changed
-- Pattern M7 Monero-wallet walk replaced its per-file `grep -qF` fork
-  loop with a single batched `find … -print0 | xargs grep -lF`
-  pipeline. Tens of thousands of forks → ~2. Eliminates hour-long
-  hangs on hosts with deep `/etc` or `/tmp` trees.
-- Pattern A `fe_count` and `fe_sample` derive from a single walk of
-  `/var/log + /var/cpanel` instead of two identical finds.
+- Pattern M7 wallet scan: batched `find -print0 | xargs grep -lF`
+  instead of per-file fork loop.
+- Pattern A `.sorry` enumeration: single walk for count + sample.
 
 ### Added
-- 5-minute walltime cap (`timeout 300`) around long-walk discovery
-  paths: Pattern A first-sorry walk, Pattern A evidence-destruction
-  walk, Pattern B BTC index walk, Pattern G keys-in-/etc walk,
-  Pattern M7 wallet walk, suspect-IP access-log scan.
-- 60-second cap on the runtime track's `ps auxfww` and `ss -tnp`
-  snapshots.
+- `timeout 300` cap on long discovery walks (Pattern A / B / G / M7,
+  suspect-IP log scan). `timeout 60` on `ps auxfww` and `ss -tnp`.
 
 ## ioc-scan v2.8.4 — 2026-05-11
 
