@@ -4,6 +4,73 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.8.3 — 2026-05-11
+
+### Fixed — three FPs found in v2.8.2 sentinel review
+
+**1. Warning-tier Pattern M emits flipped host_root_verdict=COMPROMISED.**
+v2.8.2 M2/M3/M6 review emits used keys ending in `_uncorroborated`
+or `_present` — neither matched `ioc_key_is_soft_variant`'s suffix
+gate, so the keys flowed through `ioc_key_to_persist_pattern` and
+incremented `PERSIST_PATTERNS[M]` → `persist_count_live` → COMPROMISED.
+The whole point of the review-tier demotion was to NOT flip verdict
+on uncorroborated signals.
+
+Fix: extended `ioc_key_is_soft_variant` suffix list with
+`*_uncorroborated`, `*_documentation`, `*_documentation_*`. Renamed
+M2/M3/M6 review emit keys to use the `_review` convention for
+consistency with existing Pattern A semantics.
+
+**2. User-attributed signals flipped host_root_verdict=COMPROMISED.**
+v2.8.0 / v2.8.1 / v2.8.2 verdict gates used the non-axis-aware
+`compromise_critical_live` and `persist_count_live`. A
+Pattern H seobot.php under `/home/alice/public_html/` (correctly
+attributed `actor_privilege=user`, `affected_user=alice`) would
+trip persist_count_live=1 → `host_root_verdict=COMPROMISED` even
+though `host_user_verdict=COMPROMISED` was the correct answer.
+
+Fix: introduced `root_compromise_critical_live` (axis-aware strong-
+class counter) and `PERSIST_PATTERNS_LIVE_ROOT` (axis-aware
+persistence-pattern set). Verdict gate now requires BOTH actor-
+privilege=root AND non-quarantine for `host_root_verdict=COMPROMISED`.
+User-attributed signals continue to drive `host_user_verdict` via
+the v2.8.0 axis branch.
+
+**3. Pattern M XMR/C2/image self-reference FP.** The script
+self-installs at `/usr/local/bin/sessionscribe-ioc-scan.sh` via
+`--telemetry-cron`, and the script source contains
+`PATTERN_M_XMR_WALLET=...`, `PATTERN_M_C2_IP=...`,
+`PATTERN_M_DOCKER_IMAGE=...` as constants. M7's recursive grep
+under `/usr/local/bin/` would find the script itself and emit
+strong → COMPROMISED. Same FP class for any operator-stashed copy
+of the script under `/root`, `/tmp`, `/opt`.
+
+Fix: `_is_doc_shape` now matches `sessionscribe-*` and
+`nxesec-whmscribe-*` toolkit filenames. M7's find loop also skips
+these inline before grep + content check (`PATTERN_M_XMR_WALLET=`
+or `sessionscribe-ioc-scan` substring → self-reference, not
+attacker drop).
+
+### Changed — M7 search bounded; M8/M9 bash_history dropped
+
+M7's XMR wallet search now uses `find -maxdepth 4 -size +1c -size -10M`
+with pruning of `node_modules`, `.cache`, `.composer`, `.npm`,
+`.cagefs`, `__pycache__`, `mail`, `.git`. Avoids long walks on hosts
+with large `/opt` or `/tmp` trees.
+
+M8 (C2 IP file-ref) and M9 (negoroo image file-ref) drop
+`/root/.bash_history` from the search scope — IR operator
+investigations leave the C2 IP in shell history and would FP.
+Crontab + `/etc/cron.d/*` references remain (real persistence
+signal).
+
+### Comment cleanup
+
+Per project commenting discipline: condensed multi-paragraph WHY
+blocks in Pattern M source to one-liners. Moved per-primitive
+rationale to `INTERNAL-NOTES.md`. Scrubbed internal-only references
+(IR-team identifiers) from source comments.
+
 ## sessionscribe-ioc-scan.sh v2.8.2 — 2026-05-11
 
 ### Fixed — three FP / completeness issues found in v2.8.1 sentinel review

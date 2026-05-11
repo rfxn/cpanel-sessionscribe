@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.8.2
+# sessionscribe-ioc-scan.sh v2.8.3
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -116,7 +116,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.2"
+VERSION="2.8.3"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -276,24 +276,13 @@ PATTERN_L_CMD_START="__CMD_START__"
 PATTERN_L_CMD_END="__CMD_END__"
 PATTERN_L_CMD_ENVELOPE_RE="${PATTERN_L_CMD_START}|${PATTERN_L_CMD_END}"
 
-# Pattern M — rogue UID=0 user + amco_ docker botnet cluster.
-# Field-observed 2026-05-11 (LW IR); cross-references Reddit "27 MH/s
-# botnet on cPanel" thread. Same actor drops a UID=0 backdoor user
-# (pakchoi/alexisa), wheel-group injection, sudoers.d NOPASSWD:ALL,
-# amco_<UUID> docker cryptominer, and a cron self-heal shape that
-# rebuilds the user every 30 minutes. M is persistence-class.
+# Pattern M — UID=0 backdoor user + amco_ docker botnet. See PATTERNS.md.
 PATTERN_M_KNOWN_USERS=(pakchoi alexisa)
 PATTERN_M_AMCO_RE="amco_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 PATTERN_M_CRON_SELF_HEAL_RE='\(id[[:space:]]+[a-zA-Z_][a-zA-Z0-9_-]*[[:space:]]+>/dev/null.*\|\|.*useradd.*chpasswd.*sudoers\.d'
-# 2026-04-28 00:00 UTC — watchTowr CVE-2026-41940 public disclosure.
-# Sudoers and .accesshash artifacts touched (mtime OR ctime) at or
-# after this epoch are post-disclosure-era drops. Pre-disclosure
-# artifacts are overwhelmingly legitimate IR/devops/install state.
+# 2026-04-28 = CVE-2026-41940 public disclosure; pre-date M3/M6 artifacts.
 PATTERN_M_POST_DISCLOSURE_EPOCH=$(date -u -d '2026-04-28T00:00:00Z' +%s 2>/dev/null || echo 1745798400)
 PATTERN_M_ACCESSHASH_PATH="/root/.accesshash"
-# Reddit r/cpanel "27 MH/s botnet" supporting collateral (2026-05-11):
-# the XMR mining wallet, C2 exfil endpoint, and the named docker image.
-# All three are unique, high-confidence fingerprints.
 PATTERN_M_XMR_WALLET="4AypWi9xNQvSy11FT5yr7Ajnyz2XuoUD7LGEJw4ZTRUHLrWjH1x5KoZUp9FTS4s9a5Y6Q7d4jSze4E6tq64aJTD2L7hnCrL"
 PATTERN_M_C2_IP="144.172.116.48"
 PATTERN_M_C2_PORT="8080"
@@ -2128,7 +2117,8 @@ ioc_key_to_pattern() {
 ioc_key_is_soft_variant() {
     case "$1" in
         *_review|*_review_*|*_diagnostic|*_diagnostic_only|*_candidate|*_undetermined \
-        |*_orphan|*_pre_compromise|*_probes_only|*_unknown_dim_only|*_unknown_hash) return 0 ;;
+        |*_orphan|*_pre_compromise|*_probes_only|*_unknown_dim_only|*_unknown_hash \
+        |*_uncorroborated|*_documentation|*_documentation_*) return 0 ;;
     esac
     return 1
 }
@@ -2174,14 +2164,14 @@ ioc_section_group() {
     esac
 }
 
-# Documentation-shape filter — used by Patterns A and M to suppress
-# false-positives where IOC strings (TOX_ID, XMR wallet, C2 IP, docker
-# image name) appear in IR runbooks, dossiers, and notes-style markdown.
-# Returns 0 (true / is-documentation) when path matches an IR-notes
-# location or file looks like a long-form doc; 1 otherwise.
+# Demote IOC string hits in IR docs/runbooks/dossiers + sessionscribe-*
+# toolkit self-references. See INTERNAL-NOTES.md.
 _is_doc_shape() {
     local _p="${1:-}"
     [[ -n "$_p" ]] || return 1
+    case "${_p##*/}" in
+        sessionscribe-*|nxesec-whmscribe-*) return 0 ;;
+    esac
     local _doc_re='^/root/(IR|notes|runbooks|\.claude|\.cache|admin)/|/docs/|IR-notes|runbook|notes-[0-9]|findings-|dossier|ps-hunt|/proj/.*\.(md|txt|rst|adoc)$'
     [[ "$_p" =~ $_doc_re ]] && return 0
     local _lines
@@ -2193,16 +2183,7 @@ _is_doc_shape() {
     return 1
 }
 
-# Detect quarantine-sourced signals. Covers both paths:
-#   1. ioc_quarantined_session_* — session-store IOCs synthesised from
-#      mitigate.sh .info sidecars.
-#   2. ioc_pattern_<X>_contained_*, ioc_pattern_g_contained_sshkey,
-#      ioc_contained_evidence, ioc_contained_unclassified — external-
-#      containment ingestion (mitigate ran elsewhere, artifacts hashed
-#      and re-imported via hashes.txt / ssh-pruned-keys.log).
-# Both shapes represent HISTORICAL evidence (mitigate already neutralised
-# the artifact); without live corroboration they shouldn't solo-trigger
-# host_root_verdict=COMPROMISED. See v2.8.2 demotion logic.
+# Historical/quarantine evidence — both sources. See INTERNAL-NOTES.md.
 _is_quarantine_signal() {
     case "$1" in
         (ioc_quarantined_session_*)      return 0 ;;
@@ -8105,12 +8086,9 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # ---- Pattern M: rogue UID=0 user + amco_ docker botnet cluster ------
-    # Track which M primitives fired so M6 (.accesshash) can corroboration-
-    # gate against other Pattern M evidence on the same host.
+    # ---- Pattern M: rogue UID=0 user + amco_ docker botnet ---------------
     local _m1_hit=0 _m2_hit=0 _m4_hit=0 _m5_hit=0 _m7_hit=0 _m8_hit=0 _m9_hit=0
-    # M1 UID=0 non-root user. Single hit = decisive: no legitimate cPanel
-    # configuration creates this.
+    # M1 — non-root UID=0 in /etc/passwd. Single hit = decisive.
     if [[ -f /etc/passwd ]]; then
         local _m_uid0
         while IFS= read -r _m_uid0; do
@@ -8123,11 +8101,7 @@ check_destruction_iocs() {
             ((hits++)); _m1_hit=1
         done < <(awk -F: '$3==0 && $1!="root" {print $1}' /etc/passwd 2>/dev/null)
 
-        # M2 known-bad username (string match against PATTERN_M_KNOWN_USERS).
-        # Corroboration-gated: emit strong only if the user has UID=0 OR
-        # is in wheel/sudo group OR has a /etc/sudoers.d entry matching the
-        # name. Otherwise demote to warning — pakchoi/alexisa CAN be real
-        # cPanel tenant usernames (Hispanic/Portuguese given names).
+        # M2 — known-bad username, corroboration-gated. See INTERNAL-NOTES.md.
         local _m_known _m_pwline _m_uid _m_corrob _m_corrob_reason
         for _m_known in "${PATTERN_M_KNOWN_USERS[@]}"; do
             _m_pwline=$(grep -E "^${_m_known}:" /etc/passwd 2>/dev/null | head -1)
@@ -8159,7 +8133,7 @@ check_destruction_iocs() {
                 ((hits++)); _m2_hit=1
             else
                 emit "destruction" "ioc_pattern_m_known_bad_user_review" "warning" \
-                     "ioc_pattern_m_known_bad_user_uncorroborated" 4 \
+                     "ioc_pattern_m_known_bad_user_review" 4 \
                      "username" "$_m_known" \
                      "uid" "${_m_uid:-}" \
                      "passwd_line" "$_m_pwline" \
@@ -8169,11 +8143,7 @@ check_destruction_iocs() {
         done
     fi
 
-    # M3 sudoers.d NOPASSWD:ALL drop. Post-disclosure-era guard
-    # (mtime OR ctime >= 2026-04-28) gates the emit so pre-existing
-    # IR/devops drops don't FP. Promote to strong when filename
-    # matches a known-bad shape (99-pakchoi, alexisa, ...); warn
-    # otherwise.
+    # M3 — sudoers.d NOPASSWD:ALL post-disclosure. Strong on known-bad name.
     if [[ -d /etc/sudoers.d ]]; then
         local _m_sd
         while IFS= read -r _m_sd; do
@@ -8189,8 +8159,8 @@ check_destruction_iocs() {
             fi
             local _m_sd_base="${_m_sd##*/}"
             local _m_sd_sev=warning _m_sd_wt=4
-            local _m_sd_id=ioc_pattern_m_sudoers_nopasswd
-            local _m_sd_key=ioc_pattern_m_sudoers_nopasswd_present
+            local _m_sd_id=ioc_pattern_m_sudoers_nopasswd_review
+            local _m_sd_key=ioc_pattern_m_sudoers_nopasswd_review
             local _m_sd_note="Sudoers drop $_m_sd has NOPASSWD:ALL (post-disclosure mtime/ctime) - review (legitimate IR/devops can create these; Pattern M variants drop 99-<user>)."
             local _m_known2
             for _m_known2 in "${PATTERN_M_KNOWN_USERS[@]}"; do
@@ -8212,17 +8182,33 @@ check_destruction_iocs() {
         done < <(find /etc/sudoers.d -maxdepth 1 -type f 2>/dev/null)
     fi
 
-    # M7 Monero (XMR) mining wallet fingerprint. 95-char base58; no
-    # legitimate cPanel reason for this string to land on disk.
+    # M7 — Monero wallet literal. Bounded find + prune to keep /tmp/etc fast.
     local _m_xmr_hit="" _m_xmr_paths=(
         /root /etc /opt /tmp /var/tmp /var/spool/cron
         /usr/local/bin /usr/local/sbin
     )
-    local _m_xmr_dir
+    local _m_xmr_dir _m_xmr_f
     for _m_xmr_dir in "${_m_xmr_paths[@]}"; do
         [[ -d "$_m_xmr_dir" ]] || continue
-        _m_xmr_hit=$(grep -lrF "$PATTERN_M_XMR_WALLET" "$_m_xmr_dir" 2>/dev/null | head -1)
-        [[ -n "$_m_xmr_hit" ]] && break
+        while IFS= read -r _m_xmr_f; do
+            [[ -n "$_m_xmr_f" ]] || continue
+            case "${_m_xmr_f##*/}" in
+                sessionscribe-*|nxesec-whmscribe-*) continue ;;
+            esac
+            if grep -qF "$PATTERN_M_XMR_WALLET" "$_m_xmr_f" 2>/dev/null; then
+                # Self-reference: file assigns the constant OR includes
+                # our script identifier — toolkit copy, not attacker drop.
+                if grep -qE 'PATTERN_M_XMR_WALLET=|sessionscribe-ioc-scan' "$_m_xmr_f" 2>/dev/null; then
+                    continue
+                fi
+                _m_xmr_hit="$_m_xmr_f"
+                break 2
+            fi
+        done < <(find "$_m_xmr_dir" -maxdepth 4 \
+            \( -name node_modules -o -name .cache -o -name .composer \
+               -o -name .npm -o -name .cagefs -o -name __pycache__ \
+               -o -name mail -o -name .git \) -prune \
+            -o -type f -size +1c -size -10M -print 2>/dev/null)
     done
     if [[ -z "$_m_xmr_hit" ]]; then
         local _m_xmr_h
@@ -8254,8 +8240,7 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # M8 C2 exfil endpoint 144.172.116.48 (port 8080). Looks at live
-    # network connections, then crontab + history files for references.
+    # M8 — C2 endpoint live socket + crontab/history references.
     local _m_c2_live="" _m_c2_file=""
     if command -v ss >/dev/null 2>&1; then
         _m_c2_live=$(ss -tn 2>/dev/null | awk -v ip="$PATTERN_M_C2_IP" '$0 ~ ip {print $0; exit}')
@@ -8271,7 +8256,9 @@ check_destruction_iocs() {
              "note" "Live TCP connection to Pattern M C2 $PATTERN_M_C2_IP:$PATTERN_M_C2_PORT - credential exfiltration in flight (CRITICAL)."
         ((hits++)); _m8_hit=1
     fi
-    local _m_c2_search_files=(/var/spool/cron/root /etc/crontab /root/.bash_history)
+    # Crontab-only scope — bash_history hits FP on operator IR-grep activity
+    # (the diag-shape classifier would also work but is overkill for M8/M9).
+    local _m_c2_search_files=(/var/spool/cron/root /etc/crontab)
     if [[ -d /etc/cron.d ]]; then
         local _m_cd2
         while IFS= read -r _m_cd2; do
@@ -8306,8 +8293,7 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # M9 negoroo/amco docker image — named image used to ship the
-    # cryptominer; distinct from the amco_<UUID> container check (M4).
+    # M9 — negoroo/amco docker image (distinct from amco_<UUID> in M4).
     if command -v docker >/dev/null 2>&1; then
         if docker images --format '{{.Repository}}' 2>/dev/null | grep -qFx "$PATTERN_M_DOCKER_IMAGE"; then
             emit "destruction" "ioc_pattern_m_negoroo_image_present" "strong" \
@@ -8345,14 +8331,7 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # M6 /root/.accesshash post-disclosure drop. The legacy cPanel WHM
-    # root API auth file; pre-disclosure existence is typically install
-    # state. A NEW one created on/after 2026-04-28 indicates an
-    # attacker enabling WHM root API access for a backdoor token.
-    # Corroboration-gated: legitimate admins/devops CAN create this for
-    # monitoring/automation, so emit strong only when other Pattern M
-    # primitives (M1/M2/M4/M5) also fired on this host. Otherwise
-    # warning — surfaces for IR review without flipping the verdict.
+    # M6 — /root/.accesshash post-disclosure, corroboration-gated by M1-M9.
     if [[ -f "$PATTERN_M_ACCESSHASH_PATH" ]]; then
         local _m_ah_mt _m_ah_ct
         _m_ah_mt=$(stat -c %Y "$PATTERN_M_ACCESSHASH_PATH" 2>/dev/null)
@@ -8380,7 +8359,7 @@ check_destruction_iocs() {
                      "note" "$PATTERN_M_ACCESSHASH_PATH touched on/after 2026-04-28 (CVE-2026-41940 disclosure), corroborated by $_m_ah_corrob_list - attacker enabling WHM root API access (CRITICAL)."
             else
                 emit "destruction" "ioc_pattern_m_accesshash_post_disclosure_review" "warning" \
-                     "ioc_pattern_m_accesshash_recent_drop_uncorroborated" 4 \
+                     "ioc_pattern_m_accesshash_recent_drop_review" 4 \
                      "path" "$PATTERN_M_ACCESSHASH_PATH" \
                      "mtime_epoch" "$_m_ah_mt" \
                      "ctime_epoch" "$_m_ah_ct" \
@@ -8390,8 +8369,7 @@ check_destruction_iocs() {
         fi
     fi
 
-    # M4 amco_<UUID> docker container reference. Crontab fingerprint is
-    # the persistence anchor; live `docker ps` confirms active execution.
+    # M4 — amco_<UUID> docker container in crontab or docker ps.
     local _m_amco_hit="" _m_amco_src="" _m_cf
     for _m_cf in /var/spool/cron/root /etc/crontab /etc/cron.d/*; do
         [[ -f "$_m_cf" ]] || continue
@@ -8422,8 +8400,7 @@ check_destruction_iocs() {
         fi
     fi
 
-    # M5 cron self-heal shape. Single regex against root crontab and
-    # /etc/cron.d/*; the shape itself is the IOC.
+    # M5 — cron self-heal shape against root crontab + /etc/cron.d/*.
     local _m_sh_files=(/var/spool/cron/root /etc/crontab)
     if [[ -d /etc/cron.d ]]; then
         local _m_cd
@@ -9119,6 +9096,7 @@ aggregate_verdict() {
     # Per-axis counters mirror the global counters but split by attribution.
     # Computed inline so we don't re-walk SIGNALS[] in aggregate_per_user_verdict.
     local root_compromise_critical=0 root_ioc_critical=0 root_ioc_review=0
+    local root_compromise_critical_live=0
     local user_compromise_critical=0 user_ioc_critical=0 user_ioc_review=0
     declare -gA USER_SEVERITY=()
     declare -gA USER_PATTERNS=()
@@ -9130,7 +9108,7 @@ aggregate_verdict() {
     # Persistence cluster tracking. Dedupes by pattern letter (G/J/I/F/D/H);
     # multiplier rewards distinct patterns, not key count.
     local -A PERSIST_PATTERNS=()
-    local -A PERSIST_PATTERNS_LIVE=()
+    local -A PERSIST_PATTERNS_LIVE_ROOT=()
     local persist_weight_sum=0
     # P1b/P1c/P5 aggregators (CHANGELOG v2.7.32).
     local -A PATTERN_A_SUBTYPES=()
@@ -9278,8 +9256,9 @@ aggregate_verdict() {
                     _pp=$(ioc_key_to_persist_pattern "$key")
                     if [[ -n "$_pp" ]]; then
                         PERSIST_PATTERNS["$_pp"]=1
-                        if ! _is_quarantine_signal "$id" && ! _is_quarantine_signal "$key"; then
-                            PERSIST_PATTERNS_LIVE["$_pp"]=1
+                        if ! _is_quarantine_signal "$id" && ! _is_quarantine_signal "$key" \
+                           && [[ "$_ap" == "root" ]]; then
+                            PERSIST_PATTERNS_LIVE_ROOT["$_pp"]=1
                         fi
                         local _pw
                         case "$sev" in
@@ -9442,6 +9421,9 @@ aggregate_verdict() {
                                 ((user_compromise_critical++))
                             else
                                 ((root_compromise_critical++))
+                                if ! _is_quarantine_signal "$id" && ! _is_quarantine_signal "$key"; then
+                                    ((root_compromise_critical_live++))
+                                fi
                             fi
                         fi
                     fi
@@ -9540,7 +9522,7 @@ aggregate_verdict() {
 
     # P6 persistence cluster multipliers (CHANGELOG v2.7.32).
     local persist_count=${#PERSIST_PATTERNS[@]}
-    local persist_count_live=${#PERSIST_PATTERNS_LIVE[@]}
+    local persist_count_live_root=${#PERSIST_PATTERNS_LIVE_ROOT[@]}
     local persist_mult=1
     (( persist_count >= 2 )) && persist_mult=3
     (( persist_count >= 3 )) && persist_mult=5
@@ -9599,23 +9581,19 @@ aggregate_verdict() {
     #     scoped to one or more cPanel tenants.
     # EXIT_CODE 4 dominates 1/2/3 for fleet triage.
     #
-    # v2.8.1: quarantine-only demotion. Quarantine evidence is historical
-    # (mitigate.sh already neutralised the session or external-containment
-    # already hashed+removed the artifact); without a live corroborating
-    # signal (on-disk Pattern A-M, token_used_2xx, live persist cluster)
-    # the host is operationally clean with a remediated past. SUSPICIOUS
-    # keeps the historical evidence visible without inflating the
-    # COMPROMISED IR queue. v2.8.2 extends the filter to external-
-    # containment ingestion (ioc_pattern_*_contained_*, ioc_contained_*)
-    # and gates the persist_count path on persist_count_live.
+    # Quarantine demotion + axis-aware gate (v2.8.3). host_root_verdict
+    # requires root-attributed LIVE evidence — not quarantine, not user-
+    # axis. Quarantine still credits score (P6/P1c/P7) but loses verdict
+    # trigger; user-attributed signals route to host_user_verdict only.
+    # See INTERNAL-NOTES.md "v2.8.3" for the bug-class rationale.
     local _quarantine_only=0
-    if (( compromise_critical_live == 0 )) && (( persist_count_live == 0 )) \
-       && ( (( compromise_critical_quarantine > 0 )) || (( persist_count > 0 )) ); then
+    if (( root_compromise_critical_live == 0 )) && (( persist_count_live_root == 0 )) \
+       && ( (( root_compromise_critical > 0 )) || (( persist_count > 0 )) ); then
         _quarantine_only=1
     fi
     if (( _quarantine_only )); then
         HOST_ROOT_VERDICT="SUSPICIOUS"
-    elif (( compromise_critical_live > 0 )) || (( persist_count_live >= 1 )); then
+    elif (( root_compromise_critical_live > 0 )) || (( persist_count_live_root >= 1 )); then
         HOST_ROOT_VERDICT="COMPROMISED"
     elif (( root_ioc_critical > 0 )) || (( root_ioc_review > 0 )); then
         HOST_ROOT_VERDICT="SUSPICIOUS"
