@@ -37,6 +37,10 @@ versioned per affected component.
 - Skip downstream pkgmgr queries when the health probe reports
   anything but `ok` (broken / locked / unknown). Avoids burning the
   timeout caps on a package db that's guaranteed to stall.
+- `software_inventory_meta.note` adds `query_timeout` and
+  `pkgmgr_{broken,locked,unknown}` so consumers can tell why an empty
+  inventory shipped (was conflated with `header_only` = "no packages
+  detected"). Additive; older consumers ignore unknown values.
 
 ## ioc-scan v2.8.4 — 2026-05-11
 

@@ -1747,7 +1747,7 @@ collect_software_digest() {
 # empty with a diagnostic note; the sidecar on disk is unaffected.
 # `gzip -nc` strips name+timestamp so output is byte-stable for diffing.
 encode_software_inventory_b64gz() {
-    local inv_path="$1"
+    local inv_path="$1" override_note="${2:-}"
     SOFTWARE_INVENTORY_B64GZ=""
     SOFTWARE_INVENTORY_B64GZ_NOTE=""
     SOFTWARE_INVENTORY_SHA256=""
@@ -1755,14 +1755,15 @@ encode_software_inventory_b64gz() {
     SOFTWARE_INVENTORY_ENCODED_BYTES=0
 
     if [[ ! -s "$inv_path" ]]; then
-        SOFTWARE_INVENTORY_B64GZ_NOTE="empty"
+        SOFTWARE_INVENTORY_B64GZ_NOTE="${override_note:-empty}"
         return 0
     fi
     # Sidecar always carries a `# software-inventory ...` header line; without
-    # at least one non-comment row, the body is empty and `note=ok` would be
-    # misleading (consumer decodes ~70 bytes of header and finds no packages).
+    # at least one non-comment row, the body is empty. Caller-supplied
+    # override (timeout / pkgmgr-unhealthy) wins so operators can tell why
+    # the body was empty instead of guessing from `header_only`.
     if ! grep -qv '^#' "$inv_path" 2>/dev/null; then
-        SOFTWARE_INVENTORY_B64GZ_NOTE="header_only"
+        SOFTWARE_INVENTORY_B64GZ_NOTE="${override_note:-header_only}"
         return 0
     fi
     if ! have_cmd gzip;   then SOFTWARE_INVENTORY_B64GZ_NOTE="gzip_missing";   return 0; fi
@@ -4154,10 +4155,15 @@ phase_bundle() {
         "package inventory captured (kind=${inv_kind:-none} count=${PKG_INVENTORY_COUNT})" \
         kind "${inv_kind:-none}" count "$PKG_INVENTORY_COUNT" path "software-inventory.txt"
 
-    # Encode the inventory for envelope embedding. Populates SOFTWARE_INVENTORY_*
-    # globals; write_json reads them. Re-running write_json below picks the
-    # encoded fields up so the bundle copy + the telemetry POST both ship them.
-    encode_software_inventory_b64gz "$inv"
+    # Encode the inventory for envelope embedding. Override-note carries
+    # the skip reason (timeout / pkgmgr-unhealthy) so a header-only file
+    # doesn't silently become `note=header_only`.
+    local _enc_override=""
+    case "$inv_rc" in
+        124) _enc_override="query_timeout" ;;
+        125) _enc_override="pkgmgr_${PKGMGR_HEALTH:-unknown}" ;;
+    esac
+    encode_software_inventory_b64gz "$inv" "$_enc_override"
     emit_signal bundle info pkg_inventory_b64gz \
         "inventory encoded for envelope (note=${SOFTWARE_INVENTORY_B64GZ_NOTE:-unknown} raw=${SOFTWARE_INVENTORY_RAW_BYTES} enc=${SOFTWARE_INVENTORY_ENCODED_BYTES})" \
         note "${SOFTWARE_INVENTORY_B64GZ_NOTE:-unknown}" \
