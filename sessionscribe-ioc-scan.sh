@@ -6973,7 +6973,7 @@ check_destruction_iocs() {
     # BTC index.html drops nested under /home/*/public_html (cohort).
     # 5min walltime cap; head -1 closes the pipe at first hit (#hotfix v2.8.5).
     local btc_hit=""
-    btc_hit=$(timeout 300 sh -c \
+    btc_hit=$(timeout 300 bash -c \
         'find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
             | xargs -0 -r grep -lF -- "$1" 2>/dev/null | head -1' \
         _ "$PATTERN_B_BTC_ADDR" 2>/dev/null)
