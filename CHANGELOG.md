@@ -1,2007 +1,641 @@
 # Changelog
 
 All notable changes to sessionscribe-mitigate.sh and the surrounding
-toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
-versioned per the affected component.
+toolkit. Format follows [Keep a Changelog](https://keepachangelog.com/),
+versioned per affected component.
 
-## sessionscribe-ioc-scan.sh v2.8.4 — 2026-05-11
-
-### Fixed — bundle missing `ioc-scan-envelope.json` (intake silent-CLEAN cohort)
-
-Intake-side analysis surfaced ~1.8% of v2.8.0 bundles (584 distinct hosts)
-landing in an empty-meta cohort: bundle tarball present, manifest +
-kill-chain primitives present, but `ioc-scan-envelope.json` absent. The
-intake reads `$env` exclusively from that file; when missing, `$env = []`
-and every `$env['x'] ?? null` becomes SQL NULL. The verdict then falls
-through to threshold math and silently lands as CLEAN. Affects all 2.8.x
-versions equally (pre-existing bug from v2.0.0 merged-script rewrite).
-
-**Root cause:** `phase_bundle` only `cp`-ed the envelope from
-`$LEDGER_DIR/<RUN_ID>.json`. If `LEDGER_DIR` (default
-`/var/cpanel/sessionscribe-ioc/`) was unwritable for any reason — quota,
-SELinux denial, read-only fs, transient permission issue, `--no-ledger`
-in --replay paths, snapshot mode without ledger — the source file never
-existed and the entire copy block was silently skipped (the outer
-`-n "$_env_src" && -f "$_env_src"` check was false → no emit_signal,
-no fallback).
-
-**Fix:** `phase_bundle` now writes the envelope DIRECTLY to
-`$bdir/ioc-scan-envelope.json` as the primary path. `cp` from
-`$LEDGER_DIR` becomes the fallback if direct-write fails. If both fail,
-emits `bundle fail ioc_envelope_missing` (was: silent skip with no
-diagnostic). Bundle is self-contained; intake never sees a missing
-envelope unless write_json fundamentally cannot run.
-
-### Fixed — `kill-chain.jsonl` meta line empty fields in `--full` mode
-
-The forensic-bundle meta line (`write_kill_chain_primitives`) used
-`ENV_HOST_ROOT_VERDICT`, `ENV_HOST_USER_VERDICT`, `ENV_CODE_VERDICT`,
-`ENV_SCORE` which are only populated by `read_envelope_meta()` in
-`--replay` mode. In `--full` mode (which `--telemetry` implies for
-fleet telemetry), these stay empty strings and the meta line emits
-`""` for all four fields. Pre-existing issue from v2.7.x — surfaced
-in v2.8.x when intake parsers added per-axis verdict columns.
-
-**Fix:** meta line falls back to live globals (`HOST_ROOT_VERDICT`,
-`HOST_USER_VERDICT`, `VERDICT`, `SCORE`) when `ENV_*` are unset.
-`--replay` mode behavior unchanged (still reads from envelope via
-`read_envelope_meta`).
-
-## sessionscribe-ioc-scan.sh v2.8.3 — 2026-05-11
-
-### Fixed — three FPs found in v2.8.2 sentinel review
-
-**1. Warning-tier Pattern M emits flipped host_root_verdict=COMPROMISED.**
-v2.8.2 M2/M3/M6 review emits used keys ending in `_uncorroborated`
-or `_present` — neither matched `ioc_key_is_soft_variant`'s suffix
-gate, so the keys flowed through `ioc_key_to_persist_pattern` and
-incremented `PERSIST_PATTERNS[M]` → `persist_count_live` → COMPROMISED.
-The whole point of the review-tier demotion was to NOT flip verdict
-on uncorroborated signals.
-
-Fix: extended `ioc_key_is_soft_variant` suffix list with
-`*_uncorroborated`, `*_documentation`, `*_documentation_*`. Renamed
-M2/M3/M6 review emit keys to use the `_review` convention for
-consistency with existing Pattern A semantics.
-
-**2. User-attributed signals flipped host_root_verdict=COMPROMISED.**
-v2.8.0 / v2.8.1 / v2.8.2 verdict gates used the non-axis-aware
-`compromise_critical_live` and `persist_count_live`. A
-Pattern H seobot.php under `/home/alice/public_html/` (correctly
-attributed `actor_privilege=user`, `affected_user=alice`) would
-trip persist_count_live=1 → `host_root_verdict=COMPROMISED` even
-though `host_user_verdict=COMPROMISED` was the correct answer.
-
-Fix: introduced `root_compromise_critical_live` (axis-aware strong-
-class counter) and `PERSIST_PATTERNS_LIVE_ROOT` (axis-aware
-persistence-pattern set). Verdict gate now requires BOTH actor-
-privilege=root AND non-quarantine for `host_root_verdict=COMPROMISED`.
-User-attributed signals continue to drive `host_user_verdict` via
-the v2.8.0 axis branch.
-
-**3. Pattern M XMR/C2/image self-reference FP.** The script
-self-installs at `/usr/local/bin/sessionscribe-ioc-scan.sh` via
-`--telemetry-cron`, and the script source contains
-`PATTERN_M_XMR_WALLET=...`, `PATTERN_M_C2_IP=...`,
-`PATTERN_M_DOCKER_IMAGE=...` as constants. M7's recursive grep
-under `/usr/local/bin/` would find the script itself and emit
-strong → COMPROMISED. Same FP class for any operator-stashed copy
-of the script under `/root`, `/tmp`, `/opt`.
-
-Fix: `_is_doc_shape` now matches `sessionscribe-*` and
-`nxesec-whmscribe-*` toolkit filenames. M7's find loop also skips
-these inline before grep + content check (`PATTERN_M_XMR_WALLET=`
-or `sessionscribe-ioc-scan` substring → self-reference, not
-attacker drop).
-
-### Changed — M7 search bounded; M8/M9 bash_history dropped
-
-M7's XMR wallet search now uses `find -maxdepth 4 -size +1c -size -10M`
-with pruning of `node_modules`, `.cache`, `.composer`, `.npm`,
-`.cagefs`, `__pycache__`, `mail`, `.git`. Avoids long walks on hosts
-with large `/opt` or `/tmp` trees.
-
-M8 (C2 IP file-ref) and M9 (negoroo image file-ref) drop
-`/root/.bash_history` from the search scope — IR operator
-investigations leave the C2 IP in shell history and would FP.
-Crontab + `/etc/cron.d/*` references remain (real persistence
-signal).
-
-### Comment cleanup
-
-Per project commenting discipline: condensed multi-paragraph WHY
-blocks in Pattern M source to one-liners. Moved per-primitive
-rationale to `INTERNAL-NOTES.md`. Scrubbed internal-only references
-(IR-team identifiers) from source comments.
-
-## sessionscribe-ioc-scan.sh v2.8.2 — 2026-05-11
-
-### Fixed — three FP / completeness issues found in v2.8.1 sentinel review
-
-**1. Quarantine demotion missed external-containment ingestion.** v2.8.1
-only filtered `ioc_quarantined_session_*`. The external-quarantine
-ingestion (mitigate.sh's `hashes.txt` / `ssh-pruned-keys.log` replay)
-emits `ioc_pattern_*_contained_*`, `ioc_pattern_g_contained_sshkey`,
-`ioc_contained_evidence`, `ioc_contained_unclassified` — all of which
-flow through compromise_class as persistence/destruction and trigger
-COMPROMISED via `persist_count` or `compromise_critical`. A host with
-ONLY mitigate-quarantined Pattern H seobot.php would trip COMPROMISED
-even though the artifact is contained off-disk.
-
-Fix: added `_is_quarantine_signal()` helper covering all three id
-shapes. `aggregate_verdict` now also splits `PERSIST_PATTERNS` into a
-parallel `PERSIST_PATTERNS_LIVE` map; verdict gate uses
-`persist_count_live` rather than `persist_count`. Quarantine
-contributions still credit score and emit signals (preserves forensic
-visibility) but lose solo-trigger power for verdict.
-
-**2. M2 (known-bad username) FPs on legit cPanel tenants.** A
-customer named alexisa/pakchoi as a regular UID 504+ cPanel tenant
-would trip M2 strong=10pt → compromise_critical → COMPROMISED. Hispanic
-and Portuguese-speaking customers have these as legitimate given names.
-
-Fix: M2 corroboration gate. Emit strong only if (a) user has UID=0,
-(b) user is in wheel/sudo group, OR (c) `/etc/sudoers.d/<name>` exists.
-Otherwise demote to warning `ioc_pattern_m_known_bad_user_review`
-(4pt) — surfaces for review without flipping verdict.
-
-**3. M6 (.accesshash post-disclosure) FPs on legit admin/devops.**
-Admins creating `.accesshash` for monitoring/automation post-2026-04-28
-look identical to attacker drops. Single-signal strong was too
-aggressive.
-
-Fix: corroboration-gate against M1/M2/M4/M5/M7/M8/M9. Solo M6 emits
-warning `ioc_pattern_m_accesshash_post_disclosure_review` (4pt); only
-fires strong when another Pattern M primitive corroborates on the
-same host.
-
-### Added — Pattern M extension: XMR wallet, C2 endpoint, named docker image
-
-Three new primitives from the Reddit r/cpanel "27 MH/s botnet" thread
-supporting collateral:
-
-| ID | Signal | Severity | Weight |
-|---|---|---|---|
-| M7 `ioc_pattern_m_xmr_wallet` | Monero wallet `4AypWi9xNQvSy11FT5yr7Ajnyz2XuoUD7LGEJw4ZTRUHLrWjH1x5KoZUp9FTS4s9a5Y6Q7d4jSze4E6tq64aJTD2L7hnCrL` literal in `/root /etc /opt /tmp /var/tmp /var/spool/cron /usr/local/{bin,sbin}` or root/user bash_history | strong | 12 |
-| M8 `ioc_pattern_m_c2_live_socket` / `_c2_reference` | C2 IP `144.172.116.48` in live `ss`/`netstat` (live_socket) or in cron/history files (reference) | strong | 12 / 10 |
-| M9 `ioc_pattern_m_negoroo_image_present` / `_image_reference` | docker image `negoroo/amco` in `docker images` (live) or cron/history (reference) | strong | 10 |
-
-M7/M8/M9 reference-in-file emits also pass through `_is_doc_shape()`
-to demote IR-notes/docs/runbook references to info-tier. Pattern A's
-TOX_ID handling refactored to use the same helper for consistency.
-
-`_is_doc_shape()` path heuristic covers: `/root/{IR,notes,runbooks,
-.claude,.cache,admin}/`, `/docs/`, `IR-notes`, `runbook`, `notes-N`,
-`findings-`, `dossier`, `ps-hunt`, and `/proj/.*\.(md|txt|rst|adoc)`.
-Plus a line-count guard (>200 lines AND markdown/text extension) for
-long-form docs not matching the path heuristic.
-
-## sessionscribe-ioc-scan.sh v2.8.1 — 2026-05-11
-
-### Added — Pattern M: rogue UID=0 user + amco_ docker botnet cluster
-
-Field observed 2026-05-11 (LW IR on `host.virtualstatman.com`),
-cross-references the Reddit "27 MH/s botnet hiding on cPanel" thread.
-Same actor drops a UID=0 backdoor user (`pakchoi`/`alexisa`), wheel-
-group injection, `sudoers.d/99-<user>` with `NOPASSWD:ALL`,
-`amco_<UUID>` docker cryptominer containers, and a cron self-heal
-shape that rebuilds the user every 30 minutes. M is persistence-class
-and counts toward the P6 persistence cluster bonus.
-
-Six detection primitives:
-
-| ID | Signal | Severity | Weight |
-|---|---|---|---|
-| M1 `ioc_pattern_m_uid0_user` | non-root user with UID=0 in `/etc/passwd` | strong | 15 |
-| M2 `ioc_pattern_m_known_bad_user` | username in `PATTERN_M_KNOWN_USERS` (pakchoi, alexisa) | strong | 10 |
-| M3 `ioc_pattern_m_sudoers_nopasswd` / `_sudoers_known_bad` | `/etc/sudoers.d/*` with `NOPASSWD:ALL` AND mtime/ctime on/after 2026-04-28 (CVE-2026-41940 disclosure date) | warning / strong | 4 / 10 |
-| M4 `ioc_pattern_m_amco_docker_cron` / `_live` | `amco_<UUID>` container ref in crontab or `docker ps` | strong | 10 |
-| M5 `ioc_pattern_m_cron_self_heal` | crontab line matching `(id <U> \|\| useradd...chpasswd...sudoers.d)` | strong | 10 |
-| M6 `ioc_pattern_m_accesshash_post_disclosure` | `/root/.accesshash` touched on/after 2026-04-28 | strong | 10 |
-
-The 2026-04-28 disclosure-window guard on M3 and M6 suppresses FPs
-from pre-existing legitimate IR/devops `NOPASSWD:ALL` drops and
-install-state `.accesshash` files — both are common pre-disclosure
-artifacts but post-disclosure creation is highly suggestive of
-attacker activity.
-
-Pattern letter M is added to the compromise-letter regex (
-`^ioc_pattern_([abcdefghijklm])_`) so the P1c cross-pattern cluster
-bonus credits it correctly. All M emits are `affected_user=_root`,
-`actor_privilege=root`.
-
-### Changed — quarantine-only hosts demote to SUSPICIOUS
-
-Quarantine evidence (`ioc_quarantined_session_*`) is historical:
-`mitigate.sh` already neutralised the session. Without a live
-corroborating signal (on-disk Pattern A-M, token_used_2xx,
-persistence cluster), the host is operationally clean with a
-remediated past. Continuing to flag as COMPROMISED inflates the
-IR queue.
-
-`aggregate_verdict` now splits `compromise_critical` into:
-- `compromise_critical_live` — non-quarantine sources
-- `compromise_critical_quarantine` — promoted from
-  `ioc_quarantined_session_*` via the P2 reasons_ioc inspection
-
-Verdict logic: `host_root_verdict=COMPROMISED` requires
-`compromise_critical_live > 0` OR `persist_count >= 1`. If
-`compromise_critical > 0` but `compromise_critical_live == 0` and
-`persist_count == 0`, demote to SUSPICIOUS and emit a new advisory
-`ioc_quarantine_only_no_live_corroboration` so consumers see the
-rationale.
-
-Both counters are added to the JSON envelope `summary` block so
-fleet aggregators can audit the demotion decision.
-
-## sessionscribe-ioc-scan.sh v2.8.0 — 2026-05-10
-
-### Changed — host_verdict split into root/user axes (BREAKING)
-
-`host_verdict` is replaced by two parallel verdicts: `host_root_verdict`
-and `host_user_verdict`. Multi-tenant cPanel hosts (50–500 users) need
-to distinguish "the box is owned" (e.g. SessionScribe + WHM root API
-abuse) from "one tenant got popped" (e.g. compromised user-account
-uploads `seobot.php` to their public_html). Operationally these are
-two different IR responses — host rebuild vs per-account cleanup —
-and the prior single-axis verdict collapsed both into COMPROMISED.
-
-Each `signals[]` entry now carries `affected_user` (cPanel username
-or `_root` for system-wide) and `actor_privilege` (`root` or `user`).
-The envelope adds `users[]` (capped at 50) listing each affected
-tenant with their own `verdict` (USER_COMPROMISED / USER_SUSPECT),
-pattern letters, IOC keys, evidence count, max actor privilege, and
-first/last evidence epoch. `host_user_summary` provides
-total/compromised/suspect/clean counts. `users_truncated` flags hosts
-where more than 50 users have evidence.
-
-The JSONL stream gains `kind=user_summary` events (one per affected
-tenant) so per-user views can be stream-processed without parsing
-the full envelope.
-
-A new `--chain-on-root-only` flag scopes `--full` mode to hosts
-where `host_root_verdict==COMPROMISED`, useful for IR teams who
-want to queue host-rebuild candidates separately from per-account
-cleanup.
-
-The forensic-bundle meta `schema_version` bumps to 5.
-
-**Consumer impact:**
-
-- `host_verdict` is gone from the envelope, the CSV row, the ledger
-  line, the syslog one-liner, and the forensic-bundle meta.
-- CSV column 6 was `host_verdict`; it is now `host_root_verdict`,
-  with `host_user_verdict`, `affected_user_count`, `users_truncated`
-  inserted as new columns 7–9. Positional consumers must update.
-- Aggregator (`build_master_compromised.py`,
-  `aggregate_complist.py`), the `comp.last-ioc-run-comped.csv`
-  generator, and the rfxn-website comp.list endpoint must update in
-  lockstep before fleet rollout.
-
-**Path-to-user attribution table** (covers all path-derived patterns):
-
-```
-/home/<u>/...                        → <u>
-/var/spool/cron/<u> (≠root)          → <u>
-/var/cpanel/users/<u>                → <u>
-/var/cpanel/userdata/<u>/...         → <u>
-/root/, /etc/, /usr/local/           → _root
-/var/log/, /var/cpanel/              → _root
-all cpsess events                    → _root
-```
-
-**Per-pattern privilege defaults:** Patterns A, C, D, E, F, G, I, J,
-K, L and SessionScribe (X) always emit `actor_privilege=root`.
-Pattern H (`seobot.php` under public_html) and Pattern B (BTC index
-drop) emit `actor_privilege=user` when path is under `/home/<u>/`.
-External-quarantine ingestion follows the source path.
+## ioc-scan v2.8.5 — 2026-05-11
 
 ### Fixed
-
-- `has_canonical_mailto` dead variable in `repair_telemetry_cron_file`
-  removed (shellcheck SC2034).
-
-## sessionscribe-ioc-scan.sh v2.7.44 — 2026-05-08
-
-### Fixed (`software_inventory_meta.note` now disambiguates two prior false-`ok` cases)
-
-Sentinel review of v2.7.43 surfaced two consumer-side ambiguities in the
-new `software_inventory_meta.note` field. Both are 1-line fixes that
-preserve wire format (note is still a free-text string; only the value
-domain expands) and have zero impact on the round-trip decode contract.
-
-1. **`note=header_only`** — when the host has no detectable package
-   manager (`PKGMGR_KIND=unknown`), the sidecar still gets a
-   `# software-inventory kind= ts=... count=0` header line written, so
-   `[[ -s "$inv" ]]` returns true and the encoder previously proceeded,
-   shipping ~70 bytes of header content with `note=ok`. A consumer
-   would decode the b64gz, find no actual packages, and have no
-   diagnostic to distinguish "tiny package set" from "no package
-   manager." The encoder now peeks for at least one non-comment line
-   (`grep -qv '^#'`) and emits `note=header_only` with empty `b64gz`
-   when only the header is present.
-
-2. **`note=not_collected`** — in default `--triage` mode `phase_bundle`
-   does not run, so `encode_software_inventory_b64gz` is never invoked
-   and the `SOFTWARE_INVENTORY_B64GZ_NOTE` global retained its initial
-   empty-string value. A downstream collector receiving the envelope
-   could not distinguish "encoder ran and had no result" (which never
-   actually happens — every encoder branch sets `note` explicitly) from
-   "encoder never ran." The global now initializes to `not_collected`
-   so the absent-encoder case is unambiguous in the wire envelope.
-
-The full `note` value domain is now: `ok` | `header_only` | `empty` |
-`gzip_missing` | `base64_missing` | `encode_failed` |
-`exceeds_cap_<N>` | `not_collected`. Receivers that switch on `note`
-should treat `header_only` and `not_collected` as "no inventory
-available" (distinct from `ok` with `raw_bytes=0`, which currently
-cannot occur but is reserved for future encoder paths).
-
-## sessionscribe-ioc-scan.sh v2.7.43 — 2026-05-09
-
-### Changed (software-inventory.txt now embedded in JSON envelope)
-
-The per-host package inventory is now shipped inside the JSON envelope
-under two new top-level fields, in addition to the on-disk
-`software-inventory.txt` sidecar that v2.7.42 introduced. This unblocks
-fleet CVE/erratum reconciliation for collectors that only receive the
-`--telemetry-url` POST and have no out-of-band path to pull the bundle
-directory.
-
-**Why not multipart-POST the sidecar.** Multipart breaks the existing
-client transport ladder: `curl -F` works natively but `wget` and the
-`bash /dev/tcp + openssl` fallback don't, and hand-rolling
-`multipart/form-data` boundaries in pure bash for the legacy floor is
-fragile. The single-body POST stays untouched; the inventory just
-piggy-backs on the envelope JSON.
-
-**Wire format:**
-
-```jsonc
-{
-  // ... existing envelope ...
-  "software_digest": { /* unchanged from v2.7.42 */ },
-  "software_inventory_b64gz": "<gzip → base64 of the sidecar bytes>",
-  "software_inventory_meta": {
-    "sha256":         "<sha256 of pre-encoding bytes, for receiver verification>",
-    "raw_bytes":      <int — sidecar size on disk>,
-    "encoded_bytes":  <int — length of the b64 string>,
-    "encoding":       "gzip+base64",
-    "note":           "ok | empty | gzip_missing | base64_missing | encode_failed | exceeds_cap_<N>"
-  }
-}
-```
-
-**Decode path:**
-
-```bash
-printf '%s' "$b64gz" | base64 -d | gunzip > inventory.txt
-sha256sum inventory.txt    # must match software_inventory_meta.sha256
-```
-
-**Sizing.** `gzip -nc | base64` of a typical ~5,000-pkg cPanel
-host's `rpm -qa` output runs ~70 KB; observed in test against a
-3,021-pkg host: 107 KB raw → 39 KB encoded (~36% ratio after the gzip
-benefit clears base64's 4:3 inflation). A 1 MB hard cap on the encoded
-string leaves ~3× headroom against the largest inventories observed in
-the fleet; pathological hosts emit an empty `b64gz` field with note
-`exceeds_cap_<N>` and the on-disk sidecar continues to carry the data.
-
-**Receiver-side compatibility.** Older collectors silently ignore the
-new fields (top-level JSON keys are additive); existing fields are
-unchanged. The `gzip -nc` flag strips name+timestamp so a byte-stable
-encoded payload is reproducible across runs of the same inventory —
-useful for diff-based CVE delta detection on the receiver.
-
-**Failure-mode behavior.** If `gzip` or `base64` is missing on the
-host (legacy CL6 with stripped coreutils), the encoder emits an empty
-`b64gz` with a diagnostic note rather than failing. The sidecar on
-disk is independent of the envelope embed and continues to be written
-either way.
-
-**Bundle phase ordering.** `phase_bundle` now re-writes the envelope
-to disk after generating the sidecar, BEFORE copying it into the
-bundle and BEFORE `phase_telemetry_post` runs. The end-of-run
-re-write at top-level main is preserved (it picks up forensic-phase
-signals); both writes now include the inventory.
-
-A new `pkg_inventory_b64gz` info signal in the `bundle` area records
-the encode result (note + raw/encoded byte counts + sha256), so the
-envelope's signal stream documents the inventory's encoded state
-without needing to inspect the b64gz field itself.
-
-## sessionscribe-ioc-scan.sh v2.7.42 — 2026-05-08
-
-### Added (software digest: kernel, disk, pkgmgr health, pkg inventory, reboot-pending)
-
-The detection phase now collects a per-host software digest alongside the
-existing host-meta record, exposing five new dimensions to the bundle
-manifest, the JSON envelope (`software_digest` object), and a sidecar
-inventory file:
-
-1. **Package-manager health.** Detects dnf/yum/apt and probes for broken
-   state (`rpm` query failure, `dpkg --audit` non-empty output) and live
-   locks (`/var/run/yum.pid`, `/var/run/dnf.pid`, `/var/lib/dpkg/lock*`,
-   `/var/lib/apt/lists/lock`) by checking that the recorded PID is still
-   alive — stale lockfiles after an interrupted transaction are common on
-   panicked hosts and the liveness check avoids the obvious false-positive.
-   Health rolls up to `ok / broken / locked / unknown` with a free-text
-   note. Latest-transaction epoch is captured from the dnf history sqlite,
-   the yum history dir, or `/var/log/dpkg.log` mtime.
-2. **Disk + inode pressure.** `df -P` scan flags any mount at ≥90% block
-   usage; `df -Pi` does the same for inodes (separate field — block-full
-   and inode-full are independent failure modes). `/boot` free MB is
-   tracked separately because a low `/boot` blocks kernel installs even
-   when root has plenty of space, which is a setup for missed security
-   updates.
-3. **Running-kernel full version string.** `uname -r` (running),
-   `uname -srvmo` (full string for fleet inventory diffs), and
-   `/proc/sys/kernel/tainted` (non-zero indicates loaded out-of-tree
-   modules, which is meaningful in IR context).
-4. **Installed package inventory.** Written as a sidecar
-   `software-inventory.txt` inside the bundle dir during `phase_bundle`
-   — NOT embedded in the JSON envelope (rpm output on a busy cPanel host
-   is hundreds of KB and would dominate the per-host record). Format is
-   `NAME<TAB>VERSION-RELEASE<TAB>ARCH` for RHEL family,
-   `Package<TAB>Version<TAB>Architecture` for Debian. Header comment
-   records `kind`, `ts`, and `count` so a downstream parser can validate
-   the file independently of the bundle manifest. Operators reconcile
-   CVE/erratum exposure by joining this against vendor advisory feeds.
-5. **Pending reboot / running ≠ installed kernel.** Compares the running
-   `uname -r` against the newest installed `kernel` / `kernel-core`
-   (RHEL, sorted via `sort -V` since `rpm --last` output format varies
-   across versions) or `linux-image-*` (Debian). Also honours
-   `/var/run/reboot-required` (Debian convention) and
-   `needs-restarting -r` (RHEL, run with a 5s `timeout` wrapper since
-   it can stall on hosts with very large rpmdbs). Any positive indicator
-   sets `kernel_reboot_pending=1` — a single boolean for fleet rollups.
-
-The five blocks are populated by a new `collect_software_digest()`
-function called from the detection phase right after `collect_host_meta`,
-following the same silent-populator pattern (no `say`/`emit` calls inside
-— the data lands in globals and is rendered downstream by
-`write_json` and `phase_bundle`'s manifest writer). The bundle phase
-also emits a single `pkg_inventory_written` info signal recording the
-inventory kind and row count so the per-host signal stream documents
-the sidecar's existence and size without needing to read the manifest.
-
-## sessionscribe-ioc-scan.sh v2.7.41 — 2026-05-08
-
-### Changed (`--upload` now requires an explicit token — embedded default removed)
-
-`--upload` no longer falls back to a built-in convenience token. Token
-resolution order is now `--upload-token TOK` flag > `$RFXN_INTAKE_TOKEN`
-env, with no embedded default. Mirrors the existing telemetry-token
-model (`--telemetry-token`) where credentials must be supplied
-explicitly, never baked into the published source.
-
-If neither source provides a token, the script fails fast at parse
-time with an actionable error referencing both flags and the fleet-
-token contact (`proj@rfxn.com`); the operator gets the rejection
-before any forensic work begins. Empty-string tokens
-(`--upload-token ''`) are also rejected via `${VAR:-}` semantics.
-`phase_upload`'s defensive `INTAKE_TOKEN empty` guard is preserved as
-a second-line check.
-
-### Changed (`--telemetry-cron add` — `--chain-upload` now conditional)
-
-The cron line written by `--telemetry-cron add` previously baked
-`--chain-upload` unconditionally, relying on the embedded default to
-make per-tick uploads work without an `--upload-token`. With the
-embedded default removed, that path would fail at parse time on every
-tick. The generator now omits `--chain-upload` from the cron line when
-no `--upload-token` is supplied at install time; the tick produces a
-lite bundle on disk + the optional `--telemetry-url` envelope POST,
-but does not attempt an intake upload. Summary output gains an
-`Upload: disabled (no --upload-token supplied; lite bundle stays
-local)` line so the operator sees the resulting posture immediately.
-To enable per-tick uploads, re-run `--telemetry-cron add INTERVAL
---upload-token TOK` (and optionally `--upload-url`); the cron line
-will be regenerated with the upload flags baked in.
-
-### Fixed (cron `%` parsing — fleet-wide regression since v2.7.11)
-
-The cron line written to `/etc/cron.d/sessionscribe-telemetry` by
-`--telemetry-cron add` contained `sleep $((5 + RANDOM % 296))` with an
-unescaped `%`. In `/etc/cron.d/*` files cron treats the first unescaped
-`%` as the command/stdin separator: everything before it is handed to
-`/bin/bash -c`, everything after becomes that command's stdin (with
-subsequent `%` becoming newlines). Bash therefore received a truncated
-command (`{ sleep $((5 + RANDOM `) and exited with `unexpected EOF while
-looking for matching ')'`. The trailing `>/dev/null 2>&1` redirection
-sat in the stdin half so the parse error was mailed to `root@` every
-tick. Heredoc generator at `sessionscribe-ioc-scan.sh:875` now emits
-`\%`; the rendered cron file contains a literal escaped percent that
-cron hands to bash unchanged.
-
-Regression range: v2.7.11 (introduction of `--telemetry-cron`) through
-v2.7.40. Every host whose cron file was generated by an affected version
-has been silently failing every tick — no telemetry from that path,
-parse-error mail to root spool every interval.
-
-### Changed (cron file now sets `MAILTO=""`)
-
-Heredoc emits `MAILTO=""` between the `PATH=` and schedule lines so cron
-discards any output the job ever produces (failed self-fetch warnings,
-parse-class errors, future surprises). Previously the absence of an
-explicit `MAILTO` defaulted to mailing the file owner — root on a cron.d
-file. The existing per-job `>/dev/null 2>&1` redirect already covered
-bash's stdout/stderr, but parse-time errors emitted by cron itself
-bypass that redirect; an explicit `MAILTO=""` is the cron-side
-equivalent.
-
-### Added (self-heal for deployed cron files)
-
-`repair_telemetry_cron_file()` runs early on every non-`--telemetry-cron`
-invocation. If `/etc/cron.d/sessionscribe-telemetry` exists, is writable
-by root, and either contains an unescaped `RANDOM % ` or lacks any
-`MAILTO=` line, the function rewrites it via `awk` (escaping the
-percent and inserting `MAILTO=""` after the `PATH=` line if absent),
-atomic-installs at mode 0600 root:root, restores SELinux context, and
-emits a `logger -t sessionscribe-ioc-scan` entry. Idempotent: after the
-rewrite, the grep guards fail on subsequent runs. Sysadmin-set MAILTO
-values (any non-default) are preserved.
-
-This only repairs hosts where an operator manually invokes the script;
-hosts that touch the script exclusively through the broken cron remain
-stuck until the cron file is regenerated. Operators can fleetwide-
-broadcast either:
-
-```sh
-# Regenerate via the canonical path:
-/usr/local/bin/sessionscribe-ioc-scan.sh --telemetry-cron add 2h \
-    --upload-token <TOKEN>
-
-# Or in-place (idempotent, safe on already-fixed files):
-sed -i 's/RANDOM % /RANDOM \\% /g' /etc/cron.d/sessionscribe-telemetry
-grep -q '^MAILTO=' /etc/cron.d/sessionscribe-telemetry \
-    || sed -i '/^PATH=/a MAILTO=""' /etc/cron.d/sessionscribe-telemetry
-```
-
-## sessionscribe-ioc-scan.sh v2.7.39 — 2026-05-07
-
-### Changed (live IOC severity now UID-discriminated across the runtime track)
-
-Extends the v2.7.38 gsocket-shim pattern to every UID-discriminable
-runtime IOC: root-attributed hits stay `live_compromise` (→
-`host_verdict=COMPROMISED`); non-root hits demote to `strong` (→
-`host_verdict=SUSPICIOUS`) with an `_userland` ID/key suffix and the
-matched user/UID surfaced in the signal's `kv`. A host whose only
-material IOCs lean userspace now grades SUSPICIOUS, not COMPROMISED.
-
-UID source per match type:
-
-  - process-cmdline (ps auxfww): USER column 1 == "root"
-  - file-path (RUNTIME_KNOWN_BAD_PATHS): `stat -c %u $path` == 0
-  - network ESTAB (ss -tnp): `pid=NNN` → `/proc/NNN/status` Uid line, field 2 (effective UID); unknown UID defaults to live_compromise (defensive: connection itself is real evidence)
-
-Demoted on non-root UID:
-
-  - ioc_runtime_known_bad_path (/dev/shm/.gs, /tmp/codeItems3)
-  - ioc_runtime_xmrig_ldlinux / _https / _python / _visible
-  - ioc_runtime_loader_in_flight
-  - ioc_runtime_wallet (per-prefix loop)
-  - ioc_runtime_c2_in_cmdline / _c2_host_in_cmdline
-  - ioc_runtime_reverse_shell
-  - ioc_runtime_xmr_wallet_generic
-  - ioc_runtime_c2_estab
-
-Stays live_compromise unconditionally (rationale):
-
-  - ioc_runtime_lpe_binary — kernel/setuid exploit; threat horizon is
-    seconds-to-root, not steady-state account malware.
-  - ioc_runtime_gsocket_b64_shim — UID not extractable from b64 prefix.
-
-CL6 floor preserved: `awk '{print $1}'`, `stat -c %u`, `/proc/<pid>/status`,
-`grep -oE`, bash 4.1 string compare. Validated against synthetic ps fixtures
-(root / cpaneluser / apache / nobody) plus an end-to-end run.
-
-## sessionscribe-ioc-scan.sh v2.7.38 — 2026-05-06
-
-### Changed (gsocket persistence-shim: UID-discriminated severity)
-
-`ioc_runtime_gsocket_respawn` (the `pkill -0 -U<UID> (defunct|gs-dbus|
-lscgib)` ps-tree match) now splits by the UID embedded in the shim:
-
-  - `-U0` (root-owned gsocket) → severity `live_compromise` →
-    `host_verdict=COMPROMISED` (unchanged).
-  - any non-zero UID (user-account-owned gsocket) → severity `strong` →
-    `host_verdict=SUSPICIOUS`. New signal id
-    `ioc_runtime_gsocket_respawn_userland` /
-    `ioc_runtime_gsocket_persistence_shim_userland`.
-
-Rationale: a gsocket persistence shim running under a cPanel user
-account is a user-account compromise (handled by Imunify360 / cleanup
-workflow), not a host-level operator-resident compromise. Pre-v2.7.38
-both cases flipped `host_verdict=COMPROMISED`, which was inflating
-the COMPROMISED bucket on shared-hosting fleets.
-
-The regex anchor `-U0[[:space:]]` cleanly disambiguates `-U0` from
-`-U10`, `-U500`, etc. — validated against a six-case matrix.
-
-The b64-wrapped shim variant (`ioc_runtime_gsocket_b64_shim`) cannot
-be UID-discriminated from the base64 prefix alone and remains
-`live_compromise`.
-
-## sessionscribe-ioc-scan.sh v2.7.37 — 2026-05-06
-
-### Fixed (lsof.txt stderr pollution + indistinguishable failure modes)
-
-`phase_bundle` lsof block redirects stderr to `/dev/null` (was `2>&1`,
-which mixed `lsof: no pwd entry for UID NNN` warnings into the data
-file — observed on quench-archived bundles bloating lsof.txt to 35 MB
-with 24,082 stderr lines on a host with an orphaned UID).
-
-Adds four distinct envelope signals so consumer renders can tell
-why an lsof.txt is empty:
-
-  - `lsof_captured`  (info)  — bytes recorded; healthy
-  - `lsof_timeout`   (warn)  — 30 s SIGKILL; lsof.txt may be partial
-  - `lsof_failed`    (warn)  — non-zero rc from lsof itself
-  - `lsof_empty`     (warn)  — rc=0 with no rows (pathological)
-  - `lsof_missing`   (info)  — `have_cmd lsof` short-circuit (binary absent)
-
-Pre-fix, a 0-byte lsof.txt was indistinguishable from a missing-binary
-case. Quench fleet survey across 300 recent bundles: 96 % healthy,
-4 % empty (timeout-class, now flagged), 0 % missing-from-tar.
-
-CentOS 6 floor preserved: `timeout` (coreutils 8.4) returns 124 on
-SIGKILL, `stat -c %s` and bash 4.1 arithmetic both confirmed.
-
-## sessionscribe-ioc-scan.sh v2.7.36 — 2026-05-06
-
-### Fixed (code_verdict false-VULNERABLE explosion after v2.7.35)
-
-`aggregate_verdict()` now drives `code_verdict` purely from `cpanel -V`:
-the score-based fallback that escalated hosts to `VULNERABLE` whenever
-any single strong-tier IOC fired has been removed. v2.7.35's runtime
-track (25 `live_compromise` + new strong IOCs at weight=10) caused
-hosts in non-authoritative version states (`unparseable`, `dev_tier`,
-`cutoff_unknown`, `no_cpanel_binary`) to flip to `VULNERABLE` on a
-single runtime hit — a category error: VULNERABLE is a cpsrvd
-binary-state assertion, not a host-state assertion.
-
-New verdict ladder:
-
-  - `version_says_vuln`     → VULNERABLE (exit 1)
-  - `version_says_patched`  → PATCHED    (exit 0)
-  - otherwise               → INCONCLUSIVE (exit 2)
-
-Host-state evidence still drives `host_verdict` (COMPROMISED /
-SUSPICIOUS / CLEAN) on its independent axis — a PATCHED host with
-runtime IOCs is correctly graded `code=PATCHED, host=COMPROMISED`.
-
-Validated under `--version-string` against the v2.7.34 matrix plus
-the three regression cases (`garbage_no_parse`, `11.131.0.5`
-dev-tier, `11.86.0.40` boundary).
-
-## sessionscribe-ioc-scan.sh v2.7.35 — 2026-05-06
-
-### Added (envelope plumbing + bundle lsof + runtime-state IOC track)
-
-Closes the verdict gap surfaced by the 2026-05-05 ps-hunt: 34 of 51
-hosts running active malicious processes were CLEAN-rated because the
-engine graded session-forensic evidence (IC-5790 entry-vector signals)
-but did not grade live runtime state. v2.7.35 adds three pieces in one
-shipping unit so the runtime track is usable from day one rather than
-deferred to a future release.
-
-**1. Envelope: known-bad file metadata.** `known_bad_meta()` helper
-populates `META_KV[]` with `sha256`, `md5`, `size_bytes`, `ctime_epoch`,
-`mtime_epoch`, `owner`, `mode` for any path it is asked to fingerprint.
-Wired into Pattern A (`/root/sshd`), Pattern H (`seobot.php`,
-`/tmp/seobot.zip`), Pattern I (`/etc/profile.d/system_profiled_service.sh`,
-`/root/.local/bin/system-service`), and the new runtime-track detect
-sites so every flagged high-value file ships with the same seven-field
-forensic fingerprint inside `signals[].kv` of the envelope. Operators
-no longer have to SSH back to the host to compute the hash for IR
-ticketing. Pre-existing `mtime_epoch`-only emit calls are replaced;
-no kv key was renamed (`mtime_epoch` is retained as the canonical
-field name).
-
-**2. Bundle: lsof snapshot.** `phase_bundle` now writes `lsof.txt` next
-to `ps.txt` / `connections.txt` / `iptables.txt`. Command:
-`timeout 30 lsof -nP -X` (or bare `lsof -nP -X` if `timeout(1)` is
-absent — both paths gated on `have_cmd lsof`, so hosts without lsof
-silently skip). `-n` skips DNS, `-P` skips service-name lookup,
-`-X` skips the socket cross-reference table that `ss -tnp` already
-produces. The 30s wall-clock cap prevents a wedged kernel-thread or
-unresponsive network FS from stalling the bundle. CentOS 6/CL6 safe
-(`timeout` is in coreutils ≥ 8.4, lsof package is optional). Surfaces
-masqueraded binary paths (`./.ld-linux.so`, `./https`, `./python3`)
-and the `(deleted)` tell on running-but-unlinked binaries that `ps`
-cannot show.
-
-**3. Runtime-state IOC track.** New rule cluster inside
-`check_destruction_iocs()` — runs after Patterns A–L on every triage
-scan (snapshot/--root mode skips it like A–I). Catches active operator
-infrastructure that survives the cpsrvd patch and ages out of the 90-day
-session window:
-
-  - **Known-bad on-disk paths** (six, exact match): `/dev/shm/.gs`
-    (GSocket listener), `/root/c3pool/{xmrig,config.json}`,
-    `/root/moneroocean/{xmrig,config.json}`, `/tmp/codeItems3` (PHP
-    cron-bot stage-2 payload). Any existence → `strong`/10 with full
-    forensic fingerprint.
-
-  - **GSocket relay-key files** (six globs): `/home/*/.config/{htop,dbus}/{defunct,lscgib,gs-dbus}.dat`
-    and the same set under `/root/.config/`. Any match → `strong`/10
-    with fingerprint. The keyfile is the linchpin — anyone who has it
-    can connect back through the relay.
-
-  - **`/tmp/.<hex32+>` PHP webshell drops** (cap 5 per scan). Exempts
-    CloudLinux LVE per-user mounts (`.temp_mount_*`), Imunify360 staging
-    (`.imunify360-*`), and Postgres lock files (`.s.PGSQL.*`). Match →
-    `warning`/4 (review tier — pattern is high-precision but not
-    zero-FP).
-
-  - **GSocket pkill-respawn shim**: regex `pkill -0 -U<UID> (defunct|gs-dbus|lscgib)`
-    in any cmdline → `strong`/10. The PR_SET_NAME mask + respawn-loop is
-    the gsocket-htop persistence signature.
-
-  - **xmrig argv masquerades** (three): `./.ld-linux.so` + `-c config.json`
-    or `--config=` (the dynamic linker is a library, not an exec —
-    unambiguous), `./https` + `-a rx/0` or pool flags, `./python[0-9]`
-    + `--donate-level` or `--threads ... --url ... pool*`. Each → `strong`/10.
-
-  - **Visible xmrig** (path + args two-stage): `[ /]xmrig` exec with
-    `--config=`, pool URL, c3pool/moneroocean/supportxmr/nanopool/hashvault
-    string in same line → `strong`/10.
-
-  - **Loader pipes in flight**: `setup_c3pool_miner.sh`, `c3pool/xmrig_setup`,
-    `/atdu` (perl bot), `/start.php?v=` (codeItems3 fetcher), `/s/xminstall`
-    in any cmdline → `strong`/10.
-
-  - **XMR wallet prefixes** (three, 16-char base58 prefix to match both
-    full and `ps`-truncated forms): `423Gvxk9VMFH3FUy`, `4AypWi9xNQvSy11F`,
-    `47eqhWc4e88EVdqb`. Match in any cmdline → `strong`/10. Wallet hits
-    are zero-FP (these strings do not occur in legitimate code paths).
-
-  - **Known C2 IPs** (six) in cmdline: `147.182.224.216` (atdu),
-    `45.140.17.{40,23}` (codeItems3), `157.245.235.139` (xminstall),
-    `57.129.119.218` (xmrig pool/relay), `209.14.84.37` (snap-itservices
-    novel implant). Match → `strong`/10.
-
-  - **Known C2 hosts** (one): `u.lihq.me` (custom GSocket relay,
-    operator-owned). Match → `strong`/10.
-
-  - **C2 ESTAB connections**: independent corroborator via `ss -tnp`;
-    catches dormant beacons whose loader pipe has exited but whose
-    connection persists. Match → `strong`/10.
-
-  - **Reverse-shell shapes** (six patterns, each FP-tightened across two
-    sentinel passes):
-    1. `perl /<dir>/<file>.{pl,sh} <ip4> <port>` — the
-       `ultimate2.shoppepro.com` `bc.pl` shape; IP+port-anchored.
-    2. `bash -ic .../dev/tcp/<ip>/<port>` — IP+port-anchored.
-    3. `nc ... -e /bin/bash` — requires `-e` payload tell (bare `nc -lvp`
-       was dropping benign health probes into live_compromise; first
-       sentinel pass).
-    4. `ncat ... --exec | --sh-exec` — Alpine/modern PoCs; second sentinel
-       pass coverage gap.
-    5. `socat ... TCP-{LISTEN,CONNECT}:<port>` — port-anchored.
-    6. `python -c ... (pty.spawn | .connect( | os.dup2 | subprocess.shell=True
-       | asyncio.open_connection | pwn import | paramiko.connect | /bin/sh
-       at non-identifier boundary)` — corroborator-only matching, no `import`
-       ordering requirement (broadened in second sentinel pass after pwntools
-       / paramiko / asyncio / corroborator-before-import shapes were
-       missing). FP-rejects Datadog/zabbix `socket.gethostname` / `os.path`
-       admin one-liners.
-    Each match → `live_compromise`/10.
-
-  - **LPE exploit binaries** (cwd-relative, 9 names): `./dirty`, `./dirtycow`,
-    `./dirtypipe`, `./can_bcm` (CVE-2021-22555), `./exploit`, `./poc`,
-    `./pwnkit`, `./0day`, `./local-root`. argv[0] match via awk forward-walk
-    over `\_` forest-tree tokens (`for (i=11; i<=NF && $i == "\\_"; i++)`),
-    handling arbitrary forest depth. FP-rejects `find / -name ./dirty`
-    (whose $11 is `find`, not `\_`). Second sentinel pass replaced an
-    earlier depth-1-only ternary that missed deeper-nested LPE binaries.
-    Match → `live_compromise`/10.
-
-  - **Generic 95-char XMR wallet**: regex-matches any `[48][0-9A-Za-z]{94}`
-    on a non-alphanumeric boundary, catching wallets beyond the three
-    known prefixes. Zero-FP. Match → `live_compromise`/10.
-
-  - **Base64-wrapped GSocket shim**: matches the b64 prefix `L3Vzci9iaW4vcGtpbGw`
-    (literal "/usr/bin/pkill" prefix in base64) anywhere in a cmdline.
-    Catches `host01.educabras.com`-class envelopes where the operator
-    launched the persistence loop via `bash -c "{ echo <b64> | base64 -d; }"`
-    and the plaintext `pkill -0 -U` regex above never sees the decoded
-    form. Match → `live_compromise`/10.
-
-Net runtime cost: one `ps auxfww`, one `ss -tnp`, ~6 stat calls per
-scan. ~100 ms wall-clock added. Snapshot/replay mode (`--root`) skips
-the runtime block, mirroring the existing Patterns A–I skip.
-
-**4. New severity tier — `live_compromise`.** Narrow opt-in tier above
-`strong`, reserved for the runtime IOCs whose evidence is unambiguous
-on a single hit. Mechanics:
-
-- Emit at severity `live_compromise` (or `live` via the `emit_signal`
-  wrapper). Same weight as `strong` (10).
-- The per-signal accumulator increments `compromise_critical`
-  **unconditionally** for `live_compromise` emits, bypassing the v3
-  class ladder (`ioc_compromise_class()`). Existing `strong` emits
-  still consult the ladder; the v3 FP-elimination behavior is
-  preserved for every Pattern A–L signal.
-- Single-hit `compromise_critical > 0` drives `host_verdict=COMPROMISED`
-  via the existing gate at line 8079. No threshold-based score logic
-  was changed.
-- New `[LIVE]` tag (bold red) in human-readable output; `[LIVE]` ranks
-  above `[IOC]` in the per-section worst-wins matrix.
-
-The 13 emit sites tagged `live_compromise`:
-
-| Emit `id` | Match shape |
-|---|---|
-| `ioc_runtime_reverse_shell` | perl/bash /dev/tcp / nc -e / ncat --exec / socat / python (pwntools, paramiko, asyncio, dup2, pty.spawn, subprocess shell=True, /bin/sh) |
-| `ioc_runtime_lpe_binary` | `./can_bcm`/`./dirty`/`./pwnkit` etc. running with CPU |
-| `ioc_runtime_xmrig_visible` | xmrig + pool/config args running |
-| `ioc_runtime_xmrig_ldlinux` / `_https` / `_python` | xmrig argv masquerades |
-| `ioc_runtime_wallet` | known XMR wallet prefix in cmdline |
-| `ioc_runtime_xmr_wallet_generic` | 95-char wallet regex in cmdline |
-| `ioc_runtime_loader_in_flight` | c3pool installer / atdu / xminstall pipe in process |
-| `ioc_runtime_c2_in_cmdline` / `_c2_host_in_cmdline` | known C2 IP/host in process cmdline |
-| `ioc_runtime_c2_estab` | TCP ESTAB to known C2 IP |
-| `ioc_runtime_known_bad_path` (for `/dev/shm/.gs` and `/tmp/codeItems3`) | RAM-only listener / specifically-named PHP loader payload |
-| `ioc_runtime_gsocket_respawn` (plaintext) | GSocket `pkill -0 -U` respawn shim |
-| `ioc_runtime_gsocket_b64_shim` | base64-wrapped form of the same |
-
-The 2 emit sites that stay at lower tiers:
-
-| Emit `id` | Tier | Why |
-|---|---|---|
-| `ioc_runtime_known_bad_path` (for c3pool/moneroocean install paths) | `strong` | Installed binary on disk; if xmrig is also running, the masquerade emits fire and drive live_compromise. |
-| `ioc_runtime_gsocket_keyfile` | `strong` | Keyfile alone, no shim seen — operator has a way back but isn't presently active. |
-| `ioc_runtime_tmp_hex_blob` | `warning` | High-precision `/tmp/.<hex32+>` but not zero-FP. |
-
-### Known limitations / follow-ups (not addressed in v2.7.35)
-
-- **Score-weight caps on non-IC-5790 signals.** The hunt's broader
-  finding — that `csf_disabled`, `patch_marker_absent`, `ioc_token_attempt_*`,
-  and `ioc_quarantined_session_*` are weight-capped so they cannot
-  combine to cross the SUSPICIOUS threshold — is unchanged in v2.7.35.
-  The runtime track adds a second source of high-weight signals that
-  do contribute to the score; combined-signal recalibration of the
-  capped non-session classes is a separate scoring change targeted for
-  v2.7.36.
-- **kill-chain.tsv / kill-chain.jsonl rendering.** Runtime IOCs land in
-  `signals[]` but are not yet rendered as KCE rows. CLEAN-rated hosts
-  with runtime hits will show in `signals[]` and the host_verdict but
-  not in the kill-chain timeline. Wiring the runtime rules into kill-
-  chain rendering is a v2.7.36 follow-up.
-- **Anomalous outbound port detection** (ESTAB to non-private IP on
-  non-standard port from non-root user) is intentionally deferred —
-  the rule is high-FP without a baseline of legitimate per-cPanel-user
-  outbound profiles.
-
-**Validation.** `bash -n` clean. `shellcheck -S warning` clean for the
-new code. Helper smoke-tested against `/etc/passwd` returning all seven
-metadata fields. Score-time replay against the 14k-host telemetry
-archive should be run before the runtime track is enabled fleet-wide;
-expected outcome is ~34 CLEAN→COMPROMISED transitions per the hunt.
-
-
-
-### Fixed (check_version() early-return misclassified patched 86/94/102 hosts)
-
-`check_version()` short-circuited on `tier < 110` and emitted
-`vulnerable_eol` (severity strong) before the patched-table lookup
-could run. This made the v2.7.33 table refresh inert: any host on
-11.86.0.41+, 11.94.0.28+, or 11.102.0.39+ scanned VULNERABLE with
-the wrong remediation guidance ("Migrate or decommission" instead of
-"already patched, no action"). The 86 case was latent since v2.6.1
-(masked because most 86 hosts are actually EOL); the 2026-05-05 KB
-add of 94 and 102 elevated it to a live regression.
-
-`check_version()` reordered:
-
-1. Patched-table lookup runs first — authoritative for any tier in the KB.
-2. `UNPATCHED_TIERS` explicit-exclusion list.
-3. Odd-major dev/EDGE tiers.
-4. Sub-86 truly pre-LTS → `vulnerable_eol` (threshold tightened from
-   `< 110` to `< 86`; cPanel's KB lists 86 as the lowest patched line).
-5. Even tier in supported range but not in our table → `cutoff_unknown`.
-
-Validated under `--version-string` against a 29-case matrix covering
-all five branches, boundary builds at every patched cutoff, both
-parser formats (`11.X.0.Y` and `X.0 (build Y)`), and regression
-checks for 110/118/126/130/136. No behavioral change for hosts that
-were already correctly classified pre-fix.
-
-**Corrigendum to v2.7.33:** the "silently inconclusive" framing in the
-v2.7.33 entry below is incorrect — pre-fix behavior was a strong
-`vulnerable_eol` verdict (false positive at the code_verdict gate),
-not an unscored `cutoff_unknown`. v2.7.33 added the cutoffs to the
-table; v2.7.34 makes the table reachable for those tiers.
-
-## sessionscribe-ioc-scan.sh v2.7.33 — 2026-05-05
-
-### Changed (vendor table refresh — KB 40073787579671 update of 2026-05-05 17:14 CST)
-
-cPanel published patched-build cutoffs for two previously-unmapped
-tiers: 11.94.0.28 and 11.102.0.39. Without this refresh, hosts on
-those tiers hit the `cutoff_unknown` branch in `check_version()` and
-contributed nothing to the version verdict — silently inconclusive
-rather than PATCHED/UNPATCHED.
-
-- `PATCHED_TIERS_KEYS`/`VALS`: 9 → 11 tiers (added 94/28 and 102/39).
-  Comment block trimmed: prior version-history annotations (tier
-  86/124 add, tier 130 bump) belong here, not in source.
-
-No behavioral logic changes — cutoff comparison, verdict gate, and
-scoring weights unchanged. C6/CL6 direct-update build 11.110.0.103
-already evaluates PATCHED via the existing tier-110 cutoff (97).
-WP Squared (`PATCHED_BUILD_WPSQUARED=11.136.1.7`) untouched — KB
-update did not move that lineage.
-
-## sessionscribe-mitigate.sh v0.7.4 — 2026-05-04
-
-### Fixed (broken MariaDB 10.x repos block epel-release install on CentOS 6/7)
-
-- `phase_preflight` step 2b now passes `--disablerepo=Maria\*` to both
-  the `dnf install -y epel-release` and `yum install -y epel-release`
-  calls. Hosts whose cPanel-bundled MariaDB 10.x repo URL has rotted
-  no longer abort the entire transaction in yum's strict mode before
-  reaching the epel-release package.
-
-## sessionscribe-ioc-scan.sh v2.7.32 — 2026-05-05
-
-### Changed (scoring rebalance — destruction amplified, recon flattened)
-
-Fleet-sim audit on 300 envelopes found bidirectional rank inversion:
-recon-flood hosts (700+ `ioc_token_attempt`, 200+ attempt-shape
-quarantines) scored 1657–1839 while confirmed Pattern A destruction
-(16,141 `.sorry` files) scored 23–137. Six rules realign score with
-the v3 ladder (compromise = A/B/C/D/F/G/H/I/J/K/L on-disk + token_used_2xx;
-attempt = X / token_attempt / CRLF write residue):
-
-- **P1** Pattern A `evidence_destruction` count escalator
-  (10..99→w=15, 100..999→30, 1k..9999→50, 10k+→80). Applied at
-  score-time so old envelopes replay correctly.
-- **P1b** Pattern A subtype cluster bonus (≥2/+25, ≥3/+50, ≥4/+100).
-- **P1c** Cross-pattern compromise-letter cluster bonus
-  (A/B/C/D/F/G/H/I/J/K/L; excludes E since Pattern E is recon-shape
-  even at strong): ≥2/+30, ≥3/+75, ≥4/+150, ≥5/+250.
-- **P2** Quarantine reasons-aware promotion (replaces the v2.7.20
-  multi-word-only check). E2 → strong w=10; B/E/F/H → strong w=5;
-  A/C/D/D2/I/2 → evidence (capped via P5); unknown → warning.
-  Applied at both emit-site and score-time.
-- **P3** Pattern E pre-compromise gate dropped when on-disk compromise
-  letter is present (re-credits w=0 advisory → strong w=10).
-- **P4** CRLF chain `ioc_cve_2026_41940_access_primitive` warning →
-  evidence with `+min(20, count*2)`.
-- **P5** Aggregate cap on attempt-class evidence (`token_attempt_*` +
-  attempt-tier quarantine) at `+min(20, n*2)`. Recon flood gets one
-  bounded contribution, not unbounded +2 per emit.
-- **P6** Persistence cluster multipliers boosted 2x/3x/4x → 3x/5x/8x.
-- **P7** Compromise floor: 1 letter or persist≥1 → 100; 2+ letters or
-  persist≥2 → 200.
-
-### Verdict gate unchanged
-
-`compromise_critical > 0 OR persist_count >= 1 → COMPROMISED` is
-unchanged. v2.7.32 affects scoring weights and quarantine emit
-severity only.
-
-### Maintenance (commit ba98e12)
-
-Comment compaction + dead-code trim per CLAUDE.md commenting discipline.
-Net −67 lines, no behavior change.
-
-## sessionscribe-ioc-scan.sh v2.7.31 — 2026-05-05
-
-### Changed (Pattern J — heuristic shape-scanning replaced by dossier-only)
-
-Removed:
-
-- J1 udev shape probe (~95 lines): walked `/etc/udev/rules.d` +
-  `/run/udev/rules.d` for `RUN+=...sh -c.*at now` shapes.
-- J2 systemd unit shape probe (~99 lines): walked
-  `/etc/systemd/system/*.service`, allowlist-filtered ExecStart.
-- Six unused config knobs: `PATTERN_J_UDEV_DIRS`,
-  `PATTERN_J_SYSTEMD_UNIT_DIRS`, `PATTERN_J_EXECSTART_ALLOWED_RE`,
-  `PATTERN_J_DESC_SHADOW_RE`, `PATTERN_J_RECENT_DAYS`,
-  `PATTERN_J_MAX_UNITS`.
-- Dead helper `bulk_rpm_owned_filter()` (~37 lines).
-
-Kept (dossier-only Pattern J):
-
-- `PATTERN_J_KNOWN_PATHS` literal-existence check (5 paths).
-- `PATTERN_J_PROCESS_NAMES` exact-match via `pgrep -x`.
-- At-job grep for `cdrom-id-helper|dbus-broker-helper` references.
-
-### Added (soft-variant suffix gate)
-
-`ioc_key_is_soft_variant()` is called from `ioc_key_to_persist_pattern`
-and `ioc_compromise_class` BEFORE the `ioc_pattern_X_*` prefix match.
-Suffixes filtered: `_review`, `_review_*`, `_diagnostic`,
-`_diagnostic_only`, `_candidate`, `_undetermined`, `_orphan`,
-`_pre_compromise`, `_probes_only`, `_unknown_dim_only`, `_unknown_hash`.
-
-A `_review` variant is operator-review evidence — not confirmed
-persistence residue. Hosts whose ONLY persistence-class signal is a
-`_review` warning now demote from COMPROMISED → SUSPICIOUS.
-
-### Fixed (cleanup — write-only state, dead vars, dead helper)
-
-- `CHAIN_FORENSIC` and `CHAIN_UPLOAD` were write-only after argument
-  parse — replaced with the already-consumed `FULL_MODE` / `DO_UPLOAD`
-  flags. The `--chain-forensic` / `--chain-upload` aliases still parse.
-- Dead-var pruning per shellcheck SC2034: `RECONCILED_EVENTS`,
-  `N_DEF`/`N_OFF`, `CODE_VERDICT`, `PATTERN_LABEL`, `GLYPH_BOX_TR`/
-  `GLYPH_BOX_BR`, local `row_i`/`r_ts`/`r_zone`.
-- `bulk_rpm_owned_filter()` deleted (orphaned by the J1/J2 removal).
-
-### Verification
-
-- 86/86 unit tests pass. `shellcheck -S warning` exit 0
-  (down from 12 warnings). Script line count: 8324 → 8230.
-
-## sessionscribe-ioc-scan.sh v2.7.30 — 2026-05-05
-
-### Fixed (per-session score inflation, pre-mit ↔ post-mit divergence)
-
-Live on-disk session emits and quarantined session emits used different
-score shapes. A canonical CVE-2026-41940 forged session fires 5-6
-strong emits live (each +10) but contributes a single emit
-post-quarantine (+10 or +4 warning).
-
-### Per-session dedup + confidence tier
-
-`aggregate_verdict()` now tracks per-session reason counts in
-`SESSION_REASONS` (associative array keyed on extracted session_id):
-
-1. **Score dedup**: first strong emit per session_id credits base score
-   (+10); subsequent emits for the same session bump reason count only.
-2. **Confidence tier bonus** (added once per session after the loop):
-   - 1 reason: +0
-   - 2-3 reasons: +2
-   - 4-5 reasons: +5
-   - 6+ reasons: +10 (canonical forgery shape)
-3. **Quarantined parity**: reasons_ioc kv field is parsed as
-   comma-count and applied as the session's reason count.
-4. **session_id extraction** matches the actual emit_session prefixes
-   (token_used / token_inject / preauth_extauth / short_pass /
-   multiline_pass / badpass_authmarkers / cve41940 / hasroot /
-   malformed_line / forged_timestamp / quarantined_session).
+- EL6 floor regression: 7 `declare -gA USER_*` arrays in
+  `aggregate_verdict()` rejected by bash 4.1.2 (no `-g` flag) caused
+  the script to abort on CentOS 6 after the posture section. Moved
+  to top-level `declare -A` with in-function reassignment, matching
+  the existing pattern for `SIGNALS` / `REASONS` / `IOC_KEYS`.
+
+### Changed
+- Pattern M7 Monero-wallet walk replaced its per-file `grep -qF` fork
+  loop with a single batched `find … -print0 | xargs grep -lF`
+  pipeline. Tens of thousands of forks → ~2. Eliminates hour-long
+  hangs on hosts with deep `/etc` or `/tmp` trees.
+- Pattern A `fe_count` and `fe_sample` derive from a single walk of
+  `/var/log + /var/cpanel` instead of two identical finds.
 
 ### Added
+- 5-minute walltime cap (`timeout 300`) around long-walk discovery
+  paths: Pattern A first-sorry walk, Pattern A evidence-destruction
+  walk, Pattern B BTC index walk, Pattern G keys-in-/etc walk,
+  Pattern M7 wallet walk, suspect-IP access-log scan.
+- 60-second cap on the runtime track's `ps auxfww` and `ss -tnp`
+  snapshots.
 
-- `summary.session_tiered_count` — distinct sessions with strong reasons.
-- `summary.session_max_reasons` — peak reason count on a single session.
-- CSV columns appended: `session_tiered_count`, `session_max_reasons`.
+## ioc-scan v2.8.4 — 2026-05-11
 
-### Verification
+### Fixed
+- Bundle envelope written directly to the bundle directory; the
+  ledger copy is now the fallback and a diagnostic signal is emitted
+  if both fail. Closes a silent-CLEAN cohort affecting all 2.8.x
+  bundles when the ledger directory was unwritable.
+- Kill-chain bundle meta fields fall back to live globals in `--full`
+  mode (previously emitted empty strings outside `--replay`).
 
-- 80/80 unit tests pass. 6/6 existing session-IOC tests pass.
-  `bash -n` syntax-clean.
+## ioc-scan v2.8.3 — 2026-05-11
 
-## sessionscribe-ioc-scan.sh v2.7.29 — 2026-05-04
+### Fixed
+- Review-tier persistence signals no longer flip `host_root_verdict`
+  to COMPROMISED; the soft-variant suffix gate now covers
+  `_uncorroborated` / `_documentation` variants.
+- Root verdict gate is fully axis-aware: user-attributed evidence
+  drives `host_user_verdict` only.
+- Self-reference FP — the script's own miner-pattern constants no
+  longer trigger detection when the script is copied to operator
+  paths (`/root`, `/tmp`, `/opt`).
 
-Comment-only changes; no behavioral change.
+### Changed
+- Miner-wallet search bounded to depth 4 with cache/git/mail prunes.
+- C2 IP and image file-reference checks drop `/root/.bash_history`
+  to avoid IR-operator FPs; cron and `/etc/cron.d` references stay.
 
-## sessionscribe-ioc-scan.sh v2.7.28 — 2026-05-04
+## ioc-scan v2.8.2 — 2026-05-11
 
-### Fixed (FP — shipped in v2.7.27, corrected here)
-
-v2.7.27's COMPROMISED gate fired on any strong-tier `ioc_*` signal
-(`ioc_critical > 0`), violating the v3 incident-ladder principle.
-Hosts with only Pattern E websocket Shell hits, CRLF chain attempts,
-or forged-session evidence landed COMPROMISED on circumstantial signals.
-
-Two changes:
-
-1. **`ioc_compromise_class()`** (new). Classifies signal keys into
-   `persistence` / `destruction` / `token_used` / `""` (attempt).
-   Compromise = persistence (G/J/I/F-harvester/D-reseller/H-seobot) ∪
-   destruction (A/B/C/D-acctlog/H-non-seobot/K/L) ∪ token_used
-   (`ioc_attacker_ip_2xx_on_cpsess`). Attempt-class returns "":
-   pattern_e_*, ioc_cve_2026_41940_*, ioc_quarantined_session_*,
-   ioc_failed_exploit_attempt, *_pre_compromise, *_recon_only,
-   anomalous_root_sessions, X-forged-session evidence.
-
-2. **COMPROMISED gate** now reads:
-   `compromise_critical > 0 OR persist_count >= 1 → COMPROMISED`.
-   Pattern E strong on its own → SUSPICIOUS. Pattern A ransom alone →
-   COMPROMISED. Pattern C nuclear deploy alone → COMPROMISED.
-
-3. **Pattern G IP-labeled-keys FP fix**. Added `SSH_KNOWN_GOOD_RE`
-   filter to the IP-labeled-lines count (parallel to the offense-phase
-   implementation), so a single legitimate operator-labeled SSH key
-   with an IPv4 comment can no longer flip a host to COMPROMISED.
-
-### Fixed (sentinel review of v2.7.27)
-
-- DSA key-type typo (`dsa` → `dss` to match OpenSSH wire format) in
-  destruction-phase code.
-- Dead code: `is_rpm_owned()`, dead classifier alternation
-  `ioc_pattern_f_harvester`, dead `evidence` arm in cluster accumulator.
+### Fixed
+- Quarantine demotion now covers external-containment ingestion
+  (was only filtering session quarantines); contained-only hosts no
+  longer flip COMPROMISED via persistence count.
+- Known-bad-username and post-disclosure `.accesshash` checks
+  require corroboration; otherwise demote to review-tier.
 
 ### Added
+- Pattern M extension: monero-wallet literal, known C2 endpoint,
+  named docker image — each with live and file-reference variants.
+- Documentation-shape heuristic covers IR/runbook/notes paths and
+  long-form text/markdown files.
 
-- `summary.compromise_critical` in JSON envelope + CSV column appended.
-  Distinguishes "1 strong ioc any-class" from "1 strong ioc
-  compromise-class".
+## ioc-scan v2.8.1 — 2026-05-11
 
-### Verification
+### Added
+- Pattern M: rogue UID=0 account plus cryptominer botnet cluster.
+  Six primitives (UID=0 user, known-bad usernames, NOPASSWD sudoers
+  post-disclosure, miner cron/live containers, cron self-heal,
+  post-disclosure `/root/.accesshash`). Persistence-class.
 
-- 70/70 unit tests pass. 6/6 existing session-IOC tests pass.
+### Changed
+- Hosts whose only evidence is mitigate-quarantined sessions demote
+  to SUSPICIOUS unless a live signal corroborates. Adds advisory
+  signal `ioc_quarantine_only_no_live_corroboration`.
 
-## sessionscribe-ioc-scan.sh v2.7.27 — 2026-05-04
+## ioc-scan v2.8.0 — 2026-05-10
 
-### Added (host-state elevation: persistence cluster scoring)
+### Changed (BREAKING)
+- `host_verdict` replaced by `host_root_verdict` and
+  `host_user_verdict` for multi-tenant attribution. Every signal
+  carries `affected_user` and `actor_privilege`.
+- Envelope adds a per-user verdict array (cap 50) plus
+  `host_user_summary`; JSONL gains `user_summary` events.
+- CSV column 6 renamed (`host_verdict` → `host_root_verdict`);
+  three new columns inserted (`host_user_verdict`,
+  `affected_user_count`, `users_truncated`). Positional consumers
+  must update.
+- New `--chain-on-root-only` flag scopes `--full` to host-rebuild
+  candidates.
+- Bundle meta `schema_version` bumps to 5.
+- Fleet aggregators and the comp.list endpoint must update in
+  lockstep before rollout.
 
-1. **Persistence-class signal classification**
-   (`ioc_key_to_persist_pattern`). Maps signal keys to a pattern letter
-   (G/J/I/F-harvester/D-reseller/H-seobot) for cluster scoring.
-   Conservative — only pattern keys whose existence implies
-   post-compromise host state are tagged.
+## ioc-scan v2.7.44 — 2026-05-08
 
-2. **Cluster multiplier**: when two or more distinct persistence
-   patterns fire on a host, the cumulative persistence weight
-   contribution is multiplied (count=1 ×1, 2 ×2, 3 ×3 + emit
-   `ioc_persistence_cluster_critical` advisory, 4+ capped ×4).
+### Fixed
+- `software_inventory_meta.note` disambiguates `header_only`
+  (no packages detected) and `not_collected` (encoder never ran).
+  Wire format unchanged; values are additive.
 
-3. **COMPROMISED gate on persistence**:
-   `ioc_critical > 0 OR persist_count >= 1 → COMPROMISED`. A
-   warning-tier persistence signal (e.g. a single
-   `ioc_pattern_g_ssh_key` without forged_mtime) now escalates to
-   COMPROMISED on its own.
+## ioc-scan v2.7.43 — 2026-05-09
 
-4. **Score floor**: `persist_count >= 1` floors `score >= 25`.
+### Changed
+- Per-host package inventory now embedded inside the JSON envelope
+  (gzip+base64) in addition to the bundle sidecar. Unblocks fleet
+  CVE/erratum reconciliation for telemetry-only collectors.
+- 1 MB encoded cap; oversize payloads emit empty body with a note
+  and the sidecar retains the full data.
 
-5. **JSON envelope + CSV fields** added: `summary.persist_count`,
-   `summary.persist_score`, `summary.persist_multiplier`,
-   `summary.persist_patterns`.
+## ioc-scan v2.7.42 — 2026-05-08
 
-### Verification
+### Added
+- Per-host software digest in the JSON envelope and bundle manifest:
+  package-manager health (ok/broken/locked/unknown), disk + inode
+  pressure, running-kernel version + tainted state, installed
+  package inventory sidecar, pending-reboot indicator.
 
-- 37/37 unit tests pass.
+## ioc-scan v2.7.41 — 2026-05-08
 
-## sessionscribe-ioc-scan.sh v2.7.26 — 2026-05-04
+### Changed
+- `--upload` requires an explicit token (`--upload-token` flag or
+  `RFXN_INTAKE_TOKEN` env). Embedded default removed; missing token
+  fails fast.
+- `--telemetry-cron add` omits `--chain-upload` from the generated
+  cron line when no upload token is supplied; install summary prints
+  the resulting upload posture.
 
-### Fixed (cosmetic: "bash bash" rendering when $0 isn't a path)
+### Fixed
+- Cron-line percent escaping — the previous heredoc emitted a
+  literal `%` that cron treated as a stdin separator, silently
+  failing every tick on every host using `--telemetry-cron` since
+  v2.7.11.
+- Cron file now sets `MAILTO=""` so cron-side parse errors stop
+  mailing root.
 
-The VULNERABLE recommended-action block printed `bash $0` verbatim,
-rendering as `bash bash` when invoked via stdin pipe, heredoc, or
-process substitution. Fix: prefer `${BASH_SOURCE[0]}` and fall back
-to the script's literal filename when `${var##*/}` resolves to
-`bash`/`main`/`sh`/empty.
+### Added
+- Self-heal on script start: writable broken cron files are
+  rewritten in-place (idempotent; preserves operator-set MAILTO).
 
-## sessionscribe-mitigate.sh v0.7.3 — 2026-05-03
+## ioc-scan v2.7.39 — 2026-05-07
+
+### Changed
+- Runtime IOC severity is UID-discriminated across the track:
+  non-root hits demote from `live_compromise` to `strong`
+  (SUSPICIOUS) with a `_userland` key suffix. Root-only LPE binaries
+  and the base64-wrapped persistence shim remain at the higher tier.
+
+## ioc-scan v2.7.38 — 2026-05-06
+
+### Changed
+- GSocket respawn-shim severity now splits by the embedded UID:
+  root-owned stays COMPROMISED; non-root demotes to SUSPICIOUS with
+  a `_userland` key.
+
+## ioc-scan v2.7.37 — 2026-05-06
+
+### Fixed
+- Bundle `lsof.txt` no longer mixes stderr warnings into data.
+- Four envelope signals distinguish empty `lsof.txt` causes
+  (captured / timeout / failed / empty / missing).
+
+## ioc-scan v2.7.36 — 2026-05-06
+
+### Fixed
+- `code_verdict` is now driven purely by `cpanel -V`. The score-based
+  fallback that flipped non-authoritative hosts to VULNERABLE on a
+  single runtime hit has been removed. Verdict ladder is
+  VULNERABLE / PATCHED / INCONCLUSIVE. `host_verdict` is unaffected.
+
+## ioc-scan v2.7.35 — 2026-05-06
+
+### Added
+- Runtime-state IOC track grading live process and connection state
+  alongside session forensics. Covers known-bad on-disk paths,
+  GSocket relay-keys and respawn shims (plaintext and base64),
+  masqueraded miner binaries, miner argv/wallet/pool tells, LPE
+  binary names, reverse-shell shapes (perl, bash, nc, ncat, socat,
+  python), generic 95-char wallet regex, known C2 IPs/hosts in
+  cmdline and ESTAB.
+- New `live_compromise` severity tier — single-hit unambiguous
+  evidence; bypasses the compromise-class ladder, ranks above
+  `[IOC]` in human output.
+- Envelope: standardised seven-field forensic fingerprint
+  (sha256/md5/size/ctime/mtime/owner/mode) on every flagged file.
+- Bundle: `lsof.txt` snapshot (`timeout 30 lsof -nP -X`).
+
+### Fixed
+- Patched-table lookup runs before the EOL short-circuit; hosts on
+  patched LTS lines below tier 110 no longer scan VULNERABLE.
+
+### Known limitations
+- Runtime IOCs not yet rendered in `kill-chain.{tsv,jsonl}` (v2.7.36
+  follow-up).
+
+## ioc-scan v2.7.33 — 2026-05-05
+
+### Changed
+- Vendor patched-build table refreshed (two new tiers added). No
+  scoring or verdict-gate changes.
+
+## mitigate v0.7.4 — 2026-05-04
+
+### Fixed
+- EPEL install on CentOS 6/7 now disables rotted MariaDB 10.x repos
+  so preflight no longer aborts before reaching `epel-release`.
+
+## ioc-scan v2.7.32 — 2026-05-05
+
+### Changed
+- Scoring rebalance: destruction amplifiers by count and subtype,
+  cross-pattern letter cluster bonus, persistence multiplier raised
+  to ×3 / ×5 / ×8 (cap 4), recon / attempt aggregate evidence
+  capped at +20, quarantine reasons-aware emit severity, compromise
+  floor anchored to letter count and persistence count.
+- Verdict gate unchanged.
+
+## ioc-scan v2.7.31 — 2026-05-05
+
+### Changed
+- Pattern J reduced to dossier-only: known-path existence, exact
+  process-name match, at-job content reference. Removed the udev
+  and systemd shape probes and six unused config knobs.
+
+### Added
+- Soft-variant suffix gate: `_review`, `_diagnostic`, `_candidate`,
+  `_orphan`, `_pre_compromise`, `_probes_only`, etc. are excluded
+  from persistence-class accounting before verdict.
+
+### Fixed
+- Pruned write-only state flags and a dead helper; shellcheck clean.
+
+## ioc-scan v2.7.30 — 2026-05-05
+
+### Fixed
+- Per-session score inflation: first strong emit per session credits
+  base score; repeats bump a reason count only. Confidence-tier
+  bonus rewards multi-reason sessions; quarantined sessions reach
+  parity via `reasons_ioc`.
+
+### Added
+- Envelope summary + CSV columns `session_tiered_count` and
+  `session_max_reasons`.
+
+## ioc-scan v2.7.29 — 2026-05-04
+
+- Comment-only changes; no behavioural change.
+
+## ioc-scan v2.7.28 — 2026-05-04
+
+### Fixed
+- COMPROMISED gate is now class-aware: only persistence /
+  destruction / token-used signals trigger COMPROMISED. Attempt-class
+  (CRLF chain, recon, quarantined-only, Pattern E alone) routes to
+  SUSPICIOUS.
+- Pattern G IP-labelled-key FP: trust-regex filter now applies in
+  both phases; a single labelled key cannot flip the host.
+
+### Added
+- `summary.compromise_critical` distinguishes compromise-class from
+  any-class strong evidence.
+
+## ioc-scan v2.7.27 — 2026-05-04
+
+### Added
+- Persistence-cluster scoring: two or more distinct persistence
+  patterns on one host multiply persistence weight (×2 / ×3 / ×4
+  cap). Warning-tier persistence on its own can escalate to
+  COMPROMISED. Score floor of 25 when persistence is present.
+
+## ioc-scan v2.7.26 — 2026-05-04
+
+### Fixed
+- VULNERABLE recommended-action block no longer prints `bash bash`
+  when the script is invoked via stdin pipe or process substitution.
+
+## mitigate v0.7.3 — 2026-05-03
 
 ### Security
-- **SHOULD-FIX (defense-in-depth): consume-time path re-validation in
-  `prune_ssh_keys_from_manifest`.** v0.7.2 closed the trap-injection
-  vector at the manifest-build emit-site; the manifest-consume site
-  still trusted the manifest's `path` field verbatim. A stale pre-v0.7.2
-  manifest replayed under v0.7.2 could still trip the trap.
-  Fix: re-validate the manifest path against `kill_sshkey_path_safe`
-  immediately after extraction in `prune_ssh_keys_from_manifest`.
-  Refused rows record a `refused_hostile_path` action.
+- SSH-key prune now re-validates the manifest path at consume-time
+  (defense-in-depth for the v0.7.2 trap-injection fix). Refused rows
+  record `refused_hostile_path`.
 
-### Added
-- **Result vocabulary: `refused_hostile_path`.** New apply-only sshkey
-  result; total_skip with WARN-promote (mirrors `kept_unlabeled_warned`
-  semantics — operator hand-investigates the stale manifest).
-
-### Verification
-- 50/50 unit tests pass under
-  `MITIGATE_LIBRARY_ONLY=1 MITIGATE_RUN_P1_TESTS=1`. New regression
-  test 50 synthesizes a hostile manifest path and asserts the
-  consume-time gate refuses it.
-- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 floor preserved.
-
-## sessionscribe-mitigate.sh v0.7.2 — 2026-05-03
+## mitigate v0.7.2 — 2026-05-03
 
 ### Security
-- **MUST-FIX: `ssh_keys_prune` SIGINT/SIGTERM trap-string command
-  injection.** Lines 1066/1068's `trap "rm -f \"$tmp\" ..."` expanded
-  `$path` at trap-set time; a SessionScribe-compromised WHM creating
-  a cPanel user with shell metacharacters in the home dir could
-  inject commands fired on SIGINT during the 10s flock retry.
-  Fix: new `kill_sshkey_path_safe` helper rejects paths containing
-  `" ; $ \` `` ` `` `\ & | < > * ? ! ' ( ) { } [ ]`, newline, tab,
-  or any `[[:cntrl:]]` byte. `kill_sshkey_canonical_paths` filters
-  both root-home and every `/home/<user>` through this helper before
-  emission.
+- Closed a SIGINT/SIGTERM trap-string command-injection vector in
+  the SSH-key prune. Paths containing shell metacharacters, control
+  characters, or quoting are refused before any trap is set.
 
 ### Fixed
-- **SHOULD-FIX-1: `kill_sshkey_recovery_hint` shell-quotes both paths**
-  (defense-in-depth). Wraps each path in single-quotes with
-  `'\''`-escape, so operator paste-execute is injection-safe even if
-  a future code path bypasses the canonical-paths filter.
-- **SHOULD-FIX-2: `finalize_manifest` patches `result_detail` and
-  `sha256_pre` on apply-mode kind:sshkey rows.** Prior code only
-  patched `result` + `sha256_post`, leaving the other two fields as
-  `null` on every successful prune.
+- Operator recovery hint shell-quotes both paths.
+- Apply-mode sshkey manifest rows now populate `result_detail` and
+  `sha256_pre` (previously null on every prune).
 
-### Verification
-- 49/49 unit tests pass. Regression tests 47/48/49 added.
-- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 floor preserved.
-
-## sessionscribe-mitigate.sh v0.7.1 — 2026-05-03
+## mitigate v0.7.1 — 2026-05-03
 
 ### Fixed
-- **`ssh_keys_prune`: sidecar `*.removed-keys` JSONL escapes
-  attacker-controlled comment field.** Step 14's awk `printf` wrote
-  the comment field verbatim, producing malformed JSON when the
-  comment contained `"` or `\`. Inline awk `jesc()` function added
-  inside the JSONL emit block, mirroring `json_esc()`'s `\\` then
-  `\"` ordering.
-- **`ssh_keys_prune`: leading-whitespace key lines counted in step-10
-  verify.** Step 10's `grep -cE '^[^[:space:]#]'` excluded indented
-  key lines (legal per `sshd(8)` AUTHORIZED_KEYS FILE FORMAT).
-  Replaced with an awk count.
-- **`kill_sshkey_canonical_paths`: `find -maxdepth 2` produced
-  non-canonical paths.** Returned both depth-1 user homes and depth-2
-  subdirs. Fix: `-maxdepth 1`.
+- Removed-keys JSONL sidecar properly escapes the comment field.
+- Indented `authorized_keys` lines (legal per `sshd(8)`) now count
+  in step-10 verification.
+- Canonical home-directory walk uses `-maxdepth 1` (was returning
+  depth-2 subdirs).
 
-### Verification
-- 46/46 unit tests pass. Regression tests 45/46 added.
-- bash 4.1.2 / gawk 3.1.7 floor preserved.
-
-## sessionscribe-mitigate.sh v0.7.0 — 2026-05-03
+## mitigate v0.7.0 — 2026-05-03
 
 ### Added
-- **`phase_kill` ssh-key surgical prune** (`--ssh-prune`) sweeps
-  canonical SSH-key paths (`~root/.ssh/authorized_keys{,2}` + every
-  `/home/*/.ssh/authorized_keys{,2}`) and surgically removes any key
-  whose comment doesn't match the LW trust regex (`Parent Child key
-  for [A-Z0-9]{6}` + `lwadmin`/`lw-admin`/`liquidweb`/`nexcess`
-  prefixes). Per-line precision.
-- **`--ssh-allow REGEX`** for site-specific trust-regex extensions.
-  Repeatable; values concatenated via `|`. Validated as POSIX ERE at
-  parse time; overly broad patterns emit a WARN.
-- **`--ssh-allow-lockout`** authorizes full root-key wipes on hosts
-  where every key would be pruned. Off by default.
-- **`--ssh-prune-unlabeled`** also prunes empty-comment keys. Default
-  policy KEEPS unlabeled keys with WARN.
-- **`--ssh-allow-drift`** bypasses the trust-regex sync gate. Off by
-  default.
-- **New `kind:sshkey` manifest item class** with chain-of-custody:
-  sha256 pre/post rewrite verification, pre-vs-lock-acquired sha256
-  catches mid-flight modification (`concurrent_modification`),
-  post-mv re-classify catches clobber-after-our-rename
-  (`clobbered_post_mv`), original whole file preserved at
-  `BACKUP_DIR/quarantine/<path>.original-pre-prune`, pruned-keys
-  JSONL sidecar, `recovery_hint` field per item.
-- **`kind:sshkey` summary fields** in the manifest summary block:
-  `sshkeys_files_planned`, `sshkeys_files_pruned`,
-  `sshkeys_files_clean`, `sshkeys_files_kept_unlabeled`,
-  `sshkeys_files_lock_out`, `sshkeys_files_failed`,
-  `sshkeys_files_concurrent_mod`, `sshkeys_files_lock_contended`,
-  `sshkeys_keys_pruned`, `sshkeys_keys_kept`,
-  `sshkeys_keys_kept_unlabeled`.
+- `phase_kill` SSH-key surgical prune (`--ssh-prune`) removes
+  `authorized_keys` lines whose comment does not match the trust
+  regex. Per-line precision with sha256 chain-of-custody; the
+  original file is preserved in the quarantine area; a JSONL
+  sidecar lists removed keys with a recovery hint.
+- Flags: `--ssh-allow REGEX` (site-specific trust extensions;
+  repeatable), `--ssh-allow-lockout`, `--ssh-prune-unlabeled`,
+  `--ssh-allow-drift`.
+- New `kind:sshkey` manifest item class with per-host summary
+  counters (files planned/pruned/clean/kept_unlabeled, keys
+  pruned/kept, etc).
 
-### Behavior
+### Behaviour
 - When `--ssh-prune` is active, Pattern G whole-file quarantine is
-  suppressed for canonical authorized_keys paths
-  (`action:"superseded_by_sshkey"` — manifest-visible audit).
-- `--ssh-prune` respects the `host_verdict==COMPROMISED` gate. For
-  fleet-wide hygiene runs, use `--ssh-prune --kill-anyway`.
-- Empty-comment keys are KEPT by default with WARN-promote
-  (`kept_unlabeled_warned`).
+  suppressed for canonical `authorized_keys` paths with an audit
+  marker.
+- Gated on `host_verdict==COMPROMISED`; bypass with `--kill-anyway`.
 
-### Floor compliance
-- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 / util-linux 2.17 / OpenSSH
-  5.3 (EL6) preserved. No `mapfile`, no `flock -w`, no 3-arg
-  `match()`, no `{n}` interval expressions. `ssh-keygen -lf` MD5
-  fingerprint with base64-decoded sha256 fallback (`B64SHA256:...`)
-  for ed25519 + FIDO/U2F keytypes.
-
-## sessionscribe-mitigate.sh v0.6.1 — 2026-05-03
+## mitigate v0.6.1 — 2026-05-03
 
 ### Fixed
-- **`kill_path_in_allowlist`: path-traversal bypass on EL6 floor.**
-  Two cascading coreutils-8.4 issues let the allowlist fail-open:
-  `realpath -m` is coreutils 8.15+ (EL6 ships 8.4), and `readlink -f`
-  fallback returned empty for non-existent intermediate path
-  components, allowing `/home/foo/../../etc/shadow` to bypass the
-  `/home/*` case match.
-  Fix (three-part defense): refuse on `..` presence, probe
-  `realpath -m` with a smoke test before relying on the flag, and
-  add a pure-bash `kill_normalize_abs_path` fallback that collapses
-  `/./` and `/../` segments without filesystem access.
+- Path-traversal bypass in the allowlist guard on legacy EL6 floor:
+  refuses `..` segments, probes for `realpath -m` support, and falls
+  back to a pure-bash path normaliser that collapses `/./` and
+  `/../`.
 
-### Cleanup
-- **`finalize_manifest`: dead awk code removed.** `lookup_summary_orig()`
-  read from `ORIG_SUMMARY[]`, never populated; the post-awk `sed -i`
-  pass overwrote the result anyway. Replaced with literal `"0"`
-  placeholders. Also dropped the unread `csf_keys[lkey] = 1` assignment.
-
-## sessionscribe-mitigate.sh v0.6.0 — 2026-05-03
+## mitigate v0.6.0 — 2026-05-03
 
 ### Added
-- **`phase_kill`: targeted quarantine + IP block from an IOC envelope.**
-  New opt-in phase consuming `sessionscribe-ioc-scan` envelope JSON.
-  Default-off; opt-in via `--kill`. Gated on
-  `host_verdict == COMPROMISED` (override: `--kill-anyway`).
-- **CLI flags:** `--kill`, `--envelope PATH`, `--kill-anyway`,
-  `--no-kill`. `--envelope PATH` and `--kill-anyway` imply `--kill`.
-- **Manifest-driven actions** at `$BACKUP_DIR/kill-manifest.json`:
-  - **File quarantine:** Pattern A/C/D/F/G/H/I/J on-disk evidence
-    *moved* (never deleted) to `$BACKUP_DIR/quarantine/<mirrored-path>`
-    with sha256 chain-of-custody. Cross-fs falls back to cp -a + rm.
-    Result vocabulary: `ok | gone | refused_special_file | mv_failed |
-    rm_failed_after_copy | corrupt_during_move`.
-  - **Per-incident IP blocks** via `csf -d <ip> "sessionscribe ioc=<key>
-    run=<run_id>"`. RFC1918 / loopback / link-local / multicast /
-    shape-malformed IPs refused. IPv4 + IPv6. Idempotent vs
-    `/etc/csf/csf.deny`.
-  - **rfxn fleet blocklist registration** via `/etc/csf/csf.blocklists`
-    (`RFXN_FH_L2L3|86400|0|https://cdn.rfxn.com/downloads/rfxn_fh-l2_l3_webserver.netset`).
-    Probes `LF_IPSET` and flips 0→1 in `--apply` (with `backup_file`).
-- **Path allowlist + envelope-injection guards**
-  (`kill_path_in_allowlist`): refuses any path outside documented
-  mutable roots. Pre-resolution shape probes: absolute path, no
-  control chars (NUL/newline/tab/ESC), `realpath -m` resolves
-  symlinks + `..`. Refused items recorded as `action:"refused"`.
-- **Sidecar action stream** at
-  `$BACKUP_DIR/kill-manifest.actions.jsonl`. `finalize_manifest`
-  merges into the manifest at K6, populating `ts_applied`, `csf{}`
-  block, and `summary{}` counters.
-- **`--list-phases`** now lists `kill` as opt-in.
+- `phase_kill`: targeted quarantine plus IP block driven by an
+  ioc-scan envelope (default-off; `--kill`). Gated on
+  `host_verdict==COMPROMISED` (override: `--kill-anyway`).
+- File quarantine *moves* (never deletes) Pattern A/C/D/F/G/H/I/J
+  evidence to a mirrored path with sha256 chain-of-custody.
+- Per-incident CSF IP blocks (IPv4 + IPv6); private, loopback,
+  link-local, multicast, and malformed addresses are refused.
+- Optional registration of the rfxn fleet blocklist via
+  `/etc/csf/csf.blocklists`; probes and enables `LF_IPSET`.
+- Path allowlist plus envelope-injection guards.
+- CLI flags: `--kill`, `--envelope PATH`, `--kill-anyway`,
+  `--no-kill`.
 
-### Compatibility
-- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) floor preserved.
-  `jq` opportunistic, never required. CSF version floor: any version
-  supporting `/etc/csf/csf.blocklists` + `LF_IPSET=1`.
+## ioc-scan v2.7.25 — 2026-05-04
 
-## sessionscribe-ioc-scan.sh v2.7.25 — 2026-05-04
+### Fixed
+- Suspect-IP correlation now drops RFC1918 / loopback addresses
+  (admin operators) before reporting.
+- Kill-chain render no longer aborts under `set -u` on hosts whose
+  defense state did not set every conditional timer global.
 
-### Changed (FP — RFC1918 admin sessions in suspect_ips)
+## ioc-scan v2.7.23 — 2026-05-04
 
-`suspect_ip_correlation` was emitting RFC1918 + loopback IPs as
-"suspect attacker IPs (websocket/createacct hits)" — those are WHM
-admin operators on the customer's internal network. Pattern E already
-classifies these correctly via the canonical `is_internal` awk regex;
-the `suspect_ip_correlation` walker just didn't apply the same filter.
+### Fixed
+- Pattern G no longer emits a duplicate kill-chain row when a file
+  trips both forged-mtime and known-bad-comment; rollup note label
+  corrected.
 
-Fix: mirror the Pattern E `is_internal` regex inline in the awk that
-collects `$1` from the cpsess-endpoint hits, dropping all RFC1918 +
-loopback before the `sort -u | head -50`. External IPs unchanged.
-
-### Fixed (regression: kill-chain render aborts on dirty-defense hosts)
-
-`render_kill_chain` tripped `unbound variable` under `set -u` when
-the host's defense state didn't reach the conditional setters for
-`DEF_CSF_TIME`, `DEF_APF_TIME`, `DEF_PROXYSUB_TIME`,
-`DEF_UPCP_LATEST_TIME`. Affected verdicts unchanged; only the
-visual render path was broken.
-
-Fix: initialize the four conditionally-set DEF_* globals to empty
-string at top level alongside the existing siblings.
-
-## sessionscribe-ioc-scan.sh v2.7.23 — 2026-05-04
-
-### Fixed (FP — shipped in v2.7.22, corrected here)
-
-v2.7.22 used a single `_g_high_conf` flag set by both forged-mtime
-and known-bad-comment matches. Two FPs followed:
-
-- **Duplicate kill-chain row.** A file with forged mtime AND any
-  unrecognized comment pushed both `pattern_g_forged_mtime` and
-  `pattern_g_sshkey` into `OFFENSE_EVENTS[]`.
-- **Misleading note "known-bad ssh key (ctime)"** on the rollup row
-  when the only high-conf trigger was forged-mtime.
-
-Fix: split the gate. `_g_known_bad` is now set only inside the
-`is_known_bad` branch. Note label updated to "known-bad ssh key
-label".
-
-### Slop pruned
-
-- Removed unused `atime_pre` (SC2034).
-
-## sessionscribe-ioc-scan.sh v2.7.22 — 2026-05-04
-
-### Changed (kill-chain noise reduction)
-
-`pattern_g_deep_checks` rollup now gates the per-file `OFFENSE_EVENTS`
-push on `_g_high_conf`, set only when the file's mtime matches the
-IC-5790 forged stamp (`2019-12-13 12:59:16` UTC or local) OR a key
-comment matches `PATTERN_G_BAD_KEY_LABELS`. Files whose only Pattern G
-trip is an unrecognized comment that doesn't match `SSH_KNOWN_GOOD_RE`
-no longer paint a kill-chain UNDEFENDED row; the per-key warn-tier
-emit (`pattern_g_ssh_key`) still records every unrecognized key in
-the JSONL ladder.
-
-### Reverted (FP — shipped in v2.7.20, withdrawn here)
-
-`ioc_pattern_j_payload_string_present` (J3b) reverted in full. The
-emit greped for the OVH S3 host across history and cron files, but
-that bucket is **internal** Nexcess Engineering / IR-team sharing
-infrastructure — would FP on every IR triage host. The actual IOC
-is the payload file, not the URL; J3a (literal-path existence)
-already covers it.
-
-## sessionscribe-ioc-scan.sh v2.7.20 — 2026-05-04
-
-### Added (5 new strong emits, 1 promoted)
-
-- **J3a `ioc_pattern_j_known_path_present`** strong/10 — direct
-  existence check on 5 dossier-documented paths
-  (`/etc/udev/rules.d/89-cdrom-id-helper.rules`,
-  `/usr/lib/udev/cdrom-id-helper`,
-  `/etc/systemd/system/dbus-broker-helper.service`,
-  `/usr/lib/systemd/system/dbus-broker-helper.service`,
-  `/usr/share/dbus-1/dbus-broker-helper`).
-- **J3b `ioc_pattern_j_payload_string_present`** strong/8 — OVH S3
-  payload host + object key in history/cron files. (Reverted in
-  v2.7.22 — see above.)
-- **J3c `ioc_pattern_j_process_active`** strong/10 — `pgrep -x
-  cdrom-id-helper` / `pgrep -x dbus-broker-helper`.
-- **J3d `ioc_pattern_j_atjob_payload_referenced`** strong/10 — `atq`
-  + `at -c <jobid>` content match.
-- **K3 `ioc_pattern_k_dropper_paranoid_chain`** strong/8 — regex
-  grep for the dossier-documented `wget -q -O … && chmod 755 … && …
-  -s; rm -f` paranoid-cleanup chain. Routed through
-  `_classify_history_match`.
-- **Q-promote `ioc_quarantined_session_present`** warning→strong
-  (conditional). Quarantined-session signals now promote to strong/10
-  when sidecar `reasons_ioc` indicates one of: `cve_2026_41940_combo`,
-  `hasroot_in_session`, `injected_token_used_with_2xx`,
-  `token_denied_with_badpass_origin`. Adds `ts_epoch_first` field.
-
-### Changed (FP reduction)
-
-- **Pattern J `_candidate` warning → advisory.** Demoting routes those
-  hosts to ATTEMPT/REVIEW (not SUSPICIOUS) until corroborated by the
-  new J3 literal-path / process / atjob signals.
-
-### Floor
-
-- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved. New
-  external commands: `pgrep` (procps-ng), `atq`/`at` (optional —
-  gracefully skipped when absent).
-
-## sessionscribe-ioc-scan.sh v2.7.18 — 2026-05-04
+## ioc-scan v2.7.22 — 2026-05-04
 
 ### Changed
-- **Canonical source promoted from `sh.rfxn.com` CDN to GitHub raw.**
-  The cron line tries
-  `https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh`
-  as primary on every tick and falls back to
-  `https://sh.rfxn.com/sessionscribe-ioc-scan.sh` only if GitHub
-  errors or times out. Failover is `(curl GH || curl CDN)` inside
-  the &&-chain.
-- **New constant `TELEMETRY_CRON_GITHUB_URL`.** Hard-coded to the rfxn
-  repo's `main` branch raw URL.
+- Pattern G kill-chain noise reduction: per-file rollup gated on a
+  high-confidence trigger (forged stamp or known-bad comment).
 
-### Fixed (slop-review fixups)
-- Help text 5-step list was missing the size-guard step. Now
-  enumerates 7 stages: splay → mktemp → curl (GH→CDN failover) →
-  size guard → bash -n → atomic install → timeout-exec.
-- `Test now:` echo wrote curl directly to install path with no
-  tempfile — updated to use the canonical GitHub URL with `&&`-chained
-  `timeout 300` exec.
+### Reverted
+- Pattern J payload-string-in-history primitive removed; the URL
+  was internal sharing infrastructure and tripped on every triage
+  host.
 
-## sessionscribe-ioc-scan.sh v2.7.17 — 2026-05-04
-
-### Changed
-- **Self-fetch cron line.** `--telemetry-cron add` now generates a
-  bootstrapping cron line that downloads the latest script from the
-  rfxn CDN at every tick, atomically installs it to a stable on-disk
-  path, then runs the scan. Eliminates the v2.7.16 limitation that
-  required the script to be on disk before `--telemetry-cron add`
-  could resolve `$0` for embedding.
-- **Curl-pipe install now works.** Operators can run the canonical
-  one-liner directly without a download-then-run two-step.
-- **Always-current fleet.** Every cron tick pulls the latest CDN
-  release. Fleet version-skew is bounded by one interval + splay
-  window.
-- **Constants for self-fetch source + destination:**
-  `TELEMETRY_CRON_CDN_URL` and `TELEMETRY_CRON_INSTALL_PATH`,
-  hard-coded.
-- **Removed:** `self_path` resolution block in
-  `install_telemetry_cron` (~25 lines). No longer needed.
-
-### Floor
-- bash 4.1.2 / gawk 3.1.7 / coreutils 8.4 (CL6/EL6) preserved.
-
-## sessionscribe-ioc-scan.sh v2.7.16 — 2026-05-04
+## ioc-scan v2.7.20 — 2026-05-04
 
 ### Added
-- **`--telemetry-cron add 2h`** — new interval option, schedules
-  `0 */2 * * *`. Full allowlist now: `1h | 2h | 6h | 12h | 24h`.
-  Default unchanged (`6h`).
+- Pattern J dossier-driven primitives: literal known-path existence,
+  matching process names, at-job content reference.
+- Pattern K paranoid-cleanup chain primitive.
+- Quarantined-session signals promote warning → strong when
+  `reasons_ioc` indicates one of the canonical exploit shapes.
 
 ### Changed
-- **Splay window 5-180s → 5-300s.** Spreads a 1000-host fleet across
-  ~5 minutes of intake POST traffic instead of ~3.
-- **Scan execution wrapped in `timeout 300`.** A stuck scan (network
-  hang, fork-bomb, runaway find) can no longer accumulate a backlog
-  of overlapping cron runs. On timeout, `timeout(1)` sends SIGTERM
-  and exits 124. `>/dev/null 2>&1` redirect suppresses MAILTO.
-- **Floor:** `timeout(1)` is GNU coreutils ≥ 7.0; project floor is
-  coreutils 8.4.
+- Pattern J heuristic `_candidate` warning → advisory until
+  corroborated by the new literal-path / process / at-job signals.
 
-### Operator note
-- Re-running `--telemetry-cron add <interval>` overwrites the
-  existing cron file. Hosts already running v2.7.11+ pre-install
-  cron files do not auto-pick-up the new splay/timeout shape.
-
-## sessionscribe-ioc-scan.sh v2.7.15 — 2026-05-04
+## ioc-scan v2.7.18 — 2026-05-04
 
 ### Changed
-- **Demote `ioc_cve_2026_41940_access_primitive` (the watchTowr X
-  stack) from `strong` → `warning`.** Single-emit-site change at
-  `check_crlf_access_primitive`. Aligns the verdict-math ladder with
-  the v3 verdict ladder ("only post-attack activity = COMPROMISED;
-  X stack / watchTowr / T1-origin = ATTEMPT"). At `warning ioc_*`
-  the signal still ticks `ioc_review++` and routes to SUSPICIOUS.
-- **Compound-evidence hosts retain their COMPROMISED verdict** via
-  the other strong-tier paths (Pattern A/B/C/D/F/G/H/I/J/K/L
-  destruction or persistence; Pattern E full chain; session-file
-  forensics; `ioc_attacker_ip_2xx_on_cpsess` post-CRLF).
-- **Weight reduction 10 → 4** at warning tier (informational since
-  warning weights don't increment score).
-- **Note text rewritten** from "Deterministic CVE-2026-41940
-  exploitation evidence (CRITICAL)" to "CVE-2026-41940 exploitation
-  ATTEMPT — confirm compromise via Pattern A-L residue or session-file
-  forensics (REVIEW)".
+- Self-fetch cron line prefers the GitHub raw URL and falls back to
+  the CDN. Bootstrap one-liner aligned to the canonical path.
 
-## sessionscribe-ioc-scan.sh v2.7.14 — 2026-05-04
+## ioc-scan v2.7.17 — 2026-05-04
 
 ### Changed
-- **Drop four `ioc_*` warning-tier emits down to `advisory`** where
-  the emitter itself labels the activity benign/attempt-only:
-  `ioc_pattern_e_websocket` (`_unknown_dim_only` and `_probes`),
-  `ioc_pattern_e_unknown_dimension`, `ioc_attacker_ip_probes_only`.
-  At `advisory` they no longer tick `ioc_review++` so they do not
-  route the host to SUSPICIOUS.
-- **Cap diagnostic sample emits to 1 per host.** `ioc_sample` and
-  `session_shape_sample` previously emitted up to 5 and 10 sample
-  rows per host. Both already excluded from envelope reconcile and
-  weight=0. Cap reduced to `head -1`.
+- `--telemetry-cron add` self-fetches the latest script at every
+  tick and atomically installs it before running, eliminating the
+  on-disk prerequisite from v2.7.16 and making curl-pipe install
+  viable. Bounds fleet version-skew to one interval plus splay.
 
-## sessionscribe-ioc-scan.sh v2.7.13 — 2026-05-04
+## ioc-scan v2.7.16 — 2026-05-04
+
+### Added
+- `--telemetry-cron add 2h` interval; allowlist now
+  `1h | 2h | 6h | 12h | 24h` (default `6h`).
 
 ### Changed
-- **Demote `alg_length_optrec_bug` from `bug`-kind to `marker`-kind.**
-  The unfixed OIDC operator-precedence bug is a pre-existing post-auth
-  defense-in-depth issue, NOT the SessionScribe primitive. Fleet-wide
-  signal noise drops; per-host detection preserved (queryable via
-  `area==static && id==alg_length_optrec_bug`), reclassified from
-  advisory-tier to info-tier.
+- Jitter window widened to 5-300s; scan wrapped in `timeout 300` so
+  hung runs cannot accumulate overlapping cron tasks.
 
-## sessionscribe-ioc-scan.sh v2.7.12 — 2026-05-03
+## ioc-scan v2.7.15 — 2026-05-04
+
+### Changed
+- The CRLF access-primitive (CVE-2026-41940 X stack) demoted from
+  strong → warning. ATTEMPT-class only; compound-evidence hosts
+  still flip COMPROMISED via Pattern A-L or post-attack 2xx signals.
+
+## ioc-scan v2.7.14 — 2026-05-04
+
+### Changed
+- Four review/probe-only Pattern E and attacker-IP keys demoted from
+  warning to advisory so they no longer route to SUSPICIOUS.
+- Diagnostic-sample emits capped at one per host.
+
+## ioc-scan v2.7.13 — 2026-05-04
+
+### Changed
+- The unfixed OIDC operator-precedence bug demoted from bug-kind to
+  marker-kind. It is a pre-existing post-auth defense-in-depth issue,
+  not the SessionScribe primitive.
+
+## ioc-scan v2.7.12 — 2026-05-03
 
 ### Security
-- **Tighten `/etc/cron.d/sessionscribe-telemetry` perms 0644 → 0600.**
-  v2.7.11 used cron.d-conventional 0644 (world-readable), but the
-  generated cron line embeds the `--upload-token` value verbatim.
-  Any local user could read the intake token via `cat`. cronie /
-  vixie-cron read `/etc/cron.d/*` as root and don't require
-  world-readability — verified on Fedora 40 (cronie). Mode now 0600
-  unconditionally for uniformity.
+- Cron file mode tightened to 0600 (was 0644). The cron line embeds
+  the intake token verbatim; world-readable mode allowed any local
+  user to read it via `cat`.
 
-## sessionscribe-ioc-scan.sh v2.7.11 — 2026-05-03
+## ioc-scan v2.7.11 — 2026-05-03
 
 ### Added
-- **`--telemetry-cron <add|remove> [INTERVAL]`** — install or remove
-  a system cron entry that runs the telemetry path on a fixed
-  interval. Generated cron prepends a 5-180s random-sleep jitter so
-  a fleet of N hosts doesn't synchronize on the minute mark.
-- CLI surface: `--telemetry-cron add`, `--telemetry-cron add
-  1h|6h|12h|24h`, `--telemetry-cron remove` (idempotent).
-- Pass-through of `--upload-url` and `--upload-token`. Single-quotes
-  in the values are rejected at install time.
-- Cron file: `/etc/cron.d/sessionscribe-telemetry`. `SHELL=/bin/bash`
-  declared in-file so `$RANDOM` arithmetic works at run time.
-- Validation: action must be `add` or `remove`; interval must be
-  `1h|6h|12h|24h`; EUID 0 required; `/etc/cron.d/` must exist;
-  `--upload-url`/`--upload-token` must not contain single-quote.
+- `--telemetry-cron <add|remove> [INTERVAL]` installs or removes a
+  system cron entry running the telemetry path on a fixed interval
+  with 5-180s random-sleep jitter. Allowed intervals
+  `1h|6h|12h|24h`. Pass-through of `--upload-url` / `--upload-token`
+  with single-quote rejection; EUID 0 enforced at install time.
 
-## sessionscribe-ioc-scan.sh v2.7.10 — 2026-05-03
+## ioc-scan v2.7.10 — 2026-05-03
 
 ### Added
-- **`--telemetry` mode for high-frequency fleet polling.** Lite bundle
-  that drops the heavy MB-scale tarballs but keeps every KB-scale
-  forensic artifact (~50–100 KB per-host disk footprint vs ~50 MB
-  for `--full`). Kept: `manifest.txt`, `ioc-scan-envelope.json`,
-  `kill-chain.{tsv,jsonl,md}`, `ps.txt`, `connections.txt`,
-  `iptables.txt`, pattern-{a,h,i}-metadata.txt. Skipped:
-  `sessions.tgz`, `access-logs.tgz`, `system-logs.tgz`,
-  `cpanel-state.tgz`, `cpanel-users.tgz`, `persistence.tgz`,
-  `defense-state.tgz`, per-user bash histories.
-- **`--telemetry-url URL` envelope-only HTTP POST.** Three-transport
-  fallback ladder: curl → wget (HTTPS gated on `wget --version | grep
-  '+ssl'`) → bash native (`/dev/tcp` for HTTP, `openssl s_client` for
-  HTTPS). Hosts with no curl/wget AND no openssl emit a `posture`
-  warning.
-- **Telemetry knobs:** `--telemetry-token TOK`, `--telemetry-timeout
-  N` (default 15s), `--telemetry-retry N` (default 2; exponential
-  backoff 2s/4s), `--telemetry-max-bytes B` (default 5MB).
-- **Telemetry signal vocabulary** (all `telemetry_*` keys, never
-  `ioc_*`, so failures do NOT flip `host_verdict`):
-  `telemetry_post_complete` (info), `telemetry_post_failed` (warning),
-  `telemetry_envelope_too_large`, `telemetry_envelope_empty`,
-  `telemetry_no_envelope`, `telemetry_no_transport`.
-- **Validation:** URL must be `http://` or `https://`. `--telemetry`
-  is incompatible with `--no-ledger`.
+- `--telemetry` lite-bundle mode (~50-100 KB per host vs ~50 MB for
+  `--full`): keeps every forensic artifact, drops the heavy
+  tarballs.
+- `--telemetry-url URL` envelope-only POST with curl → wget →
+  bash-native (`/dev/tcp`, `openssl s_client`) fallback ladder.
+- Knobs: `--telemetry-token`, `--telemetry-timeout` (default 15s),
+  `--telemetry-retry` (default 2, backoff 2s/4s),
+  `--telemetry-max-bytes` (default 5 MB).
+- `telemetry_*` signal vocabulary so transport failures never flip
+  `host_verdict`.
+- Incompatible with `--no-ledger`.
 
-## sessionscribe-ioc-scan.sh v2.7.9 — 2026-05-03
+## ioc-scan v2.7.9 — 2026-05-03
 
 ### Added
-- **CSF firewall posture detector (`check_csf_posture`).** Validates
-  that ConfigServer Firewall is installed AND actually enforcing on
-  each fleet host. New `posture` section sits between `destruction`
-  and `probe` in SECTION_ORDER. Surfaces 12 break-modes:
-  CSF/lfd not installed, csf.disable kill-switch, csf.conf missing,
-  TESTING="1", lfd dead, iptables missing, `csf -v` self-test fails,
-  CSF terminal chains absent (bumps to evidence-tier when INPUT
-  policy is also ACCEPT — firewall effectively off), INPUT chain
-  doesn't jump to LOCALINPUT, LOCALINPUT empty, LF_IPSET=1 promised
-  but ipset missing/empty, healthy roll-up `posture_csf_active`.
-- Severity discipline: `posture_` prefix (never `ioc_`) so findings
-  surface in the section matrix and JSON envelope without flipping
-  host_verdict.
-- Snapshot-aware: `--root` mode emits a single
-  `posture_csf_snapshot_skip` info row.
-- lfd liveness probe is robust 3-stage: pidfile +
-  `/proc/<pid>/comm` verification, then pidof, then pgrep fallback.
+- CSF firewall posture detector. Validates that CSF/lfd is installed
+  AND actively enforcing on every fleet host. Surfaces twelve
+  break-modes (kill-switch, TESTING mode, lfd dead, missing iptables
+  binary, CSF terminal chains absent, INPUT chain not jumping to
+  LOCALINPUT, ipset promised but missing, etc).
+- `posture_*` signal prefix — surfaces in section matrix and JSON
+  envelope without flipping `host_verdict`.
 
-## sessionscribe-ioc-scan.sh v2.7.8 — 2026-05-03
+## ioc-scan v2.7.8 — 2026-05-03
 
 ### Added
-- **Pattern K — Cloudflare-fronted /Update second-stage backdoor.**
-  Two IOCs scanned in shell history, both routed through
-  `_classify_history_match`:
-  - **K1** literal `cp.dene.de.com` →
-    `ioc_pattern_k_backdoor_fetch` strong/8 (hostile),
-    `ioc_pattern_k_backdoor_review` warning/4 (unknown shape),
-    `ioc_pattern_k_backdoor_diagnostic` info/0.
-  - **K2** PID-tagged hidden temp-file shape `F=/tmp/\.u([$][$]|[0-9]+)`
-    → `ioc_pattern_k_tmpfile_paranoid` warning/3.
-  - Network-control caveat: `cp.dene.de.com` is Cloudflare-fronted;
-    do NOT blackhole at edge.
-- **Pattern L — filesystem-nuke (`rm -rf --no-preserve-root /`).**
-  - **L1** primary `PATTERN_L_NUKE_RE` →
-    `ioc_pattern_l_filesystem_nuke` strong/10 (hostile),
-    `_review` warning/4, `_diagnostic` info/0.
-  - **L2** `__CMD_START__/__CMD_END__` envelope corroborator. When
-    found alongside L1, L1's emit carries `corroborated_by`;
-    standalone → `ioc_pattern_l_cmd_envelope` warning/4.
-- **Pattern F additional marker — `__CMD_DONE_<nanosec_epoch>__`.**
-  Three tiers: `_cmd_done` strong/8, `_cmd_done_review` warning/3,
-  `_cmd_done_diagnostic` info/0.
-- **Pattern G lsyncd-amplification corroboration.** When Pattern G
-  fires AND the host has lsyncd evidence (process / config dir /
-  config file), emit `ioc_pattern_g_lsyncd_amplification` warning/4
-  with `evidence` field. Surfaces blast-radius for remediation.
-- **Pattern C second binary host `87.121.84.243`** added as
-  `PATTERN_C_C2_IP_2`.
-- **`fmt_offense_detail` routing for Patterns K, L** added to the
-  area-letter mapping.
-- **`ATTACKER_IPS[]` rev5 additions:** `87.121.84.243`,
-  `67.205.166.246`.
+- Pattern K (Cloudflare-fronted second-stage backdoor): literal
+  hostname plus PID-tagged hidden-temp file shape.
+- Pattern L (filesystem nuke `rm -rf --no-preserve-root /`):
+  primary regex plus command-envelope corroborator.
+- Pattern F: additional `__CMD_DONE_<nanosec>__` marker with three
+  classification tiers.
+- Pattern G lsyncd-amplification corroboration surfaces blast-radius
+  when Pattern G fires alongside lsyncd evidence.
 
 ### Fixed
-- **`_classify_history_match` exec_verb_re extension: path-prefixed
-  shell forms.** Extended alternation to recognize `/bin/sh`,
-  `/bin/bash`, `/usr/bin/sh`, `/usr/bin/bash` (was only the bareword
-  forms).
-- **K2/L2 standalone-emit gate now reads K1/L1 emit tier, not file
-  presence.** Previous gate silently swallowed K2/L2 hostile signals
-  when K1/L1 fired diagnostic-only.
+- History-match classifier now recognises path-prefixed shell forms
+  (`/bin/sh`, `/bin/bash`, `/usr/bin/sh`, `/usr/bin/bash`).
+- Standalone K2 / L2 hostile emits no longer swallowed when K1 / L1
+  fire diagnostic-only.
 
-### Verification
-- Fixture suite 52/52 pass.
-
-## sessionscribe-ioc-scan.sh v2.7.7 — 2026-05-03
+## ioc-scan v2.7.7 — 2026-05-03
 
 ### Fixed
-- **Diagnostic-shape FP filter parity for Patterns F, H2, H3, A.**
-  v2.7.5 shipped the diagnostic-shape classifier for Pattern C; the
-  same FP class was still unfixed for the other history-string and
-  README-content primitives.
-  - **Helper hoist.** v2.7.5's inline awk classifier is now a
-    script-level helper `_classify_history_match <regex|literal>
-    <needle> <files...>`. Pattern C refactored to call it with
-    `regex 'nuclear\.x86'`.
-  - **Pattern F (`__S_MARK__` harvester envelope).** Now classified
-    per line: hostile → `ioc_pattern_f_harvester` strong/10
-    (unchanged); unknown → `ioc_pattern_f_review_undetermined`
-    warning/5; diagnostic → `ioc_pattern_f_diagnostic_only` info/0.
-  - **Pattern H2 (`pkill -9 nuclear.x86 kswapd01 xmrig` kill prelude).**
-    New helper `_classify_kill_prelude_context` classifies by
-    *adjacency*: hostile if the next 3 command lines match an install
-    primitive; diagnostic if a defensive verify appears; unknown
-    otherwise.
-  - **Pattern H3 (`ALLDONE` end marker).** Now suppressed entirely
-    unless corroborated by H1 / H2-hostile / H4. When corroborated,
-    emit carries `corroborated_by`.
-  - **Pattern A (qTox ransom README).** Documentation-shape allowlist
-    (`/root/IR/`, `/root/notes/`, `/root/runbooks/`, `/root/.claude/`,
-    files >200 lines) → `_documentation` info/0; exact TOX_ID hash +
-    short file → strong/10; qtox/Sorry-ID without exact hash →
-    `_review` warning/5.
+- Diagnostic-shape FP filter parity for Patterns F, H2, H3, and A
+  (v2.7.5's inline classifier hoisted to a shared helper).
+  Pattern A qTox ransom note now distinguishes hostile (exact ID
+  hash), review (`qtox`/`Sorry-ID` without exact hash), and
+  documentation tiers.
 
-## sessionscribe-ioc-scan.sh v2.7.5 — 2026-05-03
+## ioc-scan v2.7.5 — 2026-05-03
 
 ### Fixed
-- **Pattern C `nuke_trace` false-positive on responder-checked hosts.**
-  LW responders run `history | grep -F "nuclear.x86"` post-patch as
-  IR/QA; the check command lands in `bash_history` and the next
-  ioc-scan emits strong → COMPROMISED.
-  Pattern C bash_history lines now classified before emit:
-  - hostile-shape (download verb, pipe-to-shell, `chmod +x`,
-    `./<bin>`, source/eval/exec/bash/sh adjacent, or binary as
-    leading token) → strong/10 unchanged. Adds `hostile_lines`,
-    `diagnostic_lines`, `unknown_lines`, `ts_epoch_first` fields.
-  - diagnostic-shape (line starts with read-only verb: history / cat
-    / grep / ls / stat / etc., no hostile verb anywhere) →
-    `ioc_pattern_c_nuke_trace_diagnostic` info/0.
-  - unknown-shape → `ioc_pattern_c_nuke_trace_review` warning/4.
+- Pattern C false-positive on responder-checked hosts: bash_history
+  lines are classified before emit. Read-only verbs
+  (`history`, `grep`, `cat`, `ls`, `stat`) no longer flip
+  COMPROMISED; hostile-shape (download verb, pipe-to-shell, `chmod
+  +x`, source/eval/exec adjacent) preserved at strong.
 
-## sessionscribe-ioc-scan.sh v2.7.4 — 2026-05-03
+## ioc-scan v2.7.4 — 2026-05-03
 
 ### Added
-- **Pattern J2 ExecStart allowlist: `/usr/local/lp/`.** Liquid Web
-  management infra (Prometheus exporters under
-  `/usr/local/lp/opt/exporters/`) is RPM-unowned by design but
-  operator-deployed. Allowlist now includes
-  `/usr/local/(bin|sbin|cpanel|lsws|directadmin|lp)`.
+- Pattern J ExecStart allowlist now covers `/usr/local/lp/`
+  (operator-deployed Prometheus exporters).
 
 ### Fixed
-- **Bash 4.1 floor regression: `${path: -25}` negative-substring.**
-  Negative-offset substring is bash 4.2+; on EL6/CL6 floor (bash
-  4.1.2) the parser rejects it. Replaced with explicit-offset form
-  `${path:$((${#path}-25)):25}`.
-- **Empty-array deref under `set -u` (4 additional sites).** v2.7.3
-  guarded the Pattern J persistence checker; same class of bug
-  remained in `phase_reconcile()`,
-  `write_kill_chain_primitives()` (2 sites), `phase_bundle()`. All
-  guarded with `(( ${#arr[@]} > 0 ))`.
+- Bash 4.1 floor regression: negative-substring expression replaced
+  with an explicit-offset form; four additional empty-array
+  dereference sites guarded.
 
-## sessionscribe-ioc-scan.sh v2.7.3 — 2026-05-03
+## ioc-scan v2.7.3 — 2026-05-03
 
 ### Fixed
-- **Bash 4.1 floor regression: empty-array deref in
-  `check_pattern_j_persistence`.** v2.7.1 introduced six unguarded
-  `${arr[@]}` references. On bash 4.1 + `set -u` (CL6/EL6 floor) any
-  declared-but-empty array trips `unbound variable`. All six sites
-  guarded with the project length-check idiom.
+- Bash 4.1 floor regression: empty-array dereferences in the
+  Pattern J persistence checker guarded.
 
-## sessionscribe-ioc-scan.sh v2.7.2 — 2026-05-03
+## ioc-scan v2.7.2 — 2026-05-03
 
 ### Added
-- **Bundle retention sweep in `phase_bundle`.** New
-  `prune_old_bundles()` helper keeps the 3 newest bundles in
-  `$BUNDLE_DIR_ROOT` and removes older ones plus their sibling
-  `.upload.tgz`. Operator-renamed entries without the TS_ISO-Z
-  prefix are left alone. Configurable via `$BUNDLE_RETENTION` (0 =
-  disable). Pruned-bundle count and MiB freed emit as `bundle_pruned`
-  info signal.
+- Bundle retention sweep: keeps the three newest bundles, removes
+  older ones plus sidecar `.upload.tgz`. Operator-renamed entries
+  preserved. Configurable via `BUNDLE_RETENTION` (0 disables).
 
 ### Fixed
-- Top-of-file v-header drift: header comment now matches `VERSION`
-  at parse time.
+- Top-of-file version-header drift.
 
-## sessionscribe-ioc-scan.sh v2.7.1 — 2026-05-03
+## ioc-scan v2.7.1 — 2026-05-03
 
 ### Added
-- **Pattern J — init-facility persistence detection.** New IOC class
-  alongside A-I dossier patterns. Two sub-detectors inside
-  `check_destruction_iocs`:
-  - **J1 (udev)** — walks `/etc/udev/rules.d/` and
-    `/run/udev/rules.d/`. Strong tier requires the
-    `RUN+="...sh -c '... | at now'"` shape. Warning tier covers
-    `nohup`/`setsid`/`disown` backgrounded shell-outs. Both gate on
-    non-RPM-ownership.
-  - **J2 (systemd)** — walks `/etc/systemd/system/*.service`. Strong
-    tier requires: ExecStart inside `/usr/share/` + Description
-    shadows a known systemd/cPanel service name + unit and binary
-    not RPM-owned + mtime within 90 days.
-  - Snapshot-aware: when `--root DIR` is set, severity demotes to
-    `info` with `degraded_confidence_snapshot=1`.
-  - RPM ownership probe via `is_rpm_owned()` and bulk-mode
-    `bulk_rpm_owned_filter()`. Falls back to `dpkg -S` on debian-ish
-    hosts.
-  - Pattern letter `J` wired into `ioc_key_to_pattern()`,
-    `PATTERN_ORDER`, and `PATTERN_LABEL`.
-- **Mitigate-quarantine secondary read** in `check_sessions`. New
-  `check_quarantined_sessions()` walks
-  `$MITIGATE_BACKUP_ROOT/<RUN>/quarantined-sessions/raw/`, reads each
-  `<sname>.info` sidecar with a data-only key=value parser, emits one
-  synthetic `ioc_quarantined_session_<sname>` warning-tier signal per
-  file with `original_path`, `quarantine_run_dir`, `quarantine_ts`,
-  `mtime_epoch`, `reasons_ioc`, `sha256`. Quarantined emits route to
-  Pattern X. Cap of 200 sessions per scan. Sidecar fallback when
-  missing: live mtime + `low_confidence_no_sidecar=1`.
-- **`45.92.1.188` added to `ATTACKER_IPS`** (rev5; Pattern J operator).
+- Pattern J — init-facility persistence detection (udev rules and
+  systemd unit shape probes; RPM-ownership gated; snapshot-aware).
+- Mitigate-quarantine secondary read: walks the mitigate backup
+  area and emits one synthetic warning-tier signal per quarantined
+  session sidecar (cap 200 per scan). Falls back to live mtime when
+  sidecar is missing.
 
-### Changed
-- VERSION 2.6.1 → 2.7.1.
-- `_schema_changes` meta record bumped to `schema_version=4`.
-- `check_destruction_iocs` snapshot-mode early-return now runs
-  Pattern J (degraded confidence) before returning.
-- `check_sessions` early-return path now runs the quarantine
-  secondary first.
-
-## sessionscribe-ioc-scan.sh v2.6.1 — 2026-05-02
+## ioc-scan v2.6.1 — 2026-05-02
 
 ### Fixed
-- **`manifest.txt` and `kill-chain.jsonl` meta record now carry real
-  values.** `CPANEL_NORM`, `PRIMARY_IP`, `OS_PRETTY`, `LP_UID` were
-  declared empty at top-level with comments saying "set by banner()" —
-  but `banner()` only printed. Added `collect_host_meta()` (data-only
-  key=value parser for `/etc/os-release`; same cpanel-V resolution
-  chain as `check_version()`; `ip route get` → `hostname -I` for
-  primary IP; env-var override for `LP_UID`).
-- **`PATCHED_BUILDS_CPANEL` was declared empty and never populated.**
-  Now populated from `PATCHED_TIERS_KEYS` / `PATCHED_TIERS_VALS` at
-  startup.
-- **`PATCHED_BUILD_WPSQUARED` was declared empty.** Now set to
-  `"11.136.1.7"`.
-- **`UNPATCHED_TIERS` was a scalar string iterated as an array.**
-  Every UNPATCHABLE-tier host (112/114/116/120/122/128) was
-  misclassified as UNPATCHED. Converted to an array.
-- **`LP_UID` env-var override was clobbered.** Changed top-level to
-  `: "${LP_UID:=}"` so env-set values survive initialization.
-- **`/etc/os-release` parser was shell-injection-vulnerable.**
-  Replaced `eval` with a data-only `while IFS='=' read -r` parser.
-- **`check_version()` and `collect_host_meta()` regex paths
-  diverged.** Both now use `^[[:space:]]*(...)`-anchored matching.
+- Globals declared empty but read downstream are now populated: host
+  meta (cpanel version, OS, primary IP, LP UID), patched-build map,
+  unpatched-tier array.
+- Replaced an `eval`-based `/etc/os-release` parser
+  (shell-injection-vulnerable) with a data-only `IFS='=' read`
+  parser.
+- Unpatched-tier scalar iterated as an array misclassified every
+  UNPATCHABLE-tier host as UNPATCHED; converted to an array.
 
 ### Removed
-- Dead `to_epoch()` and `extract_log_ts()` helpers (zero callers).
-- Orphan globals: `BUNDLE_TGZ`, `ENV_STRONG`, `ENV_FIXED`,
-  `ENV_INCONCLUSIVE`, `ENV_IOC_CRITICAL`, `ENV_IOC_REVIEW`.
-- `HOSTNAME_J` global — duplicated `HOSTNAME_JSON`.
+- Dead epoch helpers; orphan globals; duplicate hostname global.
 
-### Changed
-- VERSION 2.5.0 → 2.6.1.
-
-## sessionscribe-ioc-scan.sh v2.5.0 — 2026-05-02
+## ioc-scan v2.5.0 — 2026-05-02
 
 ### Added
-- **`--chain-on-all` / `--chain-always` flag** — runs the forensic
-  chain (defense + offense + reconcile + kill-chain + bundle) for
-  EVERY host scanned, regardless of `host_verdict`. Overrides the
-  default CLEAN-skip and overrides `--chain-on-critical`. Pair with
-  `--upload` to ship every bundle to intake.
-- Forensic-gate priority (highest first): `--chain-on-all` >
-  `--chain-on-critical` > default `--full`.
-- `forensic_chain_on_all` info signal emitted when the override fires.
-- `forensic_skipped_clean` note now hints at `--chain-on-all`.
+- `--chain-on-all` / `--chain-always` runs the forensic chain
+  (defense + offense + reconcile + kill-chain + bundle) on every
+  host regardless of `host_verdict`. Pairs with `--upload`. Does
+  not change verdict semantics.
 
-### Notes
-- `--chain-on-all` does NOT change verdict semantics — host_verdict,
-  exit_code, and score are computed the same way.
-
-## sessionscribe-ioc-scan.sh v2.4.1 — 2026-05-02
+## ioc-scan v2.4.1 — 2026-05-02
 
 ### Added
-- **Visual kill-chain rendering for v2.4.0 advisory entries.** The
-  pre-compromise gate keys (`*_pre_compromise`, `*_orphan`) were
-  filtered out of `read_iocs_from_envelope` in v2.4.0; v2.4.1 admits
-  them via a narrow allow-list so operators see the full forensic
-  picture.
-- New verdict types in `phase_reconcile`: `ADVISORY-PRE-COMPROMISE`
-  and `ADVISORY-ORPHAN`. Both short-circuit the standard PRE/POST
-  defense comparison and do NOT increment `N_PRE` / `N_POST`.
-- New zone IDs in `render_kill_chain`: `adv_pre` and `adv_orphan`,
-  rendered in cyan + bold.
-- `render_offense_row` colors `ADVISORY-*` verdicts in cyan.
-- New `counters` line breakout: `advisory=N` shows the count of
-  advisory rows; the existing `iocs=N` shows attack-chain events only.
+- Kill-chain rendering for advisory entries introduced in v2.4.0:
+  new `ADVISORY-PRE-COMPROMISE` and `ADVISORY-ORPHAN` verdict
+  values, rendered in cyan; new `advisory=N` counter line that
+  remains separate from the `iocs=N` attack-chain count.
 
 ### Changed
-- `kill-chain.tsv` and `kill-chain.jsonl` will now carry rows with
-  verdict values `ADVISORY-PRE-COMPROMISE` / `ADVISORY-ORPHAN`.
-  Aggregator-side: `ss-aggregate.py` should pattern-match `ADVISORY-*`
-  to bucket separately from PRE/POST/UNDEFENDED.
+- `kill-chain.{tsv,jsonl}` may now carry `ADVISORY-*` rows; fleet
+  aggregators should bucket separately from PRE/POST/UNDEFENDED.
 
-## sessionscribe-ioc-scan.sh v2.4.0 — 2026-05-02
+## ioc-scan v2.4.0 — 2026-05-02
 
 ### Added
-- **Pre-compromise temporal gate** for two second-order signals
-  (`ioc_pattern_e_websocket_shell_hits` and
-  `ioc_attacker_ip_2xx_on_cpsess`). Both are post-RCE /
-  token-consumption evidence — they require a first-order
-  CVE-2026-41940 exploitation primitive
-  (`ioc_cve_2026_41940_crlf_access_chain`) as compromise anchor.
-- New advisory keys (weight=0; do NOT escalate `host_verdict`):
-  - `ioc_attacker_ip_2xx_on_cpsess_pre_compromise` — fired when CRLF
-    chain is absent OR `ts_first` predates first CRLF chain epoch.
-  - `ioc_pattern_e_websocket_shell_hits_pre_compromise` — same gate.
-  - `ioc_pattern_e_websocket_shell_hits_orphan` — fired when
-    Pattern E passes the CRLF gate but is more than
-    `PATTERN_E_2XX_PROXIMITY_SEC` (default 7 days) away from the
-    nearest `ioc_attacker_ip_2xx_on_cpsess` first epoch.
-- Each emit carries `crlf_first_epoch` (and Pattern E adds
-  `twoxx_first_epoch` + `proximity_sec`).
-- New constant `PATTERN_E_2XX_PROXIMITY_SEC=604800`. New globals
-  `LOGS_CRLF_CHAIN_FIRST_EPOCH`, `LOGS_2XX_CPSESS_FIRST_EPOCH`.
-- `ioc_key_to_pattern()` routes the three new keys to `init` (not
-  part of the kill-chain pattern alphabet).
+- Pre-compromise temporal gate for second-order signals (websocket
+  shell hits, 2xx-on-cpsess). Both require a first-order CRLF
+  access-chain anchor; otherwise emit advisory keys
+  (`_pre_compromise` / `_orphan`) at weight 0.
 
-### Changed
-- `check_logs` now calls `check_crlf_access_primitive` BEFORE
-  `check_attacker_ips`.
-- VERSION 2.3.0 → 2.4.0.
-
-## sessionscribe-ioc-scan.sh v2.3.0 — 2026-05-02
+## ioc-scan v2.3.0 — 2026-05-02
 
 ### Added
-- **Gap 10: `session_mtime_vs_ctime_anomaly` IOC** — flags session
-  files whose mtime diverges from ctime by `>=
-  SESSION_MTIME_CTIME_THRESHOLD_SEC` (default 600s). cpsrvd's session
-  writer sets both atomically, so divergence indicates `touch -d`
-  backdating, or `cp -p` / `tar xp` / `rsync -t` restore artifact.
-  Severity `advisory` (weight 0): does NOT escalate `host_verdict`.
-- `emit_session()` always includes `file_ctime` (ISO-8601 UTC) and
-  `mtime_ctime_delta_sec` (signed seconds). Non-breaking schema
-  addition.
-- New `analyze_session()` globals `SF_FILE_CTIME`,
-  `SF_FILE_CTIME_ISO`, `SF_MTIME_CTIME_DELTA`. `stat -c '%Y %Z'`
-  single subprocess call.
-- Section-level summary `session_mtime_anomaly_summary` (advisory).
-- `no_session_iocs` all-clear is now gated on `mtime_anomalies == 0`.
+- `session_mtime_vs_ctime_anomaly` advisory (default threshold
+  600s) flags `touch -d` backdating and restore-artifact divergence.
+  Schema-additive: `file_ctime` and `mtime_ctime_delta_sec` always
+  emitted. Does not escalate `host_verdict`.
 
-### Changed
-- VERSION 2.2.0 → 2.3.0.
-
-## sessionscribe-mitigate.sh v0.5.1 — 2026-05-02
+## mitigate v0.5.1 — 2026-05-02
 
 ### Fixed
-- **EL6 floor regression** — line 470 used `declare -ga
-  SIGNALS_JSON=()` which requires bash 4.2+. `SIGNALS_JSON` is
-  declared at top-level scope alongside the other top-level
-  declarations (no `-g` needed). Replaced with `declare -a` to
-  restore bash 4.1.2 compatibility.
+- EL6 floor regression: bash 4.2+ `declare -ga` replaced with
+  top-level `declare -a` so 4.1.2 parses.
 
-### Changed
-- VERSION 0.5.0 → 0.5.1.
-
-## sessionscribe-mitigate.sh v0.5.0 — 2026-05-02
+## mitigate v0.5.0 — 2026-05-02
 
 ### Added
-- **`phase_snapshot` runs FIRST** in the phase order; captures the
-  pre-mitigation state of `/var/cpanel/users/`, `accounting.log[.*]`,
-  `audit.log[.*]`, `cpanel.config`, and
-  `sessions/{raw,preauth,cache}/` to
-  `<BACKUP_DIR>/pre-mitigate-state.tgz` BEFORE any mutating phase
-  perturbs it.
-- `whmapi1 get_tweaksetting` output for `proxysubdomains` and
-  `proxysubdomainsfornewaccounts` captured into
-  `pre-mitigate-tweaksettings.txt`, closing the per-file backup gap
-  for `phase_proxysub`.
-- `.info` sidecar with sha256 of the tarball, byte size, tier1/tier2
-  inventory, sessions-included flag, and tar return code.
-- New CLI flags: `--no-snapshot` opt-out, `--max-snapshot-mb MB`
-  (default 500) caps the session-corpus tier.
+- `phase_snapshot` runs first and captures pre-mitigation state of
+  users, accounting/audit logs, cpanel config, and session
+  directories to a single tarball with a sha256 sidecar before any
+  mutating phase runs.
+- Tweaksetting capture for `proxysubdomains[fornewaccounts]` closes
+  the per-file backup gap for the proxysub phase.
+- Flags: `--no-snapshot`, `--max-snapshot-mb MB` (default 500).
 
 ### Changed
-- Phase order now begins with `snapshot`; existing operators relying
-  on prior bare `--apply` behavior should add `--no-snapshot`.
+- Phase order now begins with `snapshot`; operators relying on bare
+  `--apply` should add `--no-snapshot`.
 
-## sessionscribe-mitigate.sh v0.4.2 — 2026-05-02
+## mitigate v0.4.2 — 2026-05-02
 
 ### Added
-- `phase_sessions` IOC-D2: single-line `pass=` on a badpass session
-  with no auth markers (well-formed, `pass_count == 1`, not
-  stranded). ATTEMPT-class.
-- `phase_sessions` standalone IOC-2: `tfa_verified=1` outside known-
-  good origins (`handle_form_login`, `create_user_session`,
-  `handle_auth_transfer`), non-badpass. ATTEMPT-class.
-- `tests/sessions/` fixtures + `tests/run-session-tests.sh` harness.
-  Six cases: two positive, four negative.
+- Two new session attempt-class IOCs: single-line `pass=` on a
+  badpass session with no auth markers; standalone `tfa_verified=1`
+  outside known-good origins.
+- Session-IOC test harness with six fixture cases.
 
 ### Changed
-- `phase_sessions` dry-run output now distinguishes
-  `forged session: <path>` (any of A/B/C/D/E/E2/F/H/I) from
-  `attempt session: <path>` (only D2 / 2). Quarantine treatment
-  under `--apply` is identical for both classes — split is
-  display-only.
-- `tfa_verified=1` awk anchor tightened to `/^tfa_verified=1$/` so
-  `tfa_verified=10` cannot match.
-
-### Notes
-- Reasons-CSV literal append order: A,B-cand,C,D,E,E2,F,H,I,D2,2.
-- gawk 3.1.x compat: no `{n}` quantifiers, no 3-arg `match()`, no
-  `gensub`/`patsplit`.
+- Dry-run output distinguishes "forged session" from "attempt
+  session"; quarantine treatment under `--apply` is identical.

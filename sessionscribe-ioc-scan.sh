@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.8.4
+# sessionscribe-ioc-scan.sh v2.8.5
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -116,7 +116,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.4"
+VERSION="2.8.5"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -1784,6 +1784,16 @@ declare -a SIGNALS=()
 declare -a REASONS=()
 declare -a IOC_KEYS=()
 declare -a ADVISORIES=()
+# Per-user attribution maps populated by aggregate_verdict() and consumed by
+# aggregate_per_user_verdict() / write_json. Same rule: top-level -A, reset
+# by reassignment inside the producer (declare -gA is bash 4.2+).
+declare -A USER_SEVERITY=()
+declare -A USER_PATTERNS=()
+declare -A USER_KEYS=()
+declare -A USER_PRIV_MAX=()
+declare -A USER_FIRST_EPOCH=()
+declare -A USER_LAST_EPOCH=()
+declare -A USER_COUNT=()
 
 # JSON-escape an arbitrary string for embedding in JSON values.
 # Handles \, ", \n, \r, \t, and control chars.
@@ -2544,13 +2554,22 @@ suspect_ip_correlation() {
     (( ${#cp_logs[@]} > 0 )) || return
 
     # Drop RFC1918 + loopback (WHM admin); same regex shape as Pattern E is_internal.
+    # 5min cap on the full log scan — multi-year access_log corpora on busy
+    # fleets can exceed an hour of grep/awk wall-time (#hotfix v2.8.5).
     local suspect_ips
-    suspect_ips=$(
-        for lg in "${cp_logs[@]}"; do cat_log "$lg"; done \
-            | grep -E '"GET /cpsess[0-9]+/(websocket/Shell|json-api/(createacct|setupreseller|setacls))' 2>/dev/null \
-            | awk '$1 !~ /^10\./ && $1 !~ /^127\./ && $1 !~ /^192\.168\./ && $1 !~ /^172\.(1[6-9]|2[0-9]|3[01])\./ {print $1}' \
+    suspect_ips=$(timeout 300 bash -c '
+        for lg in "$@"; do
+            case "$lg" in
+                *.gz)  command -v zcat  >/dev/null 2>&1 && zcat  "$lg" 2>/dev/null ;;
+                *.xz)  command -v xzcat >/dev/null 2>&1 && xzcat "$lg" 2>/dev/null ;;
+                *.bz2) command -v bzcat >/dev/null 2>&1 && bzcat "$lg" 2>/dev/null ;;
+                *)     cat "$lg" 2>/dev/null ;;
+            esac
+        done \
+            | grep -E "\"GET /cpsess[0-9]+/(websocket/Shell|json-api/(createacct|setupreseller|setacls))" 2>/dev/null \
+            | awk "\$1 !~ /^10\\./ && \$1 !~ /^127\\./ && \$1 !~ /^192\\.168\\./ && \$1 !~ /^172\\.(1[6-9]|2[0-9]|3[01])\\./ {print \$1}" \
             | sort -u | head -50
-    )
+    ' _ "${cp_logs[@]}" 2>/dev/null)
     if [[ -n "$suspect_ips" ]]; then
         local ip_list
         ip_list=$(echo "$suspect_ips" | tr '\n' ',' | sed 's/,$//')
@@ -6807,7 +6826,7 @@ check_destruction_iocs() {
     local sorry_root
     for sorry_root in /home /var/www; do
         [[ -d "$sorry_root" ]] || continue
-        first_sorry=$(find "$sorry_root" -maxdepth 5 \
+        first_sorry=$(timeout 300 find "$sorry_root" -maxdepth 5 \
             \( -name 'mail' -o -name '.cagefs' -o -name 'node_modules' \
                -o -name '.composer' -o -name '.npm' -o -name '.cache' \
                -o -name '.trash' -o -name 'tmp' \) -prune \
@@ -6898,14 +6917,19 @@ check_destruction_iocs() {
     # Anti-forensic: encryptor also walks /var/log + /var/cpanel encrypting
     # evidence files. ≥10 .sorry OR accounting.log encrypted = strong
     # destruction signal; survives /home restore.
-    local fe_count=0 fe_acct=0 fe_sample=""
+    local fe_count=0 fe_acct=0 fe_sample="" _fe_list=""
     if [[ -d /var/log || -d /var/cpanel ]]; then
-        fe_count=$(find /var/log /var/cpanel -maxdepth 6 -name '*.sorry' \
-                       -not -path '*/imunify360/cache/*' 2>/dev/null | wc -l)
+        # Single walk; derive count and sample from one output. 5min cap
+        # against pathological /var/log trees (#hotfix v2.8.5).
+        _fe_list=$(timeout 300 find /var/log /var/cpanel -maxdepth 6 \
+                       -name '*.sorry' -not -path '*/imunify360/cache/*' \
+                       2>/dev/null)
+        if [[ -n "$_fe_list" ]]; then
+            fe_count=$(printf '%s\n' "$_fe_list" | wc -l)
+            fe_sample=$(printf '%s\n' "$_fe_list" | head -1)
+        fi
         fe_count="${fe_count:-0}"
         fe_count="${fe_count// /}"
-        fe_sample=$(find /var/log /var/cpanel -maxdepth 6 -name '*.sorry' \
-                        -not -path '*/imunify360/cache/*' 2>/dev/null | head -1)
     fi
     [[ -f /var/cpanel/accounting.log.sorry ]] && fe_acct=1
     if (( fe_count >= 10 )) || (( fe_acct == 1 )); then
@@ -6947,9 +6971,12 @@ check_destruction_iocs() {
         fi
     fi
     # BTC index.html drops nested under /home/*/public_html (cohort).
+    # 5min walltime cap; head -1 closes the pipe at first hit (#hotfix v2.8.5).
     local btc_hit=""
-    btc_hit=$(find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
-                | xargs -0 grep -lF "$PATTERN_B_BTC_ADDR" 2>/dev/null | head -1)
+    btc_hit=$(timeout 300 sh -c \
+        'find /home/*/public_html -maxdepth 4 -name index.html -print0 2>/dev/null \
+            | xargs -0 -r grep -lF -- "$1" 2>/dev/null | head -1' \
+        _ "$PATTERN_B_BTC_ADDR" 2>/dev/null)
     if [[ -n "$btc_hit" ]]; then
         local btc_mtime _au_btc
         btc_mtime=$(stat -c %Y "$btc_hit" 2>/dev/null)
@@ -7338,7 +7365,7 @@ check_destruction_iocs() {
                 fi
             fi
             oddkeys+=("$_odd")
-        done < <(find /etc /var/spool/cron -maxdepth 5 \
+        done < <(timeout 300 find /etc /var/spool/cron -maxdepth 5 \
             \( -path '/etc/cpanel/userdata' -o -path '/etc/cpanel/users' \
                -o -path '/etc/exim*' -o -path '/etc/dovecot' \
                -o -path '/etc/mail' -o -path '/etc/skel' \) -prune \
@@ -8200,34 +8227,40 @@ check_destruction_iocs() {
         done < <(find /etc/sudoers.d -maxdepth 1 -type f 2>/dev/null)
     fi
 
-    # M7 — Monero wallet literal. Bounded find + prune to keep /tmp/etc fast.
+    # M7 — Monero wallet literal. Single batched grep (find | xargs grep)
+    # across all candidate dirs at once; 5min walltime cap. Replaces a
+    # per-file fork loop that could exceed an hour on hosts with deep
+    # /etc or /tmp trees (#hotfix v2.8.5).
     local _m_xmr_hit="" _m_xmr_paths=(
         /root /etc /opt /tmp /var/tmp /var/spool/cron
         /usr/local/bin /usr/local/sbin
     )
-    local _m_xmr_dir _m_xmr_f
-    for _m_xmr_dir in "${_m_xmr_paths[@]}"; do
-        [[ -d "$_m_xmr_dir" ]] || continue
+    local _m_xmr_dirs_present=() _m_xmr_d
+    for _m_xmr_d in "${_m_xmr_paths[@]}"; do
+        [[ -d "$_m_xmr_d" ]] && _m_xmr_dirs_present+=("$_m_xmr_d")
+    done
+    if (( ${#_m_xmr_dirs_present[@]} > 0 )); then
+        local _m_xmr_f
         while IFS= read -r _m_xmr_f; do
             [[ -n "$_m_xmr_f" ]] || continue
-            case "${_m_xmr_f##*/}" in
-                sessionscribe-*|nxesec-whmscribe-*) continue ;;
-            esac
-            if grep -qF "$PATTERN_M_XMR_WALLET" "$_m_xmr_f" 2>/dev/null; then
-                # Self-reference: file assigns the constant OR includes
-                # our script identifier — toolkit copy, not attacker drop.
-                if grep -qE 'PATTERN_M_XMR_WALLET=|sessionscribe-ioc-scan' "$_m_xmr_f" 2>/dev/null; then
-                    continue
-                fi
-                _m_xmr_hit="$_m_xmr_f"
-                break 2
+            # Self-reference: file assigns the constant OR includes our
+            # script identifier — toolkit copy, not attacker drop.
+            if grep -qE 'PATTERN_M_XMR_WALLET=|sessionscribe-ioc-scan' "$_m_xmr_f" 2>/dev/null; then
+                continue
             fi
-        done < <(find "$_m_xmr_dir" -maxdepth 4 \
-            \( -name node_modules -o -name .cache -o -name .composer \
-               -o -name .npm -o -name .cagefs -o -name __pycache__ \
-               -o -name mail -o -name .git \) -prune \
-            -o -type f -size +1c -size -10M -print 2>/dev/null)
-    done
+            _m_xmr_hit="$_m_xmr_f"
+            break
+        done < <(
+            timeout 300 find "${_m_xmr_dirs_present[@]}" -maxdepth 4 \
+                \( -name node_modules -o -name .cache -o -name .composer \
+                   -o -name .npm -o -name .cagefs -o -name __pycache__ \
+                   -o -name mail -o -name .git \) -prune \
+                -o -type f -size +1c -size -10M \
+                ! -name 'sessionscribe-*' ! -name 'nxesec-whmscribe-*' \
+                -print0 2>/dev/null \
+            | xargs -0 -r grep -lF -- "$PATTERN_M_XMR_WALLET" 2>/dev/null
+        )
+    fi
     if [[ -z "$_m_xmr_hit" ]]; then
         local _m_xmr_h
         for _m_xmr_h in /root/.bash_history /home/*/.bash_history; do
@@ -8526,7 +8559,7 @@ check_destruction_iocs() {
              | grep -E "$RUNTIME_TMP_HEX_RE" 2>/dev/null)
 
     local _rt_ps_cap; _rt_ps_cap=$(mktemp /tmp/ssioc.psrun.XXXXXX 2>/dev/null)
-    if [[ -n "$_rt_ps_cap" ]] && ps auxfww > "$_rt_ps_cap" 2>/dev/null; then
+    if [[ -n "$_rt_ps_cap" ]] && timeout 60 ps auxfww > "$_rt_ps_cap" 2>/dev/null; then
         local _rt_line _rt_user
 
         _rt_line=$(grep -E "$RUNTIME_MASQ_RESPAWN_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
@@ -8767,7 +8800,7 @@ check_destruction_iocs() {
     local _rt_conn_cap=""
     if have_cmd ss; then
         _rt_conn_cap=$(mktemp /tmp/ssioc.connrun.XXXXXX 2>/dev/null)
-        [[ -n "$_rt_conn_cap" ]] && ss -tnp > "$_rt_conn_cap" 2>/dev/null || true
+        [[ -n "$_rt_conn_cap" ]] && timeout 60 ss -tnp > "$_rt_conn_cap" 2>/dev/null || true
     fi
     if [[ -n "$_rt_conn_cap" && -s "$_rt_conn_cap" ]]; then
         local _rt_ip _rt_line _rt_pid _rt_uid
@@ -9116,13 +9149,15 @@ aggregate_verdict() {
     local root_compromise_critical=0 root_ioc_critical=0 root_ioc_review=0
     local root_compromise_critical_live=0
     local user_compromise_critical=0 user_ioc_critical=0 user_ioc_review=0
-    declare -gA USER_SEVERITY=()
-    declare -gA USER_PATTERNS=()
-    declare -gA USER_KEYS=()
-    declare -gA USER_PRIV_MAX=()
-    declare -gA USER_FIRST_EPOCH=()
-    declare -gA USER_LAST_EPOCH=()
-    declare -gA USER_COUNT=()
+    # Top-level globals (see declarations near SIGNALS=()); reset contents
+    # rather than redeclare to stay on the bash 4.1.2 (EL6) floor.
+    USER_SEVERITY=()
+    USER_PATTERNS=()
+    USER_KEYS=()
+    USER_PRIV_MAX=()
+    USER_FIRST_EPOCH=()
+    USER_LAST_EPOCH=()
+    USER_COUNT=()
     # Persistence cluster tracking. Dedupes by pattern letter (G/J/I/F/D/H);
     # multiplier rewards distinct patterns, not key count.
     local -A PERSIST_PATTERNS=()
