@@ -2613,7 +2613,8 @@ phase_defense() {
         # Exact-equality (pre-v2.8.5) FP'd any post-upcp host above the
         # cutoff, including C6/CL6 direct-update 11.110.0.103, every WP
         # Squared host, and every host bumped past the original .41/.28/...
-        # release. Now matches check_version()'s cutoff-comparison logic.
+        # release. Parses CPANEL_NORM directly so the function works
+        # regardless of whether the CPANEL_WPSQ_* globals are populated.
         local patched=0 _pd_tier="" _pd_build="" _pd_i
         if [[ "$CPANEL_NORM" =~ ^11\.([0-9]+)\.0\.([0-9]+)$ ]]; then
             _pd_tier="${BASH_REMATCH[1]}"; _pd_build="${BASH_REMATCH[2]}"
@@ -2623,9 +2624,10 @@ phase_defense() {
                     patched=1; break
                 fi
             done
-        elif [[ -n "$CPANEL_WPSQ_TIER" && -n "$CPANEL_WPSQ_BUILD" ]]; then
-            if [[ "$CPANEL_WPSQ_TIER" == "$PATCHED_WPSQUARED_TIER" ]] \
-               && (( CPANEL_WPSQ_BUILD >= PATCHED_WPSQUARED_BUILD )); then
+        elif [[ "$CPANEL_NORM" =~ ^11\.([0-9]+)\.1\.([0-9]+)$ ]]; then
+            _pd_tier="${BASH_REMATCH[1]}"; _pd_build="${BASH_REMATCH[2]}"
+            if [[ "$_pd_tier" == "$PATCHED_WPSQUARED_TIER" ]] \
+               && (( _pd_build >= PATCHED_WPSQUARED_BUILD )); then
                 patched=1
             fi
         fi
