@@ -18,6 +18,18 @@ versioned per affected component.
   of warning-tier review. Re-image+restore re-stamps mtime/ctime
   post-disclosure on these files, surfacing them as M3 review noise.
   Known-bad usernames still override to strong/critical.
+- `phase_defense` PATCH_STATE used exact-equality against the cutoff
+  list and falsely classified every host *above* the cutoff as
+  UNPATCHED (post-upcp builds, C6/CL6 direct-update 11.110.0.103, all
+  WP Squared hosts). Now uses the same `build >= cutoff` comparison
+  as `check_version`, so the kill-chain timeline and envelope
+  `patch_state` field agree across the two code paths.
+- WP Squared product line (11.&lt;tier&gt;.1.&lt;build&gt; shape) is now
+  parsed by both `collect_host_meta` and `check_version` and
+  dispatched against its own cutoff (11.136.1.7). Pre-fix:
+  `CPANEL_NORM=unknown` → PATCH_STATE=UNKNOWN regardless of patch
+  state. New globals `CPANEL_WPSQ_TIER`/`CPANEL_WPSQ_BUILD` and
+  constants `PATCHED_WPSQUARED_TIER`/`PATCHED_WPSQUARED_BUILD`.
 
 ### Changed
 - Pattern M7 Monero-wallet walk replaced its per-file `grep -qF` fork

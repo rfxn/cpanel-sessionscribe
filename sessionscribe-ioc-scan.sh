@@ -1327,7 +1327,13 @@ done
 unset _i
 PATCHED_BUILD_WPSQUARED="11.136.1.7"  # WP Squared product line (separate
                             # patch lineage; see comment at PATCHED_TIERS_KEYS)
+PATCHED_WPSQUARED_TIER=136  # WP Squared tier and build cutoff. Split out
+PATCHED_WPSQUARED_BUILD=7   # so phase_defense/check_version can compare
+                            # build >= cutoff (not just exact-match).
 CPANEL_NORM=""             # normalised cPanel version "11.<tier>.0.<build>"
+                            # or "11.<tier>.1.<build>" for WP Squared.
+CPANEL_WPSQ_TIER=""        # populated alongside CPANEL_NORM when raw matches
+CPANEL_WPSQ_BUILD=""       # the WP Squared shape (11.<t>.1.<b> / <t>.1 (build <b>))
 PRIMARY_IP=""              # primary outbound IPv4 (ip-route-get probe)
 OS_PRETTY=""               # /etc/os-release PRETTY_NAME or redhat-release line
 : "${LP_UID:=}"            # hosting-provider UID; env-overridable, default ""
@@ -1546,6 +1552,14 @@ collect_host_meta() {
         CPANEL_NORM="11.${BASH_REMATCH[1]}.0.${BASH_REMATCH[2]}"
     elif [[ "$_raw" =~ ^[[:space:]]*(11\.)?([0-9]{2,3})\.0\.([0-9]+) ]]; then
         CPANEL_NORM="11.${BASH_REMATCH[2]}.0.${BASH_REMATCH[3]}"
+    elif [[ "$_raw" =~ ^[[:space:]]*([0-9]{2,3})\.1[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
+        CPANEL_WPSQ_TIER="${BASH_REMATCH[1]}"
+        CPANEL_WPSQ_BUILD="${BASH_REMATCH[2]}"
+        CPANEL_NORM="11.${BASH_REMATCH[1]}.1.${BASH_REMATCH[2]}"
+    elif [[ "$_raw" =~ ^[[:space:]]*(11\.)?([0-9]{2,3})\.1\.([0-9]+) ]]; then
+        CPANEL_WPSQ_TIER="${BASH_REMATCH[2]}"
+        CPANEL_WPSQ_BUILD="${BASH_REMATCH[3]}"
+        CPANEL_NORM="11.${BASH_REMATCH[2]}.1.${BASH_REMATCH[3]}"
     fi
     [[ -z "$CPANEL_NORM" ]] && CPANEL_NORM="unknown"
 
@@ -2595,11 +2609,26 @@ phase_defense() {
         emit_signal defense warn patch_unknown "cpanel build unparseable" \
             build "$CPANEL_NORM" patch_state "$PATCH_STATE"
     else
-        local patched=0
-        for b in "${PATCHED_BUILDS_CPANEL[@]}"; do
-            [[ "$CPANEL_NORM" == "$b" ]] && patched=1
-        done
-        [[ "$CPANEL_NORM" == "$PATCHED_BUILD_WPSQUARED" ]] && patched=1
+        # Patched if the build is >= the vendor cutoff for the host's tier.
+        # Exact-equality (pre-v2.8.5) FP'd any post-upcp host above the
+        # cutoff, including C6/CL6 direct-update 11.110.0.103, every WP
+        # Squared host, and every host bumped past the original .41/.28/...
+        # release. Now matches check_version()'s cutoff-comparison logic.
+        local patched=0 _pd_tier="" _pd_build="" _pd_i
+        if [[ "$CPANEL_NORM" =~ ^11\.([0-9]+)\.0\.([0-9]+)$ ]]; then
+            _pd_tier="${BASH_REMATCH[1]}"; _pd_build="${BASH_REMATCH[2]}"
+            for _pd_i in "${!PATCHED_TIERS_KEYS[@]}"; do
+                if [[ "${PATCHED_TIERS_KEYS[$_pd_i]}" == "$_pd_tier" ]] \
+                   && (( _pd_build >= ${PATCHED_TIERS_VALS[$_pd_i]} )); then
+                    patched=1; break
+                fi
+            done
+        elif [[ -n "$CPANEL_WPSQ_TIER" && -n "$CPANEL_WPSQ_BUILD" ]]; then
+            if [[ "$CPANEL_WPSQ_TIER" == "$PATCHED_WPSQUARED_TIER" ]] \
+               && (( CPANEL_WPSQ_BUILD >= PATCHED_WPSQUARED_BUILD )); then
+                patched=1
+            fi
+        fi
         if (( patched )) && [[ -f "$PATCH_CANARY_FILE" ]]; then
             PATCH_STATE="PATCHED"
             DEF_PATCH_TIME=$(mtime_of "$PATCH_CANARY_FILE")
@@ -4940,11 +4969,17 @@ check_version() {
     # 4+ digit prefix doesn't match its trailing 2-3 digits via leftmost-not-
     # anchored bash regex behavior. Mirrors collect_host_meta() so both
     # functions yield the same value from the same source.
-    local tier="" build=""
+    # WP Squared product line uses 11.<tier>.1.<build> instead of .0. — when
+    # detected, dispatch to the WPS cutoff and short-circuit the main ladder.
+    local tier="" build="" _is_wpsq=0
     if [[ "$raw" =~ ^[[:space:]]*([0-9]{2,3})\.0[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
         tier="${BASH_REMATCH[1]}"; build="${BASH_REMATCH[2]}"
     elif [[ "$raw" =~ ^[[:space:]]*(11\.)?([0-9]{2,3})\.0\.([0-9]+) ]]; then
         tier="${BASH_REMATCH[2]}"; build="${BASH_REMATCH[3]}"
+    elif [[ "$raw" =~ ^[[:space:]]*([0-9]{2,3})\.1[[:space:]]*\(build[[:space:]]*([0-9]+)\) ]]; then
+        tier="${BASH_REMATCH[1]}"; build="${BASH_REMATCH[2]}"; _is_wpsq=1
+    elif [[ "$raw" =~ ^[[:space:]]*(11\.)?([0-9]{2,3})\.1\.([0-9]+) ]]; then
+        tier="${BASH_REMATCH[2]}"; build="${BASH_REMATCH[3]}"; _is_wpsq=1
     fi
 
     if [[ -z "$tier" || -z "$build" ]]; then
@@ -4953,8 +4988,33 @@ check_version() {
         return
     fi
 
+    local _shape_label=0; (( _is_wpsq )) && _shape_label=1
     emit "version" "version_detect" "info" "detected" 0 \
-         "version" "${tier}.0.${build}" "tier" "$tier" "build" "$build" "raw" "$raw"
+         "version" "${tier}.${_shape_label}.${build}" "tier" "$tier" \
+         "build" "$build" "raw" "$raw" "wpsquared" "$_is_wpsq"
+
+    # WP Squared dispatch — its own cutoff (PATCHED_WPSQUARED_*), separate
+    # from the main tier ladder.
+    if (( _is_wpsq )); then
+        if [[ "$tier" == "$PATCHED_WPSQUARED_TIER" ]]; then
+            if (( build >= PATCHED_WPSQUARED_BUILD )); then
+                emit "version" "tier_class" "info" "patched_per_build" 5 \
+                     "tier" "$tier" "build" "$build" \
+                     "cutoff" "$PATCHED_WPSQUARED_BUILD" "wpsquared" "1" \
+                     "note" "${tier}.1.${build} ≥ WP Squared cutoff ${tier}.1.${PATCHED_WPSQUARED_BUILD}"
+            else
+                emit "version" "tier_class" "strong" "vulnerable_per_build" 5 \
+                     "tier" "$tier" "build" "$build" \
+                     "cutoff" "$PATCHED_WPSQUARED_BUILD" "wpsquared" "1" \
+                     "note" "${tier}.1.${build} < WP Squared cutoff ${tier}.1.${PATCHED_WPSQUARED_BUILD}"
+            fi
+        else
+            emit "version" "tier_class" "warning" "cutoff_unknown" 0 \
+                 "tier" "$tier" "wpsquared" "1" \
+                 "note" "WP Squared shape on unmapped tier $tier; verify manually."
+        fi
+        return
+    fi
 
     # Classify. Patched-table lookup is authoritative for any tier in the KB,
     # so it must run BEFORE residual EOL/dev/unknown branches — otherwise a
