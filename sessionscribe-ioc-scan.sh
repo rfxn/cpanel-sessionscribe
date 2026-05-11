@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.8.0
+# sessionscribe-ioc-scan.sh v2.8.1
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -116,7 +116,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.0"
+VERSION="2.8.1"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -275,6 +275,22 @@ PATTERN_L_NUKE_RE="rm[[:space:]]+-rf[[:space:]]+--no-preserve-root[[:space:]]+/(
 PATTERN_L_CMD_START="__CMD_START__"
 PATTERN_L_CMD_END="__CMD_END__"
 PATTERN_L_CMD_ENVELOPE_RE="${PATTERN_L_CMD_START}|${PATTERN_L_CMD_END}"
+
+# Pattern M — rogue UID=0 user + amco_ docker botnet cluster.
+# Field-observed 2026-05-11 (LW IR); cross-references Reddit "27 MH/s
+# botnet on cPanel" thread. Same actor drops a UID=0 backdoor user
+# (pakchoi/alexisa), wheel-group injection, sudoers.d NOPASSWD:ALL,
+# amco_<UUID> docker cryptominer, and a cron self-heal shape that
+# rebuilds the user every 30 minutes. M is persistence-class.
+PATTERN_M_KNOWN_USERS=(pakchoi alexisa)
+PATTERN_M_AMCO_RE="amco_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+PATTERN_M_CRON_SELF_HEAL_RE='\(id[[:space:]]+[a-zA-Z_][a-zA-Z0-9_-]*[[:space:]]+>/dev/null.*\|\|.*useradd.*chpasswd.*sudoers\.d'
+# 2026-04-28 00:00 UTC — watchTowr CVE-2026-41940 public disclosure.
+# Sudoers and .accesshash artifacts touched (mtime OR ctime) at or
+# after this epoch are post-disclosure-era drops. Pre-disclosure
+# artifacts are overwhelmingly legitimate IR/devops/install state.
+PATTERN_M_POST_DISCLOSURE_EPOCH=$(date -u -d '2026-04-28T00:00:00Z' +%s 2>/dev/null || echo 1745798400)
+PATTERN_M_ACCESSHASH_PATH="/root/.accesshash"
 
 # Runtime-state IOC tables — post-exploitation residue (gsocket, miners,
 # loaders, C2). See CHANGELOG v2.7.35 for source + rationale.
@@ -1294,6 +1310,8 @@ AFFECTED_USER_SUSPECT=0
 USERS_TRUNCATED=0
 USERS_TRUNCATED_COUNT=0
 USERS_JSON=""
+COMPROMISE_CRITICAL_LIVE=0
+COMPROMISE_CRITICAL_QUARANTINE=0
 VERDICT="UNKNOWN"
 EXIT_CODE=0
 
@@ -2120,6 +2138,7 @@ ioc_key_to_persist_pattern() {
         (ioc_pattern_f_cmd_done*|ioc_pattern_f_smark*) echo F ;;
         (ioc_pattern_d_reseller*|ioc_pattern_d_token*|ioc_pattern_d_whm_fullroot*) echo D ;;
         (ioc_pattern_h_seobot*|ioc_pattern_h_alldone*|ioc_pattern_h_contained_*) echo H ;;
+        (ioc_pattern_m_*)                       echo M ;;
         (*)                                     echo "" ;;
     esac
 }
@@ -2158,6 +2177,7 @@ ioc_compromise_class() {
         (ioc_pattern_f_cmd_done*|ioc_pattern_f_smark*)    echo persistence ;;
         (ioc_pattern_d_reseller*|ioc_pattern_d_token*|ioc_pattern_d_whm_fullroot*) echo persistence ;;
         (ioc_pattern_h_seobot*|ioc_pattern_h_alldone*|ioc_pattern_h_contained_*) echo persistence ;;
+        (ioc_pattern_m_*)                                 echo persistence ;;
         # Destruction / deployment — confirmed post-RCE action.
         (ioc_pattern_a_*|ioc_pattern_b_*|ioc_pattern_c_*) echo destruction ;;
         (ioc_pattern_d_acctlog*|ioc_pattern_d_evidence_destroyed) echo destruction ;;
@@ -8041,6 +8061,160 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
+    # ---- Pattern M: rogue UID=0 user + amco_ docker botnet cluster ------
+    # M1 UID=0 non-root user. Single hit = decisive: no legitimate cPanel
+    # configuration creates this.
+    if [[ -f /etc/passwd ]]; then
+        local _m_uid0
+        while IFS= read -r _m_uid0; do
+            [[ -n "$_m_uid0" ]] || continue
+            emit "destruction" "ioc_pattern_m_uid0_user" "strong" \
+                 "ioc_pattern_m_uid0_nonroot_user_present" 15 \
+                 "username" "$_m_uid0" \
+                 "passwd_line" "$(grep -E "^${_m_uid0}:" /etc/passwd 2>/dev/null | head -1)" \
+                 "note" "Non-root user '$_m_uid0' has UID=0 (full root equivalent) - Pattern M backdoor user (CRITICAL)."
+            ((hits++))
+        done < <(awk -F: '$3==0 && $1!="root" {print $1}' /etc/passwd 2>/dev/null)
+
+        # M2 known-bad username (string match against PATTERN_M_KNOWN_USERS).
+        local _m_known
+        for _m_known in "${PATTERN_M_KNOWN_USERS[@]}"; do
+            if grep -qE "^${_m_known}:" /etc/passwd 2>/dev/null; then
+                emit "destruction" "ioc_pattern_m_known_bad_user" "strong" \
+                     "ioc_pattern_m_known_bad_user_present" 10 \
+                     "username" "$_m_known" \
+                     "passwd_line" "$(grep -E "^${_m_known}:" /etc/passwd 2>/dev/null | head -1)" \
+                     "note" "Known-bad backdoor username '$_m_known' present in /etc/passwd - Pattern M (amco/pakchoi botnet family)."
+                ((hits++))
+            fi
+        done
+    fi
+
+    # M3 sudoers.d NOPASSWD:ALL drop. Post-disclosure-era guard
+    # (mtime OR ctime >= 2026-04-28) gates the emit so pre-existing
+    # IR/devops drops don't FP. Promote to strong when filename
+    # matches a known-bad shape (99-pakchoi, alexisa, ...); warn
+    # otherwise.
+    if [[ -d /etc/sudoers.d ]]; then
+        local _m_sd
+        while IFS= read -r _m_sd; do
+            [[ -f "$_m_sd" ]] || continue
+            grep -qE '^[^#]*NOPASSWD:[[:space:]]*ALL' "$_m_sd" 2>/dev/null || continue
+            local _m_sd_mt _m_sd_ct
+            _m_sd_mt=$(stat -c %Y "$_m_sd" 2>/dev/null)
+            _m_sd_ct=$(stat -c %Z "$_m_sd" 2>/dev/null)
+            _m_sd_mt="${_m_sd_mt:-0}"; _m_sd_ct="${_m_sd_ct:-0}"
+            if (( _m_sd_mt < PATTERN_M_POST_DISCLOSURE_EPOCH )) \
+               && (( _m_sd_ct < PATTERN_M_POST_DISCLOSURE_EPOCH )); then
+                continue
+            fi
+            local _m_sd_base="${_m_sd##*/}"
+            local _m_sd_sev=warning _m_sd_wt=4
+            local _m_sd_id=ioc_pattern_m_sudoers_nopasswd
+            local _m_sd_key=ioc_pattern_m_sudoers_nopasswd_present
+            local _m_sd_note="Sudoers drop $_m_sd has NOPASSWD:ALL (post-disclosure mtime/ctime) - review (legitimate IR/devops can create these; Pattern M variants drop 99-<user>)."
+            local _m_known2
+            for _m_known2 in "${PATTERN_M_KNOWN_USERS[@]}"; do
+                if [[ "$_m_sd_base" == *"$_m_known2"* ]]; then
+                    _m_sd_sev=strong; _m_sd_wt=10
+                    _m_sd_id=ioc_pattern_m_sudoers_known_bad
+                    _m_sd_key=ioc_pattern_m_sudoers_known_bad_present
+                    _m_sd_note="Sudoers drop $_m_sd matches known-bad name shape ($_m_known2) with NOPASSWD:ALL (post-disclosure mtime/ctime) - Pattern M backdoor sudoers (CRITICAL)."
+                    break
+                fi
+            done
+            emit "destruction" "$_m_sd_id" "$_m_sd_sev" \
+                 "$_m_sd_key" "$_m_sd_wt" \
+                 "path" "$_m_sd" \
+                 "mtime_epoch" "$_m_sd_mt" \
+                 "ctime_epoch" "$_m_sd_ct" \
+                 "note" "$_m_sd_note"
+            ((hits++))
+        done < <(find /etc/sudoers.d -maxdepth 1 -type f 2>/dev/null)
+    fi
+
+    # M6 /root/.accesshash post-disclosure drop. The legacy cPanel WHM
+    # root API auth file; pre-disclosure existence is typically install
+    # state. A NEW one created on/after 2026-04-28 indicates an
+    # attacker enabling WHM API access for a backdoor token.
+    if [[ -f "$PATTERN_M_ACCESSHASH_PATH" ]]; then
+        local _m_ah_mt _m_ah_ct
+        _m_ah_mt=$(stat -c %Y "$PATTERN_M_ACCESSHASH_PATH" 2>/dev/null)
+        _m_ah_ct=$(stat -c %Z "$PATTERN_M_ACCESSHASH_PATH" 2>/dev/null)
+        _m_ah_mt="${_m_ah_mt:-0}"; _m_ah_ct="${_m_ah_ct:-0}"
+        if (( _m_ah_mt >= PATTERN_M_POST_DISCLOSURE_EPOCH )) \
+           || (( _m_ah_ct >= PATTERN_M_POST_DISCLOSURE_EPOCH )); then
+            emit "destruction" "ioc_pattern_m_accesshash_post_disclosure" "strong" \
+                 "ioc_pattern_m_accesshash_recent_drop" 10 \
+                 "path" "$PATTERN_M_ACCESSHASH_PATH" \
+                 "mtime_epoch" "$_m_ah_mt" \
+                 "ctime_epoch" "$_m_ah_ct" \
+                 "note" "$PATTERN_M_ACCESSHASH_PATH touched on/after 2026-04-28 (CVE-2026-41940 disclosure) - attacker likely enabling WHM root API access (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+
+    # M4 amco_<UUID> docker container reference. Crontab fingerprint is
+    # the persistence anchor; live `docker ps` confirms active execution.
+    local _m_amco_hit="" _m_amco_src="" _m_cf
+    for _m_cf in /var/spool/cron/root /etc/crontab /etc/cron.d/*; do
+        [[ -f "$_m_cf" ]] || continue
+        if grep -qE "$PATTERN_M_AMCO_RE" "$_m_cf" 2>/dev/null; then
+            _m_amco_hit=$(grep -oE "$PATTERN_M_AMCO_RE" "$_m_cf" 2>/dev/null | head -1)
+            _m_amco_src="$_m_cf"
+            break
+        fi
+    done
+    if [[ -n "$_m_amco_hit" ]]; then
+        emit "destruction" "ioc_pattern_m_amco_docker_cron" "strong" \
+             "ioc_pattern_m_amco_docker_persistence" 10 \
+             "path" "$_m_amco_src" \
+             "container_name" "$_m_amco_hit" \
+             "mtime_epoch" "$(stat -c %Y "$_m_amco_src" 2>/dev/null)" \
+             "note" "amco_<UUID> docker container '$_m_amco_hit' referenced in $_m_amco_src - Pattern M cryptominer botnet persistence (CRITICAL)."
+        ((hits++))
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        local _m_amco_live
+        _m_amco_live=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E "$PATTERN_M_AMCO_RE" | head -1)
+        if [[ -n "$_m_amco_live" ]]; then
+            emit "destruction" "ioc_pattern_m_amco_docker_live" "strong" \
+                 "ioc_pattern_m_amco_docker_live_container" 10 \
+                 "container_name" "$_m_amco_live" \
+                 "note" "amco_<UUID> docker container '$_m_amco_live' present in docker ps - Pattern M cryptominer live (CRITICAL)."
+            ((hits++))
+        fi
+    fi
+
+    # M5 cron self-heal shape. Single regex against root crontab and
+    # /etc/cron.d/*; the shape itself is the IOC.
+    local _m_sh_files=(/var/spool/cron/root /etc/crontab)
+    if [[ -d /etc/cron.d ]]; then
+        local _m_cd
+        while IFS= read -r _m_cd; do
+            [[ -f "$_m_cd" ]] && _m_sh_files+=("$_m_cd")
+        done < <(find /etc/cron.d -maxdepth 1 -type f 2>/dev/null)
+    fi
+    local _m_sh_hit=""
+    for _m_cf in "${_m_sh_files[@]}"; do
+        [[ -f "$_m_cf" ]] || continue
+        if grep -qE "$PATTERN_M_CRON_SELF_HEAL_RE" "$_m_cf" 2>/dev/null; then
+            _m_sh_hit="$_m_cf"
+            break
+        fi
+    done
+    if [[ -n "$_m_sh_hit" ]]; then
+        local _m_sh_sample
+        _m_sh_sample=$(grep -oE ".{0,40}$PATTERN_M_CRON_SELF_HEAL_RE.{0,40}" "$_m_sh_hit" 2>/dev/null | head -1)
+        emit "destruction" "ioc_pattern_m_cron_self_heal" "strong" \
+             "ioc_pattern_m_cron_self_heal_present" 10 \
+             "path" "$_m_sh_hit" \
+             "sample" "${_m_sh_sample:-<elided>}" \
+             "mtime_epoch" "$(stat -c %Y "$_m_sh_hit" 2>/dev/null)" \
+             "note" "Cron self-heal shape (id <U> || useradd...chpasswd...sudoers.d) in $_m_sh_hit - Pattern M backdoor user persistence (rebuilds every cron tick)."
+        ((hits++))
+    fi
+
     # ---- Runtime-state IOCs ---- see CHANGELOG v2.7.35 / v2.7.39.
     # Live IOCs that flip host_verdict=COMPROMISED only when root-attributed.
     # Process-tree hits demote to strong (→ SUSPICIOUS) on non-root UID;
@@ -8703,7 +8877,7 @@ check_localhost_probe() {
 aggregate_verdict() {
     local score=0 strong_count=0 fixed_count=0 inconclusive_count=0
     local ioc_critical=0 ioc_review=0 advisory_count=0 probe_artifact_count=0
-    local compromise_critical=0
+    local compromise_critical=0 compromise_critical_quarantine=0 compromise_critical_live=0
     local version_says_vuln=0 version_says_patched=0
     local row area id sev key weight kv
     # Per-axis counters mirror the global counters but split by attribution.
@@ -8734,7 +8908,7 @@ aggregate_verdict() {
             IFS=$'\t' read -r _area _id _sev _key _wt _kv <<< "$_row"
             [[ "$_sev" == "strong" ]] || continue
             ioc_key_is_soft_variant "$_key" && continue
-            if [[ "$_id" =~ ^ioc_pattern_([abcdfghijkl])_ ]]; then
+            if [[ "$_id" =~ ^ioc_pattern_([abcdfghijklm])_ ]]; then
                 pre_compromise_present=1
                 break
             fi
@@ -8899,7 +9073,7 @@ aggregate_verdict() {
                                 PATTERN_A_SUBTYPES["${id#ioc_pattern_a_}"]=1
                                 ;;
                         esac
-                        if [[ "$id" =~ ^ioc_pattern_([abcdfghijkl])_ ]]; then
+                        if [[ "$id" =~ ^ioc_pattern_([abcdfghijklm])_ ]]; then
                             COMPROMISE_LETTERS["${BASH_REMATCH[1]}"]=1
                         fi
                     fi
@@ -8935,7 +9109,14 @@ aggregate_verdict() {
                         IOC_KEYS+=("$key")
                         local _cc
                         _cc=$(ioc_compromise_class "$key")
-                        [[ -n "$_cc" ]] && ((compromise_critical++))
+                        if [[ -n "$_cc" ]]; then
+                            ((compromise_critical++))
+                            if [[ "$id" == ioc_quarantined_session_* ]]; then
+                                ((compromise_critical_quarantine++))
+                            else
+                                ((compromise_critical_live++))
+                            fi
+                        fi
                     fi
                     ;;
                 live_compromise)
@@ -8947,6 +9128,7 @@ aggregate_verdict() {
                         ((ioc_critical++))
                         IOC_KEYS+=("$key")
                         ((compromise_critical++))
+                        ((compromise_critical_live++))
                     fi
                     ;;
                 evidence)
@@ -9046,7 +9228,7 @@ aggregate_verdict() {
                 if [[ "$key" == ioc_* ]] && [[ "$sev" == "strong" || "$sev" == "live_compromise" || "$sev" == "warning" ]]; then
                     USER_COUNT[$_au]=$(( ${USER_COUNT[$_au]:-0} + 1 ))
                     USER_KEYS[$_au]="${USER_KEYS[$_au]:-} $key"
-                    if [[ "$id" =~ ^ioc_pattern_([abcdefghijkl])_ ]]; then
+                    if [[ "$id" =~ ^ioc_pattern_([abcdefghijklm])_ ]]; then
                         USER_PATTERNS[$_au]="${USER_PATTERNS[$_au]:-} ${BASH_REMATCH[1]^^}"
                     fi
                     local _cur_priv="${USER_PRIV_MAX[$_au]:-user}"
@@ -9171,7 +9353,21 @@ aggregate_verdict() {
     #   host_user_verdict — actor had only user-account access; impact is
     #     scoped to one or more cPanel tenants.
     # EXIT_CODE 4 dominates 1/2/3 for fleet triage.
-    if (( root_compromise_critical > 0 )) || (( persist_count >= 1 )); then
+    #
+    # v2.8.1: quarantine-only demotion. Quarantine evidence is historical
+    # (mitigate.sh already neutralised the session); without a live
+    # corroborating signal (on-disk Pattern A-M, token_used_2xx, persist
+    # cluster) the host is operationally clean with a remediated past.
+    # SUSPICIOUS keeps the historical evidence visible without
+    # inflating the COMPROMISED IR queue.
+    local _quarantine_only=0
+    if (( root_compromise_critical > 0 )) && (( compromise_critical_live == 0 )) \
+       && (( compromise_critical_quarantine > 0 )) && (( persist_count == 0 )); then
+        _quarantine_only=1
+    fi
+    if (( _quarantine_only )); then
+        HOST_ROOT_VERDICT="SUSPICIOUS"
+    elif (( root_compromise_critical > 0 )) || (( persist_count >= 1 )); then
         HOST_ROOT_VERDICT="COMPROMISED"
     elif (( root_ioc_critical > 0 )) || (( root_ioc_review > 0 )); then
         HOST_ROOT_VERDICT="SUSPICIOUS"
@@ -9206,6 +9402,21 @@ aggregate_verdict() {
         ((advisory_count++))
         ADVISORY_COUNT="$advisory_count"
     fi
+
+    # v2.8.1: surface quarantine-only demotion so consumers see WHY
+    # host_root_verdict is SUSPICIOUS instead of COMPROMISED. Fires only
+    # when quarantine signals were the sole COMPROMISED gate input.
+    if (( _quarantine_only )); then
+        emit advisory ioc_quarantine_only_no_live_corroboration advisory \
+            ioc_quarantine_only_no_live_corroboration 0 \
+            note "$compromise_critical_quarantine quarantined_session strong-tier signal(s) with no live corroboration (no on-disk Pattern A-M, no token_used_2xx, no persistence cluster); demoted to SUSPICIOUS — mitigate.sh remediated past compromise, host is operationally clean." \
+            quarantine_count "$compromise_critical_quarantine"
+        ADVISORIES+=("ioc_quarantine_only_no_live_corroboration|ioc_quarantine_only_no_live_corroboration|$compromise_critical_quarantine quarantined_session strong-tier signal(s) with no live corroboration; demoted to SUSPICIOUS.")
+        ((advisory_count++))
+        ADVISORY_COUNT="$advisory_count"
+    fi
+    COMPROMISE_CRITICAL_LIVE="$compromise_critical_live"
+    COMPROMISE_CRITICAL_QUARANTINE="$compromise_critical_quarantine"
 }
 
 # Materialise the per-user verdict block from USER_* maps populated by
@@ -9523,8 +9734,10 @@ write_json() {
         printf '  "users_truncated_count": %d,\n' "${USERS_TRUNCATED_COUNT:-0}"
         printf '  "score": %d,\n' "$SCORE"
         printf '  "exit_code": %d,\n' "$EXIT_CODE"
-        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"compromise_critical":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s","session_tiered_count":%d,"session_max_reasons":%d},\n' \
-            "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${COMPROMISE_CRITICAL:-0}" "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}" \
+        printf '  "summary": {"strong":%d,"fixed":%d,"inconclusive":%d,"ioc_critical":%d,"ioc_review":%d,"compromise_critical":%d,"compromise_critical_live":%d,"compromise_critical_quarantine":%d,"advisories":%d,"probe_artifacts":%d,"persist_count":%d,"persist_score":%d,"persist_multiplier":%d,"persist_patterns":"%s","session_tiered_count":%d,"session_max_reasons":%d},\n' \
+            "$STRONG_COUNT" "$FIXED_COUNT" "$INCONCLUSIVE_COUNT" "$IOC_CRITICAL" "$IOC_REVIEW" "${COMPROMISE_CRITICAL:-0}" \
+            "${COMPROMISE_CRITICAL_LIVE:-0}" "${COMPROMISE_CRITICAL_QUARANTINE:-0}" \
+            "${ADVISORY_COUNT:-0}" "${PROBE_ARTIFACT_COUNT:-0}" \
             "${PERSIST_COUNT:-0}" "${PERSIST_WEIGHT_SUM:-0}" "${PERSIST_MULTIPLIER:-1}" "$(json_esc "${PERSIST_PATTERNS_LIST:-}")" \
             "${SESSION_TIERED_COUNT:-0}" "${SESSION_MAX_REASONS:-0}"
         printf '  "advisories": [\n'

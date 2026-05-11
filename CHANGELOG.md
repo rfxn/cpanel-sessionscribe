@@ -4,6 +4,64 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.8.1 — 2026-05-11
+
+### Added — Pattern M: rogue UID=0 user + amco_ docker botnet cluster
+
+Field observed 2026-05-11 (LW IR on `host.virtualstatman.com`),
+cross-references the Reddit "27 MH/s botnet hiding on cPanel" thread.
+Same actor drops a UID=0 backdoor user (`pakchoi`/`alexisa`), wheel-
+group injection, `sudoers.d/99-<user>` with `NOPASSWD:ALL`,
+`amco_<UUID>` docker cryptominer containers, and a cron self-heal
+shape that rebuilds the user every 30 minutes. M is persistence-class
+and counts toward the P6 persistence cluster bonus.
+
+Six detection primitives:
+
+| ID | Signal | Severity | Weight |
+|---|---|---|---|
+| M1 `ioc_pattern_m_uid0_user` | non-root user with UID=0 in `/etc/passwd` | strong | 15 |
+| M2 `ioc_pattern_m_known_bad_user` | username in `PATTERN_M_KNOWN_USERS` (pakchoi, alexisa) | strong | 10 |
+| M3 `ioc_pattern_m_sudoers_nopasswd` / `_sudoers_known_bad` | `/etc/sudoers.d/*` with `NOPASSWD:ALL` AND mtime/ctime on/after 2026-04-28 (CVE-2026-41940 disclosure date) | warning / strong | 4 / 10 |
+| M4 `ioc_pattern_m_amco_docker_cron` / `_live` | `amco_<UUID>` container ref in crontab or `docker ps` | strong | 10 |
+| M5 `ioc_pattern_m_cron_self_heal` | crontab line matching `(id <U> \|\| useradd...chpasswd...sudoers.d)` | strong | 10 |
+| M6 `ioc_pattern_m_accesshash_post_disclosure` | `/root/.accesshash` touched on/after 2026-04-28 | strong | 10 |
+
+The 2026-04-28 disclosure-window guard on M3 and M6 suppresses FPs
+from pre-existing legitimate IR/devops `NOPASSWD:ALL` drops and
+install-state `.accesshash` files — both are common pre-disclosure
+artifacts but post-disclosure creation is highly suggestive of
+attacker activity.
+
+Pattern letter M is added to the compromise-letter regex (
+`^ioc_pattern_([abcdefghijklm])_`) so the P1c cross-pattern cluster
+bonus credits it correctly. All M emits are `affected_user=_root`,
+`actor_privilege=root`.
+
+### Changed — quarantine-only hosts demote to SUSPICIOUS
+
+Quarantine evidence (`ioc_quarantined_session_*`) is historical:
+`mitigate.sh` already neutralised the session. Without a live
+corroborating signal (on-disk Pattern A-M, token_used_2xx,
+persistence cluster), the host is operationally clean with a
+remediated past. Continuing to flag as COMPROMISED inflates the
+IR queue.
+
+`aggregate_verdict` now splits `compromise_critical` into:
+- `compromise_critical_live` — non-quarantine sources
+- `compromise_critical_quarantine` — promoted from
+  `ioc_quarantined_session_*` via the P2 reasons_ioc inspection
+
+Verdict logic: `host_root_verdict=COMPROMISED` requires
+`compromise_critical_live > 0` OR `persist_count >= 1`. If
+`compromise_critical > 0` but `compromise_critical_live == 0` and
+`persist_count == 0`, demote to SUSPICIOUS and emit a new advisory
+`ioc_quarantine_only_no_live_corroboration` so consumers see the
+rationale.
+
+Both counters are added to the JSON envelope `summary` block so
+fleet aggregators can audit the demotion decision.
+
 ## sessionscribe-ioc-scan.sh v2.8.0 — 2026-05-10
 
 ### Changed — host_verdict split into root/user axes (BREAKING)
