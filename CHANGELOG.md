@@ -4,6 +4,68 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.8.2 — 2026-05-11
+
+### Fixed — three FP / completeness issues found in v2.8.1 sentinel review
+
+**1. Quarantine demotion missed external-containment ingestion.** v2.8.1
+only filtered `ioc_quarantined_session_*`. The external-quarantine
+ingestion (mitigate.sh's `hashes.txt` / `ssh-pruned-keys.log` replay)
+emits `ioc_pattern_*_contained_*`, `ioc_pattern_g_contained_sshkey`,
+`ioc_contained_evidence`, `ioc_contained_unclassified` — all of which
+flow through compromise_class as persistence/destruction and trigger
+COMPROMISED via `persist_count` or `compromise_critical`. A host with
+ONLY mitigate-quarantined Pattern H seobot.php would trip COMPROMISED
+even though the artifact is contained off-disk.
+
+Fix: added `_is_quarantine_signal()` helper covering all three id
+shapes. `aggregate_verdict` now also splits `PERSIST_PATTERNS` into a
+parallel `PERSIST_PATTERNS_LIVE` map; verdict gate uses
+`persist_count_live` rather than `persist_count`. Quarantine
+contributions still credit score and emit signals (preserves forensic
+visibility) but lose solo-trigger power for verdict.
+
+**2. M2 (known-bad username) FPs on legit cPanel tenants.** A
+customer named alexisa/pakchoi as a regular UID 504+ cPanel tenant
+would trip M2 strong=10pt → compromise_critical → COMPROMISED. Hispanic
+and Portuguese-speaking customers have these as legitimate given names.
+
+Fix: M2 corroboration gate. Emit strong only if (a) user has UID=0,
+(b) user is in wheel/sudo group, OR (c) `/etc/sudoers.d/<name>` exists.
+Otherwise demote to warning `ioc_pattern_m_known_bad_user_review`
+(4pt) — surfaces for review without flipping verdict.
+
+**3. M6 (.accesshash post-disclosure) FPs on legit admin/devops.**
+Admins creating `.accesshash` for monitoring/automation post-2026-04-28
+look identical to attacker drops. Single-signal strong was too
+aggressive.
+
+Fix: corroboration-gate against M1/M2/M4/M5/M7/M8/M9. Solo M6 emits
+warning `ioc_pattern_m_accesshash_post_disclosure_review` (4pt); only
+fires strong when another Pattern M primitive corroborates on the
+same host.
+
+### Added — Pattern M extension: XMR wallet, C2 endpoint, named docker image
+
+Three new primitives from the Reddit r/cpanel "27 MH/s botnet" thread
+supporting collateral:
+
+| ID | Signal | Severity | Weight |
+|---|---|---|---|
+| M7 `ioc_pattern_m_xmr_wallet` | Monero wallet `4AypWi9xNQvSy11FT5yr7Ajnyz2XuoUD7LGEJw4ZTRUHLrWjH1x5KoZUp9FTS4s9a5Y6Q7d4jSze4E6tq64aJTD2L7hnCrL` literal in `/root /etc /opt /tmp /var/tmp /var/spool/cron /usr/local/{bin,sbin}` or root/user bash_history | strong | 12 |
+| M8 `ioc_pattern_m_c2_live_socket` / `_c2_reference` | C2 IP `144.172.116.48` in live `ss`/`netstat` (live_socket) or in cron/history files (reference) | strong | 12 / 10 |
+| M9 `ioc_pattern_m_negoroo_image_present` / `_image_reference` | docker image `negoroo/amco` in `docker images` (live) or cron/history (reference) | strong | 10 |
+
+M7/M8/M9 reference-in-file emits also pass through `_is_doc_shape()`
+to demote IR-notes/docs/runbook references to info-tier. Pattern A's
+TOX_ID handling refactored to use the same helper for consistency.
+
+`_is_doc_shape()` path heuristic covers: `/root/{IR,notes,runbooks,
+.claude,.cache,admin}/`, `/docs/`, `IR-notes`, `runbook`, `notes-N`,
+`findings-`, `dossier`, `ps-hunt`, and `/proj/.*\.(md|txt|rst|adoc)`.
+Plus a line-count guard (>200 lines AND markdown/text extension) for
+long-form docs not matching the path heuristic.
+
 ## sessionscribe-ioc-scan.sh v2.8.1 — 2026-05-11
 
 ### Added — Pattern M: rogue UID=0 user + amco_ docker botnet cluster
