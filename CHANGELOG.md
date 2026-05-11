@@ -12,6 +12,12 @@ versioned per affected component.
   the script to abort on CentOS 6 after the posture section. Moved
   to top-level `declare -A` with in-function reassignment, matching
   the existing pattern for `SIGNALS` / `REASONS` / `IOC_KEYS`.
+- Pattern M3 sudoers FP: `/etc/sudoers.d/{lwadmin,lw-admin,liquidweb,
+  nexcess}` files matching the documented LW/Nexcess provisioning
+  shape now emit info-tier `ioc_pattern_m_sudoers_known_good` instead
+  of warning-tier review. Re-image+restore re-stamps mtime/ctime
+  post-disclosure on these files, surfacing them as M3 review noise.
+  Known-bad usernames still override to strong/critical.
 
 ### Changed
 - Pattern M7 Monero-wallet walk replaced its per-file `grep -qF` fork

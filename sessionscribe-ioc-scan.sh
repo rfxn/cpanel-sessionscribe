@@ -8188,7 +8188,10 @@ check_destruction_iocs() {
         done
     fi
 
-    # M3 — sudoers.d NOPASSWD:ALL post-disclosure. Strong on known-bad name.
+    # M3 — sudoers.d NOPASSWD:ALL post-disclosure. Strong on known-bad name;
+    # info-tier on documented LW/Nexcess provisioning shape (re-image+restore
+    # re-stamps mtime/ctime and is the most common FP source — Jamoore/JSexton
+    # 2026-05-11). Otherwise warning/review-tier (does not flip COMPROMISED).
     if [[ -d /etc/sudoers.d ]]; then
         local _m_sd
         while IFS= read -r _m_sd; do
@@ -8207,6 +8210,27 @@ check_destruction_iocs() {
             local _m_sd_id=ioc_pattern_m_sudoers_nopasswd_review
             local _m_sd_key=ioc_pattern_m_sudoers_nopasswd_review
             local _m_sd_note="Sudoers drop $_m_sd has NOPASSWD:ALL (post-disclosure mtime/ctime) - review (legitimate IR/devops can create these; Pattern M variants drop 99-<user>)."
+
+            # Known-good LW/Nexcess provisioning shape. Filename matches a
+            # documented drop name AND content includes either a Defaults:
+            # line or a user line whose first token starts with the same
+            # prefix (e.g. `lwadmin-H29ZBN ALL=(ALL) NOPASSWD:ALL`). Demote
+            # to info-tier so re-image+restore doesn't surface as an IOC.
+            case "$_m_sd_base" in
+                lwadmin|lw-admin|liquidweb|nexcess)
+                    if grep -qE "^[[:space:]]*(Defaults:)?(lwadmin|lw-admin|liquidweb|nexcess)[-_[:space:]]" "$_m_sd" 2>/dev/null; then
+                        _m_sd_sev=info; _m_sd_wt=0
+                        _m_sd_id=ioc_pattern_m_sudoers_known_good
+                        _m_sd_key=ioc_pattern_m_sudoers_known_good
+                        _m_sd_note="Sudoers drop $_m_sd matches LW/Nexcess provisioning shape (NOPASSWD:ALL is standard for $_m_sd_base) - re-image+restore re-stamps mtime/ctime; not a Pattern M IOC."
+                    fi
+                    ;;
+            esac
+
+            # Known-bad name shape (Pattern M backdoor users) — overrides
+            # the known-good demote above on the off chance an attacker
+            # names their drop after a documented LW path AND embeds a
+            # known-bad username.
             local _m_known2
             for _m_known2 in "${PATTERN_M_KNOWN_USERS[@]}"; do
                 if [[ "$_m_sd_base" == *"$_m_known2"* ]]; then
