@@ -324,6 +324,12 @@ RUNTIME_WALLET_PREFIXES=(
     "47eqhWc4e88EVdqb"
 )
 RUNTIME_MASQ_RESPAWN_RE='pkill[[:space:]]+-0[[:space:]]+-U[0-9]+[[:space:]]+(defunct|gs-dbus|lscgib)'
+# Runtime-context probe (populated by _rt_runtime_context). Pre-declared
+# at top-level so `set -u` doesn't trip on first read in consumers.
+_RT_CTX_USER=""        # ps auxfww column 1 (real running user)
+_RT_CTX_PID=""         # ps auxfww column 2 (PID)
+_RT_CTX_JAILED=0       # 1 if cgroup shows cagefs/lve user-jail membership
+_RT_CTX_OWNER=""       # "root" iff USER=root AND not jailed; user otherwise
 RUNTIME_LDLINUX_MASQ_RE='\./\.?ld-linux\.so[^[:space:]]*[[:space:]]+(-c[[:space:]]+config\.json|--config=)'
 RUNTIME_HTTPS_MASQ_RE='\./https[[:space:]]+(-a[[:space:]]+rx/0|-o[[:space:]].*pool\.|--url=.*pool\.)'
 RUNTIME_PYTHON_MASQ_RE='\./python[0-9]*([[:space:]]|$)'
@@ -6397,6 +6403,43 @@ _user_is_valid() {
     esac
 }
 
+# Classify the runtime context of a ps auxfww line. ps's USER column tells
+# us the real running UID, but CloudLinux CageFS / LVE jails can have
+# root-owned processes that are effectively user-axis activity (a
+# user-launched setuid binary, jailshell-spawned root helper, etc.). The
+# cgroup file at /proc/<pid>/cgroup carries `cagefs/<user>` or `lve/<uid>`
+# membership which lets us distinguish a real-root operator process from a
+# user-jailed root impersonator. Sets globals:
+#   _RT_CTX_USER   = ps column 1 (USER)
+#   _RT_CTX_PID    = ps column 2 (PID)
+#   _RT_CTX_JAILED = 1 iff cgroup shows cagefs/lve user-jail membership
+#   _RT_CTX_OWNER  = "root" iff USER=root AND not jailed; jail-user
+#                    otherwise (so emit's affected_user maps to the right
+#                    axis for the host_user_verdict gate).
+_rt_runtime_context() {
+    local _line="${1:-}"
+    _RT_CTX_USER=$(printf '%s' "$_line" | awk '{print $1}')
+    _RT_CTX_PID=$(printf '%s' "$_line" | awk '{print $2}')
+    _RT_CTX_JAILED=0
+    _RT_CTX_OWNER="${_RT_CTX_USER:-unknown}"
+    if [[ -n "$_RT_CTX_PID" && -r "/proc/$_RT_CTX_PID/cgroup" ]]; then
+        if grep -qE '/(cagefs|lve)/' "/proc/$_RT_CTX_PID/cgroup" 2>/dev/null; then
+            _RT_CTX_JAILED=1
+        fi
+    fi
+    if [[ "$_RT_CTX_USER" == "root" ]] && (( _RT_CTX_JAILED == 0 )); then
+        _RT_CTX_OWNER="root"
+    elif (( _RT_CTX_JAILED == 1 )) && [[ "$_RT_CTX_USER" == "root" ]]; then
+        # Jailed root: prefer the cagefs/lve username from the cgroup path
+        # over the bare USER column. Falls back to "root" if extraction
+        # fails; downstream emits still mark actor_privilege=user.
+        local _cu=""
+        _cu=$(grep -oE '/(cagefs|lve)/[^/[:space:]]+' "/proc/$_RT_CTX_PID/cgroup" 2>/dev/null \
+              | head -1 | awk -F/ '{print $NF}')
+        [[ -n "$_cu" ]] && _RT_CTX_OWNER="$_cu"
+    fi
+}
+
 # Resolve attribution at emit-time. Echoes "user=<u> priv=<root|user>".
 # $1 = path-or-empty, $2 = privilege-default ("root" or "user").
 # If $1 is path-derived, looks up via _attribute_path; else falls back
@@ -8650,17 +8693,31 @@ check_destruction_iocs() {
 
         _rt_line=$(grep -E "$RUNTIME_MASQ_RESPAWN_RE" "$_rt_ps_cap" 2>/dev/null | head -1)
         if [[ -n "$_rt_line" ]]; then
-            # UID 0 in shim = root gsocket → COMPROMISED; non-zero UID = user-account compromise.
-            if [[ "$_rt_line" =~ pkill[[:space:]]+-0[[:space:]]+-U0[[:space:]] ]]; then
+            # Verdict requires BOTH signals: (a) the shim's pkill target UID
+            # is 0 (operator deployed root gsocket) AND (b) the shim itself
+            # is running as real root — ps USER=root AND not inside a
+            # CageFS/LVE user-jail. Either condition failing → user-axis
+            # compromise (jailshell processes can show USER=root in ps but
+            # are effectively userland; cmdline literally containing `-U0`
+            # without root context is a userland imposter).
+            _rt_runtime_context "$_rt_line"
+            local _u0_target=0
+            [[ "$_rt_line" =~ pkill[[:space:]]+-0[[:space:]]+-U0[[:space:]] ]] && _u0_target=1
+            if (( _u0_target )) && [[ "$_RT_CTX_OWNER" == "root" ]]; then
                 emit "destruction" "ioc_runtime_gsocket_respawn" "live_compromise" \
                      "ioc_runtime_gsocket_persistence_shim" 10 \
                      "sample" "${_rt_line:0:200}" \
-                     "note" "GSocket pkill-respawn shim active under root — operator persistence (CRITICAL)."
+                     "ps_user" "$_RT_CTX_USER" "pid" "$_RT_CTX_PID" \
+                     "affected_user" "_root" "actor_privilege" "root" \
+                     "note" "GSocket pkill-respawn shim active under real root (USER=${_RT_CTX_USER}, not jailed) — operator persistence (CRITICAL)."
             else
                 emit "destruction" "ioc_runtime_gsocket_respawn_userland" "strong" \
                      "ioc_runtime_gsocket_persistence_shim_userland" 10 \
                      "sample" "${_rt_line:0:200}" \
-                     "note" "GSocket pkill-respawn shim active under non-root UID — user-account compromise; review tier."
+                     "ps_user" "$_RT_CTX_USER" "pid" "$_RT_CTX_PID" \
+                     "jailed" "$_RT_CTX_JAILED" "u0_target" "$_u0_target" \
+                     "affected_user" "$_RT_CTX_OWNER" "actor_privilege" "user" \
+                     "note" "GSocket pkill-respawn shim under user-context (USER=${_RT_CTX_USER}, jailed=${_RT_CTX_JAILED}, u0_target=${_u0_target}) — user-account compromise; review tier."
             fi
             ((hits++))
         fi
@@ -8871,13 +8928,30 @@ check_destruction_iocs() {
             ((hits++))
         fi
 
-        # b64-shim variant: UID not extractable from base64 prefix alone; stays live_compromise.
+        # b64-shim variant: the base64 prefix can't tell us the operator's
+        # intended target UID, but ps USER + cgroup still tell us whether
+        # the shim is actually running as real root. Real-root context →
+        # live_compromise (operator persistence). User-jailed root or
+        # non-root → user-axis review.
         if grep -qF "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null; then
             _rt_line=$(grep -F "$RUNTIME_GS_B64_PREFIX" "$_rt_ps_cap" 2>/dev/null | head -1)
-            emit "destruction" "ioc_runtime_gsocket_b64_shim" "live_compromise" \
-                 "ioc_runtime_gsocket_persistence_shim" 10 \
-                 "sample" "${_rt_line:0:200}" \
-                 "note" "GSocket pkill-respawn shim base64-wrapped in cmdline — operator persistence (CRITICAL)."
+            _rt_runtime_context "$_rt_line"
+            if [[ "$_RT_CTX_OWNER" == "root" ]]; then
+                emit "destruction" "ioc_runtime_gsocket_b64_shim" "live_compromise" \
+                     "ioc_runtime_gsocket_persistence_shim" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "ps_user" "$_RT_CTX_USER" "pid" "$_RT_CTX_PID" \
+                     "affected_user" "_root" "actor_privilege" "root" \
+                     "note" "GSocket pkill-respawn shim base64-wrapped under real root (USER=${_RT_CTX_USER}, not jailed) — operator persistence (CRITICAL)."
+            else
+                emit "destruction" "ioc_runtime_gsocket_b64_shim_userland" "strong" \
+                     "ioc_runtime_gsocket_persistence_shim_userland" 10 \
+                     "sample" "${_rt_line:0:200}" \
+                     "ps_user" "$_RT_CTX_USER" "pid" "$_RT_CTX_PID" \
+                     "jailed" "$_RT_CTX_JAILED" \
+                     "affected_user" "$_RT_CTX_OWNER" "actor_privilege" "user" \
+                     "note" "GSocket pkill-respawn shim base64-wrapped under user-context (USER=${_RT_CTX_USER}, jailed=${_RT_CTX_JAILED}) — user-account compromise; review tier."
+            fi
             ((hits++))
         fi
     fi

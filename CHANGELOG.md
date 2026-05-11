@@ -30,6 +30,18 @@ versioned per affected component.
   `CPANEL_NORM=unknown` → PATCH_STATE=UNKNOWN regardless of patch
   state. New globals `CPANEL_WPSQ_TIER`/`CPANEL_WPSQ_BUILD` and
   constants `PATCHED_WPSQUARED_TIER`/`PATCHED_WPSQUARED_BUILD`.
+- GSocket persistence-shim verdict gate hardened. Pre-fix used only
+  the shim's `pkill -0 -U<N>` cmdline target as the root/userland
+  signal — but a userland process (CageFS-jailed root, LVE jail,
+  cPanel user shell) can run a cmdline literally containing `-U0`
+  and would FP as host-axis COMPROMISED. Verdict now requires BOTH
+  the `-U0` target AND a real-root running context (`ps` USER=root
+  AND `/proc/&lt;pid&gt;/cgroup` does not show cagefs/lve membership).
+  Anything else routes to `ioc_runtime_gsocket_*_userland` with
+  `actor_privilege=user` and `affected_user` set from the cgroup
+  path. Same gate applied to the base64-wrapped variant
+  (`ioc_runtime_gsocket_b64_shim_userland` is new). New runtime
+  helper `_rt_runtime_context`.
 
 ### Changed
 - Pattern M7 Monero-wallet walk replaced its per-file `grep -qF` fork
