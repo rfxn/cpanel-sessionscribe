@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 ##
-# sessionscribe-ioc-scan.sh v2.8.3
+# sessionscribe-ioc-scan.sh v2.8.4
 #             (C) 2026, R-fx Networks <proj@rfxn.com>
 # This program may be freely redistributed under the terms of the GNU GPL v2
 ##
@@ -116,7 +116,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.3"
+VERSION="2.8.4"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -3770,8 +3770,10 @@ write_kill_chain_primitives() {
             "${HOSTNAME_JSON:-}" "${PRIMARY_IP_J:-}" "${LP_UID_J:-}" "${OS_J:-}" "${CPV_J:-}" "${TS_ISO:-}" \
             "$VERSION" "${INCIDENT_ID:-}" "$RUN_ID" \
             "$(json_esc "${ENV_IOC_RUN_ID:-}")" "$(json_esc "${ENV_IOC_TOOL_VERSION:-}")" "$(json_esc "${ENV_IOC_TS:-}")" \
-            "$(json_esc "${ENV_HOST_ROOT_VERDICT:-}")" "$(json_esc "${ENV_HOST_USER_VERDICT:-}")" \
-            "$(json_esc "${ENV_CODE_VERDICT:-}")" "$(json_esc "${ENV_SCORE:-}")" \
+            "$(json_esc "${ENV_HOST_ROOT_VERDICT:-${HOST_ROOT_VERDICT:-}}")" \
+            "$(json_esc "${ENV_HOST_USER_VERDICT:-${HOST_USER_VERDICT:-}}")" \
+            "$(json_esc "${ENV_CODE_VERDICT:-${VERDICT:-}}")" \
+            "$(json_esc "${ENV_SCORE:-${SCORE:-0}}")" \
             "${eff_patch:-}" "${eff_modsec:-}"
 
         local de de_epoch de_key de_note _de_line
@@ -4094,30 +4096,46 @@ phase_bundle() {
     # ${BUNDLE_BDIR}/ioc-scan-envelope.json or ENVELOPE_PATH) ships the
     # inventory in the same POST. The post-bundle re-write at end-of-run
     # would be too late — the POST has already happened.
+    # Write envelope DIRECTLY to bundle. LEDGER_DIR-based path is fallback
+    # only — bundle must be self-contained so intake never sees a missing
+    # ioc-scan-envelope.json (silent CLEAN-by-threshold). See INTERNAL-NOTES.md
+    # "v2.8.4 bundle envelope resilience".
+    local _env_dest="$bdir/ioc-scan-envelope.json"
     local _env_src="${ENVELOPE_PATH:-${SESSIONSCRIBE_IOC_JSON:-}}"
+    write_json "$_env_dest" 2>/dev/null
+    if [[ -s "$_env_dest" ]]; then
+        chmod 0600 "$_env_dest" 2>/dev/null
+        local env_size
+        env_size=$(stat -c %s "$_env_dest" 2>/dev/null)
+        emit_signal bundle info ioc_envelope_captured \
+            "ioc-scan envelope written to bundle (${env_size:-?} bytes)" \
+            dest "ioc-scan-envelope.json" bytes "${env_size:-0}"
+    elif [[ -n "$_env_src" && -f "$_env_src" && -s "$_env_src" ]]; then
+        # Fallback: copy from LEDGER_DIR if write_json failed.
+        if cp "$_env_src" "$_env_dest" 2>/dev/null; then
+            chmod 0600 "$_env_dest" 2>/dev/null
+            local env_size
+            env_size=$(stat -c %s "$_env_dest" 2>/dev/null)
+            emit_signal bundle info ioc_envelope_captured_fallback \
+                "ioc-scan envelope copied from ledger to bundle (${env_size:-?} bytes; direct write failed)" \
+                src "$_env_src" dest "ioc-scan-envelope.json" bytes "${env_size:-0}"
+        else
+            rm -f "$_env_dest" 2>/dev/null
+            emit_signal bundle fail ioc_envelope_missing \
+                "ioc-scan envelope absent from bundle — both direct-write and ledger cp failed" \
+                src "$_env_src"
+        fi
+    else
+        rm -f "$_env_dest" 2>/dev/null
+        emit_signal bundle fail ioc_envelope_missing \
+            "ioc-scan envelope absent from bundle — direct write failed and no ledger fallback available" \
+            ledger_path "${_env_src:-<unset>}"
+    fi
+    # Also refresh the ledger envelope (best effort; failure does not affect
+    # the bundle copy, which is authoritative now).
     if [[ -n "$_env_src" ]]; then
         write_json "$_env_src" 2>/dev/null
         chmod 0600 "$_env_src" 2>/dev/null
-    fi
-
-    # Stash the upstream ioc-scan JSON envelope. Only the canonical structured
-    # record is preserved (operator-facing stdout is not captured); without
-    # this, an offline analyst can see the kill-chain reconciliation but not
-    # the source per-signal evidence ioc-scan emitted. KB-sized, always safe
-    # to bundle. In --full mode ENVELOPE_PATH is the authoritative source;
-    # SESSIONSCRIBE_IOC_JSON is the legacy shim path (kept for back-compat).
-    if [[ -n "$_env_src" && -f "$_env_src" ]]; then
-        if cp "$_env_src" "$bdir/ioc-scan-envelope.json" 2>/dev/null; then
-            chmod 0600 "$bdir/ioc-scan-envelope.json" 2>/dev/null
-            local env_size
-            env_size=$(stat -c %s "$bdir/ioc-scan-envelope.json" 2>/dev/null)
-            emit_signal bundle info ioc_envelope_captured \
-                "ioc-scan envelope copied to bundle (${env_size:-?} bytes)" \
-                src "$_env_src" dest "ioc-scan-envelope.json" bytes "${env_size:-0}"
-        else
-            emit_signal bundle warn ioc_envelope_copy_failed \
-                "could not copy ioc-scan envelope into bundle" src "$_env_src"
-        fi
     fi
 
     # Kill-chain primitives next to the manifest. These are tiny (KB-scale)

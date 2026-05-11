@@ -4,6 +4,49 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit are recorded here. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per the affected component.
 
+## sessionscribe-ioc-scan.sh v2.8.4 — 2026-05-11
+
+### Fixed — bundle missing `ioc-scan-envelope.json` (intake silent-CLEAN cohort)
+
+Intake-side analysis surfaced ~1.8% of v2.8.0 bundles (584 distinct hosts)
+landing in an empty-meta cohort: bundle tarball present, manifest +
+kill-chain primitives present, but `ioc-scan-envelope.json` absent. The
+intake reads `$env` exclusively from that file; when missing, `$env = []`
+and every `$env['x'] ?? null` becomes SQL NULL. The verdict then falls
+through to threshold math and silently lands as CLEAN. Affects all 2.8.x
+versions equally (pre-existing bug from v2.0.0 merged-script rewrite).
+
+**Root cause:** `phase_bundle` only `cp`-ed the envelope from
+`$LEDGER_DIR/<RUN_ID>.json`. If `LEDGER_DIR` (default
+`/var/cpanel/sessionscribe-ioc/`) was unwritable for any reason — quota,
+SELinux denial, read-only fs, transient permission issue, `--no-ledger`
+in --replay paths, snapshot mode without ledger — the source file never
+existed and the entire copy block was silently skipped (the outer
+`-n "$_env_src" && -f "$_env_src"` check was false → no emit_signal,
+no fallback).
+
+**Fix:** `phase_bundle` now writes the envelope DIRECTLY to
+`$bdir/ioc-scan-envelope.json` as the primary path. `cp` from
+`$LEDGER_DIR` becomes the fallback if direct-write fails. If both fail,
+emits `bundle fail ioc_envelope_missing` (was: silent skip with no
+diagnostic). Bundle is self-contained; intake never sees a missing
+envelope unless write_json fundamentally cannot run.
+
+### Fixed — `kill-chain.jsonl` meta line empty fields in `--full` mode
+
+The forensic-bundle meta line (`write_kill_chain_primitives`) used
+`ENV_HOST_ROOT_VERDICT`, `ENV_HOST_USER_VERDICT`, `ENV_CODE_VERDICT`,
+`ENV_SCORE` which are only populated by `read_envelope_meta()` in
+`--replay` mode. In `--full` mode (which `--telemetry` implies for
+fleet telemetry), these stay empty strings and the meta line emits
+`""` for all four fields. Pre-existing issue from v2.7.x — surfaced
+in v2.8.x when intake parsers added per-axis verdict columns.
+
+**Fix:** meta line falls back to live globals (`HOST_ROOT_VERDICT`,
+`HOST_USER_VERDICT`, `VERDICT`, `SCORE`) when `ENV_*` are unset.
+`--replay` mode behavior unchanged (still reads from envelope via
+`read_envelope_meta`).
+
 ## sessionscribe-ioc-scan.sh v2.8.3 — 2026-05-11
 
 ### Fixed — three FPs found in v2.8.2 sentinel review
