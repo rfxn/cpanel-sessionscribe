@@ -4,6 +4,14 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per affected component.
 
+## ioc-scan v2.8.6 — 2026-05-13
+
+### Security
+- Vendor patched-build cutoffs refreshed for CVE-2026-41940 across
+  all 11 supported tiers (11.86 through 11.136) and the WP Squared
+  136.1 series; hosts at the prior cutoffs now classify as
+  `vulnerable_per_build`.
+
 ## ioc-scan v2.8.5 — 2026-05-11
 
 ### Fixed

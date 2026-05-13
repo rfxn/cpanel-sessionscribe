@@ -116,12 +116,12 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.5"
+VERSION="2.8.6"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
-# (136.1.7) is tracked separately in PATCHED_BUILD_WPSQUARED below.
+# tracked separately in PATCHED_BUILD_WPSQUARED below.
 PATCHED_TIERS_KEYS=(86 94 102 110 118 124 126 130 132 134 136)
-PATCHED_TIERS_VALS=(41 28 39  97  63  35  54  19  29  20  5)
+PATCHED_TIERS_VALS=(44 31 42  118 67  38  59  23  32  26  10)
 
 # Tiers with no in-place vendor patch — hosts must upgrade. Both call sites
 # (phase_defense, check_version) match via ` $UNPATCHED_TIERS_STR ` == *" $tier "*.
@@ -1329,9 +1329,9 @@ for _i in "${!PATCHED_TIERS_KEYS[@]}"; do
     PATCHED_BUILDS_CPANEL+=("11.${PATCHED_TIERS_KEYS[$_i]}.0.${PATCHED_TIERS_VALS[$_i]}")
 done
 unset _i
-PATCHED_BUILD_WPSQUARED="11.136.1.7"
+PATCHED_BUILD_WPSQUARED="11.136.1.12"
 PATCHED_WPSQUARED_TIER=136
-PATCHED_WPSQUARED_BUILD=7
+PATCHED_WPSQUARED_BUILD=12
 CPANEL_NORM=""
 CPANEL_WPSQ_TIER=""
 CPANEL_WPSQ_BUILD=""
