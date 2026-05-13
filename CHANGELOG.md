@@ -7,40 +7,36 @@ versioned per affected component.
 ## ioc-scan v2.8.5 — 2026-05-11
 
 ### Fixed
-- EL6 floor regression: `declare -gA` in `aggregate_verdict` aborted
-  the script on bash 4.1.2. Moved to top-level `declare -A`.
-- Pattern M3 FP: `lwadmin` / `lw-admin` / `liquidweb` / `nexcess`
-  sudoers drops matching the LW/Nexcess provisioning shape demote
-  to info-tier; re-image+restore no longer surfaces as a review IOC.
-- `phase_defense` PATCH_STATE used exact-equality and FP'd every
-  host above the cutoff (post-upcp, direct-update 11.110.0.103).
-  Now uses `build >= cutoff` to match `check_version`.
-- WP Squared (11.&lt;t&gt;.1.&lt;b&gt; shape) is now parsed and dispatched
-  against its own cutoff (11.136.1.7); was emitting UNKNOWN.
+- EL6 floor regression: a global-array primitive aborted on bash
+  4.1.2; moved to a floor-safe top-level declaration.
+- Pattern M3 FP: LW/Nexcess provisioning sudoers drops demote to
+  info-tier; re-image+restore no longer surfaces as a review IOC.
+- Patch-state check used exact-equality and FP'd every host above
+  the cutoff (post-upcp / direct-update). Now compares build against
+  cutoff to match the version gate.
+- WP Squared cPanel build series is now parsed and dispatched against
+  its own cutoff (11.136.1.7); previously emitted UNKNOWN.
 - GSocket shim verdict-gate respects real-root vs CageFS/LVE-jailed
-  context (`ps` USER + `/proc/&lt;pid&gt;/cgroup`); user-jailed root
-  now routes to `*_userland` with `affected_user` from the cgroup.
+  context; user-jailed root now routes to `*_userland` with
+  `affected_user` set.
 
 ### Changed
-- Pattern M7 wallet scan: batched `find -print0 | xargs grep -lF`
-  instead of per-file fork loop.
-- Pattern A `.sorry` enumeration: single walk for count + sample.
+- Pattern M7 wallet scan: batched walk replaces per-file invocation.
+- Pattern A `.sorry` enumeration consolidated into a single walk.
 
 ### Added
-- `timeout 300` cap on long discovery walks (Pattern A / B / G / M7,
-  suspect-IP log scan). `timeout 60` on `ps auxfww` and `ss -tnp`.
-- `timeout 30` on rpm/dpkg health probes, kernel queries, and
-  `needs-restarting -r` (was unguarded `rpm -qa` could hang on a
-  corrupt rpmdb; `needs-restarting` was capped at 5s, now 30s to
-  match floor). `timeout 300` on the full inventory query
-  (`rpm -qa` / `dpkg-query -W`).
-- Skip downstream pkgmgr queries when the health probe reports
-  anything but `ok` (broken / locked / unknown). Avoids burning the
-  timeout caps on a package db that's guaranteed to stall.
+- Defensive walltime caps: 5min on long discovery walks (Pattern A /
+  B / G / M7, suspect-IP log scan); 60s on process and socket
+  snapshots.
+- 30s cap on package-manager health probes, kernel queries, and the
+  `needs-restarting` check; 5min cap on the full package inventory.
+- Skip the full package inventory when the health probe reports
+  anything but `ok` (broken / locked / unknown), avoiding wasted
+  timeout budget on a stalled package db.
 - `software_inventory_meta.note` adds `query_timeout` and
-  `pkgmgr_{broken,locked,unknown}` so consumers can tell why an empty
-  inventory shipped (was conflated with `header_only` = "no packages
-  detected"). Additive; older consumers ignore unknown values.
+  `pkgmgr_{broken,locked,unknown}` so consumers can distinguish an
+  aborted query from `header_only` (no packages detected). Additive;
+  older consumers ignore unknown values.
 
 ## ioc-scan v2.8.4 — 2026-05-11
 
