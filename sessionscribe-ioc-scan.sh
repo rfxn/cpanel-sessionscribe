@@ -1,113 +1,38 @@
 #!/bin/bash
+# sessionscribe-ioc-scan.sh — (C) 2026, R-fx Networks <proj@rfxn.com> / GPL v2
+# On-host validator for CVE-2026-41940 (cPanel/WHM SessionScribe).
+# Read-only; provided as-is, no warranty. Validate against your own change control.
 #
-##
-# sessionscribe-ioc-scan.sh v2.8.5
-#             (C) 2026, R-fx Networks <proj@rfxn.com>
-# This program may be freely redistributed under the terms of the GNU GPL v2
-##
+# Modes:
+#   --triage      detection only (default)
+#   --full        detection + forensic + bundle
+#   --replay PATH re-render forensic against a saved envelope/bundle/.tgz
 #
-###############################################################################
-# sessionscribe-ioc-scan.sh
-#
-# DISCLAIMER / USE AT YOUR OWN RISK
-#   This script is provided as-is, without warranty of any kind, express or
-#   implied. The authors accept no responsibility for any loss, damage,
-#   downtime, or service impact arising from use, misuse, or modification of
-#   this script. The validator is read-only by design, but you are solely
-#   responsible for verifying suitability before running it on production
-#   hosts and for interpreting its output. Validate against your own
-#   change-control process.
-###############################################################################
-#
-# ============================================================================
-# Researcher credits
-# ============================================================================
-#
-# Two surfaces under the cPanel/WHM auth-bypass disclosure cluster (2026-04-28):
-#
-#   CVE-2026-41940 (SessionScribe)
-#     Researcher: Sina Kheirkhah (@SinSinology) / watchTowr Labs.
-#     Public PoC: github.com/watchtowrlabs/watchTowr-vs-cPanel-WHM-AuthBypass-to-RCE.py
-#     Surface: unauthenticated session forgery via CRLF injection into the
-#     password field of a preauth session. Outcome: full root.
-#     Detected here via session-store IOC scan, multi-line `pass=` heuristic,
-#     and code-state fingerprints (version, Perl modules, cpsrvd binary).
-#
-#   WhmScribe-A
-#     Researcher: Ryan MacDonald, Nexcess Engineering <rmacdonald@nexcess.net>
-#                 Ryan MacDonald, rfxn | forged in prod | <ryan@rfxn.com>
-#     Surface: Authorization: WHM <user>:<token> commits username to the
-#     access_log identity slot before token validation. ACL gate holds -
-#     bounded to log-level identity injection (no privilege escalation).
-#     Surfaced here by the localhost-marker check (logged user=root with no
-#     auth) when --probe is passed.
-#
-# ============================================================================
-#
-# On-host validator for SessionScribe (CVE-2026-41940) - the 2026-04-28
-# cPanel/WHM unauthenticated session-forgery bypass (vendor KB 40073787579671).
-#
-# Primitive: an attacker mints a preauth session, strips the ,<obhex> ob_part
-# from the cookie, and sends Authorization: Basic <base64(user:CRLF-laced-pw)>
-# against any URL. cpsrvd's saveSession() writes the multi-line password
-# verbatim into the session file (the encoder short-circuits when ob_part is
-# missing), promoting attacker-supplied key=value lines into authenticated
-# session attributes. A follow-up /scripts2/listaccts propagates raw -> cache;
-# the leaked /cpsess<token> from the 307 Location header is then root.
-#
-# Local-only design: assumes shell access on the cPanel host. Converging
-# signals from version metadata, Perl module patterns, the cpsrvd binary,
-# and the on-disk session/log stores. Vendor's published session IOCs are
-# folded in alongside a multi-line-pass detector and a CVE-2026-41940
-# co-occurrence fingerprint. Companion remote detection probe ships as
-# sessionscribe-remote-probe.sh.
-#
-# Modes (v2.0.0+ - forensic phases live inline; --replay supersedes the
-# v1.x two-script chain):
-#   --triage      detection only (default); writes envelope to run-ledger
-#   --full        detection + forensic (defense, offense, reconcile,
-#                 kill-chain, bundle, upload). Bundle on by default.
-#   --replay PATH replay forensic against a saved envelope (.json), bundle
-#                 directory, or .tgz - re-render or re-submit without rescan.
-#
-# Output streams (any mode):
+# Output:
 #   default       ANSI sectioned report on stderr
-#   -o, --output  structured output to FILE (JSON, or CSV with --csv)
-#   --jsonl       one JSON signal per line on stdout (suppresses sectioned)
-#   --csv         one per-host summary row on stdout (suppresses sectioned)
+#   -o FILE       structured output (JSON or CSV with --csv)
+#   --jsonl       one JSON signal per line on stdout
+#   --csv         one per-host summary row on stdout
 #   --quiet       suppress sectioned report
 #   --verbose     expand matrix detail
 #
 # Verdict axes (independent):
-#   code_verdict  PATCHED / VULNERABLE / INCONCLUSIVE - from version, Perl
-#                 patterns, cpsrvd binary fingerprint
-#   host_root_verdict  CLEAN / SUSPICIOUS / COMPROMISED - actor had root
-#                       access (X via WHM, /etc, /root, system paths).
-#                       Persistence cluster also routes here.
-#   host_user_verdict  CLEAN / SUSPICIOUS / COMPROMISED - actor had only
-#                       user-account access; impact scoped to one or more
-#                       cPanel tenants. See users[] for per-tenant detail.
-#                 Sessions tagged with the companion probe's canary attribute
-#                 bucket as PROBE_ARTIFACT (do NOT escalate either verdict).
+#   code_verdict       PATCHED / VULNERABLE / INCONCLUSIVE
+#   host_root_verdict  CLEAN / SUSPICIOUS / COMPROMISED  (actor had root)
+#   host_user_verdict  CLEAN / SUSPICIOUS / COMPROMISED  (user-account scope)
 #
-# Exit codes (highest priority wins):
-#   0  PATCHED+CLEAN
-#   1  VULNERABLE      code-state: cpsrvd binary unpatched
-#   2  INCONCLUSIVE    code-state ambiguous; also tool error (bad args/deps)
-#   3  SUSPICIOUS      host-state: ioc_review > 0 (warning-tier IOC hits)
-#   4  COMPROMISED     host-state: ioc_critical > 0 (overrides 0/1/2/3 -
-#                      a patched host can still be compromised from prior
-#                      exploitation)
+# Exit codes (highest wins):
+#   0 PATCHED+CLEAN  1 VULNERABLE  2 INCONCLUSIVE  3 SUSPICIOUS  4 COMPROMISED
 #
 # Usage:
-#   bash sessionscribe-ioc-scan.sh                       # triage (default)
-#   bash sessionscribe-ioc-scan.sh --full                # + forensic + bundle
-#   bash sessionscribe-ioc-scan.sh --full --upload       # + ship to intake
-#   bash sessionscribe-ioc-scan.sh --replay PATH         # re-render saved bundle
-#   bash sessionscribe-ioc-scan.sh --since 90 --jsonl    # 90d window, JSONL stream
+#   bash sessionscribe-ioc-scan.sh                    # triage
+#   bash sessionscribe-ioc-scan.sh --full             # + forensic + bundle
+#   bash sessionscribe-ioc-scan.sh --full --upload    # + ship to intake
+#   bash sessionscribe-ioc-scan.sh --replay PATH      # re-render saved bundle
+#   bash sessionscribe-ioc-scan.sh --since 90 --jsonl # 90d window, stream
 #
-# Fleet (Ansible/Salt/SSH wrap of local mode):
-#   ansible -i hosts all -m script -a 'sessionscribe-ioc-scan.sh --full --jsonl --quiet'
+# Fleet:
+#   ansible all -m script -a 'sessionscribe-ioc-scan.sh --full --jsonl --quiet'
 #   pdsh -w cpanel-fleet 'bash -s' < sessionscribe-ioc-scan.sh
 
 set -u
@@ -138,7 +63,7 @@ ACL_STRINGS_PATTERN='init_acls|checkacl|clear_acls|filter_acls|_dynamic_acl_upda
 # the substring is unique enough to not FP on real-browser Mozilla rows.
 IOC_AUTOMATED_UA='python-requests|^curl/|Go-http-client|libwww-perl|aiohttp|okhttp|httpx|l9scan'
 
-# cpsrvd ports that the WebPros-published IOC pattern landed on.
+# cpsrvd-served ports.
 CPSRVD_PORT_RE='^(2082|2083|2086|2087|2095|2096)$'
 
 # UA used by the marker probe (--probe). Distinctive so an IDS / log search
@@ -170,11 +95,8 @@ SESSION_MTIME_CTIME_THRESHOLD_SEC=600
 # cross-check so we don't tag ourselves.
 PROBE_UA_RE='sessionscribe-validator|nxesec-cve-2026-41940-probe'
 
-###############################################################################
-# Destruction-stage IOCs (Patterns A-I). Bounded stat/hash/grep host-state
-# probes suitable for fleet triage. Full kill-chain reconstruction runs
-# inline under --full / --replay. Source: IC-5790 dossier (2026-05-01).
-###############################################################################
+# Destruction-stage IOCs (Patterns A-I). Bounded host-state probes for
+# fleet triage; full kill-chain runs inline under --full / --replay.
 
 # Pattern A - .sorry encryptor + qTox ransom note. Masquerades as /root/sshd.
 PATTERN_A_BINARY="/root/sshd"
@@ -190,8 +112,8 @@ PATTERN_B_MYSQL_DIR="/var/lib/mysql"
 PATTERN_B_MYSQL_DB="/var/lib/mysql/mysql"
 
 # Pattern C - Mirai/nuclear.x86. Dropper deletes binary; string survives
-# in shell history. C2 host/IP catch the drop even after rename. _IP_2
-# is the rev5 second binary host (same /24, same actor scaling infra).
+# in shell history. C2 host/IP catch the drop even after rename.
+# _IP_2 is the second binary host (same /24, same actor infra).
 PATTERN_C_BIN="nuclear.x86"
 PATTERN_C_C2_HOST="raw.flameblox.com"
 PATTERN_C_C2_IP="87.121.84.78"
@@ -212,8 +134,7 @@ PATTERN_E_WS_RE='GET /cpsess[0-9]+/websocket/Shell'
 PATTERN_E_KNOWN_DIMS="24x80,24x120,24x134,24x200"
 
 # Pattern F - harvester wrap (actor fingerprint). __S_MARK__/__E_MARK__
-# wraps recon; __CMD_DONE_<nanos>__ is an additional same-actor marker
-# (rev5: Vishnu's host, imagicktest).
+# wraps recon; __CMD_DONE_<nanos>__ is an additional same-actor marker.
 PATTERN_F_S_MARK="__S_MARK__"
 PATTERN_F_E_MARK="__E_MARK__"
 PATTERN_F_CMD_DONE_RE='__CMD_DONE_[0-9]+__'
@@ -239,7 +160,7 @@ PATTERN_I_PROCNAME="system-service"
 
 # Pattern J — dossier-only persistence IOCs (paths/processes/at-jobs).
 # `-helper` suffix is the discriminator vs legitimate counterparts on
-# stock cPanel; see CHANGELOG v2.7.31 for the heuristic-removal rationale.
+# stock cPanel; heuristic removed (see CHANGELOG).
 PATTERN_J_KNOWN_PATHS=(
     "/etc/udev/rules.d/89-cdrom-id-helper.rules"
     "/usr/lib/udev/cdrom-id-helper"
@@ -256,21 +177,12 @@ PATTERN_J_PROCESS_NAMES=(cdrom-id-helper dbus-broker-helper)
 # both literal `$$` (as-typed) and `[0-9]+` (echo-expanded) forms.
 PATTERN_K_BACKDOOR_HOST="cp.dene.de.com"
 PATTERN_K_TMP_RE='F=/tmp/\.u([$][$]|[0-9]+)'
-# Pattern K dropper paranoid-cleanup shape (v2.7.20 — survives C2 rotation).
-# Per dossier: "Combination of `wget -q -O ... && chmod 755 ... && ... -s; rm -f`
-# on a single line — paranoid-cleanup pattern that rarely appears in legitimate
-# sysadmin work." Catches Pattern K from a renamed/rotated C2 host where the
-# cp.dene.de.com literal no longer applies.
+# Pattern K dropper paranoid-cleanup shape — single-line wget+chmod+exec+rm.
+# Catches Pattern K from a renamed/rotated C2 where the host literal no longer applies.
 PATTERN_K_DROPPER_SHAPE_RE='wget[[:space:]]+-q[[:space:]]+-O[[:space:]].*&&[[:space:]]*chmod[[:space:]]+755.*&&.*-s[[:space:]]*;[[:space:]]*rm[[:space:]]+-f'
 
-# Pattern L - filesystem-nuke (rm -rf --no-preserve-root /). The
-# --no-preserve-root flag is the load-bearing IOC; GNU coreutils
-# defaults to --preserve-root specifically to block accidental nukes.
-# Trailing-`/`-as-target anchor (followed by whitespace, special char,
-# or EOL) avoids FP on `--no-preserve-root /tmp/foo` (operator just
-# disabled the safety on a non-root target). __CMD_START__/__CMD_END__
-# wraps destructive commands (Pattern F-family marker; distinct from
-# __S_MARK__/__E_MARK__ recon envelope).
+# Pattern L filesystem-nuke. --no-preserve-root is the load-bearing IOC.
+# Trailing-`/` anchor (ws/special/EOL after) avoids FP on non-root targets.
 PATTERN_L_NUKE_RE="rm[[:space:]]+-rf[[:space:]]+--no-preserve-root[[:space:]]+/([[:space:]&;\"']|\$)"
 PATTERN_L_CMD_START="__CMD_START__"
 PATTERN_L_CMD_END="__CMD_END__"
@@ -289,7 +201,7 @@ PATTERN_M_C2_PORT="8080"
 PATTERN_M_DOCKER_IMAGE="negoroo/amco"
 
 # Runtime-state IOC tables — post-exploitation residue (gsocket, miners,
-# loaders, C2). See CHANGELOG v2.7.35 for source + rationale.
+# loaders, C2). See CHANGELOG.
 RUNTIME_KNOWN_BAD_PATHS=(
     "/dev/shm/.gs"
     "/root/c3pool/xmrig"
@@ -358,7 +270,7 @@ RUNTIME_XMR_WALLET_RE='[ /=][48][0-9A-Za-z]{94}([[:space:]]|$)'
 # Base64 prefix of "/usr/bin/pkill" — catches base64-wrapped GSocket shim.
 RUNTIME_GS_B64_PREFIX='L3Vzci9iaW4vcGtpbGw'
 
-# Attacker-planted jumphost-mimic SSH key labels (per IC-5790 dossier).
+# Attacker-planted jumphost-mimic SSH key labels.
 PATTERN_G_BAD_KEY_LABELS=(
     "209.59.141.49"
     "50.28.104.57"
@@ -375,10 +287,8 @@ SSH_KEY_FILES=(
     "/root/.ssh/authorized_keys2"
 )
 
-# Attacker IPs from IC-5790 dossier rev3 (2026-05-01). Some blackholed —
-# still count hits in case rotation didn't take. --exclude-ip suppresses
-# operator scan boxes. 183.82.160.147 has DEC 2025 websocket/Shell hits,
-# four months pre-disclosure — --since 90 misses these.
+# Attacker IPs. Some blackholed — still count hits in case rotation
+# didn't take. --exclude-ip suppresses operator scan boxes.
 ATTACKER_IPS=(
     # badpass exploitation source IPs (initial-access wave)
     68.233.238.100   206.189.2.13     137.184.77.0     38.146.25.154
@@ -390,30 +300,16 @@ ATTACKER_IPS=(
     94.231.206.39
     # C2 / dropper / payload origin (Pattern A/C/D/H)
     68.183.190.253   87.121.84.78     96.30.39.236     68.47.28.118
-    # Pattern Unknown (rev3 cohort entry, not yet classified A or B)
+    # Pattern Unknown (unclassified)
     89.34.18.59
-    # rev4 expansion (2026-05-02): four DigitalOcean operators chained
-    # the CRLF exploit over 8h on a single target then handed off to a
-    # destruction operator running 24x200 websocket Shell. 80.75.212.14
-    # is the early scout (mixed-UA recon hours before the exploit wave).
+    # DigitalOcean operator cluster (CRLF exploit handoff → 24x200 websocket Shell)
     80.75.212.14     206.189.227.202  159.223.155.255  67.205.134.215
     136.244.66.225
-    # rev5 (2026-05-03): Pattern J operator - drops udev/systemd-unit
-    # persistence that fetches an out-of-band payload binary. Detection
-    # is by the Pattern J shape gates (J1/J2) plus this operator IP; no
-    # payload-binary fingerprint shipped yet (sha256 will land in the
-    # dossier when the binary is fully analyzed).
+    # Pattern J operator — udev/systemd persistence with OOB payload
     45.92.1.188
-    # rev5 (2026-05-03): second nuclear.x86 binary host (Pattern C
-    # variant - same /24 as 87.121.84.78, same actor scaling
-    # infrastructure). Surfaced on host.eworksinc.com (Rahul Krishnan
-    # case 46501374) with multiple active nuclear.x86 processes still
-    # running as root; binary persisted and beaconing - confirms
-    # Pattern C can run in active-process mode in addition to the
-    # originally-documented hit-and-run.
+    # Pattern C active-process mode (same /24 cluster)
     87.121.84.243
-    # rev5 (2026-05-03): badpass exploit IP null-routed by Jamie 8:02
-    # CDT. Source host: cloudvpstemplate.1g9j3u-lwsites.com.
+    # badpass exploit IP (null-routed)
     67.205.166.246
 )
 
@@ -443,12 +339,8 @@ SINCE_EPOCH=""           # computed from SINCE_DAYS at parse time
 # sessions have rotated out of /var/cpanel/sessions/raw/.
 NO_DESTRUCTION_IOCS=0
 
-# Run ledger. /var/cpanel/sessionscribe-ioc/ holds an append-only JSONL
-# of every run plus a per-run JSON envelope. Default ON so operators get
-# local history without an aggregator; --no-ledger opts out for paranoid
-# runs that must leave no host residue. Sibling to sessionscribe-mitigate's
-# /var/cpanel/sessionscribe-mitigation/ - both stay under /var/cpanel/
-# so cpanel-tool state is co-located.
+# Run ledger: append-only JSONL + per-run envelope under /var/cpanel/.
+# Default ON; --no-ledger opts out for runs that must leave no residue.
 NO_LEDGER=0
 LEDGER_DIR_DEFAULT="/var/cpanel/sessionscribe-ioc"
 LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
@@ -458,13 +350,8 @@ LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
 DEFAULT_BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
 DEFAULT_MAX_BUNDLE_MB=2048      # per-tarball cap (NOT bundle-wide)
 DEFAULT_FORENSIC_SINCE_DAYS=90  # forensic-mode default --since when unspecified
-# Bundle retention: keep the N newest bundles in $BUNDLE_DIR_ROOT (current
-# run + the N-1 most-recent prior runs); older bundle dirs and any sibling
-# .upload.tgz are pruned at the end of phase_bundle. Bundle uploads ride
-# off-host to intake, so the local copy is operator-recovery scratch -
-# 3 is enough to keep "this run + last two" without unbounded growth on
-# busy fleet hosts. Override via $BUNDLE_RETENTION env var; set 0 to
-# disable pruning entirely.
+# Bundle retention: keep N newest in $BUNDLE_DIR_ROOT; older pruned at
+# end of phase_bundle. Override via $BUNDLE_RETENTION (0 = no prune).
 DEFAULT_BUNDLE_RETENTION=3
 INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
 # No embedded default token — --upload requires an explicit token from
@@ -477,11 +364,9 @@ INTAKE_DEFAULT_URL="https://intake.rfxn.com/"
 PATCH_CANARY_FILE="/usr/local/cpanel/Cpanel/Session/Load.pm"
 MITIGATE_BACKUP_ROOT="/var/cpanel/sessionscribe-mitigation"
 
-# External-containment ingestion. Operator IR scripts move artifacts off
-# disk into per-run dirs (hashes.txt + ssh-pruned-keys.log written before
-# removal); we replay those so a contained host still scores correctly.
-# Glob must be root-owned and single-token (expanded unquoted by the
-# walker). Empty disables.
+# External-containment ingestion. Replay operator IR per-run dirs
+# (hashes.txt + ssh-pruned-keys.log) so a contained host still scores.
+# Glob must be root-owned + single-token; empty disables.
 EXTERNAL_QUARANTINE_GLOB="/root/quarantine-*"
 MAX_EXTERNAL_QUARANTINE_HITS="${MAX_EXTERNAL_QUARANTINE_HITS:-200}"
 MAX_EXTERNAL_QUARANTINE_FILE_BYTES="${MAX_EXTERNAL_QUARANTINE_FILE_BYTES:-1048576}"
@@ -531,7 +416,7 @@ INTAKE_TOKEN=""
 # Telemetry mode — lite bundle (envelope + kill-chain + KB-scale snapshots
 # only; no sessions/access-logs/persistence tarballs). ~50-100 KB per host.
 # Optional envelope POST via --telemetry-url; transport ladder curl > wget >
-# bash /dev/tcp + openssl. See INTERNAL-NOTES.md "v2.7.16/v2.7.17".
+# bash /dev/tcp + openssl.
 TELEMETRY_MODE=0
 TELEMETRY_URL=""
 TELEMETRY_TOKEN=""
@@ -544,21 +429,17 @@ TELEMETRY_MAX_BYTES=$((5 * 1024 * 1024))
 
 # --telemetry-cron <add|remove> [1h|2h|6h|12h|24h]: manages /etc/cron.d/
 # entry. Cron line self-fetches latest script (GitHub raw → sh.rfxn.com
-# fallback) every tick. See INTERNAL-NOTES.md "v2.7.16/v2.7.17".
+# fallback) every tick.
 TELEMETRY_CRON_ACTION=""
 TELEMETRY_CRON_INTERVAL="6h"
 TELEMETRY_CRON_FILE="/etc/cron.d/sessionscribe-telemetry"
 # Cron self-fetch sources (GitHub canonical, CDN fallback) + install dest.
-# See INTERNAL-NOTES.md "v2.7.17/v2.7.18" for failover + drift-window detail.
 TELEMETRY_CRON_GITHUB_URL="https://raw.githubusercontent.com/rfxn/cpanel-sessionscribe/main/sessionscribe-ioc-scan.sh"
 TELEMETRY_CRON_CDN_URL="https://sh.rfxn.com/sessionscribe-ioc-scan.sh"
 TELEMETRY_CRON_INSTALL_PATH="/usr/local/bin/sessionscribe-ioc-scan.sh"
 
-# --exclude-ip CIDR (repeatable). Suppress attacker-IP cross-ref hits from
-# operator scan boxes / known-good IR sources.
-# Declared with -a (not -ga) for bash 4.1 / EL6 compatibility - declared
-# once at top-level scope so the global is already established when
-# functions append to it.
+# --exclude-ip CIDR (repeatable). Suppress attacker-IP hits from
+# operator scan boxes / known-good IR sources. -a (not -ga) for bash 4.1.
 declare -a EXCLUDE_IPS=()
 
 usage() {
@@ -798,20 +679,9 @@ EOF
     exit 0
 }
 
-###############################################################################
-# Telemetry cron management — install/remove /etc/cron.d/<name> entry. Cron
-# line self-fetches the latest script (GitHub canonical → sh.rfxn.com
-# fallback), atomic-installs after size+syntax check, runs under timeout 300.
-# See INTERNAL-NOTES.md "v2.7.16/v2.7.17/v2.7.18" for design rationale.
-###############################################################################
+# Telemetry cron management.
 
-# v2.7.41: rewrite legacy cron files. Bug class 1: unescaped '%' parses
-# as cron's command/stdin separator, so cron-shell never reaches bash.
-# Bug class 2: no MAILTO (or MAILTO=root) routes the parse error and
-# any future job output to root@. Self-heal forces MAILTO="" right after
-# the PATH= line and drops any prior MAILTO=root or duplicate MAILTO=
-# entries (non-root MAILTO overrides — e.g. ops@example.com — survive
-# the rewrite). Idempotent.
+# Self-heal legacy cron files (unescaped %, MAILTO=root).
 repair_telemetry_cron_file() {
     local f="$TELEMETRY_CRON_FILE" tmp
     [[ -f "$f" && -w "$f" ]] || return 0
@@ -907,15 +777,8 @@ manage_telemetry_cron() {
              exit 2 ;;
     esac
 
-    # Pass through --upload-url and --upload-token if the operator set them
-    # on this command line — embed in the generated cron so the scheduled
-    # run ships to their custom intake without manual file edits. Single-
-    # quoted in the cron line so values containing spaces or special chars
-    # don't break shell parsing at run time. Operators can rotate the
-    # token by re-running '--telemetry-cron add ... --upload-token NEW'.
-    # Upload is only baked into the cron when --upload-token is supplied
-    # (no embedded default — see INTAKE_DEFAULT_URL block); otherwise the
-    # tick produces a lite bundle on disk + optional --telemetry-url POST.
+    # Embed --upload-url/--upload-token into the cron line (single-quoted
+    # to survive special chars). Only baked in when --upload-token is set.
     local extra_args=""
     local upload_arg=""
     if [[ -n "${CHAIN_UPLOAD_URL:-}" ]]; then
@@ -937,43 +800,16 @@ manage_telemetry_cron() {
     fi
 
     # Heredoc preserves \$((…)) for cron-shell evaluation per tick.
-    # See INTERNAL-NOTES.md "v2.7.16/v2.7.17" for timeout + splay rationale.
     local tmp
     tmp=$(mktemp /tmp/telemetry-cron.XXXXXX) || {
         echo "Error: mktemp failed" >&2; exit 2; }
     cat > "$tmp" <<CRONEOF
-# /etc/cron.d/sessionscribe-telemetry
-# Managed by sessionscribe-ioc-scan.sh --telemetry-cron
+# /etc/cron.d/sessionscribe-telemetry — managed by sessionscribe-ioc-scan.sh
 # Generated $(date -u +%FT%TZ) at interval=${TELEMETRY_CRON_INTERVAL}
-#
-# DO NOT EDIT DIRECTLY — re-running '--telemetry-cron add' overwrites this
-# file. Use '--telemetry-cron remove' to uninstall, or re-run 'add' with
-# different flags to update.
-#
-# Perms: 0600 root:root. The cron line below embeds an --upload-token
-# value; world-readability would expose the credential to any local user.
-# crond reads /etc/cron.d/* as root, so 0600 doesn't break execution.
-#
-# Self-fetch shape: each cron tick downloads the latest script with a
-# canonical -> fallback source order: (1) GitHub raw (canonical, updated
-# within ~5min of every git push), (2) sh.rfxn.com CDN (fallback, updated
-# by the freedom-syncs publish workflow). The (curl GH || curl CDN)
-# subshell tries primary first and falls back on any curl failure. After
-# fetch the script is size-guarded, syntax-validated with bash -n, atomic-
-# installed at mode 0755, then run under timeout 300. Always-current; no
-# operator-side push for routine updates. Splay 5-300s spreads fleet
-# intake load across the minute mark (~5 min for a 1000-host fleet).
-#
-# Failure modes (each gated by &&-chain so a failure short-circuits cleanly):
-#   mktemp fails  -> chain bails before curl, prior install runs unchanged
-#   GH unreachable-> CDN fallback fires (the || curl) and runs second
-#   both fail     -> chain bails after the (||) group fails, prior install
-#                    runs unchanged ([ -x "\$_D" ] still true on second tick)
-#   0-byte body   -> [ -s "\$_T" ] catches it (Caddy serves 200+0 for missing
-#                    on the CDN tree; GH raw returns 404 caught by curl -f)
-#   bad bash      -> bash -n catches truncation/HTML-error-page corruption
-#   install fails -> destination keeps prior version; rm -f cleans temp
-#   cold start    -> [ -x "\$_D" ] short-circuits exec, no error spam
+# DO NOT EDIT — `--telemetry-cron add` overwrites; `remove` uninstalls.
+# Perms: 0600 root:root (cron line may embed --upload-token).
+# Each tick self-fetches latest script (GitHub raw → sh.rfxn.com CDN),
+# size-checks, validates with bash -n, atomic-installs, runs under timeout 300.
 SHELL=/bin/bash
 PATH=/sbin:/bin:/usr/sbin:/usr/bin
 MAILTO=""
@@ -1058,11 +894,9 @@ while [[ $# -gt 0 ]]; do
         --extra-logs)         EXTRA_LOGS_DIR="$2"; shift 2 ;;
         --no-history)         INCLUDE_HOMEDIR_HISTORY=0; shift ;;
         --upload)             DO_UPLOAD=1; shift ;;
-        # Telemetry mode — lite bundle (no heavy tarballs) for high-frequency
-        # fleet polling. Implies --full --chain-on-all --bundle so the
-        # forensic phases run on every host and the bundle dir gets the
-        # envelope + kill-chain primitives written. The lite-mode skip
-        # logic lives inside phase_bundle (gated on TELEMETRY_MODE).
+        # Telemetry mode — lite bundle for high-frequency fleet polling.
+        # Implies --full --chain-on-all --bundle. phase_bundle gates on
+        # TELEMETRY_MODE to skip heavy tarballs.
         --telemetry)
             TELEMETRY_MODE=1; FULL_MODE=1; CHAIN_ON_ALL=1
             DO_BUNDLE=1; shift ;;
@@ -1074,14 +908,8 @@ while [[ $# -gt 0 ]]; do
         --telemetry-timeout)  TELEMETRY_TIMEOUT="$2"; shift 2 ;;
         --telemetry-retry)    TELEMETRY_RETRY="$2"; shift 2 ;;
         --telemetry-max-bytes) TELEMETRY_MAX_BYTES="$2"; shift 2 ;;
-        # --telemetry-cron <add|remove> [INTERVAL]: action arg is required;
-        # for 'add', the optional positional INTERVAL is consumed if it
-        # doesn't look like another flag (i.e., doesn't start with '--').
-        # The function validates the interval value at run time so a bad
-        # value like '99h' produces a clear "invalid interval" error
-        # instead of falling through to the parser's "Unknown option"
-        # branch. For 'remove', no interval is meaningful — leave the
-        # next token alone so it can be parsed normally.
+        # `add` may take an optional positional INTERVAL (only if not
+        # starting with '--'); `remove` never consumes the next token.
         --telemetry-cron)
             if [[ -z "${2:-}" ]]; then
                 echo "Error: --telemetry-cron requires <add|remove>" >&2
@@ -1145,9 +973,6 @@ if [[ -n "$TELEMETRY_CRON_ACTION" ]]; then
     exit 0
 fi
 
-# v2.7.41 self-heal: rewrite legacy /etc/cron.d/sessionscribe-telemetry
-# files whose '%' was unescaped (cron split on it; cron-shell never
-# reached bash) or that lack an explicit MAILTO (cron mails to root).
 repair_telemetry_cron_file
 
 # --csv and --jsonl both want stdout - mutual exclusion.
@@ -1224,11 +1049,8 @@ if (( TELEMETRY_MODE )); then
         echo "Error: --telemetry-max-bytes requires an integer >= 1024 (bytes)" >&2
         exit 2
     fi
-    # --telemetry is incompatible with --no-ledger for the same reason --full
-    # is — phase_telemetry_post and the kill-chain primitives both need the
-    # envelope on disk. The earlier --full + --no-ledger gate covers this
-    # transitively (TELEMETRY_MODE implies FULL_MODE) but we restate it for
-    # clarity in the error message.
+    # --telemetry needs the envelope on disk; --no-ledger blocks that.
+    # Caught transitively by --full + --no-ledger gate; restate for clarity.
     if (( NO_LEDGER )); then
         echo "Error: --telemetry is incompatible with --no-ledger (lite bundle requires the envelope on disk)" >&2
         exit 2
@@ -1257,12 +1079,8 @@ fi
 TS_EPOCH=$(date -u +%s)
 RUN_ID="${SESSIONSCRIBE_RUN_ID:-${TS_EPOCH}-$$}"
 
-###############################################################################
-# Forensic state
-###############################################################################
-# When the operator runs --full or --replay, the forensic phases populate
-# these arrays. They stay empty in default --triage mode. All forensic
-# findings flow through emit() into the unified SIGNALS[] stream.
+# Forensic state — populated only by --full / --replay phases.
+# All findings flow through emit() into SIGNALS[].
 DEFENSE_EVENTS=()       # "epoch|kind|note" strings, sorted at render time
 OFFENSE_EVENTS=()       # "epoch|pattern|key|note|defenses_required" strings
 IOC_PRIMITIVES=()       # parallel-indexed with OFFENSE_EVENTS; TSV row per IOC
@@ -1338,7 +1156,7 @@ CPANEL_WPSQ_BUILD=""
 PRIMARY_IP=""              # primary outbound IPv4 (ip-route-get probe)
 OS_PRETTY=""               # /etc/os-release PRETTY_NAME or redhat-release line
 : "${LP_UID:=}"            # hosting-provider UID; env-overridable, default ""
-INCIDENT_ID="IC-5790"      # dossier identifier baked into all forensic output
+INCIDENT_ID="IC-5790"      # incident ID stamped into forensic output
 PRIMARY_IP_J=""            # json_esc'd PRIMARY_IP
 LP_UID_J=""                # json_esc'd LP_UID
 OS_J=""                    # json_esc'd OS_PRETTY
@@ -1360,22 +1178,23 @@ DISK_INODE_FULL_MOUNTS=""
 BOOT_FREE_MB=""
 PKG_INVENTORY_COUNT="0"
 
-# Software-inventory transmission (v2.7.43+). The on-disk sidecar
-# software-inventory.txt is also gzipped + base64 encoded into the JSON
-# envelope so a fleet-collector receiving only the envelope POST can
-# reconcile per-host CVE/erratum exposure without out-of-band bundle
-# pulls. encode_software_inventory_b64gz() populates these from
-# phase_bundle, after the sidecar is written. Note carries one of:
-# 'ok' | 'header_only' | 'empty' | 'gzip_missing' | 'base64_missing' |
-# 'encode_failed' | 'exceeds_cap_<N>' | 'not_collected' (encoder never
-# ran — default --triage mode does not invoke phase_bundle). Receivers
-# verify integrity via _SHA256 over the pre-encoding bytes.
 SOFTWARE_INVENTORY_B64GZ=""
 SOFTWARE_INVENTORY_B64GZ_NOTE="not_collected"
 SOFTWARE_INVENTORY_SHA256=""
 SOFTWARE_INVENTORY_RAW_BYTES=0
 SOFTWARE_INVENTORY_ENCODED_BYTES=0
 SOFTWARE_INVENTORY_B64GZ_MAX=$((1024 * 1024))   # 1 MB cap on the b64 string
+
+LMD_INSTALLED=0
+LMD_ACTIVE=0
+LMD_VERSION=""
+LMD_HITS_B64GZ=""
+LMD_HITS_B64GZ_NOTE="not_collected"
+LMD_HITS_RAW_BYTES=0
+LMD_HITS_ENCODED_BYTES=0
+LMD_HITS_ROW_COUNT=0
+LMD_HITS_WINDOW_DAYS=30
+LMD_HITS_MAX_ROWS=2000
 
 # Defense extraction outputs (set by phase_defense, read by phase_reconcile +
 # write_kill_chain_primitives). Empty = "defense state unknown".
@@ -1393,14 +1212,9 @@ PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 # Bundle output paths (set by phase_bundle, read by phase_upload).
 BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
 
-###############################################################################
-# Per-section verdict tracking
-# SECTION_ORDER drives the summary matrix row sequence + section ID display.
-# SECTION_LABEL maps the emit() area to the human-facing matrix row label.
-# SECTION_VERDICT[area] is filled by aggregate_verdict() (worst-wins) and
-# consumed by print_verdict() to render the 7-row matrix at the top of
-# the summary block.
-###############################################################################
+# Per-section verdict tracking. SECTION_ORDER drives row sequence,
+# SECTION_LABEL maps area→display, SECTION_VERDICT[area] is worst-wins
+# (filled by aggregate_verdict, consumed by print_verdict).
 SECTION_ORDER=(version static binary logs sessions destruction posture probe)
 declare -A SECTION_LABEL=(
     [version]="version"
@@ -1428,11 +1242,8 @@ ENVELOPE_PATH=""
 # stays machine-readable end-to-end.
 if (( JSONL || CSV )); then QUIET=1; fi
 
-# High-level host gate: /var/cpanel is the canonical cPanel state directory.
-# Its absence means we're not on a cPanel/WHM host. Bail before doing anything
-# that would emit confusing "no log dir / no cpsrvd / no sessions" boilerplate.
-# Snapshot/offline forensic runs use --root / --version-string / --cpsrvd-path
-# to override; in that case, skip the gate (the operator opted in explicitly).
+# Host gate: /var/cpanel absent → not a cPanel host; bail.
+# --root / --version-string / --cpsrvd-path overrides (snapshot/offline).
 if [[ -z "${ROOT_OVERRIDE}${VERSION_OVERRIDE}${CPSRVD_OVERRIDE}" ]] \
    && [[ ! -d /var/cpanel ]]; then
     echo "Error: /var/cpanel not found - this host does not appear to run cPanel/WHM." >&2
@@ -1502,13 +1313,9 @@ banner() {
 # JSON-escaped twins). CPANEL_NORM resolution mirrors check_version() so
 # both yield the same value. LP_UID accepts an env-var override.
 collect_host_meta() {
-    # OS_PRETTY: /etc/os-release preferred; /etc/redhat-release fallback for
-    # EL6 hosts that predate os-release. Read with a data-only key=value
-    # parser (no eval, no `.` sourcing) so the file is treated as data even
-    # when it contains shell metachars like `$(...)` or backticks. /etc/os-
-    # release is root-owned so adversarial content shouldn't be reachable,
-    # but a snapshot/offline run may consume an attacker-influenced copy and
-    # we'd rather be safe by construction.
+    # OS_PRETTY: os-release preferred, redhat-release fallback (EL6).
+    # Data-only parser (no eval/sourcing) so attacker-influenced
+    # snapshot input can't execute via shell metachars.
     OS_PRETTY=""
     if [[ -r /etc/os-release ]]; then
         local _k="" _v="" _name=""
@@ -1529,12 +1336,8 @@ collect_host_meta() {
     fi
     [[ -z "$OS_PRETTY" ]] && OS_PRETTY="unknown"
 
-    # CPANEL_NORM: same four-source resolution chain check_version() walks.
-    # Two raw shapes accepted:
-    #   "110.0 (build 97)"   -> 11.110.0.97
-    #   "11.110.0.97"        -> 11.110.0.97 (already normalized)
-    # Bash `=~` uses libc POSIX ERE - `{2,3}` interval expressions are safe
-    # (only awk regexes need the gawk-3.x-safe rewrite per project floor).
+    # CPANEL_NORM: accepts "110.0 (build 97)" or "11.110.0.97".
+    # Bash `=~` (libc POSIX ERE) supports `{2,3}` intervals; awk doesn't.
     local _root="${CPANEL_ROOT:-/usr/local/cpanel}" _raw=""
     CPANEL_NORM=""
     if [[ -n "${VERSION_OVERRIDE:-}" ]]; then
@@ -1578,11 +1381,8 @@ collect_host_meta() {
     fi
     [[ -z "$PRIMARY_IP" ]] && PRIMARY_IP="unknown"
 
-    # LP_UID is the hosting-provider tag. No filesystem source defined today;
-    # operators set it via the LP_UID env-var at fleet dispatch time. The
-    # top-level `: "${LP_UID:=}"` declaration preserves an inherited env-var
-    # so we don't reassign it here - if the env was set, it's already in
-    # LP_UID; if unset, top-level defaulted it to "".
+    # LP_UID hosting-provider tag — set via env at fleet dispatch.
+    # Top-level `: "${LP_UID:=}"` preserves inherited env; no reassign here.
 
     # JSON-escaped variants used by the meta record at write_kill_chain_primitives.
     PRIMARY_IP_J=$(json_esc "$PRIMARY_IP")
@@ -1734,18 +1534,6 @@ collect_software_digest() {
     fi
 }
 
-# Encode the on-disk software-inventory.txt sidecar into the
-# SOFTWARE_INVENTORY_B64GZ global so write_json can embed it in the
-# envelope. Decision: rpm-qa output on a 5,000+ pkg cPanel host is
-# ~300KB raw, ~50KB gzipped, ~70KB base64 — fits a single envelope
-# POST without breaking the curl/wget/bash transport ladder. Receivers
-# decode with `printf '%s' "$b64gz" | base64 -d | gunzip` and verify
-# integrity via the SHA256 emitted in software_inventory_meta.
-#
-# Failure modes: gzip/base64 missing on legacy CL6 hosts, or pathological
-# inventory exceeding the 1MB encoded cap. Both leave the b64gz field
-# empty with a diagnostic note; the sidecar on disk is unaffected.
-# `gzip -nc` strips name+timestamp so output is byte-stable for diffing.
 encode_software_inventory_b64gz() {
     local inv_path="$1" override_note="${2:-}"
     SOFTWARE_INVENTORY_B64GZ=""
@@ -1793,13 +1581,75 @@ encode_software_inventory_b64gz() {
     SOFTWARE_INVENTORY_B64GZ_NOTE="ok"
 }
 
-###############################################################################
-# Signal accumulator
-#
-# Each signal is one line in the SIGNALS array, fields tab-delimited:
+collect_lmd_meta() {
+    LMD_INSTALLED=0
+    LMD_ACTIVE=0
+    LMD_VERSION=""
+    LMD_HITS_B64GZ=""
+    LMD_HITS_B64GZ_NOTE="not_collected"
+    LMD_HITS_RAW_BYTES=0
+    LMD_HITS_ENCODED_BYTES=0
+    LMD_HITS_ROW_COUNT=0
+
+    local _insp="/usr/local/maldetect"
+    [[ -f "$_insp/internals/internals.conf" ]] || return 0
+    LMD_INSTALLED=1
+
+    local _ver
+    _ver=$(head -1 "$_insp/VERSION" 2>/dev/null | tr -d '[:space:]')
+    LMD_VERSION="${_ver:-unknown}"
+
+    local _hitsfile="$_insp/sess/hits.hist"
+    [[ -f "$_hitsfile" && -r "$_hitsfile" ]] || { LMD_HITS_B64GZ_NOTE="no_hits_file"; return 0; }
+
+    local _now _mtime
+    _now=$(date -u +%s)
+    _mtime=$(stat -c %Y "$_hitsfile" 2>/dev/null)
+    if { have_cmd pgrep && pgrep -f "maldet" >/dev/null 2>&1; } \
+        || (( (_now - ${_mtime:-0}) < 2592000 )); then
+        LMD_ACTIVE=1
+    fi
+
+    local _cutoff=$(( _now - LMD_HITS_WINDOW_DAYS * 86400 ))
+    local _tmp
+    _tmp=$(mktemp 2>/dev/null) || { LMD_HITS_B64GZ_NOTE="mktemp_failed"; return 0; }
+
+    timeout 60 awk -F: -v cutoff="$_cutoff" \
+        'NF >= 11 && $1+0 >= cutoff' "$_hitsfile" 2>/dev/null \
+        | tail -n "$LMD_HITS_MAX_ROWS" > "$_tmp"
+
+    LMD_HITS_ROW_COUNT=$(wc -l < "$_tmp" 2>/dev/null)
+    LMD_HITS_ROW_COUNT="${LMD_HITS_ROW_COUNT//[[:space:]]/}"
+
+    if [[ ! -s "$_tmp" ]]; then
+        rm -f "$_tmp"
+        LMD_HITS_B64GZ_NOTE="no_hits_in_window"
+        return 0
+    fi
+
+    LMD_HITS_RAW_BYTES=$(wc -c < "$_tmp" 2>/dev/null)
+    LMD_HITS_RAW_BYTES="${LMD_HITS_RAW_BYTES//[[:space:]]/}"
+
+    if ! have_cmd gzip;   then rm -f "$_tmp"; LMD_HITS_B64GZ_NOTE="gzip_missing";   return 0; fi
+    if ! have_cmd base64; then rm -f "$_tmp"; LMD_HITS_B64GZ_NOTE="base64_missing"; return 0; fi
+
+    local enc
+    enc=$(gzip -nc "$_tmp" 2>/dev/null | base64 2>/dev/null | tr -d '\r\n')
+    rm -f "$_tmp"
+
+    if [[ -z "$enc" ]]; then
+        LMD_HITS_B64GZ_NOTE="encode_failed"
+        return 0
+    fi
+
+    LMD_HITS_B64GZ="$enc"
+    LMD_HITS_ENCODED_BYTES="${#enc}"
+    LMD_HITS_B64GZ_NOTE="ok"
+}
+
+# Signal accumulator. One line per signal, tab-delimited:
 #   area<TAB>id<TAB>severity<TAB>key<TAB>weight<TAB>jsonkv
-# jsonkv is a comma-separated list of "key":"value" pairs already JSON-escaped.
-###############################################################################
+# jsonkv = comma-separated "key":"value" pairs (pre-JSON-escaped).
 
 # Bash 4.1 / EL6: -a (not -ga) at top-level scope.
 declare -a SIGNALS=()
@@ -1845,10 +1695,8 @@ build_jsonkv() {
 }
 
 # severity ∈ {info, evidence, strong, warning, error}
-# Each JSONL line is prefixed with "host":"<fqdn>" so fleet aggregators can
-# attribute every signal to a source host without joining against an enclosing
-# envelope. The same prefix is added to every entry in the structured JSON
-# file's signals[] array (write_json) for the same reason.
+# Each JSONL line + every signals[] entry is prefixed with "host":"<fqdn>"
+# so fleet aggregators can attribute without joining the envelope.
 emit() {
     local area="$1" id="$2" severity="$3" key="$4" weight="$5"; shift 5
     local _has_au=0 _has_ap=0 _i
@@ -1929,23 +1777,16 @@ print_signal_human() {
         printf '  %s%-10s%s %-44s %s%s%s\n' "$color" "$tag" "$NC" "$id" "$DIM" "$key" "$NC" >&2
     fi
 
-    # Suppress detail for known-clean info rows whose payload is meaningless.
-    # Per-row IOC samples are NOT suppressed - operators need ip/status/log_file/
-    # raw line to triage. anomalous_session_path samples are NOT suppressed
-    # because emit_session populates user/src_ip/login_time/file_mtime which
-    # are exactly the forensic fields that distinguish injection from a benign
-    # root-named session.
+    # Suppress detail only on info rows whose payload is meaningless;
+    # per-row IOC + anomalous_session_path samples stay (triage fields).
     case "$key" in
         no_ioc_hits|no_session_iocs|patched_per_build|patch_marker_present| \
         ancillary_bug_fixed|acl_machinery_present_informational)
             return ;;
     esac
 
-    # 1. WHERE - filesystem pointer the operator can stat/read/grep directly.
-    # log_file (rotated access_log) takes precedence for IOC-sample rows: the
-    # operator's first action is "grep this in <file>", and we want to show
-    # the exact file rather than the live access_log they may have already
-    # checked.
+    # WHERE field — operator-stat-able file pointer. log_file (rotated
+    # access_log) wins over live access_log for IOC-sample rows.
     local location="${log_file:-${path:-${sample_path:-$file}}}"
     if [[ -n "$location" ]]; then
         printf '       %s→ %s%s\n' "$DIM" "$location" "$NC" >&2
@@ -1983,12 +1824,8 @@ print_signal_human() {
     fi
 }
 
-###############################################################################
-# Forensic output primitives
-# say_* / hdr() mirror ioc-scan's section style with status-prefixed tags so
-# the forensic phase output stays visually distinct from detection sections.
-# All output goes to stderr (never contaminates --jsonl/--json on stdout).
-###############################################################################
+# Forensic output primitives. say_*/hdr() use status-prefixed tags
+# (visually distinct from detection); all output → stderr.
 
 hdr_section()   { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
 say_pass()      { (( QUIET )) || printf '  %s[OK]%s %s\n'        "$C_GRN" "$C_NC" "$*" >&2; }
@@ -2018,11 +1855,8 @@ emit_signal() {
     emit "$area" "$key" "$ioc_sev" "$key" "$weight" "note" "$note" "$@"
 }
 
-###############################################################################
-# Forensic helpers — used by phase_defense / phase_offense
-# / phase_reconcile / render_kill_chain / phase_bundle / phase_upload.
-# No-op in default --triage mode (the phase functions aren't called).
-###############################################################################
+# Forensic helpers — used by phase_defense/offense/reconcile + render_kill_chain
+# + phase_bundle/upload. No-op in --triage (phase funcs aren't called).
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -2056,17 +1890,6 @@ known_bad_meta() {
     v=$(stat -c %Y "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(mtime_epoch "$v")
     v=$(stat -c %U "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(owner "$v")
     v=$(stat -c %a "$f" 2>/dev/null); [[ -n "$v" ]] && META_KV+=(mode "$v")
-}
-
-cat_log() {
-    local f="$1"
-    [[ -f "$f" ]] || return 0
-    case "$f" in
-        (*.gz)  have_cmd zcat  && zcat  "$f" 2>/dev/null ;;
-        (*.xz)  have_cmd xzcat && xzcat "$f" 2>/dev/null ;;
-        (*.bz2) have_cmd bzcat && bzcat "$f" 2>/dev/null ;;
-        (*)     cat "$f" 2>/dev/null ;;
-    esac
 }
 
 epoch_to_iso() {
@@ -2200,7 +2023,7 @@ ioc_section_group() {
 }
 
 # Demote IOC string hits in IR docs/runbooks/dossiers + sessionscribe-*
-# toolkit self-references. See INTERNAL-NOTES.md.
+# toolkit self-references.
 _is_doc_shape() {
     local _p="${1:-}"
     [[ -n "$_p" ]] || return 1
@@ -2218,7 +2041,7 @@ _is_doc_shape() {
     return 1
 }
 
-# Historical/quarantine evidence — both sources. See INTERNAL-NOTES.md.
+# Historical/quarantine evidence — both sources.
 _is_quarantine_signal() {
     case "$1" in
         (ioc_quarantined_session_*)      return 0 ;;
@@ -2229,7 +2052,7 @@ _is_quarantine_signal() {
 }
 
 # Compromise class for verdict gating: persistence / destruction /
-# token_used / "" (attempt). v3 ladder — see CHANGELOG v2.7.28.
+# token_used / "" (attempt). v3 ladder — see CHANGELOG.
 ioc_compromise_class() {
     ioc_key_is_soft_variant "$1" && { echo ""; return; }
     case "$1" in
@@ -2267,11 +2090,9 @@ ioc_signal_epoch() {
         fi
     done
 
-    # Pattern-aware fallback: pattern=X events MUST have a real timestamp;
-    # synthesizing TS_EPOCH for them pollutes cluster-onset analysis
-    # (q5/q8 in summary.json - patient-zero anchor shifts to scan time).
-    # File-on-disk patterns (A/B/C/D/F/G/H/I) retain the TS_EPOCH fallback
-    # because they are authentic on-disk evidence even when the emit omits ts.
+    # pattern=X requires a real ts (synthesizing TS_EPOCH corrupts q5/q8
+    # patient-zero anchor); file-on-disk patterns (A/B/C/D/F/G/H/I) retain
+    # TS_EPOCH fallback — they're real on-disk evidence regardless of ts.
     key=$(json_str_field "$line" "key")
     pattern=$(ioc_key_to_pattern "$key")
     if [[ "$pattern" == "X" ]]; then
@@ -2328,11 +2149,8 @@ ioc_primitive_row() {
         "${cpsess_token:-}"
 }
 
-# Modified from forensic: takes envelope path as $1 with
-# $SESSIONSCRIBE_IOC_JSON as fallback. Otherwise verbatim. Reads the
-# envelope from disk, populates OFFENSE_EVENTS[], IOC_PRIMITIVES[],
-# IOC_ANNOTATIONS[]. Returns 1 with a non-fatal say_warn if envelope is
-# absent — preserves forensic's standalone-mode tolerance.
+# Reads envelope ($1 or $SESSIONSCRIBE_IOC_JSON), populates OFFENSE_EVENTS/
+# IOC_PRIMITIVES/IOC_ANNOTATIONS. Returns 1 + non-fatal say_warn if absent.
 read_iocs_from_envelope() {
     local env="${1:-${SESSIONSCRIBE_IOC_JSON:-}}"
     if [[ -z "$env" ]]; then
@@ -2382,12 +2200,8 @@ read_iocs_from_envelope() {
         esac
         note=$(json_str_field "$line" note)
         ts=$(ioc_signal_epoch "$line")
-        # Pattern X events with no resolvable timestamp are refused:
-        # ioc_signal_epoch() returns 0 for pattern=X when no real ts is found.
-        # Using TS_EPOCH for pattern=X would synthesize a scan-time anchor and
-        # corrupt cluster-onset (q8_patient_zero_x) analysis.
-        # The warning emitted here is a pattern=meta informational row
-        # recording the refused event for post-hoc review.
+        # Pattern X with no resolvable ts is refused — a scan-time
+        # anchor via TS_EPOCH would corrupt q8_patient_zero_x.
         if [[ "$ts" == "0" ]]; then
             key_for_warn=$(json_str_field "$line" key)
             emit_signal offense warn ts_unresolvable_pattern_x \
@@ -2423,13 +2237,9 @@ read_iocs_from_envelope() {
     return 0
 }
 
-###############################################################################
-# Forensic phases — defense / offense / reconcile.
-# Run only when --full or --replay is set. Inputs: envelope (read from disk
-# via read_iocs_from_envelope). Outputs: DEFENSE_EVENTS[], OFFENSE_EVENTS[],
-# IOC_PRIMITIVES[], IOC_ANNOTATIONS[], RECONCILED[], N_PRE, N_POST,
-# plus signals via emit() under areas defense/offense/reconcile.
-###############################################################################
+# Forensic phases (defense/offense/reconcile) — run under --full/--replay.
+# In: envelope on disk. Out: DEFENSE_EVENTS/OFFENSE_EVENTS/IOC_PRIMITIVES/
+# IOC_ANNOTATIONS/RECONCILED/N_PRE/N_POST + emit() signals.
 
 # Pattern G deep checks ioc-scan doesn't perform: forged-mtime detection
 # (touch -d backdating) + per-key-comment validation against the LW
@@ -2452,8 +2262,8 @@ pattern_g_deep_checks() {
         ctime_pre=$(stat -c %Z "$ak" 2>/dev/null)
         local _g_known_bad=0
         # `touch -d` interprets in local timezone, so the resulting epoch
-        # depends on the host's UTC offset. Compare the wall-clock string
-        # under both UTC and localtime - either match is the IC-5790 stamp.
+        # depends on the host's UTC offset. Compare wall-clock under
+        # both UTC and localtime — either match is the forged stamp.
         if [[ -n "$mtime_pre" ]]; then
             mt_utc=$(date -u   -d "@$mtime_pre" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
             mt_local=$(date    -d "@$mtime_pre" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
@@ -2477,13 +2287,9 @@ pattern_g_deep_checks() {
         while IFS= read -r line; do
             [[ "$line" =~ ^# ]] && continue
             [[ -z "$line" ]] && continue
-            # Extract the full multi-word comment field (fields 3..end of
-            # `<keytype> <base64> <comment...>`). The prior `awk '{print $NF}'`
-            # only returned the last token, breaking the SSH_KNOWN_GOOD_RE
-            # whitelist on multi-word comments like
-            # "Parent Child key for W9Z2DL" - LW provisioning keys were
-            # being flagged as Pattern G IOCs because $NF returned just
-            # "W9Z2DL", which doesn't match any known-good prefix.
+            # Extract the FULL multi-word comment (fields 3..end);
+            # `$NF` alone breaks SSH_KNOWN_GOOD_RE on "Parent Child key
+            # for XXXXXX"-style LW provisioning keys.
             comment=$(awk 'NF>=3 {sub(/^[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print}' <<< "$line")
             is_known_bad=0; bad_label=""
             for bad in "${PATTERN_G_BAD_KEY_LABELS[@]}"; do
@@ -2580,7 +2386,7 @@ suspect_ip_correlation() {
 
     # Drop RFC1918 + loopback (WHM admin); same regex shape as Pattern E is_internal.
     # 5min cap on the full log scan — multi-year access_log corpora on busy
-    # fleets can exceed an hour of grep/awk wall-time (#hotfix v2.8.5).
+    # fleets can exceed an hour of grep/awk wall-time.
     local suspect_ips
     suspect_ips=$(timeout 300 bash -c '
         for lg in "$@"; do
@@ -2606,14 +2412,6 @@ suspect_ip_correlation() {
 phase_defense() {
     hdr_section "defense" "extracting timestamps for every mitigation layer"
 
-    # 1. cpanel patch landing time. PATCH_STATE distinguishes:
-    #    PATCHED      build matches vendor cutoff list - upgrade complete
-    #    UNPATCHED    sub-cutoff but tier has a patch available - run upcp
-    #    UNPATCHABLE  tier in vendor "no in-place patch" list (112/114/116/
-    #                 120/122/124/128) - response is upgrade major series
-    #    UNKNOWN      cpanel binary missing or build unparseable
-    # Mirrors mitigate.sh PATCH_STATE vocabulary so a fleet jq pipeline can
-    # join on the same state space.
     PATCH_STATE="UNKNOWN"
     if [[ "$CPANEL_NORM" == "unknown" || -z "$CPANEL_NORM" ]]; then
         say_def_miss "cpanel binary missing or build unparseable - patch defense UNKNOWN"
@@ -2714,14 +2512,9 @@ phase_defense() {
         emit_signal defense warn mitigate_absent "$MITIGATE_BACKUP_ROOT does not exist"
     fi
 
-    # 4. modsec rule presence + install time. Rule 1500030 is the primary
-    # CRLF-in-Authorization-Basic block. Without it, the host had no
-    # exploit-vector defense regardless of cPanel patch state.
-    # Match both `id:1500030` and `id:"1500030"` shapes (mitigate.sh
-    # convention; either is valid SecRule syntax).
-    # Resolve modsec config from candidate paths (EA4 default, then non-EA4
-    # fallbacks). First existing path wins; if none exist we keep the
-    # canonical EA4 path for the "absent" diagnostic.
+    # ModSec rule 1500030 is the primary CRLF-in-Authorization-Basic block;
+    # absent → no exploit-vector defense regardless of cPanel patch state.
+    # Match both `id:1500030` and `id:"1500030"` (both valid SecRule shapes).
     local mc
     for mc in "${MODSEC_USER_CONFS[@]}"; do
         if [[ -f "$mc" ]]; then
@@ -2748,11 +2541,8 @@ phase_defense() {
         emit_signal defense warn modsec_conf_absent "$MODSEC_USER_CONF not found"
     fi
 
-    # 5. CSF cpsrvd port closure. The defensive state we want is
-    # TCP_IN/TCP6_IN with NO cpsrvd ports (2082/3, 2086/7, 2095/6).
-    # Two ways the closure can be defeated: explicit cpsrvd port in the
-    # CSV, OR a port range like 2080:2090 that overlaps a cpsrvd port.
-    # We treat either as `csf_dirty`.
+    # CSF cpsrvd port closure: TCP_IN/TCP6_IN must NOT carry 2082-2096.
+    # Defeated by explicit port OR overlap range (e.g. 2080:2090) → csf_dirty.
     if [[ -f /etc/csf/csf.conf ]]; then
         local csf_clean=1 cur p k
         local range_overlaps=()
@@ -2807,14 +2597,9 @@ phase_defense() {
             say_def_miss "CSF still has cpsrvd ports in TCP_IN/TCP6_IN"
             emit_signal defense warn csf_dirty "cpsrvd ports present in TCP_IN/TCP6_IN"
         fi
-        # Verify actual iptables state (cohort observation: csf.conf
-        # can be clean but iptables wasn't reloaded - false sense of
-        # defense). cPanel/CSF
-        # posture is "explicit ACCEPT allowlist + default DROP via fall-
-        # through", so the defense state is checked as the ABSENCE of an
-        # ACCEPT 0.0.0.0/0 -> dpt:N rule for each cpsrvd port. We walk
-        # INPUT plus secondary chains CSF references (mirrors mitigate.sh
-        # phase_runfw logic).
+        # Verify actual iptables state — csf.conf clean ≠ rules reloaded.
+        # Defense = ABSENCE of ACCEPT 0.0.0.0/0 → dpt:N for each cpsrvd port.
+        # Walk INPUT + secondary CSF chains (mirrors mitigate.sh phase_runfw).
         if have_cmd iptables; then
             local stale_ports=()
             local secondary_chains
@@ -3067,7 +2852,7 @@ phase_reconcile() {
 
         local max_def=""
         # bash 4.1 (CL6/EL6 floor) + set -u: empty array deref crashes;
-        # guard with project length-check idiom (see v2.7.3 Pattern J fix).
+        # guard with project length-check idiom.
         if (( ${#DEFENSE_EVENTS[@]} > 0 )); then
             for de in "${DEFENSE_EVENTS[@]}"; do
                 local ts
@@ -3103,10 +2888,8 @@ phase_reconcile() {
 # Kill-chain renderer + primitives writer.
 ###############################################################################
 
-# Order patterns canonically for the offense timeline. init is the recon
-# pre-cursor; A-I map to the IC-5790 dossier Pattern letters; X is forged-
-# session evidence that doesn't fit a destruction pattern; ? is anything
-# unmapped (a runtime ioc_key_to_pattern gap).
+# Canonical pattern order for the offense timeline. init=recon pre-cursor;
+# A-I=destruction patterns; X=forged-session evidence; ?=unmapped.
 PATTERN_ORDER=(init A B C D E F G H I J X "?")
 
 # Strip CSI sequences from a string. Used to capture an ANSI-free copy of
@@ -3354,14 +3137,10 @@ render_kill_chain() {
 
     build_kc_section_rows
 
-    # Build a single chronologically-merged event list (defense + offense)
-    # so the timeline reads as one story instead of two parallel sections.
-    # Each entry: epoch \t kind \t payload, where kind is DEF or OFF and
-    # payload is the index into DEFENSE_EVENTS or RECONCILED.
-    # Group both loops in `{ ... }` so the trailing `| sort` applies to the
-    # combined output, not just the second loop. Without the brace group,
-    # bash parses the pipe as binding to the immediately preceding compound
-    # statement, leaving DEFENSE rows unsorted in front of OFFENSE rows.
+    # Merged defense+offense timeline; entry = epoch \t kind \t payload-index.
+    # Brace-group is load-bearing: `| sort` must apply to BOTH loops, else
+    # bash binds the pipe to only the second loop and DEFENSE rows stay
+    # unsorted.
     local merged
     merged=$(
         {
@@ -3385,11 +3164,8 @@ render_kill_chain() {
     # capture an ANSI-stripped copy for the bundle in a single pass.
     local buf
     buf=$({
-        # ── Banner ──────────────────────────────────────────────────────
-        # Open box: top has title embedded in a horizontal bar, bottom is
-        # plain bar. Content lines have left bar only - skipping the right
-        # close-bar avoids width-counting around variable-length FQDNs and
-        # unicode combining chars.
+        # Open box: title in top bar, plain bottom. Left bar only on
+        # content lines avoids width-counting around FQDNs + combining chars.
         local W=72
         local title="CVE-2026-41940 / IC-5790"
         # Title takes (3 left bar+space) + len(title) + 1 trailing space
@@ -3490,11 +3266,8 @@ render_kill_chain() {
             printf '\n  %s%s no events to render (no offenses, no defenses)%s\n' \
                 "$C_DIM" "$GLYPH_BOX_V" "$C_NC"
         else
-            # First pass: bucket merged entries into zones by current verdict
-            # class. Zone IDs: pre / def / post / undef. Defense rows sit in
-            # their own def zone; consecutive offense rows of same class
-            # accumulate; class transitions emit a zone header before the
-            # first row of the new zone with the zone size in the label.
+            # Bucket merged entries into zones (pre/def/post/undef).
+            # Class transitions emit a zone header with row count.
             local _line _ts _kind _idx
             local zones=() rows=()
             local cur_zone="" cur_count=0 cur_first=-1
@@ -3677,12 +3450,8 @@ render_kill_chain() {
             done
         fi
 
-        # ── Counters ────────────────────────────────────────────────────
-        # Surface UNDEFENDED + ADVISORY breakouts separately. UNDEFENDED is
-        # rolled into N_PRE during reconcile; advisory rows live in
-        # OFFENSE_EVENTS but never increment N_PRE / N_POST (they're
-        # context, not attack chain). One pass over RECONCILED computes
-        # both breakouts.
+        # Counters: UNDEFENDED rolls into N_PRE; ADVISORY rows are context,
+        # never increment N_PRE/N_POST. Single pass over RECONCILED.
         local n_undef=0 n_adv=0 _r _v
         (( ${#RECONCILED[@]} > 0 )) && for _r in "${RECONCILED[@]}"; do
             _v=$(printf '%s' "$_r" | cut -d'|' -f1)
@@ -3917,12 +3686,8 @@ write_kill_chain_primitives() {
         tsv "kill-chain.tsv" jsonl "kill-chain.jsonl" md "kill-chain.md"
 }
 
-###############################################################################
-# Bundle + upload pipeline.
-# Bundle root: $BUNDLE_DIR_ROOT/<TS>-<RUN_ID>/ (set in Phase 4 CLI parsing).
-# Tarball cap: --max-bundle-mb (per-tarball). Upload: --upload (PUT to
-# $INTAKE_URL with $INTAKE_TOKEN).
-###############################################################################
+# Bundle + upload pipeline. Root: $BUNDLE_DIR_ROOT/<TS>-<RUN_ID>/.
+# Per-tarball cap: --max-bundle-mb. Upload PUT to $INTAKE_URL.
 
 # Estimate the on-disk footprint of a path list (MB). Used pre-tar to
 # enforce the bundle size budget before we spend wall time compressing.
@@ -3950,12 +3715,9 @@ collect_recent() {
     find "$src" -type f -newermt "@$SINCE_EPOCH" -print0 2>/dev/null
 }
 
-# Tar a candidate set with pre-flight size check.
-#   $1 = destination tarball name (relative to bundle dir)
-#   $2 = label for messages
-#   $3 = mode: "filtered" reads NUL-delimited paths from the file at $4;
-#               "raw" tars the literal paths in $4..N.
-# Skips with a warning if estimated size exceeds MAX_BUNDLE_MB (when > 0).
+# Tar a candidate set with pre-flight size check. Args:
+#   $1 dest, $2 label, $3 mode (filtered=NUL paths from $4 file; raw=$4..N).
+# Skips with warning if estimated size > MAX_BUNDLE_MB (when > 0).
 bundle_tar() {
     local dest="$1" label="$2" mode="$3"; shift 3
     local bdir="$BUNDLE_BDIR" sz_mb=0 args=() rc=0
@@ -3998,15 +3760,6 @@ bundle_tar() {
     fi
 }
 
-# Bundle retention sweep. Keeps the $keep newest bundles in $BUNDLE_DIR_ROOT
-# (sorted lexically by name; TS_ISO prefix is sortable) and removes older
-# ones plus any sibling .upload.tgz. Operator-renamed entries that don't
-# match the TS_ISO-Z- prefix are left alone so a manually-staged bundle is
-# never silently deleted.
-#
-# bash 4.1 floor: char-class repetition only (no {n} quantifiers); case-
-# pattern dedupe instead of associative arrays; C-style for over an array
-# index range so set -u + empty-array iteration doesn't trip the floor.
 prune_old_bundles() {
     local keep="${BUNDLE_RETENTION:-$DEFAULT_BUNDLE_RETENTION}"
     local root="$BUNDLE_DIR_ROOT"
@@ -4106,12 +3859,8 @@ phase_bundle() {
         echo "boot_free_mb=$BOOT_FREE_MB"
     } > "$bdir/manifest.txt"
 
-    # Package inventory sidecar: also gzip+base64-embedded in the JSON
-    # envelope (v2.7.43+) so a fleet collector receiving only the
-    # envelope POST can still reconcile per-host CVE/erratum exposure.
-    # The on-disk sidecar is preserved unchanged for out-of-band tooling
-    # and for hosts where encoding fails (no gzip/base64 on stripped
-    # legacy distros).
+    # Sidecar is also gzip+base64-embedded in the envelope (encoder may
+    # fail on legacy distros without gzip/base64; sidecar preserved).
     local inv="$bdir/software-inventory.txt"
     local inv_kind="" inv_rc=0
     # Skip the inventory query when the pkgmgr health probe already flagged
@@ -4171,14 +3920,10 @@ phase_bundle() {
         encoded_bytes "$SOFTWARE_INVENTORY_ENCODED_BYTES" \
         sha256 "${SOFTWARE_INVENTORY_SHA256:-}"
 
-    # Re-write the on-disk envelope NOW so phase_telemetry_post (which reads
-    # ${BUNDLE_BDIR}/ioc-scan-envelope.json or ENVELOPE_PATH) ships the
-    # inventory in the same POST. The post-bundle re-write at end-of-run
-    # would be too late — the POST has already happened.
-    # Write envelope DIRECTLY to bundle. LEDGER_DIR-based path is fallback
-    # only — bundle must be self-contained so intake never sees a missing
-    # ioc-scan-envelope.json (silent CLEAN-by-threshold). See INTERNAL-NOTES.md
-    # "v2.8.4 bundle envelope resilience".
+    # Re-write envelope NOW so phase_telemetry_post ships the inventory in
+    # the same POST; end-of-run re-write is too late. Direct-to-bundle
+    # path — LEDGER_DIR is fallback only (intake must never see missing
+    # ioc-scan-envelope.json or it silently CLEANs by threshold).
     local _env_dest="$bdir/ioc-scan-envelope.json"
     local _env_src="${ENVELOPE_PATH:-${SESSIONSCRIBE_IOC_JSON:-}}"
     write_json "$_env_dest" 2>/dev/null
@@ -4221,12 +3966,8 @@ phase_bundle() {
     # so they're always written - independent of any per-tarball size cap.
     write_kill_chain_primitives
 
-    # 1. cPanel sessions - forensically-relevant subtrees only. /var/cpanel/
-    # sessions/cache + tmpcache are the bulk of session-dir size on busy
-    # hosts and carry no forensic value (encoder cache, not forged-session
-    # artifacts). raw/ + preauth/ are where the IOCs live.
-    # TELEMETRY: skipped — sessions are MB-scale and per-host PII; the
-    # envelope + kill-chain already carry the IOC summary.
+    # cPanel sessions: bundle raw/+preauth/ (where the IOCs live); skip
+    # cache/tmpcache (encoder noise). TELEMETRY_MODE skips entirely (PII).
     if (( ! TELEMETRY_MODE )); then
         local sess_list; sess_list=$(mktemp /tmp/forensic-sess.XXXXXX)
         {
@@ -4237,18 +3978,13 @@ phase_bundle() {
         rm -f "$sess_list"
     fi
 
-    # TELEMETRY: skip sections 2-5 (heavy tarballs). The access-log /
-    # system-log / cpanel-state / persistence / defense-state subtrees
-    # are MB-scale per host; the envelope's signals[] already carries
-    # the IOC findings derived from these sources. Operators who need
-    # the raw artifacts can re-run on flagged hosts without --telemetry.
+    # TELEMETRY skips sections 2-5 (MB-scale subtrees); envelope signals[]
+    # already carries the derived IOC findings. Re-run sans --telemetry
+    # on flagged hosts for the raw artifacts.
     if (( ! TELEMETRY_MODE )); then
 
-    # 2. Apache + cPanel access logs + cpsrvd incoming/error logs, filtered
-    # to within the window. incoming_http_requests.log carries the raw
-    # CRLF carrier on hosts that have it enabled - the highest-fidelity
-    # Pattern X primary source. error_log captures cpsrvd exception
-    # traces during exploitation attempts.
+    # Apache + cPanel access + cpsrvd incoming/error logs, window-filtered.
+    # incoming_http_requests.log (when enabled) carries the raw CRLF carrier.
     local logs_list; logs_list=$(mktemp /tmp/forensic-logs.XXXXXX)
     {
         local lg
@@ -4278,13 +4014,8 @@ phase_bundle() {
     bundle_tar "access-logs.tgz" "access logs (cpanel+apache+cpsrvd)" filtered "$logs_list"
     rm -f "$logs_list"
 
-    # 2b. System auth + audit logs. /var/log/secure carries sshd auth events
-    # (brute force, key acceptance), /var/log/messages catches sudo + kernel
-    # events, /var/log/audit/audit.log records syscall-level evidence of any
-    # post-RCE shell-out. Filtered by mtime so historical rotations outside
-    # the incident window don't blow the budget. cPanel runs RHEL family,
-    # so /var/log/secure is the canonical sshd log; /var/log/auth.log is
-    # included as a Debian-family fallback (no-op when absent).
+    # System auth/audit logs (secure, messages, audit.log) — mtime-filtered
+    # to incident window. /var/log/auth.log included for Debian-family.
     local sys_logs_list; sys_logs_list=$(mktemp /tmp/forensic-syslogs.XXXXXX)
     {
         local lg
@@ -4344,18 +4075,15 @@ phase_bundle() {
     [[ -f /root/.local/share/fish/fish_history ]] && persist+=(/root/.local/share/fish/fish_history)
     [[ -f /etc/passwd ]] && persist+=(/etc/passwd)
     [[ -f /etc/group ]] && persist+=(/etc/group)
-    # /etc/shadow intentionally NOT bundled - hash material is sensitive and
-    # not required for IC-5790 IR (no Pattern relies on shadow). /etc/sudoers
-    # + /etc/sudoers.d/ are bundled instead: attacker-planted sudo rules
-    # ("user ALL=(ALL) NOPASSWD:ALL") are a common post-RCE persistence
-    # vector and the file mtime/ctime brackets the plant time.
+    # /etc/shadow NOT bundled (sensitive, no Pattern uses it). /etc/sudoers
+    # + /etc/sudoers.d/ are bundled — attacker-planted NOPASSWD rules
+    # are common post-RCE persistence; mtime/ctime brackets plant time.
     [[ -f /etc/sudoers ]] && persist+=(/etc/sudoers)
     [[ -d /etc/sudoers.d ]] && persist+=(/etc/sudoers.d)
     bundle_tar "persistence.tgz" "persistence artifacts" raw "${persist[@]}"
 
     # 5. Defense state. updatelogs accumulate per upcp; filter by window so
-    # a 5-year-old host doesn't blow the budget on historical update logs
-    # irrelevant to the IC-5790 timeline.
+    # 5-year-old host doesn't blow the budget on historical update logs.
     local def_static=()
     [[ -d "$MITIGATE_BACKUP_ROOT" ]] && def_static+=("$MITIGATE_BACKUP_ROOT")
     [[ -f /etc/csf/csf.conf ]] && def_static+=(/etc/csf/csf.conf)
@@ -4580,13 +4308,9 @@ phase_upload() {
         return
     fi
 
-    # Re-archive the bundle directory into a single outer tarball. The
-    # individual tarballs inside are already gzipped; tar -cz over them
-    # yields very little extra compression but produces one upload artifact
-    # per host with valid gzip magic on the outer wrapper. In TELEMETRY_MODE
-    # there are NO inner tarballs — just the envelope/kill-chain/manifest/
-    # snapshot files — so the outer tarball is itself the primary
-    # compression layer (and the upload is KB-scale, not MB-scale).
+    # Outer tarball wraps the bundle dir as one upload artifact with valid
+    # gzip magic. In TELEMETRY_MODE there are no inner tarballs, so the
+    # outer is the primary compression layer (KB-scale upload).
     local outer="${BUNDLE_BDIR}.upload.tgz"
     if ! tar -C "$BUNDLE_DIR_ROOT" -czf "$outer" "$(basename "$BUNDLE_BDIR")" 2>/dev/null; then
         say_fail "outer tarball build failed: $outer"
@@ -4637,12 +4361,9 @@ phase_upload() {
     rm -f "$outer"
 }
 
-###############################################################################
-# Telemetry POST — ships envelope JSON to a fleet collector. Distinct from
-# phase_upload (tarball PUT to intake); ships envelope.json only (KB-scale).
-# Transport ladder: curl > wget > bash /dev/tcp + openssl. Retry with expo
-# backoff (2^N s); failure emits warning but never changes EXIT_CODE.
-###############################################################################
+# Telemetry POST — envelope.json (KB-scale) to a fleet collector.
+# Transport ladder: curl > wget > bash /dev/tcp + openssl.
+# Retry with 2^N expo backoff; failure warns, never changes EXIT_CODE.
 
 phase_telemetry_post() {
     (( TELEMETRY_MODE )) || return 0
@@ -4688,12 +4409,9 @@ phase_telemetry_post() {
         return
     fi
 
-    # Probe transport ladder. bash-native is the floor: /dev/tcp covers
-    # HTTP, openssl s_client covers HTTPS. We probe in best-first order
-    # and stop at the first viable transport. HTTPS adds an SSL
-    # requirement (curl/wget compiled with SSL OR openssl binary); we
-    # surface that as a separate diagnostic so the operator knows why a
-    # transport was rejected.
+    # Probe best-first, stop at first viable. HTTPS adds an SSL
+    # requirement (SSL-capable curl/wget OR openssl) — surfaced as a
+    # separate diagnostic when a transport is rejected.
     local _xport=""
     local _is_https=0
     [[ "$TELEMETRY_URL" =~ ^https:// ]] && _is_https=1
@@ -4712,12 +4430,8 @@ phase_telemetry_post() {
             _xport="wget"
         fi
     fi
-    # bash-native fallback: /dev/tcp for HTTP, openssl s_client for HTTPS.
-    # bash on RHEL/CL6+ is built with --enable-net-redirections; the
-    # /dev/tcp/<host>/<port> pseudo-path opens a TCP socket via the
-    # built-in. For HTTPS we require an openssl binary — cPanel hosts
-    # always have one (cpsrvd uses libssl) but verify before declaring
-    # the transport viable.
+    # bash-native fallback: /dev/tcp (HTTP) / openssl s_client (HTTPS).
+    # Requires bash built with --enable-net-redirections (RHEL/CL6+ does).
     if [[ -z "$_xport" ]]; then
         if (( _is_https )); then
             have_cmd openssl && _xport="bash"
@@ -4738,11 +4452,8 @@ phase_telemetry_post() {
     fi
     say_info "transport: $_xport (envelope=${env_size}B)"
 
-    # Retry loop. Backoff is 2^attempt seconds (2, 4, 8, …). Each attempt
-    # uses TELEMETRY_TIMEOUT as the per-call ceiling. TELEMETRY_RETRY is
-    # capped at 10 here as a defense-in-depth bound — the parse-time
-    # validator allows any non-negative int, but at attempt=10 the
-    # backoff is 1024s (~17min) and at attempt=20 it would be 12 days.
+    # Retry loop, 2^attempt backoff. TELEMETRY_RETRY hard-capped at 10
+    # (attempt=10 ≈17min; attempt=20 would be 12d).
     local attempt=0 max_attempts=$((TELEMETRY_RETRY + 1))
     if (( max_attempts > 11 )); then max_attempts=11; fi
     # Hoist all per-attempt locals to the function scope (vs re-declaring
@@ -4780,13 +4491,9 @@ phase_telemetry_post() {
                 rm -f "$_resp_file" "$_err_file"
                 ;;
             wget)
-                # NOTE: --quiet AND --no-verbose both silence --server-
-                # response in wget2 (Fedora/EL9+) — we need the HTTP/x.x
-                # status line to extract the response code. Default-noise
-                # wget without quiet flags is the only portable way; the
-                # 2>FILE redirect captures everything to a scratch file we
-                # then grep. Classic CL6 wget 1.12 prints the same
-                # `HTTP/1.1 NNN` line shape, so the regex matches both.
+                # wget2 (EL9+) silences --server-response under --quiet/
+                # --no-verbose, so we run with default noise and grep
+                # 2>FILE for the `HTTP/1.1 NNN` line (CL6 wget 1.12 too).
                 _resp_file=$(mktemp /tmp/telemetry-resp.XXXXXX)
                 _hdr_file=$(mktemp /tmp/telemetry-hdr.XXXXXX)
                 _wget_args=(
@@ -4800,11 +4507,9 @@ phase_telemetry_post() {
                 )
                 [[ -n "$TELEMETRY_TOKEN" ]] && \
                     _wget_args+=(--header="Authorization: Bearer ${TELEMETRY_TOKEN}")
-                # Capture stdout + stderr both — wget2 (Fedora/EL9+) writes
-                # --server-response output to stdout; classic wget 1.12
-                # (CL6) writes it to stderr. -O FILE has already taken
-                # ownership of the response body, so combining stdout+
-                # stderr into the header trace is safe.
+                # wget2 (EL9+) writes --server-response to stdout; classic
+                # wget 1.12 (CL6) writes to stderr. -O FILE owns the body,
+                # so combining stdout+stderr for the header trace is safe.
                 wget "${_wget_args[@]}" "$TELEMETRY_URL" >"$_hdr_file" 2>&1 || rc=$?
                 # Last "HTTP/x.x NNN" line. Both wget1 and wget2 print the
                 # status line either bare or 2-space-indented; match both.
@@ -4815,12 +4520,9 @@ phase_telemetry_post() {
                 rm -f "$_resp_file" "$_hdr_file"
                 ;;
             bash)
-                # Bash-native HTTP. Parse URL into host/port/path, build the
-                # full request to a tempfile (so request body and headers
-                # are atomic on the wire), then deliver via /dev/tcp (HTTP)
-                # or openssl s_client (HTTPS). The whole operation is
-                # wrapped in `timeout` so a hung connect or stalled read
-                # is bounded by TELEMETRY_TIMEOUT.
+                # Bash-native HTTP. Tempfile-staged request (atomic on
+                # wire), delivered via /dev/tcp or openssl s_client.
+                # Wrapped in `timeout` bounded by TELEMETRY_TIMEOUT.
                 _scheme="${TELEMETRY_URL%%://*}"
                 _rest="${TELEMETRY_URL#*://}"
                 _hp="${_rest%%/*}"
@@ -4863,12 +4565,9 @@ phase_telemetry_post() {
                 } > "$_req_file"
 
                 if [[ "$_scheme" == "https" ]]; then
-                    # openssl s_client: -quiet suppresses cert dump; -ign_eof
-                    # keeps reading after the server's TLS close-notify so
-                    # we don't truncate the response body. -servername sends
-                    # SNI for vhost-routed endpoints. Args are passed via
-                    # the argv (not interpolated into a shell string), so
-                    # no quote-injection surface for hostile URL values.
+                    # -ign_eof avoids truncated body on TLS close-notify;
+                    # -servername for SNI; argv-passed args (no quote-
+                    # injection surface for hostile URL values).
                     timeout "$TELEMETRY_TIMEOUT" openssl s_client \
                         -connect "${_host}:${_port}" \
                         -servername "$_host" \
@@ -4979,11 +4678,8 @@ check_version() {
     if [[ -n "$VERSION_OVERRIDE" ]]; then
         raw="$VERSION_OVERRIDE"
     elif [[ -x "${CPANEL_ROOT}/cpanel" ]]; then
-        # Discard stderr (perl deprecation noise can precede the version line
-        # on some cpanel builds) and strip CR so a CRLF-translated pipe
-        # doesn't leave \r inside the captured build digits. Matches the
-        # read form in collect_host_meta() so both paths produce identical
-        # raw strings on the same host.
+        # Discard stderr (perl deprecation noise) + strip CR so a
+        # CRLF pipe doesn't leave \r inside build digits.
         raw=$("${CPANEL_ROOT}/cpanel" -V 2>/dev/null | head -1 | tr -d '\r')
     elif [[ -f "${CPANEL_ROOT}/version" ]]; then
         raw=$(< "${CPANEL_ROOT}/version")
@@ -5124,21 +4820,18 @@ STATIC_FIXED_PATS=(
     'comet_backup_license_verification'
     'tr/[^/]*\\r[^/]*\\n[^/]*//[a-z]*|tr/[^/]*\\n[^/]*\\r[^/]*//[a-z]*|s/\[[^]]*\\[rn][^]]*\]//[a-z]*|s/\\r/[^/]*/[a-z]*[[:space:]]*[;}].*s/\\n/[^/]*/[a-z]*'
 )
-# Pattern kind: 'bug' = ancillary bug (advisory when unpatched);
-# 'marker' = build-line patch marker, informational. The CVE-2026-41940 fix
-# itself is in the cpsrvd binary; cve_41940_set_pass_crlf_strip marker just
-# tracks its presence. See INTERNAL-NOTES.md "v2.7.13" for the bug→marker
-# demote rationale on alg_length_optrec_bug.
+# Pattern kind: 'bug' = ancillary bug (advisory); 'marker' = build-line
+# patch marker (informational).
 STATIC_KINDS=(marker bug marker marker marker marker marker marker)
 STATIC_EXPLAINS=(
-    'OpenIdConnectBase.pm:795 operator-precedence trap (`if !length $algorithm > 2` is always false). Pre-existing OIDC bug, NOT the SessionScribe primitive; post-auth defense-in-depth, fixed on the 134-line and not backported to 110/118/126/132. Resolves on tier upgrade.'
-    'OpenIdConnectBase.pm start_authorize() invoked inside a die() arg list mutates session-state on the error path. Pre-existing OIDC bug, NOT the SessionScribe primitive; post-auth oracle, fixed on the 134-line and not backported. Resolves on tier upgrade.'
+    'OpenIdConnectBase.pm operator-precedence trap (`if !length $algorithm > 2` is always false). Pre-existing OIDC bug, not the SessionScribe primitive; resolves on tier upgrade.'
+    'OpenIdConnectBase.pm start_authorize() invoked inside a die() arg list mutates session-state on the error path. Pre-existing OIDC bug, not the SessionScribe primitive; resolves on tier upgrade.'
     'Patched build adds the $service_name fallback in get_display_configuration().'
-    'Patched session loader has the no-ob: prefix branch (WebPros plumbing).'
-    'Patched encoder adds hex_decode_only / hex_encode_only methods (WebPros plumbing).'
+    'Patched session loader has the no-ob: prefix branch.'
+    'Patched encoder adds hex_decode_only / hex_encode_only methods.'
     'Patched Normalize.pm dies with UserNotFound on missing uid (defense-in-depth).'
-    'Patched handler contains the Comet-state branch (WebPros feature).'
-    'CVE-2026-41940 source-level fix: Cpanel/Session.pm set_pass()/saveSession() now strips CR/LF from the pass field in addition to NUL. Absence on a sub-cutoff build means the host is vulnerable to the Authorization: Basic CRLF-injection chain.'
+    'Patched handler contains the Comet-state branch.'
+    'CVE-2026-41940 source-level fix: session loader strips CR/LF from the pass field in addition to NUL. Absence on a sub-cutoff build means the host is vulnerable to the Authorization: Basic CRLF-injection chain.'
 )
 
 check_static() {
@@ -5439,12 +5132,9 @@ check_attacker_ips() {
                 ts = mktime(_p[3]" "_p[1]" "_p[2]" "_p[4]" "_p[5]" "_p[6])
             }
 
-            # --since gate: when SINCE_EPOCH is set (floor > 0), drop hits
-            # whose log timestamp is older than the cutoff. Lines with
-            # unparseable timestamps (ts == 0) bypass the gate so a corrupt
-            # date stamp never silently hides a real hit. The historical
-            # count is tracked separately so the operator can see how
-            # many in-history hits were filtered.
+            # --since gate (floor > 0) drops older hits; ts == 0 bypasses
+            # so a corrupt date stamp never silently hides a real hit.
+            # Historical-drop count tracked separately for operator.
             if (floor > 0 && ts > 0 && ts < floor) {
                 historical_drops++
                 next
@@ -5504,12 +5194,8 @@ check_attacker_ips() {
     h3xx="${h3xx:-0}"; h4xx="${h4xx:-0}"; hother="${hother:-0}"; ts_first="${ts_first:-0}"
     historical_drops="${historical_drops:-0}"
 
-    # If --since pruned all in-window hits but historical hits exist,
-    # emit a low-noise informational so fleet aggregation still records
-    # that the host was historically touched - just not within the
-    # window the operator asked about. Does not contribute to
-    # ioc_critical / ioc_review (severity=info, weight=0), so cannot
-    # escalate host_verdict to COMPROMISED or SUSPICIOUS.
+    # Historical-only hits emit info (severity=info, weight=0) so fleet
+    # aggregation records the touch without escalating host_verdict.
     if (( total == 0 && historical_drops > 0 )); then
         emit "logs" "ioc_attacker_ip_historical_only" "info" \
              "ioc_attacker_ip_outside_since_window" 0 \
@@ -5519,12 +5205,10 @@ check_attacker_ips() {
     fi
 
     if (( total > 0 )); then
-        # cpsess-split: three-way emit depending on where the 2xx hits landed.
-        #   h2xx_cpsess > 0 → strong  (2xx on /cpsess<10digits>/ = real exploitation)
-        #   h2xx_recon  > 0 → info    (2xx on other paths = reconnaissance only)
-        #   total > 0, 4xx only → warning (probing, all rejected)
-        # The legacy ioc_attacker_ip_in_access_log strong emit is REPLACED by
-        # this chain; it no longer fires at strong severity for any path.
+        # cpsess-split: three-way emit by 2xx landing path:
+        #   h2xx_cpsess > 0 → strong (real exploitation on /cpsess<10>/)
+        #   h2xx_recon  > 0 → info   (reconnaissance only)
+        #   total > 0, 4xx only → warning (probing rejected)
         if (( h2xx_cpsess > 0 )); then
             # Parse structured fields from first cpsess-2xx sample line.
             local _c_ip _c_path _c_status _c_token=""
@@ -5534,12 +5218,9 @@ check_attacker_ips() {
             if [[ "$_c_path" =~ /cpsess([0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])/ ]]; then
                 _c_token="${BASH_REMATCH[1]}"
             fi
-            # Pre-compromise gate. 2xx_on_cpsess (token consumption) is
-            # second-order — it needs the deterministic CRLF chain firing
-            # AT OR BEFORE ts_first to anchor as compromise. Otherwise the
-            # hit is most likely shared-infra T1-IP coincidence, a recycled
-            # cpsess from a prior legitimate session, or pre-disclosure recon.
-            # Demote to advisory; surfaces in signals[] for fleet aggregator.
+            # Pre-compromise gate: 2xx_on_cpsess needs the CRLF chain firing
+            # at-or-before ts_first to anchor as compromise; otherwise it's
+            # T1 coincidence / recycled cpsess / recon — demote to advisory.
             local _gate_sev="strong" _gate_key="ioc_attacker_ip_2xx_on_cpsess" _gate_weight=8
             local _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
             if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
@@ -5601,10 +5282,9 @@ check_attacker_ips() {
     rm -f "$tmp"
 }
 
-# Deterministic CRLF chain at the access-log layer: 401 POST
-# /login/?login_only=1 then 2xx GET /cpsess<N>/* as root from the same
-# IP within 2s. cpsrvd 401s the POST but saveSession() has already minted
-# the cpsess token. Survives mitigate purging (only needs access_log).
+# Deterministic CRLF chain in access_log: 401 POST /login/?login_only=1
+# then 2xx GET /cpsess<N>/* as root from same IP within 2s. cpsrvd 401s
+# but the cpsess token has already been minted. Survives mitigate purging.
 check_crlf_access_primitive() {
     local logdir="$1"
     local log="$logdir/access_log"
@@ -5657,7 +5337,7 @@ check_crlf_access_primitive() {
     crlf_hits="${crlf_hits:-0}"
     crlf_ts_first="${crlf_ts_first:-0}"
     if (( crlf_hits > 0 )); then
-        # X-stack = ATTEMPT, not compromise; see INTERNAL-NOTES.md "v2.7.15".
+        # X-stack = ATTEMPT, not compromise.
         emit "logs" "ioc_cve_2026_41940_access_primitive" "warning" \
              "ioc_cve_2026_41940_crlf_access_chain" 4 \
              "count" "$crlf_hits" \
@@ -5665,11 +5345,8 @@ check_crlf_access_primitive() {
              "log_file" "$log" \
              "line" "${crlf_sample:0:240}" \
              "note" "$crlf_hits CRLF-bypass chain(s) in $log: POST /login → 401 then GET /cpsess<N>/* → 2xx as root within 2s. CVE-2026-41940 exploitation ATTEMPT — confirm compromise via Pattern A-L residue or session-file forensics (REVIEW)."
-        # Record CRLF first epoch globally so downstream second-order
-        # signals (ioc_attacker_ip_2xx_on_cpsess,
-        # ioc_pattern_e_websocket_shell_hits) can demote pre-compromise
-        # events to advisory tier instead of polluting host_verdict +
-        # cluster-onset timeline.
+        # Record CRLF first epoch so downstream second-order signals
+        # (2xx_on_cpsess, pattern_e) demote pre-compromise events.
         if [[ "$crlf_ts_first" =~ ^[0-9]+$ ]]; then
             LOGS_CRLF_CHAIN_FIRST_EPOCH="$crlf_ts_first"
         fi
@@ -5677,11 +5354,9 @@ check_crlf_access_primitive() {
 }
 
 # ---- session-store analyzer ----------------------------------------------
-# Single awk pass per session file sets SF_* globals; emit_session() is the
-# wrapper around emit() that attaches identity/provenance KPIs from the
-# most recent analyze_session() call so every fleet record carries
-# {user, src_ip, login_time, file_mtime, file_ctime, mtime_ctime_delta_sec}.
-# login_time and file_mtime are forgeable; file_ctime is not.
+# Single-awk-pass per file sets SF_* globals; emit_session() wraps emit()
+# with identity/provenance KPIs. login_time + file_mtime are forgeable;
+# file_ctime is not.
 emit_session() {
     local key="$1" sev="$2" sig="$3" weight="$4"
     shift 4
@@ -5789,13 +5464,8 @@ analyze_session() {
             next
         }
         pass_at > 0 && line_idx == pass_at + 1 && /./ && !/^[a-zA-Z_][a-zA-Z0-9_]*=/ { stranded=1 }
-        # Broader malformed-line detector (per WebPros IOC-3): any non-blank
-        # line that does not match key=value. cpsrvd serializes via
-        # FlushConfig with `=` separator and a fixed _SESSION_PARTS key
-        # whitelist (Cpanel/Server.pm:2216-2247), and Cpanel::Session::
-        # filter_sessiondata strips \r\n from values - so legitimate
-        # sessions cannot produce non-conforming lines. Any hit here is
-        # injection footprint that bypassed those invariants.
+        # Malformed-line detector. cpsrvd serialization invariants exclude
+        # non-key=value lines; any hit is injection footprint.
         $0 != "" && $0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/ {
             malformed=1
             if (malformed_sample == "") malformed_sample=substr($0,1,80)
@@ -5934,11 +5604,8 @@ check_sessions() {
                 continue
             fi
 
-            # IOC-A: token_denied + cp_security_token co-occur. Three-tier
-            # mirrors cPanel's ioc_checksessions_files.sh. badpass call
-            # site (Cpanel/Server.pm:1244-1252) cannot legitimately set
-            # auth markers; saveSession (Cpanel/Session.pm:181) only
-            # writes pass= when length>0.
+            # IOC-A: token_denied + cp_security_token co-occur.
+            # Mirrors cPanel's ioc_checksessions_files.sh three-tier.
             if (( SF_TOKEN_DENIED && SF_CP_TOKEN )); then
                 if (( SF_BADPASS )); then
                     if (( SF_HASROOT || SF_TFA || SF_EXT_AUTH || SF_INT_AUTH )); then
@@ -5972,11 +5639,9 @@ check_sessions() {
                 fi
             fi
 
-            # IOC-B: pre-auth-paired session with successful_*_auth_with_timestamp.
-            # Both external (original PoC) and internal (watchtowr poc/poc_
-            # watchtowr.py:35) variants are caught - cpsrvd's write_session
-            # removes the preauth marker on auth promotion, so any session
-            # carrying both is structurally impossible in a benign flow.
+            # IOC-B: preauth marker + auth_with_timestamp co-present.
+            # cpsrvd strips preauth on promotion — both together is
+            # structurally impossible in a benign flow.
             if [[ -f "$preauth_file" ]] && (( SF_EXT_AUTH || SF_INT_AUTH )); then
                 local _which="external"
                 (( SF_INT_AUTH && ! SF_EXT_AUTH )) && _which="internal"
@@ -5988,13 +5653,9 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-C: short pass= + successful_*_auth_with_timestamp. Replaces
-            # the loose "any auth-timestamp present" detector. Legitimate pass=
-            # is encoder output (`no-ob:<hex>` post-patch, hex-encoded ciphertext
-            # pre-patch), always >>PASS_FORGERY_MAX_LEN chars. CRLF-injection
-            # writes single-byte cleartext like `pass=x` because the basic-auth
-            # password is consumed as the literal first line before the CRLF.
-            # Short pass + injected timestamp is the canonical primitive shape.
+            # IOC-C: short pass= + successful_*_auth_with_timestamp.
+            # Legitimate pass= is encoder output >>PASS_FORGERY_MAX_LEN chars;
+            # CRLF injection leaks single-byte cleartext (`pass=x`).
             if (( (SF_INT_AUTH || SF_EXT_AUTH) && SF_PASS_LEN > 0 && SF_PASS_LEN <= PASS_FORGERY_MAX_LEN )); then
                 emit_session "ioc_short_pass_$session_name" "strong" \
                      "ioc_short_pass_with_auth_timestamp" 10 \
@@ -6014,12 +5675,9 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-E: badpass origin combined with ANY auth marker (per
-            # WebPros code-path analysis: the badpass call site at
-            # Cpanel/Server.pm:1244-1252 cannot legitimately set
-            # successful_*_auth_with_timestamp, hasroot=1, or tfa_verified=1).
-            # Catches any single-field injection that promotes the badpass
-            # session, including watchtowr's internal_auth variant.
+            # IOC-E: badpass + ANY auth marker. The badpass code path
+            # cannot legitimately set ext/int auth, hasroot, or tfa_verified;
+            # any combination is single-field promotion injection.
             if (( SF_BADPASS && (SF_EXT_AUTH || SF_INT_AUTH || SF_HASROOT || SF_TFA) )); then
                 local _markers=""
                 (( SF_EXT_AUTH )) && _markers+="${_markers:+,}ext_auth_ts"
@@ -6033,11 +5691,9 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-E2: high-confidence 4-way co-occurrence. The canonical
-            # exploit shape sets hasroot=1 + tfa_verified=1 + auth_timestamp
-            # + badpass-origin in one CRLF-injection write. Effectively
-            # zero-FP; emitted as a separate signal so the dedicated
-            # ioc_cve_2026_41940_combo key remains in fleet aggregations.
+            # IOC-E2: canonical 4-way co-occurrence (hasroot + tfa_verified
+            # + auth_timestamp + badpass-origin). Effectively zero-FP;
+            # separate signal preserves ioc_cve_2026_41940_combo key.
             if (( SF_HASROOT && SF_TFA && (SF_INT_AUTH || SF_EXT_AUTH) && SF_BADPASS )); then
                 emit_session "ioc_cve41940_$session_name" "strong" \
                      "ioc_cve_2026_41940_combo" 10 \
@@ -6046,24 +5702,19 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # IOC-H: standalone hasroot=1. Not in cpsrvd's _SESSION_PARTS
-            # whitelist (Cpanel/Server.pm:2216-2247); no caller writes it.
-            # Conclusive injection evidence regardless of other markers.
+            # IOC-H: standalone hasroot=1. Not in cpsrvd's session-key
+            # whitelist; no caller writes it. Conclusive injection evidence.
             if (( SF_HASROOT )); then
                 emit_session "ioc_hasroot_$session_name" "strong" \
                      "ioc_hasroot_in_session" 10 \
                      "path" "$f" "origin" "$SF_ORIGIN" \
-                     "note" "hasroot=1 present in session - not in cpsrvd _SESSION_PARTS whitelist; conclusive injection footprint (CRITICAL)."
+                     "note" "hasroot=1 present in session — not in cpsrvd session-key whitelist; conclusive injection footprint (CRITICAL)."
                 ((ioc_hits++))
             fi
 
-            # IOC-I: malformed session line. Any non-blank line not matching
-            # ^[A-Za-z_][A-Za-z0-9_]*= is structurally impossible in a
-            # legitimate session (FlushConfig serialization + filter_sessiondata
-            # CR/LF strip + _SESSION_PARTS whitelist exclude this shape).
-            # Catches injection footprints where smuggled bytes did not
-            # form valid key=value pairs. Distinct from IOC-D (multiline
-            # pass=) which is the specific pass-continuation subset.
+            # IOC-I: malformed line (any non-blank not matching `name=`).
+            # cpsrvd serialization invariants exclude this shape; any hit
+            # is injection footprint. Distinct from IOC-D (multiline pass=).
             if (( SF_MALFORMED )); then
                 emit_session "ioc_malformed_line_$session_name" "strong" \
                      "ioc_malformed_session_line" 10 \
@@ -6072,11 +5723,8 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # Token-use cross-ref. If any token-injection IOC fired AND
-            # we have the cp_security_token value, grep access_log for
-            # that token paired with a 2xx response. A hit means the
-            # forged session was actually USED by the attacker - escalates
-            # the actionable shape from "forged" to "forged AND used".
+            # Token-use cross-ref: token-injection IOC + cp_security_token
+            # paired with 2xx in access_log → forged AND used (not just forged).
             if [[ -n "$SF_CP_VAL" ]] \
                && (( (SF_TOKEN_DENIED && SF_CP_TOKEN && SF_BADPASS) \
                      || (SF_BADPASS && (SF_EXT_AUTH || SF_INT_AUTH || SF_HASROOT || SF_TFA)) \
@@ -6121,11 +5769,9 @@ check_sessions() {
                 ((ioc_hits++))
             fi
 
-            # Gap 10: mtime/ctime divergence on a session file. cpsrvd
-            # writes both atomically; divergence is `touch -d` backdating.
-            # Advisory only — cp -p / tar xp / rsync -t restores also
-            # produce divergence. Section-level count distinguishes
-            # single-session forgery from fleet-wide restore artifacts.
+            # Gap 10: mtime/ctime divergence (advisory — also produced by
+            # cp -p / tar xp / rsync -t restore). Section count distinguishes
+            # single-forge from fleet-wide restore artifact.
             if [[ -n "$SF_MTIME_CTIME_DELTA" ]]; then
                 local _abs_delta="${SF_MTIME_CTIME_DELTA#-}"
                 if [[ "$_abs_delta" =~ ^[0-9]+$ ]] \
@@ -6208,10 +5854,8 @@ check_sessions() {
     fi
 
     # ---- (b) Mitigate-quarantine secondary read --------------------------
-    # Post-mitigation, forged sessions live under $MITIGATE_BACKUP_ROOT/
-    # <RUN>/quarantined-sessions/raw/ instead of /var/cpanel/sessions/raw/.
-    # Sidecars (`<sname>.info`) carry the original mtime + IOC reasons.
-    # Direct call (not subshell) so emit()'s SIGNALS[] mutations persist.
+    # Post-mitigation, forged sessions live under quarantined-sessions/raw/;
+    # sidecars (`<sname>.info`) carry original mtime + IOC reasons.
     check_quarantined_sessions
     ioc_hits=$((ioc_hits + QUARANTINED_HITS))
 
@@ -6273,7 +5917,6 @@ check_quarantined_sessions() {
             sname=$(basename -- "$f")
             _key="ioc_quarantined_session_${sname}"
 
-            # Reasons-aware tier — see INTERNAL-NOTES.md "v2.7.32".
             local _q_sev=warning _q_wt=4
             if (( _has_sidecar )) && [[ -n "$q_reasons" ]]; then
                 if [[ "$q_reasons" =~ (cve_2026_41940_combo|hasroot_in_session|injected_token_used_with_2xx|token_denied_with_badpass_origin) ]] \
@@ -6442,27 +6085,9 @@ _rt_runtime_context() {
     fi
 }
 
-# Resolve attribution at emit-time. Echoes "user=<u> priv=<root|user>".
-# $1 = path-or-empty, $2 = privilege-default ("root" or "user").
-# If $1 is path-derived, looks up via _attribute_path; else falls back
-# to "_root". Used by emit() helpers; see PLAN-multiuser-verdict.md.
-_attrib_for_emit() {
-    local _ap="${1:-}" _ad="${2:-root}" _au="_root"
-    if [[ -n "$_ap" ]]; then
-        _au=$(_attribute_path "$_ap")
-        _user_is_valid "$_au" || _au="_root"
-    fi
-    printf 'user=%s priv=%s\n' "$_au" "$_ad"
-}
-
-# ---- _classify_history_match ---------------------------------------------
 # Diagnostic-shape classifier shared by Patterns C/F/H3.
-#   $1 mode  : "regex"   - <needle> is awk ERE (e.g. nuclear\.x86)
-#              "literal" - <needle> is literal substring (e.g. __S_MARK__)
-#   $2 needle: matcher per mode
-#   $3.. files
-# Output: h=N d=N u=N fhe=EPOCH file_h=PATH (counts aggregate; file_h is
-# the file with the first hostile/unknown match; fhe = its `#<epoch>` marker).
+# Args: $1 mode (regex|literal), $2 needle, $3.. files.
+# Output: h=N d=N u=N fhe=EPOCH file_h=PATH.
 _classify_history_match() {
     local mode="$1" needle="$2"
     shift 2
@@ -6544,17 +6169,6 @@ _classify_field() {
 }
 
 # ---- _classify_kill_prelude_context --------------------------------------
-# Pattern H2 adjacency classifier. `pkill -9 nuclear.x86 kswapd01 xmrig`
-# is destructive on both attacker (prelude before drop) and responder
-# (cleanup) paths, so diag_re shape doesn't apply - classify by what
-# FOLLOWS within ctx command lines (epoch markers don't count).
-#   hostile  : same line OR any next-ctx line matches install primitive
-#              (wget|curl|fetch|tftp|base64 -d|chmod +x|<octal>|bash <(|./seobot)
-#   diagnostic: next-ctx line matches ps|pgrep|echo|exit|true at line start
-#              or is empty
-#   unknown  : kill matched but neither condition - review tier
-#   $1 file  $2 ERE (PATTERN_H_KILL_PRELUDE)  $3 ctx (default 3)
-# Output: h=N d=N u=N fhe=EPOCH file_h=PATH
 _classify_kill_prelude_context() {
     local _kf="$1" _kre="$2" _kctx="${3:-3}"
     if [[ ! -f "$_kf" ]]; then
@@ -6639,19 +6253,6 @@ _classify_kill_prelude_context() {
 }
 
 # ---- destruction-stage IOC scan (Patterns A-J) ---------------------------
-# Cheap, bounded host-state probes for late-stage compromise residue.
-# Scoped to /home, /var/www, /root, /etc, /var/spool/cron, /tmp, /var/tmp -
-# operator-overrideable via $CPANEL_ROOT? No: these paths are filesystem
-# constants, not cpanel-prefixed. Snapshot mode (--root) skips most patterns
-# but Pattern J does honor --root with degraded confidence (the udev/systemd
-# trees ARE present in a snapshot).
-# External-containment ingestion. Replays operator IR-side hashes.txt
-# (`<sha>  <path>`) + ssh-pruned-keys.log (`path\tline=N\tfp=F\tcomment=C`)
-# from per-run dirs so a contained host still scores correctly.
-# `pattern` field can be a letter (A/C/G/H/I/J), "evidence" (history),
-# or "unclassified" (warning tier). `published_hash_match` is one of
-# match / mismatch (decoy candidate) / unverified.
-# Direct call (not subshell): emit() mutates SIGNALS[].
 
 # Classifier returns via globals to avoid a fork per row.
 # _CLASSIFY_KNOWN_HASH carries the published bad-hash IOC when one
@@ -6765,12 +6366,9 @@ check_quarantined_artifacts() {
                         _hash_match=unverified
                     fi
 
-                    # Both id and key need ioc_pattern_<letter>_* shape:
-                    # aggregate_verdict routes via key for compromise_class,
-                    # via id for COMPROMISE_LETTERS. Wrong shape silently
-                    # downgrades contained-only hosts to SUSPICIOUS.
-                    # _key includes qdir-basename + sha[0:16] so re-quarantine
-                    # of the same binary doesn't collide (emit() does no dedup).
+                    # Both id and key need ioc_pattern_<letter>_* shape —
+                    # wrong shape silently downgrades contained-only hosts
+                    # to SUSPICIOUS. _key carries qdir+sha[0:16] vs emit dedup.
                     _key_id="${_qbase_safe}_${sha:0:16}"
                     case "$_pattern" in
                         A|C|G|H|I|J)
@@ -6894,11 +6492,8 @@ check_destruction_iocs() {
     hdr_section "destruct" "destruction IOC scan (Patterns A-L + runtime)"
     local hits=0
 
-    # History files swept by Pattern F harvester and Pattern H markers
-    # (kill-prelude, ALLDONE). Bash + zsh + sh + fish, root + every cPanel
-    # user. Empty globs expand to literal pattern; grep handles missing
-    # paths via 2>/dev/null. Hoisted once so both pattern blocks share
-    # a single source of truth.
+    # History files for Pattern F harvester + Pattern H markers (bash/
+    # zsh/sh/fish, root + cPanel users). Hoisted once for both patterns.
     local HISTORY_FILES_GLOB=(
         /root/.bash_history /root/.zsh_history /root/.sh_history
         /root/.local/share/fish/fish_history
@@ -7042,7 +6637,7 @@ check_destruction_iocs() {
         if (( fe_count < 10 && fe_acct == 1 )); then
             fe_sev="warning"; fe_weight=5
         fi
-        # P1 count escalator applied at score-time (CHANGELOG v2.7.32).
+        # P1 count escalator applied at score-time.
         [[ -n "$fe_sample" ]] && fe_mtime=$(stat -c %Y "$fe_sample" 2>/dev/null)
         emit "destruction" "ioc_pattern_a_evidence_destruction" "$fe_sev" \
              "ioc_pattern_a_evidence_targeted" "$fe_weight" \
@@ -7097,11 +6692,8 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern C: nuclear.x86 botnet drop ------------------------------
-    # Three independent signals: literal binary name in bash_history,
-    # binary on disk in known drop paths (sha256 anchored), or C2 host/IP
-    # referenced. bash_history hits are hostile-shape vs diagnostic-shape
-    # classified before emit so IR `history | grep nuclear.x86` doesn't
-    # FP. See INTERNAL-NOTES.md "v2.7.5" for shape-classifier rationale.
+    # Three signals: bash_history mention (shape-classified to avoid IR-grep
+    # FP), on-disk binary (sha256-anchored), C2 host/IP.
     local nuke_files=()
     local _nf
     for _nf in /root/.bash_history /home/*/.bash_history; do
@@ -7258,11 +6850,9 @@ check_destruction_iocs() {
              "note" "Pattern D evidence file $acct_log_sorry encrypted by Pattern A; reseller-persistence cannot be ruled in/out from this file - rely on /var/cpanel/users/ second source."
         ((hits++))
     fi
-    # Reseller account presence - the accounting.log row may have rotated
-    # OR been encrypted by Pattern A. /var/cpanel/users/<name> is cpanel's
-    # canonical user record (written by createacct before any /etc/passwd
-    # row materializes; survives Pattern A which only walks logs). getent
-    # passwd is kept as a fallback for completeness.
+    # Reseller presence — accounting.log may rotate or be Pattern A'd.
+    # /var/cpanel/users/<name> is the canonical record (survives Pattern A);
+    # getent passwd kept as fallback.
     local d_userfile="/var/cpanel/users/$PATTERN_D_RESELLER"
     if [[ -f "$d_userfile" ]]; then
         local d_userfile_mtime
@@ -7301,10 +6891,8 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern F: __S_MARK__ harvester envelope -----------------------
-    # Diagnostic-shape filter via shared _classify_history_match (same
-    # primitive as v2.7.5 Pattern C). Without it `grep __S_MARK__
-    # /root/.bash_history` (responder check) lands the literal in history
-    # and the next scan fires strong/COMPROMISED on a clean host.
+    # Shape-classified (responder `grep __S_MARK__` lands the literal in
+    # bash_history → next scan would fire strong/COMPROMISED on a clean host).
     local _f_files=()
     local _ff
     while IFS= read -r _ff; do
@@ -7359,7 +6947,7 @@ check_destruction_iocs() {
         fi
     fi
 
-    # Pattern F additional marker: __CMD_DONE_<nanos>__ (rev5 dossier).
+    # Pattern F additional marker: __CMD_DONE_<nanos>__.
     local _fc_files=()
     local _fcf
     while IFS= read -r _fcf; do
@@ -7407,11 +6995,8 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern G: suspect SSH keys ------------------------------------
-    # IC-5790 fingerprint: mtime forged to 2019-12-13 + IP-shaped key
-    # comment. _g_hit feeds the lsyncd-amplification check at end of this
-    # block. IP-labeled count excludes known-good provisioning labels
-    # (lwadmin/liquidweb/nexcess/Parent Child key for ...) so warning-tier
-    # emit doesn't FP on legitimate operator labels with IPv4 comments.
+    # Fingerprint: mtime forged to 2019-12-13 + IP-shaped comment.
+    # IP-label count excludes known-good provisioning labels.
     local _g_hit=0
     local key_file
     for key_file in "${SSH_KEY_FILES[@]}"; do
@@ -7489,11 +7074,9 @@ check_destruction_iocs() {
         fi
     fi
 
-    # Pattern G lsyncd-amplification: master compromise = implicit
-    # replica compromise via the cluster's replication keypair (Norman
-    # Dumond, 5/3 dossier). Doesn't escalate THIS host's verdict but
-    # surfaces blast-radius for remediation (revoke + reissue cluster
-    # keypair, not just master's key).
+    # Pattern G lsyncd-amplification: master compromise → implicit replica
+    # compromise via cluster replication keypair. Surfaces blast-radius for
+    # remediation; doesn't escalate THIS host's verdict.
     if (( _g_hit )); then
         local _lsyncd_evidence=""
         if command -v pgrep >/dev/null 2>&1 && pgrep -x lsyncd >/dev/null 2>&1; then
@@ -7514,12 +7097,9 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern H: seobot defacement / SEO spam dropper -----------------
-    # Four signals: H1/H2-hostile/H4 each strong on their own; H3 (ALLDONE)
-    # generic English so emits only when corroborated by H1, H2 (any tier
-    # incl. review - kill-prelude line existing at all is corroboration
-    # for the operator end-marker), or H4. H2 uses adjacency classifier
-    # (pkill is destructive on both sides; diag_re shape check from C/F
-    # doesn't apply).
+    # H1/H2-hostile/H4 strong solo; H3 (ALLDONE) is generic English, emits
+    # only when corroborated by H1, H2 (any tier), or H4. H2 uses adjacency
+    # classifier (pkill is destructive both ways; C/F diag_re doesn't fit).
     local _h1_hit=0 _h2_hostile=0 _h2_review=0 _h4_hit=0
     local _h_alldone_hit=""
 
@@ -7652,11 +7232,8 @@ check_destruction_iocs() {
     fi
 
     # H3 deferred emit: corroboration-gated. ALLDONE alone is too generic
-    # (responder `grep ALLDONE`, deployment `echo "ALLDONE"`, copy-pasted
-    # CI output) to justify IR queue capacity. H2-review (kill prelude
-    # with ambiguous adjacency: id/whoami/cd in ctx window) ALSO
-    # corroborates - the kill-prelude line existing at all alongside an
-    # ALLDONE marker is enough signal to surface for IR (sentinel finding).
+    # (responder grep / deploy echo / CI paste); requires H1/H2/H4. H2-review
+    # (ambiguous kill-prelude adjacency) ALSO counts as corroboration.
     if [[ -n "$_h_alldone_hit" ]] \
        && (( _h1_hit || _h2_hostile || _h2_review || _h4_hit )); then
         local _h_alldone_mtime
@@ -7677,10 +7254,8 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern I: system-service profile.d backdoor --------------------
-    # Three primary signals - profile.d hook, binary present, process
-    # running. Any one is strong. I4 (failed-chmod log signature) is
-    # corroborating evidence that confirms the hook actually fired for
-    # non-root logins.
+    # Three strong signals (profile.d hook / binary / running process);
+    # I4 (failed-chmod in /var/log/secure) is corroborating.
 
     # I1: profile.d hook file. Filename is unique per dossier; no benign
     # system component creates this exact filename.
@@ -7714,11 +7289,8 @@ check_destruction_iocs() {
         fi
     fi
 
-    # I4: failed-chmod log signature in /var/log/secure (or rotation).
-    # Discovery path: when a non-root user logs in via SSH, the profile.d
-    # hook tries to chmod the binary, hits permission-denied, and logs
-    # the failure to /var/log/secure. Confirms the hook is actively
-    # firing in the wild.
+    # I4: non-root SSH login → profile.d hook chmod hits EPERM → logged
+    # to /var/log/secure. Confirms the hook is actively firing.
     local i_log_hit=""
     i_log_hit=$(grep -lF "chmod: cannot access '$PATTERN_I_BINARY'" \
                     /var/log/secure /var/log/secure.[0-9]* /var/log/secure-* \
@@ -7740,23 +7312,18 @@ check_destruction_iocs() {
     hits=$((hits + PATTERN_J_HITS))
 
     # ---- Pattern E: websocket/Shell access-log signature ---------------
-    # /cpsess<id>/websocket/Shell is WHM Terminal. Categorize per
-    # (origin, status): external+2xx → strong (RCE landed); external+non-2xx
-    # → warning; internal+2xx → info (admin Terminal); internal+non-2xx
-    # → ignore. EXCLUDE_IPS suppresses known-good external admin IPs.
+    # /cpsess<id>/websocket/Shell = WHM Terminal. By (origin, status):
+    # ext+2xx=strong, ext+!2xx=warn, int+2xx=info, int+!2xx=skip.
+    # EXCLUDE_IPS suppresses known-good external admin IPs.
     local ws_log=/usr/local/cpanel/logs/access_log
     if [[ -f "$ws_log" ]]; then
         local excludes_env=""
         if (( ${#EXCLUDE_IPS[@]} > 0 )); then
             excludes_env=$(printf '%s\n' "${EXCLUDE_IPS[@]}")
         fi
-        # Per-dimension breakout + handoff-burst detection: terminal
-        # dimensions (rows×cols in the websocket Shell URL) function as
-        # operator fingerprints across the dossier - distinct dimensions
-        # imply distinct toolchains. The known-good set is maintained in
-        # sync with PATTERNS.md; new dimensions are flagged warning-tier.
-        # Handoff burst: >=2 distinct external IPs each landing a 2xx in
-        # any 15-minute window indicates multi-operator exploit chaining.
+        # Terminal dimensions (rows×cols in websocket Shell URL) act as
+        # operator fingerprints; unknown dimensions flag warning-tier.
+        # Handoff burst: ≥2 distinct ext IPs landing 2xx in 15m = multi-op.
         local ws_result
         ws_result=$(grep -E "$PATTERN_E_WS_RE" "$ws_log" 2>/dev/null \
                        | grep -vE "$PROBE_UA_RE" \
@@ -7826,11 +7393,8 @@ check_destruction_iocs() {
                             if (d in known) {
                                 # Attacker-fingerprint dim — strong-tier signal.
                                 ext_2xx_known++
-                                # Capture the FIRST attacker-dim 2xx line as
-                                # the canonical sample for the strong-emit
-                                # structured fields. ext_sample (any external
-                                # line) is preserved for fallback / lower-tier
-                                # emits.
+                                # First attacker-dim 2xx = canonical sample for
+                                # strong emit; ext_sample preserved for fallback.
                                 if (ext_known_sample == "") ext_known_sample = $0
                                 # Handoff-burst tracking only counts attacker-
                                 # dimension hits; legitimate admin teams from
@@ -7939,14 +7503,9 @@ check_destruction_iocs() {
                     _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions but ts_first ($ts_first_ext) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity (REVIEW; does not escalate host_verdict)."
                 fi
             elif (( LOGS_2XX_CPSESS_FIRST_EPOCH > 0 )); then
-                # Co-temporal proximity check vs. successful token-consumption
-                # event. Compute |delta| via arithmetic + parameter-strip of
-                # the leading sign. Skip the proximity demotion when 2xx_on_cpsess
-                # did not fire at strong tier (LOGS_2XX_CPSESS_FIRST_EPOCH == 0):
-                # in that case, the host has CRLF-anchored compromise but no
-                # in-window token-use evidence, and Pattern E by itself is
-                # still real RCE evidence (operator opened shell, didn't
-                # subsequently re-use token). Strong stands.
+                # Skip proximity demotion when 2xx_on_cpsess didn't fire
+                # strong (LOGS_2XX_CPSESS_FIRST_EPOCH == 0): no in-window
+                # token-use means Pattern E alone still stands as RCE.
                 local _e_delta=$((ts_first_ext - LOGS_2XX_CPSESS_FIRST_EPOCH))
                 local _e_abs="${_e_delta#-}"
                 if (( _e_abs > PATTERN_E_2XX_PROXIMITY_SEC )); then
@@ -8033,11 +7592,9 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern K: Cloudflare-fronted /Update second-stage backdoor ----
-    # K1 (PATTERN_K_BACKDOOR_HOST literal) routed through
-    # _classify_history_match so responder `grep cp.dene` doesn't FP.
-    # K2 (PATTERN_K_TMP_RE shape) corroborates K1; standalone emit only
-    # when K1 didn't fire strong-or-warning (sentinel-driven gate -
-    # diagnostic-only K1 must not silently swallow a real K2 signal).
+    # K1 (host literal) shape-classified to avoid responder-grep FP.
+    # K2 (tmp-path shape) emits standalone only when K1 was diagnostic-only
+    # — diagnostic K1 must not silently swallow real K2 signal.
     local _k1_files=()
     local _k1f
     while IFS= read -r _k1f; do
@@ -8111,7 +7668,7 @@ check_destruction_iocs() {
         ((hits++))
     fi
 
-    # K3 dropper-shape — survives C2 rotation; see INTERNAL-NOTES.md "v2.7.20".
+    # K3 dropper-shape — survives C2 rotation.
     local _k3_files=()
     local _k3f
     while IFS= read -r _k3f; do
@@ -8143,10 +7700,8 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern L: filesystem-nuke (rm -rf --no-preserve-root /) -------
-    # L1 (PATTERN_L_NUKE_RE) routed through _classify_history_match for
-    # diag-shape FP filtering. L2 (__CMD_START__/__CMD_END__ envelope)
-    # corroborates L1; standalone emit only when L1 didn't fire strong-
-    # or-warning (sentinel-driven gate parallel to K1/K2).
+    # L1 shape-classified for diag-shape FP. L2 (__CMD_START__/__CMD_END__)
+    # emits standalone only when L1 didn't fire strong/warning.
     local _l1_files=()
     local _l1f
     while IFS= read -r _l1f; do
@@ -8250,7 +7805,7 @@ check_destruction_iocs() {
             ((hits++)); _m1_hit=1
         done < <(awk -F: '$3==0 && $1!="root" {print $1}' /etc/passwd 2>/dev/null)
 
-        # M2 — known-bad username, corroboration-gated. See INTERNAL-NOTES.md.
+        # M2 — known-bad username, corroboration-gated.
         local _m_known _m_pwline _m_uid _m_corrob _m_corrob_reason
         for _m_known in "${PATTERN_M_KNOWN_USERS[@]}"; do
             _m_pwline=$(grep -E "^${_m_known}:" /etc/passwd 2>/dev/null | head -1)
@@ -8593,12 +8148,10 @@ check_destruction_iocs() {
         ((hits++)); _m5_hit=1
     fi
 
-    # ---- Runtime-state IOCs ---- see CHANGELOG v2.7.35 / v2.7.39.
-    # Live IOCs that flip host_verdict=COMPROMISED only when root-attributed.
-    # Process-tree hits demote to strong (→ SUSPICIOUS) on non-root UID;
-    # file-path live hits use stat -c %u; ESTAB hits use /proc/<pid>/status.
-    # LPE PoC binaries stay live_compromise unconditionally (kernel/setuid
-    # exploitation aims at root in seconds — not account-tier malware).
+    # ---- Runtime-state IOCs ----
+    # Live IOCs flip host_verdict=COMPROMISED only when root-attributed
+    # (process UID, stat %u, /proc/<pid>/status). LPE PoC binaries stay
+    # live_compromise unconditionally — kernel/setuid aims at root.
     local _rt_p _rt_owner _rt_id _rt_key _rt_sev _rt_label _rt_note_suffix
     for _rt_p in "${RUNTIME_KNOWN_BAD_PATHS[@]}"; do
         [[ -f "$_rt_p" ]] || continue
@@ -8978,11 +8531,9 @@ check_destruction_iocs() {
 }
 
 # ---- CSF firewall posture ------------------------------------------------
-# Validates CSF is installed AND enforcing. Posture findings emit with the
-# `posture_` prefix (not `ioc_`) so they surface in the matrix without
-# escalating host_verdict — they're defense-degradation, not attacker
-# evidence. Probe phases run independently so one run surfaces every break.
-# Snapshot mode (--root): all live probes skipped.
+# Validates CSF installed AND enforcing. Findings emit `posture_*` (not
+# `ioc_*`) so they surface without escalating host_verdict. --root skips
+# live probes.
 check_csf_posture() {
     if [[ -n "$ROOT_OVERRIDE" ]]; then
         hdr_section "posture" "CSF posture (skipped: snapshot mode)"
@@ -9298,7 +8849,7 @@ aggregate_verdict() {
     local -A PERSIST_PATTERNS=()
     local -A PERSIST_PATTERNS_LIVE_ROOT=()
     local persist_weight_sum=0
-    # P1b/P1c/P5 aggregators (CHANGELOG v2.7.32).
+    # P1b/P1c/P5 aggregators.
     local -A PATTERN_A_SUBTYPES=()
     local -A COMPROMISE_LETTERS=()
     local attempt_evidence_count=0
@@ -9345,12 +8896,12 @@ aggregate_verdict() {
             _ap=$(_kv_get "$kv" actor_privilege)
             [[ -z "$_au" ]] && _au="_root"
             [[ -z "$_ap" ]] && _ap="root"
-            # P3 Pattern E pre-compromise re-credit when on-disk letter present (CHANGELOG v2.7.32).
+            # P3 Pattern E pre-compromise re-credit when on-disk letter present.
             if [[ "$id" == "ioc_pattern_e_websocket" ]] && (( pre_compromise_present )) \
                && [[ "$weight" == "0" ]]; then
                 sev="strong"; weight=10
             fi
-            # P4 CRLF chain warning→evidence with capped per-chain bonus (CHANGELOG v2.7.32).
+            # P4 CRLF chain warning→evidence with capped per-chain bonus.
             local _crlf_bonus=0
             if [[ "$id" == "ioc_cve_2026_41940_access_primitive" ]] && [[ "$sev" == "warning" ]]; then
                 local _cnt=0
@@ -9366,7 +8917,7 @@ aggregate_verdict() {
                     _crlf_bonus=2
                 fi
             fi
-            # P2 quarantine reasons-aware promotion (CHANGELOG v2.7.32).
+            # P2 quarantine reasons-aware promotion.
             if [[ "$id" == ioc_quarantined_session_* ]] && [[ "$sev" == "warning" ]] \
                && [[ "$kv" == *'"reasons_ioc":"'* ]]; then
                 local _ri="${kv#*\"reasons_ioc\":\"}"; _ri="${_ri%%\"*}"
@@ -9433,11 +8984,9 @@ aggregate_verdict() {
             if [[ "$sev" == "live_compromise" || "$sev" == "strong" || "$sev" == "warning" || "$sev" == "evidence" || "$sev" == "advisory" ]]; then
                 SECTION_KEYS[$area]="${SECTION_KEYS[$area]:-} $key"
             fi
-            # Persistence-class accumulation. Tracked at strong/warning
-            # severity (info/advisory/evidence excluded — info too low-confidence,
-            # advisories explicitly non-verdict-affecting, no persistence-class
-            # emit currently uses evidence severity). Uses pattern letter so
-            # multiple keys per pattern dedupe to one cluster slot.
+            # Persistence-class accumulation: strong/warning only
+            # (info/advisory/evidence excluded). Dedup by pattern letter
+            # so multiple keys per pattern fold to one cluster slot.
             case "$sev" in
                 live_compromise|strong|warning)
                     local _pp
@@ -9460,7 +9009,7 @@ aggregate_verdict() {
             esac
             case "$sev" in
                 strong)
-                    # P1 Pattern A evidence_destruction count escalator (CHANGELOG v2.7.32).
+                    # P1 Pattern A evidence_destruction count escalator.
                     if [[ "$id" == "ioc_pattern_a_evidence_destruction" ]]; then
                         local _fe_cnt=0
                         if [[ "$kv" == *'"count":"'* ]]; then
@@ -9473,7 +9022,7 @@ aggregate_verdict() {
                         elif (( _fe_cnt >= 10 ));    then weight=15
                         fi
                     fi
-                    # P1b/P1c subtype + compromise-letter tracking (CHANGELOG v2.7.32).
+                    # P1b/P1c subtype + compromise-letter tracking.
                     if ! ioc_key_is_soft_variant "$key"; then
                         case "$id" in
                             ioc_pattern_a_sorry|ioc_pattern_a_readme|ioc_pattern_a_evidence_destruction|ioc_pattern_a_c2_live|ioc_pattern_a_encryptor)
@@ -9527,7 +9076,7 @@ aggregate_verdict() {
                     fi
                     ;;
                 live_compromise)
-                    # Single-hit COMPROMISED (bypasses v3 ladder); see CHANGELOG v2.7.35.
+                    # Single-hit COMPROMISED (bypasses v3 ladder).
                     score=$((score + (weight > 0 ? weight : 10)))
                     ((strong_count++))
                     REASONS+=("$key")
@@ -9543,7 +9092,7 @@ aggregate_verdict() {
                     fi
                     ;;
                 evidence)
-                    # P5 attempt-class aggregator (CHANGELOG v2.7.32).
+                    # P5 attempt-class aggregator.
                     if [[ "$id" == ioc_token_attempt_* ]] || [[ "$id" == ioc_quarantined_session_* ]]; then
                         ((attempt_evidence_count++))
                     elif (( _crlf_bonus > 0 )); then
@@ -9669,7 +9218,7 @@ aggregate_verdict() {
     # Per-session confidence tier: sessions with multi-reason co-occurrence
     # (canonical CVE-2026-41940 shape) score above single-trace sessions.
     # Bounded bonus tiers; same math for live (per-reason emit count) and
-    # quarantined (reasons_ioc comma count). See CHANGELOG v2.7.30.
+    # quarantined (reasons_ioc comma count).
     local _sid _rcnt _bonus
     local session_tiered_count=0 session_max_reasons=0
     if (( ${#SESSION_REASONS[@]} > 0 )); then
@@ -9686,14 +9235,14 @@ aggregate_verdict() {
         done
     fi
 
-    # P1b Pattern A on-disk subtype cluster bonus (CHANGELOG v2.7.32).
+    # P1b Pattern A on-disk subtype cluster bonus.
     local _pa_subs=${#PATTERN_A_SUBTYPES[@]}
     if   (( _pa_subs >= 4 )); then score=$((score + 100))
     elif (( _pa_subs >= 3 )); then score=$((score + 50))
     elif (( _pa_subs >= 2 )); then score=$((score + 25))
     fi
 
-    # P1c cross-pattern compromise-letter cluster bonus, excludes E (CHANGELOG v2.7.32).
+    # P1c cross-pattern compromise-letter cluster bonus, excludes E.
     local _comp_letters=${#COMPROMISE_LETTERS[@]}
     if   (( _comp_letters >= 5 )); then score=$((score + 250))
     elif (( _comp_letters >= 4 )); then score=$((score + 150))
@@ -9701,14 +9250,14 @@ aggregate_verdict() {
     elif (( _comp_letters >= 2 )); then score=$((score + 30))
     fi
 
-    # P5 attempt-class evidence cap +20 (CHANGELOG v2.7.32).
+    # P5 attempt-class evidence cap +20.
     if (( attempt_evidence_count > 0 )); then
         local _att=$(( attempt_evidence_count * 2 ))
         (( _att > 20 )) && _att=20
         score=$((score + _att))
     fi
 
-    # P6 persistence cluster multipliers (CHANGELOG v2.7.32).
+    # P6 persistence cluster multipliers.
     local persist_count=${#PERSIST_PATTERNS[@]}
     local persist_count_live_root=${#PERSIST_PATTERNS_LIVE_ROOT[@]}
     local persist_mult=1
@@ -9719,7 +9268,7 @@ aggregate_verdict() {
         score=$((score + persist_weight_sum * (persist_mult - 1)))
     fi
 
-    # P7 compromise floor (CHANGELOG v2.7.32).
+    # P7 compromise floor.
     local _comp_floor=0
     if (( _pa_subs > 0 )) || (( _comp_letters > 0 )) || (( persist_count >= 1 )); then
         _comp_floor=100
@@ -9761,19 +9310,8 @@ aggregate_verdict() {
         EXIT_CODE=2
     fi
 
-    # Host-state axes (v2.8.0 split). Two parallel verdicts:
-    #   host_root_verdict — actor had root (X via WHM, /etc, /root, system).
-    #     Persistence cluster (any actor_privilege) also routes here since
-    #     persistence implies system-level write access.
-    #   host_user_verdict — actor had only user-account access; impact is
-    #     scoped to one or more cPanel tenants.
-    # EXIT_CODE 4 dominates 1/2/3 for fleet triage.
-    #
-    # Quarantine demotion + axis-aware gate (v2.8.3). host_root_verdict
-    # requires root-attributed LIVE evidence — not quarantine, not user-
-    # axis. Quarantine still credits score (P6/P1c/P7) but loses verdict
-    # trigger; user-attributed signals route to host_user_verdict only.
-    # See INTERNAL-NOTES.md "v2.8.3" for the bug-class rationale.
+    # Quarantine still credits score but loses verdict trigger;
+    # user-attributed signals route to host_user_verdict only.
     local _quarantine_only=0
     if (( root_compromise_critical_live == 0 )) && (( persist_count_live_root == 0 )) \
        && ( (( root_compromise_critical > 0 )) || (( persist_count > 0 )) ); then
@@ -9817,9 +9355,8 @@ aggregate_verdict() {
         ADVISORY_COUNT="$advisory_count"
     fi
 
-    # v2.8.1: surface quarantine-only demotion so consumers see WHY
-    # host_root_verdict is SUSPICIOUS instead of COMPROMISED. Fires only
-    # when quarantine signals were the sole COMPROMISED gate input.
+    # Surface quarantine-only demotion so consumers see WHY host_root_verdict
+    # is SUSPICIOUS. Fires only when quarantine was the sole compromise input.
     if (( _quarantine_only )); then
         emit advisory ioc_quarantine_only_no_live_corroboration advisory \
             ioc_quarantine_only_no_live_corroboration 0 \
@@ -9833,11 +9370,8 @@ aggregate_verdict() {
     COMPROMISE_CRITICAL_QUARANTINE="$compromise_critical_quarantine"
 }
 
-# Materialise the per-user verdict block from USER_* maps populated by
-# aggregate_verdict. Caps at USERS_BLOCK_CAP (50) by severity-then-count.
-# Sets USERS_JSON / USERS_TRUNCATED / USERS_TRUNCATED_COUNT and
-# AFFECTED_USER_COUNT / AFFECTED_USER_COMPROMISED / AFFECTED_USER_SUSPECT.
-# total_users counts /var/cpanel/users/ for fleet visibility.
+# Materialise per-user verdict block. Caps at USERS_BLOCK_CAP (50) by
+# severity-then-count. Sets USERS_JSON + AFFECTED_USER_* + total_users.
 USERS_BLOCK_CAP=50
 aggregate_per_user_verdict() {
     AFFECTED_USER_COUNT=0
@@ -10197,22 +9731,23 @@ write_json() {
             "$(json_esc "$DISK_FULL_MOUNTS")" \
             "$(json_esc "$DISK_INODE_FULL_MOUNTS")" \
             "$(json_esc "$BOOT_FREE_MB")"
-        # Software inventory in two parts:
-        #   software_inventory_b64gz  — gzip(base64) of software-inventory.txt
-        #                               (decode: base64 -d | gunzip)
-        #   software_inventory_meta   — sha256 + raw/encoded byte counts +
-        #                               diagnostic note. Receivers verify
-        #                               integrity by comparing sha256 of
-        #                               decoded content vs meta.sha256.
-        # When encoding is unavailable or the cap is exceeded, b64gz is ""
-        # and note carries the reason. The on-disk sidecar is independent
-        # — operators can always pull it out-of-band.
         printf '  "software_inventory_b64gz": "%s",\n' "$SOFTWARE_INVENTORY_B64GZ"
-        printf '  "software_inventory_meta": {"sha256":"%s","raw_bytes":%d,"encoded_bytes":%d,"encoding":"gzip+base64","note":"%s"}\n' \
+        printf '  "software_inventory_meta": {"sha256":"%s","raw_bytes":%d,"encoded_bytes":%d,"encoding":"gzip+base64","note":"%s"},\n' \
             "$(json_esc "${SOFTWARE_INVENTORY_SHA256:-}")" \
             "${SOFTWARE_INVENTORY_RAW_BYTES:-0}" \
             "${SOFTWARE_INVENTORY_ENCODED_BYTES:-0}" \
             "$(json_esc "${SOFTWARE_INVENTORY_B64GZ_NOTE:-}")"
+        printf '  "lmd_hits_b64gz": "%s",\n' "${LMD_HITS_B64GZ:-}"
+        printf '  "lmd_hits_meta": {"installed":%s,"active":%s,"version":"%s","window_days":%d,"max_rows":%d,"row_count":%d,"raw_bytes":%d,"encoded_bytes":%d,"encoding":"gzip+base64","note":"%s"}\n' \
+            "$([[ ${LMD_INSTALLED:-0} -eq 1 ]] && echo true || echo false)" \
+            "$([[ ${LMD_ACTIVE:-0} -eq 1 ]] && echo true || echo false)" \
+            "$(json_esc "${LMD_VERSION:-}")" \
+            "${LMD_HITS_WINDOW_DAYS:-30}" \
+            "${LMD_HITS_MAX_ROWS:-2000}" \
+            "${LMD_HITS_ROW_COUNT:-0}" \
+            "${LMD_HITS_RAW_BYTES:-0}" \
+            "${LMD_HITS_ENCODED_BYTES:-0}" \
+            "$(json_esc "${LMD_HITS_B64GZ_NOTE:-not_collected}")"
         printf '}\n'
     } > "$out"
 }
@@ -10241,9 +9776,8 @@ write_csv() {
         adv_ids="${adv_ids:+${adv_ids};}${adv_id}"
     done
     {
-        # Column order: v2.8.0 swaps host_verdict for two-axis verdicts
-        # and appends affected_user_count + users_truncated. Consumers must
-        # update header parsing; positional consumers must remap col 6.
+        # Column order: two-axis verdicts (host_root + host_user) +
+        # affected_user_count + users_truncated. Positional consumers map col 6.
         printf 'host,run_id,ts,tool_version,code_verdict,host_root_verdict,host_user_verdict,affected_user_count,users_truncated,score,exit_code,strong,fixed,inconclusive,ioc_critical,ioc_review,advisories,probe_artifacts,reasons,advisory_ids,persist_count,persist_score,persist_multiplier,persist_patterns,compromise_critical,session_tiered_count,session_max_reasons\n'
         printf '%s,%s,%s,%s,%s,%s,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%d,%d,%d,%s,%d,%d,%d\n' \
             "$(csv_field "$HOSTNAME_FQDN")" \
@@ -10430,6 +9964,7 @@ if (( ! REPLAY_MODE )); then
     local_init
     collect_host_meta
     collect_software_digest
+    collect_lmd_meta
     if (( IOC_ONLY )); then
         hdr_section "ioc-only" "code-state checks skipped"
     else
@@ -10518,11 +10053,8 @@ if (( RUN_FORENSIC )); then
         (( DO_UPLOAD )) && phase_upload
     fi
 
-    # Forensic summary signal (mirrors the old standalone forensic exit
-    # logic, but now folded into the unified envelope + verdict). NO `local`
-    # keyword — this code runs at top level (outside any function); local
-    # would be a parse error. The names become globals; they're only read
-    # in the emit() call below so the namespace pollution is harmless.
+    # Forensic summary signal. NO `local` keyword — this runs at top level;
+    # `local` would be a parse error. Names become globals (read once below).
     n_off="${#OFFENSE_EVENTS[@]}"; n_def="${#DEFENSE_EVENTS[@]}"
     f_verdict="CLEAN"; f_exit=0
     if (( n_off > 0 )); then
