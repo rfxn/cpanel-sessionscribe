@@ -407,6 +407,7 @@ REPLAY_PATH=""                          # set by --replay PATH
 REPLAY_MODE=0                           # 1 if --replay PATH set (skip detection)
 DO_BUNDLE=1                             # default ON when --full active; --no-bundle disables
 BUNDLE_DIR_ROOT="$DEFAULT_BUNDLE_DIR_ROOT"
+BUNDLE_DIR_OVERRIDDEN=0
 MAX_BUNDLE_MB="$DEFAULT_MAX_BUNDLE_MB"
 EXTRA_LOGS_DIR=""
 INCLUDE_HOMEDIR_HISTORY=1
@@ -892,7 +893,7 @@ while [[ $# -gt 0 ]]; do
                               ;;
         --bundle)             DO_BUNDLE=1; shift ;;
         --no-bundle)          DO_BUNDLE=0; shift ;;
-        --bundle-dir)         BUNDLE_DIR_ROOT="$2"; shift 2 ;;
+        --bundle-dir)         BUNDLE_DIR_ROOT="$2"; BUNDLE_DIR_OVERRIDDEN=1; shift 2 ;;
         --max-bundle-mb)      MAX_BUNDLE_MB="$2"; shift 2 ;;
         --extra-logs)         EXTRA_LOGS_DIR="$2"; shift 2 ;;
         --no-history)         INCLUDE_HOMEDIR_HISTORY=0; shift ;;
@@ -964,11 +965,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Pre-rename hosts wrote bundles under /root/.ic5790-forensic; if operator
-# did not override --bundle-dir and the legacy path exists while the new
-# one does not, prefer legacy so existing captures stay discoverable.
-if [[ "$BUNDLE_DIR_ROOT" == "$DEFAULT_BUNDLE_DIR_ROOT" ]] \
-   && [[ ! -d "$BUNDLE_DIR_ROOT" ]] && [[ -d "$LEGACY_BUNDLE_DIR_ROOT" ]]; then
+# Back-compat: prefer legacy /root/.ic5790-forensic when default + new path absent.
+if (( ! BUNDLE_DIR_OVERRIDDEN )) && [[ ! -d "$BUNDLE_DIR_ROOT" ]] && [[ -d "$LEGACY_BUNDLE_DIR_ROOT" ]]; then
     BUNDLE_DIR_ROOT="$LEGACY_BUNDLE_DIR_ROOT"
 fi
 
@@ -2589,8 +2587,7 @@ phase_defense() {
         fi
         if (( csf_clean )); then
             DEF_CSF_TIME=$(mtime_of /etc/csf/csf.conf)
-            # Operator pre-mutation backup (new name first; .ic5790.bak
-            # for back-compat) records the original CSF mutation time.
+            # Operator pre-mutation backup; .ic5790.bak honored for back-compat.
             local _csf_bak="" _bak_name
             for _bak_name in /etc/csf/csf.conf.cve-2026-41940.bak /etc/csf/csf.conf.ic5790.bak; do
                 [[ -f "$_bak_name" ]] && { _csf_bak="$_bak_name"; break; }
@@ -6664,9 +6661,7 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern B: mysql wipe + BTC-note index drop ---------------------
-    # innodb-residue check rules out fresh-install hosts that legitimately
-    # have no mysql/ subdir. Shape is informational only — too many benign
-    # operator causes (manual cleanup, restore-in-progress) to verdict-gate.
+    # innodb-residue gates the wipe heuristic; wipe shape is info-tier (too many benign causes).
     if [[ -d "$PATTERN_B_MYSQL_DIR" && ! -d "$PATTERN_B_MYSQL_DB" ]]; then
         local has_innodb=0
         if compgen -G "${PATTERN_B_MYSQL_DIR}/ibdata*" >/dev/null 2>&1 \
@@ -6736,8 +6731,7 @@ check_destruction_iocs() {
         _nuke_mtime=$(stat -c %Y "$_nuke_sample" 2>/dev/null)
 
         if (( ${_nh:-0} > 0 )); then
-            # bash_history-only hits demote to warning (responder-paste FP risk);
-            # /tmp/*.log fallback hits stay strong (real dropper trace).
+            # bash_history-only hits demote to warning; /tmp/*.log hits stay strong.
             local _hf="${_nfh_file:-$_nuke_sample}"
             local _hf_mtime _c_sev _c_id _c_key _c_weight _c_note
             _hf_mtime=$(stat -c %Y "$_hf" 2>/dev/null)
