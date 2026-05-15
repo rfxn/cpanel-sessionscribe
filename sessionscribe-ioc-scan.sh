@@ -1470,11 +1470,14 @@ collect_software_digest() {
                     note="${note:+${note}; }live lock $lock_file pid=$lock_pid"
                 fi
             done
-            if [[ -f /var/log/dpkg.log ]]; then
-                local newest
+            # /var/lib/dpkg/status mtime is dpkg-authoritative; dpkg.log mtime is bumped by logrotate.
+            local newest=""
+            if [[ -f /var/lib/dpkg/status ]]; then
+                newest=$(stat -c %Y /var/lib/dpkg/status 2>/dev/null)
+            elif [[ -f /var/log/dpkg.log ]]; then
                 newest=$(stat -c %Y /var/log/dpkg.log 2>/dev/null)
-                [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="$newest"
             fi
+            [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="$newest"
             ;;
         (*)
             PKGMGR_HEALTH="unknown"; note="no supported package manager found"
