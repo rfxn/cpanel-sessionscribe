@@ -41,7 +41,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.6"
+VERSION="2.8.7"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -6649,9 +6649,9 @@ check_destruction_iocs() {
     fi
 
     # ---- Pattern B: mysql wipe + BTC-note index drop ---------------------
-    # Wipe heuristic: /var/lib/mysql/ exists, mysql/ subdir is gone, AND
-    # innodb residue (ibdata1, ib_logfile*) is still present. The innodb
-    # check rules out fresh-install hosts that legitimately have no mysql/.
+    # innodb-residue check rules out fresh-install hosts that legitimately
+    # have no mysql/ subdir. Shape is informational only — too many benign
+    # operator causes (manual cleanup, restore-in-progress) to verdict-gate.
     if [[ -d "$PATTERN_B_MYSQL_DIR" && ! -d "$PATTERN_B_MYSQL_DB" ]]; then
         local has_innodb=0
         if compgen -G "${PATTERN_B_MYSQL_DIR}/ibdata*" >/dev/null 2>&1 \
@@ -6662,12 +6662,11 @@ check_destruction_iocs() {
         if (( has_innodb )); then
             local mysql_parent_mtime
             mysql_parent_mtime=$(stat -c %Y "$PATTERN_B_MYSQL_DIR" 2>/dev/null)
-            emit "destruction" "ioc_pattern_b_mysql_wipe" "strong" \
-                 "ioc_pattern_b_mysql_dir_missing" 10 \
+            emit "destruction" "ioc_pattern_b_mysql_wipe_diagnostic" "info" \
+                 "ioc_pattern_b_mysql_dir_missing_diagnostic_only" 0 \
                  "expected" "$PATTERN_B_MYSQL_DB" \
                  "mtime_epoch" "${mysql_parent_mtime:-0}" \
-                 "note" "${PATTERN_B_MYSQL_DIR}/ exists with innodb residue but mysql/ subdir is gone - matches Pattern B DB wipe (CRITICAL)."
-            ((hits++))
+                 "note" "${PATTERN_B_MYSQL_DIR}/ exists with innodb residue but mysql/ subdir is gone - informational, manual review to distinguish Pattern B wipe from operator action."
         fi
     fi
     # BTC index.html drops nested under /home/*/public_html (cohort).
@@ -6695,12 +6694,15 @@ check_destruction_iocs() {
     # Three signals: bash_history mention (shape-classified to avoid IR-grep
     # FP), on-disk binary (sha256-anchored), C2 host/IP.
     local nuke_files=()
+    local _nuke_from_history=0
     local _nf
     for _nf in /root/.bash_history /home/*/.bash_history; do
         [[ -f "$_nf" ]] && grep -qF "$PATTERN_C_BIN" "$_nf" 2>/dev/null \
             && nuke_files+=("$_nf")
     done
-    if (( ${#nuke_files[@]} == 0 )); then
+    if (( ${#nuke_files[@]} > 0 )); then
+        _nuke_from_history=1
+    else
         for _nf in /tmp/*.log /var/tmp/*.log; do
             [[ -f "$_nf" ]] && grep -qF "$PATTERN_C_BIN" "$_nf" 2>/dev/null \
                 && nuke_files+=("$_nf")
@@ -6719,22 +6721,33 @@ check_destruction_iocs() {
         _nuke_mtime=$(stat -c %Y "$_nuke_sample" 2>/dev/null)
 
         if (( ${_nh:-0} > 0 )); then
-            # Hostile-shape line(s) present - real dropper trace; emit
-            # strong as before, with classifier counts for IR triage.
-            # mtime_epoch tracks the actual hostile-file (which may
-            # differ from _nuke_sample when multiple history files match).
+            # bash_history-only hits demote to warning (responder-paste FP risk);
+            # /tmp/*.log fallback hits stay strong (real dropper trace).
             local _hf="${_nfh_file:-$_nuke_sample}"
-            local _hf_mtime
+            local _hf_mtime _c_sev _c_id _c_key _c_weight _c_note
             _hf_mtime=$(stat -c %Y "$_hf" 2>/dev/null)
-            emit "destruction" "ioc_pattern_c_nuke_trace" "strong" \
-                 "ioc_pattern_c_nuclear_x86_referenced" 10 \
+            if (( _nuke_from_history )); then
+                _c_sev="warning"
+                _c_id="ioc_pattern_c_nuke_trace_history_review"
+                _c_key="ioc_pattern_c_nuclear_x86_history_review"
+                _c_weight=4
+                _c_note="$PATTERN_C_BIN dropper-shape command in $_hf - bash_history-only evidence, manual review (responder paste vs real drop)."
+            else
+                _c_sev="strong"
+                _c_id="ioc_pattern_c_nuke_trace"
+                _c_key="ioc_pattern_c_nuclear_x86_referenced"
+                _c_weight=10
+                _c_note="$PATTERN_C_BIN dropper-shape command in $_hf (Mirai botnet drop, Abuse 46488376)."
+            fi
+            emit "destruction" "$_c_id" "$_c_sev" \
+                 "$_c_key" "$_c_weight" \
                  "sample_path" "$_hf" \
                  "mtime_epoch" "${_hf_mtime:-${_nuke_mtime:-0}}" \
                  "ts_epoch_first" "${_nfhe:-0}" \
                  "hostile_lines" "${_nh:-0}" \
                  "diagnostic_lines" "${_nd:-0}" \
                  "unknown_lines" "${_nu:-0}" \
-                 "note" "$PATTERN_C_BIN dropper-shape command in $_hf (Mirai botnet drop, Abuse 46488376)."
+                 "note" "$_c_note"
             ((hits++))
         elif (( ${_nu:-0} > 0 )); then
             # Unknown-shape only - no clear dropper verb but no clear
@@ -6795,11 +6808,11 @@ check_destruction_iocs() {
     if [[ -n "$flame_hit" ]]; then
         local flame_mtime
         flame_mtime=$(stat -c %Y "$flame_hit" 2>/dev/null)
-        emit "destruction" "ioc_pattern_c_c2_ref" "strong" \
-             "ioc_pattern_c_c2_referenced" 8 \
+        emit "destruction" "ioc_pattern_c_c2_ref_history_review" "warning" \
+             "ioc_pattern_c_c2_referenced_history_review" 4 \
              "sample_path" "$flame_hit" \
              "mtime_epoch" "${flame_mtime:-0}" \
-             "note" "Mirai C2 ($PATTERN_C_C2_HOST / $PATTERN_C_C2_IP / $PATTERN_C_C2_IP_2) referenced in $flame_hit."
+             "note" "Mirai C2 ($PATTERN_C_C2_HOST / $PATTERN_C_C2_IP / $PATTERN_C_C2_IP_2) referenced in $flame_hit - bash_history-only evidence, manual review."
         ((hits++))
     fi
     local persist_hit=""
@@ -6912,15 +6925,15 @@ check_destruction_iocs() {
         _f_mtime=$(stat -c %Y "$_f_sample" 2>/dev/null)
 
         if (( ${_fh:-0} > 0 )); then
-            emit "destruction" "ioc_pattern_f_harvester" "strong" \
-                 "ioc_pattern_f_smark_envelope" 10 \
+            emit "destruction" "ioc_pattern_f_harvester_history_review" "warning" \
+                 "ioc_pattern_f_smark_envelope_history_review" 5 \
                  "sample_path" "$_f_sample" \
                  "ts_epoch_first" "${_ffhe:-0}" \
                  "mtime_epoch" "${_f_mtime:-0}" \
                  "hostile_lines" "${_fh:-0}" \
                  "diagnostic_lines" "${_fd:-0}" \
                  "unknown_lines" "${_fu:-0}" \
-                 "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $_f_sample - automated post-exploit recon (CRITICAL)."
+                 "note" "$PATTERN_F_S_MARK / $PATTERN_F_E_MARK harvester envelope in $_f_sample - bash_history-only evidence, manual review."
             ((hits++))
         elif (( ${_fu:-0} > 0 )); then
             local _f_review_sample="${_f_files[0]}"
@@ -6965,15 +6978,15 @@ check_destruction_iocs() {
         local _fc_mtime
         _fc_mtime=$(stat -c %Y "$_fc_sample" 2>/dev/null)
         if (( ${_fch:-0} > 0 )); then
-            emit "destruction" "ioc_pattern_f_cmd_done" "strong" \
-                 "ioc_pattern_f_cmd_done_marker" 8 \
+            emit "destruction" "ioc_pattern_f_cmd_done_history_review" "warning" \
+                 "ioc_pattern_f_cmd_done_marker_history_review" 4 \
                  "sample_path" "$_fc_sample" \
                  "ts_epoch_first" "${_fcfhe:-0}" \
                  "mtime_epoch" "${_fc_mtime:-0}" \
                  "hostile_lines" "${_fch:-0}" \
                  "diagnostic_lines" "${_fcd:-0}" \
                  "unknown_lines" "${_fcu:-0}" \
-                 "note" "Pattern F additional marker __CMD_DONE_<nanos>__ in $_fc_sample - same harvester actor toolchain as __S_MARK__/__E_MARK__."
+                 "note" "Pattern F __CMD_DONE_<nanos>__ marker in $_fc_sample - bash_history-only evidence, manual review (responder paste vs harvester toolchain)."
             ((hits++))
         elif (( ${_fcu:-0} > 0 )); then
             emit "destruction" "ioc_pattern_f_cmd_done_review" "warning" \
@@ -7176,15 +7189,15 @@ check_destruction_iocs() {
         local _hk_mtime
         _hk_mtime=$(stat -c %Y "$_hk_sample" 2>/dev/null)
         if (( _hk_h_total > 0 )); then
-            emit "destruction" "ioc_pattern_h_kill_prelude" "strong" \
-                 "ioc_pattern_h_competitor_kill" 8 \
+            emit "destruction" "ioc_pattern_h_kill_prelude_history_review" "warning" \
+                 "ioc_pattern_h_competitor_kill_history_review" 4 \
                  "sample_path" "$_hk_sample" \
                  "ts_epoch_first" "${_hk_fhe:-0}" \
                  "mtime_epoch" "${_hk_mtime:-0}" \
                  "hostile_lines" "$_hk_h_total" \
                  "diagnostic_lines" "$_hk_d_total" \
                  "unknown_lines" "$_hk_u_total" \
-                 "note" "Pattern H competitor-kill prelude in $_hk_sample followed by install primitive (kills nuclear.x86/kswapd01/xmrig before drop)."
+                 "note" "Pattern H competitor-kill prelude in $_hk_sample followed by install primitive - bash_history-only evidence, manual review."
             ((hits++))
             _h2_hostile=1
         elif (( _hk_u_total > 0 )); then
@@ -7244,12 +7257,12 @@ check_destruction_iocs() {
         (( _h2_review ))  && _h_corrob+="H2(review-tier kill prelude),"
         (( _h4_hit ))     && _h_corrob+="H4(seobot.zip),"
         _h_corrob="${_h_corrob%,}"
-        emit "destruction" "ioc_pattern_h_alldone" "warning" \
-             "ioc_pattern_h_alldone_marker" 5 \
+        emit "destruction" "ioc_pattern_h_alldone_review" "warning" \
+             "ioc_pattern_h_alldone_marker_review" 5 \
              "sample_path" "$_h_alldone_hit" \
              "mtime_epoch" "${_h_alldone_mtime:-0}" \
              "corroborated_by" "$_h_corrob" \
-             "note" "Pattern H operator end-marker '$PATTERN_H_END_MARKER' in $_h_alldone_hit, corroborated by $_h_corrob."
+             "note" "Pattern H operator end-marker '$PATTERN_H_END_MARKER' in $_h_alldone_hit, corroborated by $_h_corrob - bash_history-only marker, manual review."
         ((hits++))
     fi
 
@@ -7743,8 +7756,8 @@ check_destruction_iocs() {
         local _l1_mtime
         _l1_mtime=$(stat -c %Y "$_l1_sample" 2>/dev/null)
         if (( ${_l1h:-0} > 0 )); then
-            emit "destruction" "ioc_pattern_l_filesystem_nuke" "strong" \
-                 "ioc_pattern_l_no_preserve_root_rm" 10 \
+            emit "destruction" "ioc_pattern_l_filesystem_nuke_history_review" "warning" \
+                 "ioc_pattern_l_no_preserve_root_rm_history_review" 4 \
                  "sample_path" "$_l1_sample" \
                  "ts_epoch_first" "${_l1fhe:-0}" \
                  "mtime_epoch" "${_l1_mtime:-0}" \
@@ -7752,7 +7765,7 @@ check_destruction_iocs() {
                  "diagnostic_lines" "${_l1d:-0}" \
                  "unknown_lines" "${_l1u:-0}" \
                  "corroborated_by" "${_l_envelope_corrob:-(none)}" \
-                 "note" "Pattern L filesystem-nuke (rm -rf --no-preserve-root /) in $_l1_sample - scorched-earth destruction, REIMAGE only (CRITICAL)."
+                 "note" "Pattern L filesystem-nuke (rm -rf --no-preserve-root /) in $_l1_sample - bash_history-only evidence, manual review."
             ((hits++))
             _l1_emit_real=1
         elif (( ${_l1u:-0} > 0 )); then
@@ -7781,12 +7794,12 @@ check_destruction_iocs() {
     if [[ -n "$_l_envelope_corrob" ]] && (( _l1_emit_real == 0 )); then
         local _l_env_mtime
         _l_env_mtime=$(stat -c %Y "$_l2_sample" 2>/dev/null)
-        emit "destruction" "ioc_pattern_l_cmd_envelope" "warning" \
-             "ioc_pattern_l_destructive_cmd_envelope" 4 \
+        emit "destruction" "ioc_pattern_l_cmd_envelope_review" "warning" \
+             "ioc_pattern_l_destructive_cmd_envelope_review" 4 \
              "sample_path" "$_l2_sample" \
              "mtime_epoch" "${_l_env_mtime:-0}" \
              "envelope_lines" "$((_l2_h + _l2_u))" \
-             "note" "Pattern L __CMD_START__/__CMD_END__ destructive-command envelope in $_l2_sample without the rm -rf --no-preserve-root command itself - destructive-class harvester ran, manual review (command may have been rotated/redacted)."
+             "note" "Pattern L __CMD_START__/__CMD_END__ destructive-command envelope in $_l2_sample - bash_history-only evidence, manual review."
         ((hits++))
     fi
 
@@ -7901,7 +7914,7 @@ check_destruction_iocs() {
     fi
 
     # M7 — Monero wallet literal. Batched grep, 5min walltime cap.
-    local _m_xmr_hit="" _m_xmr_paths=(
+    local _m_xmr_hit="" _m_xmr_from_history=0 _m_xmr_paths=(
         /root /etc /opt /tmp /var/tmp /var/spool/cron
         /usr/local/bin /usr/local/sbin
     )
@@ -7936,6 +7949,7 @@ check_destruction_iocs() {
             [[ -f "$_m_xmr_h" ]] || continue
             if grep -qF "$PATTERN_M_XMR_WALLET" "$_m_xmr_h" 2>/dev/null; then
                 _m_xmr_hit="$_m_xmr_h"
+                _m_xmr_from_history=1
                 break
             fi
         done
@@ -7948,6 +7962,13 @@ check_destruction_iocs() {
                  "wallet" "$PATTERN_M_XMR_WALLET" \
                  "mtime_epoch" "$(stat -c %Y "$_m_xmr_hit" 2>/dev/null)" \
                  "note" "Pattern M XMR wallet string in $_m_xmr_hit but file is in IR-notes/docs path or long-form documentation - reference, not attacker drop."
+        elif (( _m_xmr_from_history )); then
+            emit "destruction" "ioc_pattern_m_xmr_wallet_history_review" "warning" \
+                 "ioc_pattern_m_xmr_wallet_history_review" 5 \
+                 "path" "$_m_xmr_hit" \
+                 "wallet" "$PATTERN_M_XMR_WALLET" \
+                 "mtime_epoch" "$(stat -c %Y "$_m_xmr_hit" 2>/dev/null)" \
+                 "note" "Pattern M XMR mining wallet fingerprint in $_m_xmr_hit - bash_history-only evidence, manual review (responder paste vs cryptominer C2)."
         else
             emit "destruction" "ioc_pattern_m_xmr_wallet" "strong" \
                  "ioc_pattern_m_xmr_wallet_present" 12 \

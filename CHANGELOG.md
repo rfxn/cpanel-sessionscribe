@@ -4,6 +4,12 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per affected component.
 
+## ioc-scan v2.8.7 — 2026-05-15
+
+### Changed
+- MySQL data-directory wipe shape (Pattern B) demoted to informational; too many benign operator causes (manual cleanup, restore-in-progress) to drive a destructive verdict on its own.
+- Shell-history-only findings across Patterns C, F, H, L, and M demoted to review-tier; bash_history evidence alone no longer escalates a host to COMPROMISED. Hits sourced from on-disk droppers, persistence files, crontabs, or live sockets are unchanged.
+
 ## ioc-scan v2.8.6 — 2026-05-13
 
 ### Security
