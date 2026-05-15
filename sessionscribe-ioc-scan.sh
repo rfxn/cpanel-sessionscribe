@@ -1437,15 +1437,25 @@ collect_software_digest() {
                     note="${note:+${note}; }live lock $lock_file pid=$lock_pid"
                 fi
             done
-            if [[ -d /var/lib/dnf/history ]]; then
-                local newest
-                newest=$(stat -c %Y /var/lib/dnf/history/*.sqlite 2>/dev/null | sort -n | tail -1)
-                [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="$newest"
-            elif [[ -d /var/lib/yum/history ]]; then
-                local newest
-                newest=$(find /var/lib/yum/history -maxdepth 2 -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
-                [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="${newest%.*}"
+            # rpmdb mtime captures raw rpm -i / upcp actions that bypass yum/dnf history.
+            local newest="" _rpmdb_f _rpmdb_m
+            for _rpmdb_f in /var/lib/rpm/Packages /var/lib/rpm/rpmdb.sqlite; do
+                [[ -f "$_rpmdb_f" ]] || continue
+                _rpmdb_m=$(stat -c %Y "$_rpmdb_f" 2>/dev/null)
+                [[ -n "$_rpmdb_m" ]] || continue
+                if [[ -z "$newest" ]] || (( _rpmdb_m > newest )); then
+                    newest="$_rpmdb_m"
+                fi
+            done
+            if [[ -z "$newest" ]]; then
+                if [[ -d /var/lib/dnf/history ]]; then
+                    newest=$(stat -c %Y /var/lib/dnf/history/*.sqlite 2>/dev/null | sort -n | tail -1)
+                elif [[ -d /var/lib/yum/history ]]; then
+                    newest=$(find /var/lib/yum/history -maxdepth 2 -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+                    newest="${newest%.*}"
+                fi
             fi
+            [[ -n "$newest" ]] && PKGMGR_LAST_TXN_EPOCH="$newest"
             ;;
         (apt)
             if command -v dpkg >/dev/null 2>&1; then
