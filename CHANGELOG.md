@@ -4,6 +4,11 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per affected component.
 
+## ioc-scan v2.8.8 — 2026-05-15
+
+### Changed
+- Forensic bundle directory and JSONL incident-id refreshed to CVE-2026-41940 naming; pre-rename hosts with `/root/.ic5790-forensic/` and `csf.conf.ic5790.bak` continue working via auto-detected fallback.
+
 ## ioc-scan v2.8.7 — 2026-05-15
 
 ### Changed

@@ -3772,7 +3772,7 @@ quarantine_session() {
     # Quarantine subtree contains forged-session bodies (which may carry
     # cp_security_token values, hex-encoded passwords, etc). Lock down to
     # 0700 so only root can read - same posture as ioc-scan --full bundle
-    # dirs (/root/.ic5790-forensic/...). No-op if the dirs were already
+    # dirs (/root/.cve-2026-41940-forensic/...). No-op if the dirs were already
     # created on a prior run.
     chmod 0700 "$qdir" "$qraw" "$qpre" "$qcache" 2>/dev/null || true
 

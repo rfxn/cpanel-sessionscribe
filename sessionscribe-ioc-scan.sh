@@ -41,7 +41,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.7"
+VERSION="2.8.8"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -347,7 +347,8 @@ LEDGER_DIR=""            # resolved at run time; --ledger-dir overrides
 
 # Forensic phase defaults — used when --full or --replay
 # is supplied; no-op in default --triage mode.
-DEFAULT_BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
+DEFAULT_BUNDLE_DIR_ROOT="/root/.cve-2026-41940-forensic"
+LEGACY_BUNDLE_DIR_ROOT="/root/.ic5790-forensic"
 DEFAULT_MAX_BUNDLE_MB=2048      # per-tarball cap (NOT bundle-wide)
 DEFAULT_FORENSIC_SINCE_DAYS=90  # forensic-mode default --since when unspecified
 # Bundle retention: keep N newest in $BUNDLE_DIR_ROOT; older pruned at
@@ -552,7 +553,9 @@ Bundle (active in full or replay mode):
                              hosts where du+tar would compete with the
                              encryptor for IO)
       --bundle-dir DIR       Override $BUNDLE_DIR_ROOT
-                             (default: /root/.ic5790-forensic)
+                             (default: /root/.cve-2026-41940-forensic;
+                             pre-rename hosts: /root/.ic5790-forensic
+                             auto-detected when present)
       --max-bundle-mb N      Per-tarball size cap in MB (0 = no cap;
                              default: 2048)
       --extra-logs DIR       Additional access-log directory to scan (e.g.
@@ -961,6 +964,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Pre-rename hosts wrote bundles under /root/.ic5790-forensic; if operator
+# did not override --bundle-dir and the legacy path exists while the new
+# one does not, prefer legacy so existing captures stay discoverable.
+if [[ "$BUNDLE_DIR_ROOT" == "$DEFAULT_BUNDLE_DIR_ROOT" ]] \
+   && [[ ! -d "$BUNDLE_DIR_ROOT" ]] && [[ -d "$LEGACY_BUNDLE_DIR_ROOT" ]]; then
+    BUNDLE_DIR_ROOT="$LEGACY_BUNDLE_DIR_ROOT"
+fi
+
 # Telemetry-cron management runs before any scan-mode validation or the
 # cPanel host gate. Cron management is its own operational mode — install
 # or remove the /etc/cron.d/ entry and exit. Operators don't need a live
@@ -1156,7 +1167,7 @@ CPANEL_WPSQ_BUILD=""
 PRIMARY_IP=""              # primary outbound IPv4 (ip-route-get probe)
 OS_PRETTY=""               # /etc/os-release PRETTY_NAME or redhat-release line
 : "${LP_UID:=}"            # hosting-provider UID; env-overridable, default ""
-INCIDENT_ID="IC-5790"      # incident ID stamped into forensic output
+INCIDENT_ID="CVE-2026-41940"      # incident ID stamped into forensic output
 PRIMARY_IP_J=""            # json_esc'd PRIMARY_IP
 LP_UID_J=""                # json_esc'd LP_UID
 OS_J=""                    # json_esc'd OS_PRETTY
@@ -1210,7 +1221,7 @@ DEF_UPCP_LATEST_TIME="" # epoch of last successful upcp run
 PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 
 # Bundle output paths (set by phase_bundle, read by phase_upload).
-BUNDLE_BDIR=""          # absolute path to /root/.ic5790-forensic/<TS>-<RUN_ID>
+BUNDLE_BDIR=""          # absolute path to $BUNDLE_DIR_ROOT/<TS>-<RUN_ID>
 
 # Per-section verdict tracking. SECTION_ORDER drives row sequence,
 # SECTION_LABEL maps area→display, SECTION_VERDICT[area] is worst-wins
@@ -2271,7 +2282,7 @@ pattern_g_deep_checks() {
                || "$mt_local" == "$PATTERN_G_FORGED_MTIME_WALL" ]]; then
                 say_ioc "PATTERN-G: $ak mtime matches known forged stamp \"$PATTERN_G_FORGED_MTIME_WALL\""
                 emit_signal offense fail pattern_g_forged_mtime \
-                    "$ak mtime matches IC-5790 backdate stamp" \
+                    "$ak mtime matches CVE-2026-41940 backdate stamp" \
                     file "$ak" forged_mtime_wall "$PATTERN_G_FORGED_MTIME_WALL" \
                     actual_mtime_utc "$mt_utc" actual_mtime_local "$mt_local"
                 if [[ -n "$ctime_pre" ]]; then
@@ -2578,14 +2589,15 @@ phase_defense() {
         fi
         if (( csf_clean )); then
             DEF_CSF_TIME=$(mtime_of /etc/csf/csf.conf)
-            # Prefer the .ic5790.bak file mtime if it exists (operator
-            # pre-mutation backup) since that records the original CSF
-            # mutation time.
-            if [[ -f /etc/csf/csf.conf.ic5790.bak ]]; then
+            # Operator pre-mutation backup (new name first; .ic5790.bak
+            # for back-compat) records the original CSF mutation time.
+            local _csf_bak="" _bak_name
+            for _bak_name in /etc/csf/csf.conf.cve-2026-41940.bak /etc/csf/csf.conf.ic5790.bak; do
+                [[ -f "$_bak_name" ]] && { _csf_bak="$_bak_name"; break; }
+            done
+            if [[ -n "$_csf_bak" ]]; then
                 local bak_time
-                bak_time=$(mtime_of /etc/csf/csf.conf.ic5790.bak)
-                # The .bak mtime is the pre-mutation original; the conf
-                # mtime is when we mutated. We want the mutation time.
+                bak_time=$(mtime_of "$_csf_bak")
                 say_def "CSF cpsrvd ports stripped; csf.conf mtime $(epoch_to_iso "$DEF_CSF_TIME") (bak from $(epoch_to_iso "$bak_time"))"
             else
                 say_def "CSF cpsrvd ports clean; csf.conf mtime $(epoch_to_iso "$DEF_CSF_TIME")"
@@ -3167,7 +3179,7 @@ render_kill_chain() {
         # Open box: title in top bar, plain bottom. Left bar only on
         # content lines avoids width-counting around FQDNs + combining chars.
         local W=72
-        local title="CVE-2026-41940 / IC-5790"
+        local title="CVE-2026-41940"
         # Title takes (3 left bar+space) + len(title) + 1 trailing space
         # visual columns; remainder fills with horizontal bars.
         local title_used=$(( 4 + ${#title} ))
@@ -4087,7 +4099,10 @@ phase_bundle() {
     local def_static=()
     [[ -d "$MITIGATE_BACKUP_ROOT" ]] && def_static+=("$MITIGATE_BACKUP_ROOT")
     [[ -f /etc/csf/csf.conf ]] && def_static+=(/etc/csf/csf.conf)
-    [[ -f /etc/csf/csf.conf.ic5790.bak ]] && def_static+=(/etc/csf/csf.conf.ic5790.bak)
+    local _csf_bak_name
+    for _csf_bak_name in /etc/csf/csf.conf.cve-2026-41940.bak /etc/csf/csf.conf.ic5790.bak; do
+        [[ -f "$_csf_bak_name" ]] && def_static+=("$_csf_bak_name")
+    done
     [[ -f /etc/apf/conf.apf ]] && def_static+=(/etc/apf/conf.apf)
     [[ -f "$MODSEC_USER_CONF" ]] && def_static+=("$MODSEC_USER_CONF")
     local def_list; def_list=$(mktemp /tmp/forensic-def.XXXXXX)
@@ -4166,7 +4181,7 @@ phase_bundle() {
     local h_seobot_meta="$bdir/pattern-h-seobot-metadata.txt"
     local h_seobot_count=0
     {
-        echo "# Pattern H seobot.php capture (IC-5790 dossier rev3)"
+        echo "# Pattern H seobot.php capture (CVE-2026-41940 dossier rev3)"
         echo "# captured_at=$TS_ISO host=$HOSTNAME_FQDN"
         echo
         local _dr_list_inner
@@ -4216,7 +4231,7 @@ phase_bundle() {
     if [[ -f "$PATTERN_I_BINARY" ]]; then
         local i_meta="$bdir/pattern-i-system-service-metadata.txt"
         {
-            echo "# Pattern I system-service binary capture (IC-5790 dossier rev3)"
+            echo "# Pattern I system-service binary capture (CVE-2026-41940 dossier rev3)"
             echo "# captured_at=$TS_ISO host=$HOSTNAME_FQDN"
             echo "# binary path: $PATTERN_I_BINARY"
             echo
@@ -5222,7 +5237,7 @@ check_attacker_ips() {
             # at-or-before ts_first to anchor as compromise; otherwise it's
             # T1 coincidence / recycled cpsess / recon — demote to advisory.
             local _gate_sev="strong" _gate_key="ioc_attacker_ip_2xx_on_cpsess" _gate_weight=8
-            local _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
+            local _gate_note="$h2xx_cpsess hit(s) from CVE-2026-41940 IPs returned 2xx on /cpsess<N>/ paths - real exploitation (CRITICAL)."
             if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
                || ! [[ "$ts_first" =~ ^[0-9]+$ ]] \
                || (( ts_first == 0 )) \
@@ -5231,9 +5246,9 @@ check_attacker_ips() {
                 _gate_key="ioc_attacker_ip_2xx_on_cpsess_pre_compromise"
                 _gate_weight=0
                 if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )); then
-                    _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths but NO CVE-2026-41940 CRLF access-chain detected on this host - 2xx-on-cpsess is second-order (token consumption) and requires CRLF as compromise anchor. Likely pre-compromise / shared-infra coincidence / pre-disclosure recon (REVIEW; does not escalate host_verdict)."
+                    _gate_note="$h2xx_cpsess hit(s) from CVE-2026-41940 IPs returned 2xx on /cpsess<N>/ paths but NO CVE-2026-41940 CRLF access-chain detected on this host - 2xx-on-cpsess is second-order (token consumption) and requires CRLF as compromise anchor. Likely pre-compromise / shared-infra coincidence / pre-disclosure recon (REVIEW; does not escalate host_verdict)."
                 else
-                    _gate_note="$h2xx_cpsess hit(s) from IC-5790 IPs returned 2xx on /cpsess<N>/ paths but ts_first ($ts_first) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity, mtime-pollution risk for cluster-onset analysis (REVIEW; does not escalate host_verdict)."
+                    _gate_note="$h2xx_cpsess hit(s) from CVE-2026-41940 IPs returned 2xx on /cpsess<N>/ paths but ts_first ($ts_first) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity, mtime-pollution risk for cluster-onset analysis (REVIEW; does not escalate host_verdict)."
                 fi
             else
                 # Strong-tier emit passed the gate; record first epoch as
@@ -5258,7 +5273,7 @@ check_attacker_ips() {
                  "hits_3xx" "$h3xx" "hits_4xx" "$h4xx" "hits_other" "$hother" \
                  "historical_drops" "$historical_drops" \
                  "ts_epoch_first" "$ts_first" \
-                 "note" "$h2xx_recon hit(s) from IC-5790 IPs returned 2xx on non-cpsess paths - reconnaissance only (REVIEW)."
+                 "note" "$h2xx_recon hit(s) from CVE-2026-41940 IPs returned 2xx on non-cpsess paths - reconnaissance only (REVIEW)."
         elif (( total > 0 )); then
             emit "logs" "ioc_attacker_ip_probes_only" "advisory" \
                  "ioc_attacker_ip_in_access_log_probes_only" 3 \
@@ -5266,7 +5281,7 @@ check_attacker_ips() {
                  "hits_other" "$hother" \
                  "historical_drops" "$historical_drops" \
                  "ts_epoch_first" "$ts_first" \
-                 "note" "$total hit(s) from IC-5790 IPs - all rejected (probing only, no successful response)."
+                 "note" "$total hit(s) from CVE-2026-41940 IPs - all rejected (probing only, no successful response)."
         fi
 
         local tag src ip st ts line trim
@@ -6508,7 +6523,7 @@ check_destruction_iocs() {
             emit "destruction" "ioc_pattern_a_encryptor" "strong" \
                  "ioc_pattern_a_encryptor_match" 10 \
                  "path" "$PATTERN_A_BINARY" "${META_KV[@]}" \
-                 "note" "$PATTERN_A_BINARY sha256 matches IC-5790 .sorry encryptor (CRITICAL)."
+                 "note" "$PATTERN_A_BINARY sha256 matches CVE-2026-41940 .sorry encryptor (CRITICAL)."
             ((hits++))
         else
             # Same path, different hash - variant or unrelated /root/sshd.
@@ -6788,7 +6803,7 @@ check_destruction_iocs() {
                  "ioc_pattern_c_nuclear_binary_match" 10 \
                  "path" "$nx" "sha256" "$nx_sha" \
                  "mtime_epoch" "${nx_mtime:-0}" \
-                 "note" "$nx sha256 matches IC-5790 nuclear.x86 sample (CRITICAL)."
+                 "note" "$nx sha256 matches CVE-2026-41940 nuclear.x86 sample (CRITICAL)."
             ((hits++))
         else
             emit "destruction" "ioc_pattern_c_binary_variant" "warning" \
@@ -7349,7 +7364,7 @@ check_destruction_iocs() {
                 kn = split(ENVIRON["KNOWN_DIMS"], kd_arr, ",")
                 for (i = 1; i <= kn; i++) if (kd_arr[i] != "") known[kd_arr[i]] = 1
                 ext_total = 0; ext_2xx = 0; int_2xx = 0; int_other = 0
-                # Split ext_2xx by terminal dim: _known = IC-5790 attacker
+                # Split ext_2xx by terminal dim: _known = CVE-2026-41940 attacker
                 # fingerprint set; _unknown = legitimate WHM Terminal
                 # sessions from real browsers. Without the split, wide-window
                 # admin sessions (24x165 etc) trip Pattern E STRONG.
@@ -7502,7 +7517,7 @@ check_destruction_iocs() {
             fi
             # Pattern E gate: requires CRLF anchor + 2xx-proximity, else demote to advisory.
             local _gate_sev="strong" _gate_key="ioc_pattern_e_websocket_shell_hits" _gate_weight=10
-            local _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
+            local _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at CVE-2026-41940 attacker dimensions (${PATTERN_E_KNOWN_DIMS//,/ }) - Pattern E interactive RCE (CRITICAL)."
             if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )) \
                || ! [[ "$ts_first_ext" =~ ^[0-9]+$ ]] \
                || (( ts_first_ext == 0 )) \
@@ -7511,9 +7526,9 @@ check_destruction_iocs() {
                 _gate_key="ioc_pattern_e_websocket_shell_hits_pre_compromise"
                 _gate_weight=0
                 if (( LOGS_CRLF_CHAIN_FIRST_EPOCH == 0 )); then
-                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions but NO CVE-2026-41940 CRLF access-chain detected on this host - Pattern E is post-RCE toolchain and requires CRLF anchor as compromise evidence. Likely shared-infra coincidence or pre-disclosure noise (REVIEW; does not escalate host_verdict)."
+                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at CVE-2026-41940 attacker dimensions but NO CVE-2026-41940 CRLF access-chain detected on this host - Pattern E is post-RCE toolchain and requires CRLF anchor as compromise evidence. Likely shared-infra coincidence or pre-disclosure noise (REVIEW; does not escalate host_verdict)."
                 else
-                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions but ts_first ($ts_first_ext) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity (REVIEW; does not escalate host_verdict)."
+                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at CVE-2026-41940 attacker dimensions but ts_first ($ts_first_ext) PREDATES first CRLF chain ($LOGS_CRLF_CHAIN_FIRST_EPOCH) - pre-compromise activity (REVIEW; does not escalate host_verdict)."
                 fi
             elif (( LOGS_2XX_CPSESS_FIRST_EPOCH > 0 )); then
                 # Skip proximity demotion when 2xx_on_cpsess didn't fire
@@ -7525,7 +7540,7 @@ check_destruction_iocs() {
                     _gate_sev="advisory"
                     _gate_key="ioc_pattern_e_websocket_shell_hits_orphan"
                     _gate_weight=0
-                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at IC-5790 attacker dimensions, post-CRLF, but ts_first ($ts_first_ext) is ${_e_abs}s away from successful token-use event ($LOGS_2XX_CPSESS_FIRST_EPOCH) - exceeds ${PATTERN_E_2XX_PROXIMITY_SEC}s operator-session window. Pattern E is exploitation-detached / orphan (REVIEW; does not escalate host_verdict)."
+                    _gate_note="$ext_2xx_known external IP(s) reached /cpsess*/websocket/Shell with 2xx at CVE-2026-41940 attacker dimensions, post-CRLF, but ts_first ($ts_first_ext) is ${_e_abs}s away from successful token-use event ($LOGS_2XX_CPSESS_FIRST_EPOCH) - exceeds ${PATTERN_E_2XX_PROXIMITY_SEC}s operator-session window. Pattern E is exploitation-detached / orphan (REVIEW; does not escalate host_verdict)."
                 fi
             fi
             emit "destruction" "ioc_pattern_e_websocket" "$_gate_sev" \
@@ -7553,7 +7568,7 @@ check_destruction_iocs() {
                  "unknown_dimensions" "${unknown_csv:-(none)}" \
                  "ts_epoch_first" "$ts_first_ext" \
                  "sample" "${unknown_dim_sample:0:200}" \
-                 "note" "$ext_2xx_unknown external IP(s) reached /cpsess*/websocket/Shell with 2xx, but ALL dimensions ($unknown_csv) are outside the IC-5790 attacker fingerprint - likely legitimate WHM Terminal admin sessions from non-canonical browsers. Confirm via the parallel ioc_pattern_e_unknown_dimension review (REVIEW)."
+                 "note" "$ext_2xx_unknown external IP(s) reached /cpsess*/websocket/Shell with 2xx, but ALL dimensions ($unknown_csv) are outside the CVE-2026-41940 attacker fingerprint - likely legitimate WHM Terminal admin sessions from non-canonical browsers. Confirm via the parallel ioc_pattern_e_unknown_dimension review (REVIEW)."
             ((hits++))
         elif (( ext_total > 0 )); then
             emit "destruction" "ioc_pattern_e_websocket" "advisory" \
