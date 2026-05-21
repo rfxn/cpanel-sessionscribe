@@ -10142,7 +10142,16 @@ resolve_replay_envelope() {
 # Main
 ###############################################################################
 
-HOSTNAME_FQDN=$(hostname -f 2>/dev/null || hostname || echo unknown)
+# Pre-banner heartbeat: hostname -f can block on bad DNS; the unqualified
+# hostname is /proc-only and always fast. Surface "we are alive" before any
+# slow probe so interactive operators don't think the script is hung.
+if (( ! QUIET )); then
+    printf '\n %ssessionscribe-ioc-scan%s v%s — starting on %s...\n' \
+        "$BOLD" "$NC" "$VERSION" \
+        "$(hostname 2>/dev/null || echo unknown)" >&2
+fi
+
+HOSTNAME_FQDN=$(timeout 2 hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)
 HOSTNAME_JSON=$(json_esc "$HOSTNAME_FQDN")    # pre-escaped, used by emit/write_json
 TS_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -10152,6 +10161,7 @@ TS_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 if (( ! REPLAY_MODE )); then
     banner
 
+    say_info "gathering host facts (cpanel build, software inventory, lmd state)..."
     local_init
     collect_host_meta
     collect_software_digest
