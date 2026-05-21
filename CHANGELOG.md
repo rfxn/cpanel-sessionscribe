@@ -15,6 +15,8 @@ versioned per affected component.
 - Forensic timeline no longer re-prints the verdict triplet — it appears once, in the verdict card.
 - The six per-phase headers in `--full` mode (defense, offense, reconcile, bundle, upload, telemetry) consolidated into a single footer line.
 - PATCHED hosts with no IOCs and clean verdicts now render just the verdict card and clean-check summary; `--verbose` restores full detail.
+- Startup is no longer silent: a short "starting on <host>..." line prints immediately, before any host-fact probes, so interactive operators (including `curl | bash` invocations) see the script is alive instead of a blinking cursor.
+- FQDN lookup capped at 2 seconds; hosts with broken or slow DNS no longer block startup for tens of seconds.
 
 ## ioc-scan v2.8.8 — 2026-05-15
 
