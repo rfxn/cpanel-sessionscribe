@@ -10,7 +10,7 @@ versioned per affected component.
 - Pattern M false positive: `/etc/sudoers.d/90-cloud-init-users` (cloud-init provisioning) and `/etc/sudoers.d/48-wp-toolkit` (cPanel WP Toolkit) now recognized as known-good drops; filename and content shape must both match.
 
 ### Changed
-- Triage output now leads with a compact verdict card (code state, host verdicts, IOC tally, top reasons, exit code); per-section detail follows below.
+- Summary block now opens with a compact verdict card (code state, host verdicts, IOC tally, top reasons, exit code) for at-a-glance triage; the rest of the summary (counters, reasons, advisories) follows below.
 - Detection sections with no findings collapse into a single one-line summary instead of printing empty headers; sections with findings render unchanged.
 - Forensic timeline no longer re-prints the verdict triplet — it appears once, in the verdict card.
 - The six per-phase headers in `--full` mode (defense, offense, reconcile, bundle, upload, telemetry) consolidated into a single footer line.
