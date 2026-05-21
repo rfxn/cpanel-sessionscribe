@@ -1223,7 +1223,9 @@ PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 BUNDLE_BDIR=""          # absolute path to $BUNDLE_DIR_ROOT/<TS>-<RUN_ID>
 BUNDLE_SIZE_FOOTER=""   # human size string for the housekeeping footer
 UPLOAD_STATUS=""        # ok|fail|skip — for housekeeping footer
+UPLOAD_NOTE=""          # short fail-reason for the housekeeping footer
 TELEMETRY_STATUS=""     # ok|fail|skip — for housekeeping footer
+TELEMETRY_NOTE=""       # short fail-reason for the housekeeping footer
 
 # Per-section verdict tracking. SECTION_ORDER drives row sequence,
 # SECTION_LABEL maps area→display, SECTION_VERDICT[area] is worst-wins
@@ -1920,8 +1922,8 @@ render_housekeeping_footer() {
     if (( DO_BUNDLE )) && [[ -n "$BUNDLE_BDIR" ]]; then
         parts+=("bundle: ${BUNDLE_SIZE_FOOTER:-?} → $BUNDLE_BDIR")
     fi
-    [[ -n "$UPLOAD_STATUS"    ]] && parts+=("upload: $UPLOAD_STATUS")
-    [[ -n "$TELEMETRY_STATUS" ]] && parts+=("telemetry: $TELEMETRY_STATUS")
+    [[ -n "$UPLOAD_STATUS"    ]] && parts+=("upload: $UPLOAD_STATUS${UPLOAD_NOTE:+ ($UPLOAD_NOTE)}")
+    [[ -n "$TELEMETRY_STATUS" ]] && parts+=("telemetry: $TELEMETRY_STATUS${TELEMETRY_NOTE:+ ($TELEMETRY_NOTE)}")
     parts+=("defense: $def_state")
     parts+=("offense: ${#OFFENSE_EVENTS[@]} events")
     parts+=("reconcile: $reconcile_state")
@@ -4333,26 +4335,26 @@ phase_bundle() {
 phase_upload() {
     (( DO_UPLOAD )) || return 0
     if (( ! DO_BUNDLE )); then
-        UPLOAD_STATUS="skip"
+        UPLOAD_STATUS="skip"; UPLOAD_NOTE="no bundle"
         say_warn "--no-bundle precludes upload (nothing was captured)"
         emit_signal upload warn upload_no_bundle "--no-bundle was set; skipping upload"
         return
     fi
     if [[ -z "${BUNDLE_BDIR:-}" || ! -d "$BUNDLE_BDIR" ]]; then
-        UPLOAD_STATUS="skip"
+        UPLOAD_STATUS="skip"; UPLOAD_NOTE="no bundle dir"
         say_warn "no bundle directory present; skipping upload"
         emit_signal upload warn upload_no_bundle_dir "BUNDLE_BDIR unset or missing"
         return
     fi
     if ! have_cmd curl; then
-        UPLOAD_STATUS="fail"
+        UPLOAD_STATUS="fail"; UPLOAD_NOTE="curl missing"
         say_fail "curl(1) not in PATH; cannot upload"
         emit_signal upload fail upload_no_curl "curl is required for --upload"
         return
     fi
     if [[ -z "$INTAKE_TOKEN" ]]; then
         say_fail "no upload token resolved (this should not happen)"
-        UPLOAD_STATUS="fail"
+        UPLOAD_STATUS="fail"; UPLOAD_NOTE="no token"
         emit_signal upload fail upload_no_token "INTAKE_TOKEN empty"
         return
     fi
@@ -4362,7 +4364,7 @@ phase_upload() {
     # outer is the primary compression layer (KB-scale upload).
     local outer="${BUNDLE_BDIR}.upload.tgz"
     if ! tar -C "$BUNDLE_DIR_ROOT" -czf "$outer" "$(basename "$BUNDLE_BDIR")" 2>/dev/null; then
-        UPLOAD_STATUS="fail"
+        UPLOAD_STATUS="fail"; UPLOAD_NOTE="tar failed"
         say_fail "outer tarball build failed: $outer"
         emit_signal upload fail upload_tar_failed "tar -czf $outer"
         return
@@ -4389,7 +4391,7 @@ phase_upload() {
            | grep -v '^$' | head -c 2048)
 
     if (( rc != 0 )) || [[ "$http_code" != "201" ]]; then
-        UPLOAD_STATUS="fail"
+        UPLOAD_STATUS="fail"; UPLOAD_NOTE="curl_rc=$rc http=${http_code:-?}"
         say_fail "upload failed (curl_rc=$rc http=${http_code:-?})"
         [[ -n "$body" ]] && say_fail "  response: $body"
         emit_signal upload fail upload_failed \
@@ -4432,7 +4434,7 @@ phase_telemetry_post() {
         env_src="$ENVELOPE_PATH"
     fi
     if [[ -z "$env_src" ]]; then
-        TELEMETRY_STATUS="skip"
+        TELEMETRY_STATUS="skip"; TELEMETRY_NOTE="no envelope"
         say_warn "no envelope on disk to POST (BUNDLE_BDIR + ENVELOPE_PATH both empty)"
         # warn (not fail): telemetry-internal errors are operational, not
         # security findings. emit_signal "fail" maps to severity=strong
@@ -4448,12 +4450,14 @@ phase_telemetry_post() {
     env_size=$(stat -c %s "$env_src" 2>/dev/null)
     env_size="${env_size:-0}"
     if (( env_size == 0 )); then
+        TELEMETRY_STATUS="skip"; TELEMETRY_NOTE="envelope empty"
         say_warn "envelope is empty: $env_src"
         emit_signal telemetry warn telemetry_envelope_empty \
             "envelope file is zero bytes" path "$env_src"
         return
     fi
     if (( env_size > TELEMETRY_MAX_BYTES )); then
+        TELEMETRY_STATUS="skip"; TELEMETRY_NOTE="envelope too large ($env_size > $TELEMETRY_MAX_BYTES)"
         say_warn "envelope size ${env_size} > cap ${TELEMETRY_MAX_BYTES}; skipping POST"
         emit_signal telemetry warn telemetry_envelope_too_large \
             "envelope_size=${env_size} cap=${TELEMETRY_MAX_BYTES}" \
@@ -4495,6 +4499,7 @@ phase_telemetry_post() {
     if [[ -z "$_xport" ]]; then
         local _need_msg="curl, wget, or bash + openssl"
         (( _is_https )) && _need_msg="curl, wget(+ssl), or bash + openssl s_client"
+        TELEMETRY_STATUS="fail"; TELEMETRY_NOTE="no transport"
         say_warn "no HTTP transport available (need: $_need_msg)"
         emit_signal telemetry warn telemetry_no_transport \
             "need: $_need_msg" \
@@ -4693,7 +4698,7 @@ phase_telemetry_post() {
 
     t_end=$(date -u +%s)
     duration_ms=$(( (t_end - t_start) * 1000 ))
-    TELEMETRY_STATUS="fail"
+    TELEMETRY_STATUS="fail"; TELEMETRY_NOTE="rc=$rc http=${http_code:-?} attempts=$max_attempts"
     say_fail "POST failed after $max_attempts attempts (rc=$rc http=${http_code:-?})"
     [[ -n "$body" ]] && say_fail "  response: $(printf '%s' "$body" | head -c 256)"
     [[ -n "$last_err" ]] && say_fail "  err: $(printf '%s' "$last_err" | head -c 256)"
@@ -9673,9 +9678,14 @@ render_verdict_card() {
         CLEAN)       user_color="$GREEN" ;;
     esac
     local ioc_total=$(( IOC_CRITICAL + IOC_REVIEW ))
-    local window="${SINCE_DAYS:-all}"
-    printf '\n%ssessionscribe-ioc-scan v%s%s · %s · %s · %sd window\n\n' \
-        "$BOLD" "$VERSION" "$NC" "$HOSTNAME_FQDN" "$TS_ISO" "$window" >&2
+    local window_label
+    if [[ -n "${SINCE_DAYS:-}" ]]; then
+        window_label="${SINCE_DAYS}d window"
+    else
+        window_label="all-time window"
+    fi
+    printf '\n%ssessionscribe-ioc-scan v%s%s · %s · %s · %s\n\n' \
+        "$BOLD" "$VERSION" "$NC" "$HOSTNAME_FQDN" "$TS_ISO" "$window_label" >&2
     printf '  %s| %-11s | %-11s | %-11s | %-8s | %-4s |%s\n' \
         "$BOLD" "code" "host (root)" "host (user)" "IOC hits" "exit" "$NC" >&2
     printf '  |-------------|-------------|-------------|----------|------|\n' >&2
