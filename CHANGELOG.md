@@ -4,6 +4,18 @@ All notable changes to sessionscribe-mitigate.sh and the surrounding
 toolkit. Format follows [Keep a Changelog](https://keepachangelog.com/),
 versioned per affected component.
 
+## ioc-scan v2.9.0 — 2026-05-21
+
+### Fixed
+- Pattern M false positive: `/etc/sudoers.d/90-cloud-init-users` (cloud-init provisioning) and `/etc/sudoers.d/48-wp-toolkit` (cPanel WP Toolkit) now recognized as known-good drops; filename and content shape must both match.
+
+### Changed
+- Triage output now leads with a compact verdict card (code state, host verdicts, IOC tally, top reasons, exit code); per-section detail follows below.
+- Detection sections with no findings collapse into a single one-line summary instead of printing empty headers; sections with findings render unchanged.
+- Forensic timeline no longer re-prints the verdict triplet — it appears once, in the verdict card.
+- The six per-phase headers in `--full` mode (defense, offense, reconcile, bundle, upload, telemetry) consolidated into a single footer line.
+- PATCHED hosts with no IOCs and clean verdicts now render just the verdict card and clean-check summary; `--verbose` restores full detail.
+
 ## ioc-scan v2.8.8 — 2026-05-15
 
 ### Changed

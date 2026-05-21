@@ -41,7 +41,7 @@ set -u
 # Constants - vendor patch cutoffs and signal definitions
 ###############################################################################
 
-VERSION="2.8.8"
+VERSION="2.9.0"
 
 # Vendor patched-build cutoffs per tier (cPanel KB 40073787579671). WP Squared
 # tracked separately in PATCHED_BUILD_WPSQUARED below.
@@ -323,6 +323,7 @@ JSONL=0
 CSV=0
 QUIET=0
 VERBOSE=0
+HK_SILENT=0
 NO_COLOR=0
 NO_LOGS=0
 NO_SESSIONS=0
@@ -1220,6 +1221,9 @@ PATCH_STATE="UNKNOWN"   # PATCHED|UNPATCHED|UNPATCHABLE|UNKNOWN
 
 # Bundle output paths (set by phase_bundle, read by phase_upload).
 BUNDLE_BDIR=""          # absolute path to $BUNDLE_DIR_ROOT/<TS>-<RUN_ID>
+BUNDLE_SIZE_FOOTER=""   # human size string for the housekeeping footer
+UPLOAD_STATUS=""        # ok|fail|skip — for housekeeping footer
+TELEMETRY_STATUS=""     # ok|fail|skip — for housekeeping footer
 
 # Per-section verdict tracking. SECTION_ORDER drives row sequence,
 # SECTION_LABEL maps area→display, SECTION_VERDICT[area] is worst-wins
@@ -1743,8 +1747,18 @@ emit() {
 # Map (severity, key) → (icon, color) for human-readable rows.
 # "good info" keys (patched_per_build, pattern_fixed, ...) get a check.
 print_signal_human() {
-    (( QUIET )) && return
+    (( QUIET || HK_SILENT )) && return
     local area="$1" id="$2" severity="$3" key="$4"; shift 4
+    if [[ "$severity" == "info" ]]; then
+        case "$key" in
+            no_destruction_iocs|no_session_iocs|no_ioc_hits| \
+            posture_csf_active|patched_per_build| \
+            ancillary_bug_fixed|patch_marker_present| \
+            acl_machinery_present_informational)
+                return ;;
+        esac
+    fi
+    hdr_flush
     local tag color
     case "$severity" in
         live_compromise) tag="[LIVE]"; color="${BOLD}${RED}" ;;
@@ -1753,14 +1767,8 @@ print_signal_human() {
         warning)  tag="[WARN]";     color="$YELLOW" ;;
         advisory) tag="[ADVISORY]"; color="$CYAN"   ;;
         error)    tag="[ERR]";      color="$RED"    ;;
-        info)
-            case "$key" in
-                patched_per_build|ancillary_bug_fixed|patch_marker_present|acl_machinery_present_informational|no_ioc_hits|no_session_iocs|posture_csf_active)
-                    tag="[OK]"; color="$GREEN" ;;
-                *)  tag="[..]"; color="$DIM"   ;;
-            esac
-            ;;
-        *) tag="[..]"; color="$DIM" ;;
+        info)     tag="[..]";       color="$DIM"    ;;
+        *)        tag="[..]";       color="$DIM"    ;;
     esac
 
     # WHERE / WHO / WHAT sub-lines, all optional. Full kv lands in JSONL.
@@ -1850,13 +1858,79 @@ print_signal_human() {
 # (visually distinct from detection); all output → stderr.
 
 hdr_section()   { (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' "$C_BLD" "$1" "$C_NC" "$C_DIM" "$2" "$C_NC" >&2; }
-say_pass()      { (( QUIET )) || printf '  %s[OK]%s %s\n'        "$C_GRN" "$C_NC" "$*" >&2; }
-say_info()      { (( QUIET )) || printf '  %s[INFO]%s %s\n'      "$C_DIM" "$C_NC" "$*" >&2; }
-say_warn()      { (( QUIET )) || printf '  %s[WARN]%s %s\n'      "$C_YEL" "$C_NC" "$*" >&2; }
-say_fail()      { (( QUIET )) || printf '  %s[FAIL]%s %s\n'      "$C_RED" "$C_NC" "$*" >&2; }
-say_def()       { (( QUIET )) || printf '  %s[DEF-OK]%s %s\n'    "$C_GRN" "$C_NC" "$*" >&2; }
-say_def_miss()  { (( QUIET )) || printf '  %s[DEF-MISS]%s %s\n'  "$C_YEL" "$C_NC" "$*" >&2; }
-say_ioc()       { (( QUIET )) || printf '  %s[IOC]%s %s\n'       "$C_RED" "$C_NC" "$*" >&2; }
+
+# Deferred section header. check_* calls hdr_defer "name" "detail" instead of
+# hdr_section. hdr_flush emits the pending header on first body line. If a
+# check finishes without flushing, hdr_release pushes the section onto
+# OK_SECTIONS for the consolidated clean-strip line.
+HDR_PENDING_NAME=""
+HDR_PENDING_DETAIL=""
+HDR_PENDING_DISPLAY=""
+OK_SECTIONS=()
+hdr_defer()   { HDR_PENDING_NAME="$1"; HDR_PENDING_DETAIL="$2"; HDR_PENDING_DISPLAY="${3:-$1}"; }
+hdr_flush()   {
+    [[ -z "$HDR_PENDING_NAME" ]] && return
+    (( QUIET )) || printf '\n%s== %s ==%s %s%s%s\n' \
+        "$C_BLD" "$HDR_PENDING_NAME" "$C_NC" "$C_DIM" "$HDR_PENDING_DETAIL" "$C_NC" >&2
+    HDR_PENDING_NAME=""; HDR_PENDING_DETAIL=""; HDR_PENDING_DISPLAY=""
+}
+hdr_release() {
+    [[ -z "$HDR_PENDING_NAME" ]] && return
+    OK_SECTIONS+=("$HDR_PENDING_DISPLAY")
+    HDR_PENDING_NAME=""; HDR_PENDING_DETAIL=""; HDR_PENDING_DISPLAY=""
+}
+say_pass()      { (( QUIET || HK_SILENT )) || printf '  %s[OK]%s %s\n'        "$C_GRN" "$C_NC" "$*" >&2; }
+say_info()      { (( QUIET || HK_SILENT )) || printf '  %s[INFO]%s %s\n'      "$C_DIM" "$C_NC" "$*" >&2; }
+say_warn()      { (( QUIET || HK_SILENT )) || printf '  %s[WARN]%s %s\n'      "$C_YEL" "$C_NC" "$*" >&2; }
+say_fail()      { (( QUIET || HK_SILENT )) || printf '  %s[FAIL]%s %s\n'      "$C_RED" "$C_NC" "$*" >&2; }
+say_def()       { (( QUIET || HK_SILENT )) || printf '  %s[DEF-OK]%s %s\n'    "$C_GRN" "$C_NC" "$*" >&2; }
+say_def_miss()  { (( QUIET || HK_SILENT )) || printf '  %s[DEF-MISS]%s %s\n'  "$C_YEL" "$C_NC" "$*" >&2; }
+say_ioc()       { (( QUIET || HK_SILENT )) || printf '  %s[IOC]%s %s\n'       "$C_RED" "$C_NC" "$*" >&2; }
+
+render_ok_sections() {
+    (( QUIET )) && return
+    (( ${#OK_SECTIONS[@]} == 0 )) && return
+    local i out=""
+    for (( i=0; i<${#OK_SECTIONS[@]}; i++ )); do
+        out+="${out:+ · }${OK_SECTIONS[$i]}"
+    done
+    printf '\n  %s%s %s%s    %s(all clean)%s\n' \
+        "$C_GRN" "$GLYPH_OK" "$out" "$C_NC" "$C_DIM" "$C_NC" >&2
+}
+
+render_housekeeping_footer() {
+    (( QUIET )) && return
+    local def_state="none" def_up=0
+    [[ -n "$DEF_PATCH_TIME"    ]] && def_up=$((def_up+1))
+    [[ -n "$DEF_MODSEC_TIME"   ]] && def_up=$((def_up+1))
+    [[ -n "$DEF_CSF_TIME"      ]] && def_up=$((def_up+1))
+    [[ -n "$DEF_MITIGATE_LAST" ]] && def_up=$((def_up+1))
+    case "$def_up" in
+        0) def_state="none" ;;
+        4) def_state="ok"   ;;
+        *) def_state="partial" ;;
+    esac
+    local reconcile_state="clean"
+    if (( ${#OFFENSE_EVENTS[@]} > 0 )); then
+        if (( N_PRE > 0 )); then reconcile_state="pre-defense"
+        else                     reconcile_state="post-defense"
+        fi
+    fi
+    local parts=()
+    if (( DO_BUNDLE )) && [[ -n "$BUNDLE_BDIR" ]]; then
+        parts+=("bundle: ${BUNDLE_SIZE_FOOTER:-?} → $BUNDLE_BDIR")
+    fi
+    [[ -n "$UPLOAD_STATUS"    ]] && parts+=("upload: $UPLOAD_STATUS")
+    [[ -n "$TELEMETRY_STATUS" ]] && parts+=("telemetry: $TELEMETRY_STATUS")
+    parts+=("defense: $def_state")
+    parts+=("offense: ${#OFFENSE_EVENTS[@]} events")
+    parts+=("reconcile: $reconcile_state")
+    local i out=""
+    for (( i=0; i<${#parts[@]}; i++ )); do
+        out+="${out:+   }${parts[$i]}"
+    done
+    printf '\n%s%s%s\n' "$C_DIM" "$out" "$C_NC" >&2
+}
 
 ###############################################################################
 # Forensic signal emitter — wraps emit(). pass/info → info(0), warn →
@@ -2432,8 +2506,6 @@ suspect_ip_correlation() {
 }
 
 phase_defense() {
-    hdr_section "defense" "extracting timestamps for every mitigation layer"
-
     PATCH_STATE="UNKNOWN"
     if [[ "$CPANEL_NORM" == "unknown" || -z "$CPANEL_NORM" ]]; then
         say_def_miss "cpanel binary missing or build unparseable - patch defense UNKNOWN"
@@ -2693,7 +2765,6 @@ phase_defense() {
 }
 
 phase_offense() {
-    hdr_section "offense" "ingesting IOCs from canonical detector + deep checks"
     read_iocs_from_envelope "${ENVELOPE_PATH:-}" || true
     pattern_g_deep_checks
     suspect_ip_correlation
@@ -2707,8 +2778,6 @@ phase_offense() {
 ###############################################################################
 
 phase_reconcile() {
-    hdr_section "reconcile" "comparing defense activation vs compromise timestamps"
-
     if (( ${#OFFENSE_EVENTS[@]} == 0 )); then
         say_pass "no compromise indicators - nothing to reconcile"
         emit_signal reconcile pass clean "no IOCs to reconcile"
@@ -3200,30 +3269,6 @@ render_kill_chain() {
         local full_bar="" _bi2
         for (( _bi2=0; _bi2<W; _bi2++ )); do full_bar+="$GLYPH_BOX_H"; done
 
-        # Verdict color + display text. Compound view of the two-axis
-        # verdict (root-trust + user-account); worst-of for the headline.
-        local hv_root="${ENV_HOST_ROOT_VERDICT:-}"
-        local hv_user="${ENV_HOST_USER_VERDICT:-}"
-        local hv=""
-        if [[ "$hv_root" == "COMPROMISED" || "$hv_user" == "COMPROMISED" ]]; then
-            hv="COMPROMISED"
-        elif [[ "$hv_root" == "SUSPICIOUS" || "$hv_user" == "SUSPICIOUS" ]]; then
-            hv="SUSPICIOUS"
-        elif [[ -n "$hv_root" || -n "$hv_user" ]]; then
-            hv="CLEAN"
-        fi
-        local hv_text="$hv"
-        if [[ -n "$hv" ]]; then
-            hv_text="$hv (root=$hv_root, user=$hv_user)"
-        fi
-        local hv_color="$C_GRN"
-        case "$hv" in
-            COMPROMISED) hv_color="$C_RED" ;;
-            SUSPICIOUS)  hv_color="$C_YEL" ;;
-            CLEAN)       hv_color="$C_GRN" ;;
-            "")          hv_color="$C_DIM"; hv_text="(no envelope - re-run from ioc-scan for verdict)" ;;
-        esac
-
         # Defense layer badges - inline glyphs (✓ up / ✗ absent / ⚠ dirty).
         local def_patch="$GLYPH_BAD absent" def_modsec="$GLYPH_BAD absent"
         local def_csf="$GLYPH_WARN dirty"   def_mitigate="$GLYPH_BAD never"
@@ -3231,11 +3276,6 @@ render_kill_chain() {
         [[ -n "$DEF_MODSEC_TIME"    ]] && def_modsec="$GLYPH_OK up"
         [[ -n "$DEF_CSF_TIME"       ]] && def_csf="$GLYPH_OK clean"
         [[ -n "$DEF_MITIGATE_LAST"  ]] && def_mitigate="$GLYPH_OK ran"
-
-        # Compose verdict + score + ioc-scan version into one column line.
-        local verdict_line="$hv_text"
-        [[ -n "$ENV_SCORE" ]]            && verdict_line+="   score $ENV_SCORE"
-        [[ -n "$ENV_IOC_TOOL_VERSION" ]] && verdict_line+="   ioc-scan v$ENV_IOC_TOOL_VERSION"
 
         printf '\n%s%s%s%s %s%s%s %s%s%s\n' \
             "$C_BLD" "$GLYPH_BOX_TL" "$GLYPH_BOX_H" "$GLYPH_BOX_H" \
@@ -3251,7 +3291,6 @@ render_kill_chain() {
             printf '%s%s%s host         %s%s%s\n'      "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$C_BLD" "$_kc_host" "$C_NC"
         fi
         printf '%s%s%s cpanel       %s   os %s\n'    "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "${CPANEL_NORM:-unknown}" "${OS_PRETTY:-unknown}"
-        printf '%s%s%s verdict      %s%s%s\n'        "$C_BLD" "$GLYPH_BOX_V" "$C_NC" "$hv_color" "$verdict_line" "$C_NC"
         local _pcount=${#KC_PERSIST_ROWS[@]}
         local _dcount=${#KC_DESTRUCT_ROWS[@]}
         if (( _pcount > 0 || _dcount > 0 )); then
@@ -3399,16 +3438,8 @@ render_kill_chain() {
         fi
 
         # ── HEADLINE ────────────────────────────────────────────────────
-        # Verdict + defense lag + attacker IPs. The plain-IP line is the
-        # copy-paste artifact - space-separated, no decorations, ready for
-        # `csf -d`, ipset, or abuse-report pasting.
+        # Defense lag + attacker IPs. Verdict triplet is in the top card.
         printf '\n  %s%s %sHEADLINE%s\n' "$C_DIM" "$GLYPH_BOX_V" "$C_BLD" "$C_NC"
-
-        # Verdict line.
-        printf '  %s%s   verdict       %s%s%s' \
-            "$C_DIM" "$GLYPH_BOX_V" "$hv_color" "${hv:-(no envelope)}" "$C_NC"
-        [[ -n "$ENV_SCORE" ]] && printf '  (score %s)' "$ENV_SCORE"
-        printf '\n'
 
         # Defense lag line. Computed from min(offense epoch) vs max(defense
         # epoch) - matches phase_reconcile's calculation.
@@ -3829,12 +3860,6 @@ prune_old_bundles() {
 }
 
 phase_bundle() {
-    if (( TELEMETRY_MODE )); then
-        hdr_section "bundle" "lite mode (envelope + kill-chain + KB snapshots; no tarballs)"
-    else
-        hdr_section "bundle" "capturing raw artifacts (window=${SINCE_DAYS:-all}d, cap=${MAX_BUNDLE_MB}MB)"
-    fi
-
     if (( ! DO_BUNDLE )); then
         say_info "--no-bundle: skipping artifact capture"
         return
@@ -4300,35 +4325,34 @@ phase_bundle() {
     # Final sweep: signal what we built.
     local total_size
     total_size=$(du -sh "$bdir" 2>/dev/null | awk '{print $1}')
+    BUNDLE_SIZE_FOOTER="$total_size"
     say_info "bundle complete: $bdir ($total_size)"
     emit_signal bundle info bundle_complete "dir=$bdir size=$total_size" dir "$bdir" size "$total_size"
 }
 
 phase_upload() {
     (( DO_UPLOAD )) || return 0
-    if (( TELEMETRY_MODE )); then
-        hdr_section "upload" "submitting LITE bundle to $INTAKE_URL (telemetry mode; no heavy tarballs)"
-    else
-        hdr_section "upload" "submitting bundle to $INTAKE_URL"
-    fi
-
     if (( ! DO_BUNDLE )); then
+        UPLOAD_STATUS="skip"
         say_warn "--no-bundle precludes upload (nothing was captured)"
         emit_signal upload warn upload_no_bundle "--no-bundle was set; skipping upload"
         return
     fi
     if [[ -z "${BUNDLE_BDIR:-}" || ! -d "$BUNDLE_BDIR" ]]; then
+        UPLOAD_STATUS="skip"
         say_warn "no bundle directory present; skipping upload"
         emit_signal upload warn upload_no_bundle_dir "BUNDLE_BDIR unset or missing"
         return
     fi
     if ! have_cmd curl; then
+        UPLOAD_STATUS="fail"
         say_fail "curl(1) not in PATH; cannot upload"
         emit_signal upload fail upload_no_curl "curl is required for --upload"
         return
     fi
     if [[ -z "$INTAKE_TOKEN" ]]; then
         say_fail "no upload token resolved (this should not happen)"
+        UPLOAD_STATUS="fail"
         emit_signal upload fail upload_no_token "INTAKE_TOKEN empty"
         return
     fi
@@ -4338,6 +4362,7 @@ phase_upload() {
     # outer is the primary compression layer (KB-scale upload).
     local outer="${BUNDLE_BDIR}.upload.tgz"
     if ! tar -C "$BUNDLE_DIR_ROOT" -czf "$outer" "$(basename "$BUNDLE_BDIR")" 2>/dev/null; then
+        UPLOAD_STATUS="fail"
         say_fail "outer tarball build failed: $outer"
         emit_signal upload fail upload_tar_failed "tar -czf $outer"
         return
@@ -4364,6 +4389,7 @@ phase_upload() {
            | grep -v '^$' | head -c 2048)
 
     if (( rc != 0 )) || [[ "$http_code" != "201" ]]; then
+        UPLOAD_STATUS="fail"
         say_fail "upload failed (curl_rc=$rc http=${http_code:-?})"
         [[ -n "$body" ]] && say_fail "  response: $body"
         emit_signal upload fail upload_failed \
@@ -4374,6 +4400,7 @@ phase_upload() {
         return
     fi
 
+    UPLOAD_STATUS="ok"
     say_pass "uploaded: http=201"
     [[ -n "$body" ]] && say_info "  $body"
     emit_signal upload info upload_complete \
@@ -4393,7 +4420,6 @@ phase_upload() {
 phase_telemetry_post() {
     (( TELEMETRY_MODE )) || return 0
     [[ -z "$TELEMETRY_URL" ]] && return 0
-    hdr_section "telemetry" "POST envelope to $TELEMETRY_URL"
 
     # Locate envelope. Bundle copy is preferred (it lives next to the
     # kill-chain primitives the operator may also want to ship out-of-band)
@@ -4406,6 +4432,7 @@ phase_telemetry_post() {
         env_src="$ENVELOPE_PATH"
     fi
     if [[ -z "$env_src" ]]; then
+        TELEMETRY_STATUS="skip"
         say_warn "no envelope on disk to POST (BUNDLE_BDIR + ENVELOPE_PATH both empty)"
         # warn (not fail): telemetry-internal errors are operational, not
         # security findings. emit_signal "fail" maps to severity=strong
@@ -4645,6 +4672,7 @@ phase_telemetry_post() {
         if (( rc == 0 )) && [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
             t_end=$(date -u +%s)
             duration_ms=$(( (t_end - t_start) * 1000 ))
+            TELEMETRY_STATUS="ok"
             say_pass "POST ok: http=$http_code attempt=$attempt duration=${duration_ms}ms"
             emit_signal telemetry info telemetry_post_complete \
                 "http=$http_code attempt=$attempt duration_ms=$duration_ms transport=$_xport" \
@@ -4665,6 +4693,7 @@ phase_telemetry_post() {
 
     t_end=$(date -u +%s)
     duration_ms=$(( (t_end - t_start) * 1000 ))
+    TELEMETRY_STATUS="fail"
     say_fail "POST failed after $max_attempts attempts (rc=$rc http=${http_code:-?})"
     [[ -n "$body" ]] && say_fail "  response: $(printf '%s' "$body" | head -c 256)"
     [[ -n "$last_err" ]] && say_fail "  err: $(printf '%s' "$last_err" | head -c 256)"
@@ -4860,7 +4889,7 @@ STATIC_EXPLAINS=(
 )
 
 check_static() {
-    hdr_section "patterns" "static config-file patterns (ancillary; not CVE-driver)"
+    hdr_defer "patterns" "static config-file patterns (ancillary; not CVE-driver)" "patterns"
     local i id kind file vuln_pat fixed_pat explain fpath vhit fhit
     for i in "${!STATIC_IDS[@]}"; do
         id="${STATIC_IDS[$i]}"
@@ -4912,11 +4941,12 @@ check_static() {
                 ;;
         esac
     done
+    hdr_release
 }
 
 # ---- cpsrvd binary --------------------------------------------------------
 check_binary() {
-    hdr_section "cpsrvd" "cpsrvd binary patch markers"
+    hdr_defer "cpsrvd" "cpsrvd binary patch markers" "cpsrvd"
     if [[ -z "$CPSRVD_BIN" || ! -f "$CPSRVD_BIN" ]]; then
         emit "binary" "cpsrvd_locate" "error" "cpsrvd_not_found" 0 \
              "note" "could not locate cpsrvd under ${CPANEL_ROOT}"
@@ -4953,16 +4983,18 @@ check_binary() {
              "acl_count" "$acl_count" "token_count" "$token_count" \
              "note" "${acl_count} ACL + ${token_count} token-reader strings - informational only; on 134+ both vuln and patched binaries carry these. Defer to version-string verdict."
     fi
+    hdr_release
 }
 
 # ---- IOC log scan ---------------------------------------------------------
 check_logs() {
     (( NO_LOGS )) && return
-    hdr_section "iocscan" "access_log scan over ${SINCE_DAYS:-all}d window"
+    hdr_defer "iocscan" "access_log scan over ${SINCE_DAYS:-all}d window" "iocscan"
     local logdir=/usr/local/cpanel/logs
     if [[ ! -d "$logdir" ]]; then
         emit "logs" "logs_dir" "info" "no_log_dir" 0 \
              "note" "no $logdir - skipping"
+        hdr_release
         return
     fi
     local total=0 hits_2xx=0 unique_ips=0 ts_first=""
@@ -5061,6 +5093,7 @@ check_logs() {
     # anchor used by 2xx_on_cpsess and Pattern E pre-compromise gates.
     check_crlf_access_primitive "$logdir"
     check_attacker_ips "$logdir"
+    hdr_release
 }
 
 check_attacker_ips() {
@@ -5586,7 +5619,7 @@ check_token_used() {
 # Sessions with nxesec_canary_<nonce>=1 are PROBE_ARTIFACT and skipped.
 check_sessions() {
     (( NO_SESSIONS )) && return
-    hdr_section "sessions" "session-store IOC ladder"
+    hdr_defer "sessions" "session-store IOC ladder" "sessions"
     # Snapshot-aware path roots. Live mode prefix is empty.
     local _root_prefix="${ROOT_OVERRIDE:-}"
     local d="${_root_prefix}/var/cpanel/sessions"
@@ -5597,6 +5630,7 @@ check_sessions() {
     if [[ ! -d "$d" ]]; then
         emit "sessions" "sess_dir" "info" "no_session_dir" 0 "note" "no $d"
         check_quarantined_sessions
+        hdr_release
         return
     fi
     local raw_dir="$d/raw" preauth_dir="$d/preauth"
@@ -5892,6 +5926,7 @@ check_sessions() {
              "scanned" "$scanned" "probe_artifacts" "$probe_artifacts" \
              "note" "no IOCs or anomalous-shape sessions found"
     fi
+    hdr_release
 }
 
 # Direct call (not subshell): emit() mutates SIGNALS[].
@@ -6501,7 +6536,7 @@ check_quarantined_artifacts() {
 check_destruction_iocs() {
     (( NO_DESTRUCTION_IOCS )) && return
     if [[ -n "$ROOT_OVERRIDE" ]]; then
-        hdr_section "destruct" "destruction IOC scan (Pattern J only - snapshot mode)"
+        hdr_defer "destruct" "destruction IOC scan (Pattern J only - snapshot mode)" "destruct"
         emit "destruction" "destruction_scan" "info" "snapshot_mode_partial" 0 \
              "note" "Patterns A-I skip snapshot/--root mode (no host filesystem). Pattern J (udev/systemd persistence) walks the snapshot tree with degraded confidence (no live rpmdb)."
         # Pattern J is snapshot-aware - the trees it walks (udev rules + systemd
@@ -6512,9 +6547,10 @@ check_destruction_iocs() {
         # Snapshot-safe: hashes.txt and ssh-pruned-keys.log are static
         # evidence files, meaningful without a live filesystem.
         check_quarantined_artifacts
+        hdr_release
         return
     fi
-    hdr_section "destruct" "destruction IOC scan (Patterns A-L + runtime)"
+    hdr_defer "destruct" "destruction IOC scan (Patterns A-L + runtime)" "destruct"
     local hits=0
 
     # History files for Pattern F harvester + Pattern H markers (bash/
@@ -7902,7 +7938,7 @@ check_destruction_iocs() {
             local _m_sd_key=ioc_pattern_m_sudoers_nopasswd_review
             local _m_sd_note="Sudoers drop $_m_sd has NOPASSWD:ALL (post-disclosure mtime/ctime) - review (legitimate IR/devops can create these; Pattern M variants drop 99-<user>)."
 
-            # Known-good LW/Nexcess provisioning shapes: info-tier.
+            # Known-good shapes: filename AND content must both match.
             case "$_m_sd_base" in
                 lwadmin|lw-admin|liquidweb|nexcess)
                     if grep -qE "^[[:space:]]*(Defaults:)?(lwadmin|lw-admin|liquidweb|nexcess)[-_[:space:]]" "$_m_sd" 2>/dev/null; then
@@ -7912,16 +7948,40 @@ check_destruction_iocs() {
                         _m_sd_note="Sudoers drop $_m_sd matches LW/Nexcess provisioning shape (NOPASSWD:ALL is standard for $_m_sd_base) - re-image+restore re-stamps mtime/ctime; not a Pattern M IOC."
                     fi
                     ;;
+                90-cloud-init-users)
+                    if grep -qE '^[[:space:]]*#[[:space:]]*(Created by cloud-init|User rules for)' "$_m_sd" 2>/dev/null; then
+                        _m_sd_sev=info; _m_sd_wt=0
+                        _m_sd_id=ioc_pattern_m_sudoers_known_good
+                        _m_sd_key=ioc_pattern_m_sudoers_known_good
+                        _m_sd_note="Sudoers drop $_m_sd matches cloud-init provisioning shape (NOPASSWD:ALL on default user is standard for 90-cloud-init-users) - re-image re-stamps mtime/ctime; not a Pattern M IOC."
+                    fi
+                    ;;
+                48-wp-toolkit)
+                    if grep -qiE '(^[[:space:]]*wp-toolkit[[:space:]]+ALL=|Cmnd_Alias[[:space:]]+(WPT|WPTOOLKIT))' "$_m_sd" 2>/dev/null; then
+                        _m_sd_sev=info; _m_sd_wt=0
+                        _m_sd_id=ioc_pattern_m_sudoers_known_good
+                        _m_sd_key=ioc_pattern_m_sudoers_known_good
+                        _m_sd_note="Sudoers drop $_m_sd matches cPanel WP Toolkit provisioning shape (NOPASSWD:ALL is standard for 48-wp-toolkit) - reinstall re-stamps mtime/ctime; not a Pattern M IOC."
+                    fi
+                    ;;
             esac
 
-            # Known-bad name overrides known-good demote.
+            # Known-bad name overrides known-good demote — check filename OR
+            # file body, so an attacker can't squat a known-good filename and
+            # smuggle a known-bad user grant inside.
             local _m_known2
             for _m_known2 in "${PATTERN_M_KNOWN_USERS[@]}"; do
+                local _m_known_src=""
                 if [[ "$_m_sd_base" == *"$_m_known2"* ]]; then
+                    _m_known_src="filename"
+                elif grep -qE "^[[:space:]]*${_m_known2}[[:space:]]+ALL=" "$_m_sd" 2>/dev/null; then
+                    _m_known_src="body"
+                fi
+                if [[ -n "$_m_known_src" ]]; then
                     _m_sd_sev=strong; _m_sd_wt=10
                     _m_sd_id=ioc_pattern_m_sudoers_known_bad
                     _m_sd_key=ioc_pattern_m_sudoers_known_bad_present
-                    _m_sd_note="Sudoers drop $_m_sd matches known-bad name shape ($_m_known2) with NOPASSWD:ALL (post-disclosure mtime/ctime) - Pattern M backdoor sudoers (CRITICAL)."
+                    _m_sd_note="Sudoers drop $_m_sd matches known-bad shape ($_m_known2 in $_m_known_src) with NOPASSWD:ALL (post-disclosure mtime/ctime) - Pattern M backdoor sudoers (CRITICAL)."
                     break
                 fi
             done
@@ -8571,6 +8631,7 @@ check_destruction_iocs() {
         emit "destruction" "destruction_scan" "info" "no_destruction_iocs" 0 \
              "note" "no destruction-stage residue (Patterns A-L + runtime) found"
     fi
+    hdr_release
 }
 
 # ---- CSF firewall posture ------------------------------------------------
@@ -8579,13 +8640,14 @@ check_destruction_iocs() {
 # live probes.
 check_csf_posture() {
     if [[ -n "$ROOT_OVERRIDE" ]]; then
-        hdr_section "posture" "CSF posture (skipped: snapshot mode)"
+        hdr_defer "posture" "CSF posture (skipped: snapshot mode)" "posture"
         emit "posture" "csf_snapshot_skip" "info" "posture_csf_snapshot_skip" 0 \
              "note" "Snapshot/--root mode: CSF posture probes live iptables/lfd state and is skipped on offline trees."
+        hdr_release
         return
     fi
 
-    hdr_section "posture" "CSF firewall posture (chains, lfd, testing flag)"
+    hdr_defer "posture" "CSF firewall posture (chains, lfd, testing flag)" "posture"
 
     # ---- 1. presence ------------------------------------------------------
     local csf_bin="" csf_conf="/etc/csf/csf.conf"
@@ -8821,12 +8883,13 @@ check_csf_posture() {
              "ipset_sets" "$ipset_set_count" \
              "note" "CSF active: LOCALINPUT/LOCALOUTPUT/LOGDROPIN loaded, INPUT->LOCALINPUT jump present (${localin_rule_count} rules), lfd pid=${lfd_pid}, csf=${csf_version:-?}, INPUT policy=${input_policy}."
     fi
+    hdr_release
 }
 
 # ---- localhost marker probe ----------------------------------------------
 check_localhost_probe() {
     (( PROBE )) || return
-    hdr_section "probe" "localhost marker probe"
+    hdr_defer "probe" "localhost marker probe" "probe"
     if ! command -v curl >/dev/null 2>&1; then
         emit "probe" "probe" "warning" "curl_missing" 0 "note" "curl required"
         return
@@ -8861,6 +8924,7 @@ check_localhost_probe() {
         emit "probe" "probe_log" "strong" "marker_logged_as_root" 5 \
              "note" "Localhost marker request logged with user=root despite no auth - strong identity-spoof signal."
     fi
+    hdr_release
 }
 
 ###############################################################################
@@ -9570,8 +9634,82 @@ print_section_matrix() {
     printf '\n' >&2
 }
 
+render_verdict_card() {
+    (( QUIET )) && return
+    local code_short host_root_short host_user_short
+    case "$VERDICT" in
+        PATCHED)      code_short="PATCHED" ;;
+        VULNERABLE)   code_short="VULN" ;;
+        INCONCLUSIVE) code_short="INC" ;;
+        SKIPPED)      code_short="SKIP" ;;
+        *)            code_short="$VERDICT" ;;
+    esac
+    case "$HOST_ROOT_VERDICT" in
+        CLEAN)       host_root_short="CLEAN" ;;
+        SUSPICIOUS)  host_root_short="SUSP" ;;
+        COMPROMISED) host_root_short="COMP" ;;
+        *)           host_root_short="$HOST_ROOT_VERDICT" ;;
+    esac
+    case "$HOST_USER_VERDICT" in
+        CLEAN)       host_user_short="CLEAN" ;;
+        SUSPICIOUS)  host_user_short="SUSP" ;;
+        COMPROMISED) host_user_short="COMP" ;;
+        *)           host_user_short="$HOST_USER_VERDICT" ;;
+    esac
+    local code_color="$DIM" root_color="$DIM" user_color="$DIM"
+    case "$VERDICT" in
+        VULNERABLE|INCONCLUSIVE) code_color="$RED" ;;
+        PATCHED)                 code_color="$GREEN" ;;
+    esac
+    [[ "$VERDICT" == "INCONCLUSIVE" ]] && code_color="$YELLOW"
+    case "$HOST_ROOT_VERDICT" in
+        COMPROMISED) root_color="$RED" ;;
+        SUSPICIOUS)  root_color="$YELLOW" ;;
+        CLEAN)       root_color="$GREEN" ;;
+    esac
+    case "$HOST_USER_VERDICT" in
+        COMPROMISED) user_color="$RED" ;;
+        SUSPICIOUS)  user_color="$YELLOW" ;;
+        CLEAN)       user_color="$GREEN" ;;
+    esac
+    local ioc_total=$(( IOC_CRITICAL + IOC_REVIEW ))
+    local window="${SINCE_DAYS:-all}"
+    printf '\n%ssessionscribe-ioc-scan v%s%s · %s · %s · %sd window\n\n' \
+        "$BOLD" "$VERSION" "$NC" "$HOSTNAME_FQDN" "$TS_ISO" "$window" >&2
+    printf '  %s| %-11s | %-11s | %-11s | %-8s | %-4s |%s\n' \
+        "$BOLD" "code" "host (root)" "host (user)" "IOC hits" "exit" "$NC" >&2
+    printf '  |-------------|-------------|-------------|----------|------|\n' >&2
+    printf '  | %s%-11s%s | %s%-11s%s | %s%-11s%s | %-8d | %-4d |\n' \
+        "$code_color" "$code_short" "$NC" \
+        "$root_color" "$host_root_short" "$NC" \
+        "$user_color" "$host_user_short" "$NC" \
+        "$ioc_total" "${EXIT_CODE:-0}" >&2
+    if (( ${#REASONS[@]} > 0 )); then
+        local uniq_list
+        uniq_list=$(printf '%s\n' "${REASONS[@]}" | awk '!seen[$0]++' | head -3)
+        printf '\n%sreasons:%s\n' "$BOLD" "$NC" >&2
+        local r
+        while IFS= read -r r; do
+            [[ -z "$r" ]] && continue
+            printf '  · %s\n' "$r" >&2
+        done <<< "$uniq_list"
+    fi
+    printf '\n' >&2
+}
+
 print_verdict() {
     (( QUIET )) && return
+    render_verdict_card
+    if (( ! VERBOSE )) \
+       && [[ "$VERDICT" == "PATCHED" ]] \
+       && [[ "$HOST_ROOT_VERDICT" == "CLEAN" ]] \
+       && [[ "$HOST_USER_VERDICT" == "CLEAN" ]] \
+       && (( (IOC_CRITICAL + IOC_REVIEW) == 0 )) \
+       && (( ${ADVISORY_COUNT:-0} == 0 )) \
+       && (( ${INCONCLUSIVE_COUNT:-0} == 0 )); then
+        printf '%sclean host — re-run with --verbose for full detail%s\n\n' "$DIM" "$NC" >&2
+        return
+    fi
     hdr_section "summary" "code state + host posture"
     sayf '  host: %s   os: %s   cpanel: %s\n\n' \
         "$HOSTNAME_FQDN" "${OS_PRETTY:-unknown}" "${CPANEL_NORM:-unknown}"
@@ -10020,6 +10158,7 @@ if (( ! REPLAY_MODE )); then
     check_destruction_iocs
     check_csf_posture
     check_localhost_probe
+    render_ok_sections
 
     aggregate_verdict
     aggregate_per_user_verdict
@@ -10083,18 +10222,20 @@ elif (( FULL_MODE )); then
 fi
 
 if (( RUN_FORENSIC )); then
+    HK_SILENT=1
     phase_defense
     phase_offense
     phase_reconcile
+    HK_SILENT=0
     render_kill_chain
+    HK_SILENT=1
     if (( DO_BUNDLE )); then
         phase_bundle
-        # Telemetry POST runs after the bundle so it can read the in-bundle
-        # envelope copy. Independent of --upload (which ships the outer
-        # tarball to intake); both can fire in the same run.
         (( TELEMETRY_MODE )) && [[ -n "$TELEMETRY_URL" ]] && phase_telemetry_post
         (( DO_UPLOAD )) && phase_upload
     fi
+    HK_SILENT=0
+    render_housekeeping_footer
 
     # Forensic summary signal. NO `local` keyword — this runs at top level;
     # `local` would be a parse error. Names become globals (read once below).
